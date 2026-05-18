@@ -1,0 +1,3 @@
+Pillow
+Flask
+pillow-heif  # optional: only needed to scan libraries that contain HEIC images
