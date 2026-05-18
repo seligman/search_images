@@ -11,6 +11,10 @@ the images can be searched.
 import argparse
 import json
 import os
+import sys
+from datetime import datetime
+if sys.version_info >= (3, 11): from datetime import UTC
+else: import datetime as datetime_fix; UTC=datetime_fix.timezone.utc
 
 import common
 import images
@@ -185,7 +189,7 @@ def rebuild_dirty(conn, store, dirty):
     conn.commit()
 
 
-def describe_one(conn, endpoint, helper, row, full):
+def describe_one(conn, endpoint, helper, row, full, remaining):
     temp = None
     image_path = full
     if common.is_heic_file(full):
@@ -205,7 +209,7 @@ def describe_one(conn, endpoint, helper, row, full):
             "UPDATE images SET info=?, search_text=?, described=1 WHERE id=?",
             (json.dumps(info), search_text, row["id"]))
         conn.commit()
-        print("  Described " + row["path"])
+        print("%s: %5d left | Described %s" % (datetime.now(UTC).strftime("%d %H:%M:%S"), remaining, row["path"]))
     except Exception as error:
         print("  Failed to describe " + row["path"] + ": " + str(error))
     finally:
@@ -231,6 +235,7 @@ def describe_pending(conn, config):
     if helper and hasattr(helper, "before_launch"):
         helper.before_launch()
     aborted = False
+    remaining = len(rows)
     for row in rows:
         if abort_requested():
             aborted = True
@@ -239,7 +244,8 @@ def describe_pending(conn, config):
         if not root:
             continue
         full = os.path.join(root, *row["path"].split("/"))
-        describe_one(conn, endpoint, helper, row, full)
+        remaining -= 1
+        describe_one(conn, endpoint, helper, row, full, remaining)
     if helper and hasattr(helper, "after_launch"):
         helper.after_launch()
     if aborted:
