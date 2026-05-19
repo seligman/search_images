@@ -38,6 +38,12 @@ def default_config():
     return json.loads(json.dumps(DEFAULT_CONFIG))
 
 
+def _merge_endpoint(stored_endpoint):
+    endpoint = dict(DEFAULT_CONFIG["endpoint"])
+    endpoint.update(stored_endpoint)
+    return endpoint
+
+
 def load_config():
     config = default_config()
     if not os.path.exists(CONFIG_PATH):
@@ -46,9 +52,12 @@ def load_config():
         stored = json.load(handle)
     config.update(stored)
     # Endpoint keys are merged separately so older config files keep working.
-    endpoint = dict(DEFAULT_CONFIG["endpoint"])
-    endpoint.update(stored.get("endpoint", {}))
-    config["endpoint"] = endpoint
+    # A list of endpoints (round robin) merges the defaults into each item.
+    stored_endpoint = stored.get("endpoint", {})
+    if isinstance(stored_endpoint, list):
+        config["endpoint"] = [_merge_endpoint(item) for item in stored_endpoint]
+    else:
+        config["endpoint"] = _merge_endpoint(stored_endpoint)
     return config
 
 

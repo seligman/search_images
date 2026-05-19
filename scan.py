@@ -9,9 +9,12 @@ the images can be searched.
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
+import queue
 import sys
+import threading
 from datetime import datetime
 if sys.version_info >= (3, 11): from datetime import UTC
 else: import datetime as datetime_fix; UTC=datetime_fix.timezone.utc
@@ -77,17 +80,22 @@ def build_search_text(name, path, info):
     return " ".join(parts).lower()
 
 
-def request_description(endpoint, helper, image_path):
+def request_description(endpoint, helper, image_path, helper_lock=None):
     """Ask the LLM for a description, retrying until the reply parses.
 
     Raises an exception if no valid JSON reply arrives within a few attempts.
+    helper_lock, when given, serializes helper calls across worker threads.
     """
     last_error = None
     for _attempt in range(MAX_DESCRIBE_ATTEMPTS):
         prompt = DESCRIBE_PROMPT
         path = image_path
         if helper and hasattr(helper, "call_api"):
-            changed = helper.call_api(prompt, path)
+            if helper_lock is not None:
+                with helper_lock:
+                    changed = helper.call_api(prompt, path)
+            else:
+                changed = helper.call_api(prompt, path)
             if changed is not None:
                 prompt, path = changed
         try:
@@ -189,51 +197,64 @@ def rebuild_dirty(conn, store, dirty):
     conn.commit()
 
 
-def describe_one(conn, endpoint, helper, row, full, remaining):
+def compute_description(endpoint, helper, helper_lock, row, full):
+    """Run the LLM for one image. Returns the info dict, or None on failure.
+
+    This does no database work, so it is safe to call from worker threads.
+    """
     temp = None
     image_path = full
     if common.is_heic_file(full):
         if not images.ensure_heif():
             print("  Skipping " + row["path"] + " (pillow-heif not installed)")
-            return
+            return None
         try:
             temp = images.heic_to_temp_jpeg(full)
             image_path = temp
         except Exception as error:
             print("  Could not convert " + row["path"] + ": " + str(error))
-            return
+            return None
     try:
-        info = request_description(endpoint, helper, image_path)
-        search_text = build_search_text(row["name"], row["path"], info)
-        conn.execute(
-            "UPDATE images SET info=?, search_text=?, described=1 WHERE id=?",
-            (json.dumps(info), search_text, row["id"]))
-        conn.commit()
-        print("%s: %5d left | Described %s" % (datetime.now(UTC).strftime("%d %H:%M:%S"), remaining, row["path"]))
+        return request_description(endpoint, helper, image_path, helper_lock)
     except Exception as error:
         print("  Failed to describe " + row["path"] + ": " + str(error))
+        return None
     finally:
         if temp and os.path.exists(temp):
             os.remove(temp)
 
 
-def describe_pending(conn, config):
-    """Describe images that need it. Returns True if an abort file stopped it."""
-    rows = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
-    if not rows:
-        print("All images already have descriptions.")
-        return False
+def store_description(conn, row, info, remaining):
+    """Save a computed description. Called only from the main thread."""
+    search_text = build_search_text(row["name"], row["path"], info)
+    conn.execute(
+        "UPDATE images SET info=?, search_text=?, described=1 WHERE id=?",
+        (json.dumps(info), search_text, row["id"]))
+    conn.commit()
+    print("%s: %5d left | Described %s"
+          % (datetime.now(UTC).strftime("%d %H:%M:%S"), remaining, row["path"]))
+
+
+def describe_one(conn, endpoint, helper, row, full, remaining):
+    info = compute_description(endpoint, helper, None, row, full)
+    if info is not None:
+        store_description(conn, row, info, remaining)
+
+
+def endpoint_list(config):
+    """Return the configured endpoints as a list.
+
+    A single endpoint dict becomes a one item list; a list (round robin) is
+    kept as is. Only endpoints that name a model are returned.
+    """
     endpoint = config.get("endpoint", {})
-    if not endpoint.get("model"):
-        print("No LLM model configured; skipping descriptions. Run settings.py.")
-        return False
-    helper = common.load_helper(config.get("helper", ""))
-    roots = {}
-    for library in config.get("libraries", []):
-        roots[library.get("name", "")] = library.get("path", "")
-    print("Describing %d image(s)..." % len(rows))
-    if helper and hasattr(helper, "before_launch"):
-        helper.before_launch()
+    items = endpoint if isinstance(endpoint, list) else [endpoint]
+    return [item for item in items
+            if isinstance(item, dict) and item.get("model")]
+
+
+def describe_in_series(conn, endpoint, helper, roots, rows):
+    """Describe images one at a time. Returns True if an abort file stopped it."""
     aborted = False
     remaining = len(rows)
     for row in rows:
@@ -246,6 +267,89 @@ def describe_pending(conn, config):
         full = os.path.join(root, *row["path"].split("/"))
         remaining -= 1
         describe_one(conn, endpoint, helper, row, full, remaining)
+    return aborted
+
+
+def describe_in_parallel(conn, endpoints, helper, roots, rows):
+    """Describe images using several endpoints at once (round robin).
+
+    Each endpoint handles one request at a time, so images spread across the
+    endpoints and the slow LLM calls overlap. New work stops as soon as an
+    abort file appears; requests already in flight are allowed to finish and
+    their results are saved. Returns True if an abort file stopped it.
+    """
+    tasks = []
+    for row in rows:
+        root = roots.get(row["library"])
+        if root:
+            full = os.path.join(root, *row["path"].split("/"))
+            tasks.append((row, full))
+    helper_lock = threading.Lock()
+    free_endpoints = queue.Queue()
+    for endpoint in endpoints:
+        free_endpoints.put(endpoint)
+
+    def work(row, full):
+        endpoint = free_endpoints.get()
+        try:
+            return compute_description(endpoint, helper, helper_lock, row, full)
+        finally:
+            free_endpoints.put(endpoint)
+
+    aborted = False
+    remaining = len(tasks)
+    task_iter = iter(tasks)
+    in_flight = {}
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(endpoints)) as pool:
+        def submit_next():
+            for row, full in task_iter:
+                in_flight[pool.submit(work, row, full)] = row
+                return True
+            return False
+        for _ in endpoints:
+            if abort_requested():
+                aborted = True
+                break
+            if not submit_next():
+                break
+        while in_flight:
+            done, _ = concurrent.futures.wait(
+                in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                row = in_flight.pop(future)
+                info = future.result()
+                remaining -= 1
+                if info is not None:
+                    store_description(conn, row, info, remaining)
+                if not aborted and abort_requested():
+                    aborted = True
+                if not aborted:
+                    submit_next()
+    return aborted
+
+
+def describe_pending(conn, config):
+    """Describe images that need it. Returns True if an abort file stopped it."""
+    rows = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
+    if not rows:
+        print("All images already have descriptions.")
+        return False
+    endpoints = endpoint_list(config)
+    if not endpoints:
+        print("No LLM model configured; skipping descriptions. Run settings.py.")
+        return False
+    helper = common.load_helper(config.get("helper", ""))
+    roots = {}
+    for library in config.get("libraries", []):
+        roots[library.get("name", "")] = library.get("path", "")
+    print("Describing %d image(s)..." % len(rows))
+    if helper and hasattr(helper, "before_launch"):
+        helper.before_launch()
+    if len(endpoints) > 1:
+        aborted = describe_in_parallel(conn, endpoints, helper, roots, rows)
+    else:
+        aborted = describe_in_series(conn, endpoints[0], helper, roots, rows)
     if helper and hasattr(helper, "after_launch"):
         helper.after_launch()
     if aborted:
