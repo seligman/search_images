@@ -358,7 +358,7 @@ def describe_pending(conn, config):
     return aborted
 
 
-def run_scan(describe):
+def run_scan(scan_images, describe):
     config = common.load_config()
     libraries = config.get("libraries", [])
     if not libraries:
@@ -368,34 +368,35 @@ def run_scan(describe):
         print("Abort file present; remove 'abort' or 'abort.txt' first.")
         return
     conn = common.open_db()
-    store = common.ThumbStore(common.THUMB_DIR)
-    dirty = set()
-    configured = set()
-    aborted = False
-    for library in libraries:
-        name = library.get("name", "")
-        root = library.get("path", "")
-        configured.add(name)
-        if not name or not os.path.isdir(root):
-            print("Skipping library (missing folder): " + str(name))
-            continue
-        print("Scanning library: " + name)
-        if not scan_library(conn, store, dirty, name, root):
-            aborted = True
-            break
-    if aborted:
+    if scan_images:
+        store = common.ThumbStore(common.THUMB_DIR)
+        dirty = set()
+        configured = set()
+        aborted = False
+        for library in libraries:
+            name = library.get("name", "")
+            root = library.get("path", "")
+            configured.add(name)
+            if not name or not os.path.isdir(root):
+                print("Skipping library (missing folder): " + str(name))
+                continue
+            print("Scanning library: " + name)
+            if not scan_library(conn, store, dirty, name, root):
+                aborted = True
+                break
+        if aborted:
+            rebuild_dirty(conn, store, dirty)
+            conn.close()
+            print("Abort requested. Progress saved; run scan.py again to continue.")
+            return
+        # Drop images that belong to libraries no longer in the config.
+        for row in conn.execute("SELECT id, library, thumb_shard FROM images").fetchall():
+            if row["library"] not in configured:
+                if row["thumb_shard"] is not None:
+                    dirty.add(row["thumb_shard"])
+                conn.execute("DELETE FROM images WHERE id = ?", (row["id"],))
+        conn.commit()
         rebuild_dirty(conn, store, dirty)
-        conn.close()
-        print("Abort requested. Progress saved; run scan.py again to continue.")
-        return
-    # Drop images that belong to libraries no longer in the config.
-    for row in conn.execute("SELECT id, library, thumb_shard FROM images").fetchall():
-        if row["library"] not in configured:
-            if row["thumb_shard"] is not None:
-                dirty.add(row["thumb_shard"])
-            conn.execute("DELETE FROM images WHERE id = ?", (row["id"],))
-    conn.commit()
-    rebuild_dirty(conn, store, dirty)
     if describe and describe_pending(conn, config):
         conn.close()
         return
@@ -405,10 +406,12 @@ def run_scan(describe):
 
 def main():
     parser = argparse.ArgumentParser(description="Scan the image libraries.")
+    parser.add_argument("--no-scan", action="store_true",
+                        help="Skip the index image step, and only run LLM descriptions.")
     parser.add_argument("--no-describe", action="store_true",
                         help="Index images without requesting LLM descriptions.")
     args = parser.parse_args()
-    run_scan(describe=not args.no_describe)
+    run_scan(scan_images=not args.no_scan, describe=not args.no_describe)
 
 
 if __name__ == "__main__":
