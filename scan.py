@@ -10,6 +10,7 @@ the images can be searched.
 
 import argparse
 import concurrent.futures
+import fnmatch
 import json
 import os
 import queue
@@ -44,6 +45,26 @@ ABORT_FILES = ("abort", "abort.txt")
 
 def abort_requested():
     return any(os.path.exists(name) for name in ABORT_FILES)
+
+
+def normalize_ignore(patterns):
+    """Return a clean list of ignore patterns with forward-slash separators.
+
+    Either separator (/ or backslash) is accepted in the config so the same
+    library entry works on every platform.
+    """
+    result = []
+    for pattern in patterns or []:
+        if isinstance(pattern, str) and pattern.strip():
+            result.append(pattern.strip().replace("\\", "/"))
+    return result
+
+
+def matches_ignore(rel_path, patterns):
+    for pattern in patterns:
+        if fnmatch.fnmatch(rel_path, pattern):
+            return True
+    return False
 
 
 def as_string_list(value):
@@ -145,13 +166,28 @@ def process_file(conn, store, dirty, library, root, rel, full, filename):
         print("  Added " + rel)
 
 
-def scan_library(conn, store, dirty, name, root):
+def scan_library(conn, store, dirty, name, root, ignore=None):
     """Scan one library. Returns False if an abort file interrupted it."""
+    patterns = normalize_ignore(ignore)
     seen = set()
     aborted = False
-    for current, _dirs, files in os.walk(root):
+    for current, dirs, files in os.walk(root):
         if aborted:
             break
+        rel_dir = os.path.relpath(current, root).replace(os.sep, "/")
+        prefix = "" if rel_dir == "." else rel_dir + "/"
+        if patterns:
+            # Prune subdirectories whose contents are fully ignored. A made-up
+            # placeholder name probes whether anything inside the dir could
+            # match an ignore pattern.
+            kept = []
+            for d in dirs:
+                sub = prefix + d
+                if (matches_ignore(sub, patterns)
+                        or matches_ignore(sub + "/_", patterns)):
+                    continue
+                kept.append(d)
+            dirs[:] = kept
         for filename in files:
             if not common.is_image_file(filename):
                 continue
@@ -160,6 +196,8 @@ def scan_library(conn, store, dirty, name, root):
                 break
             full = os.path.join(current, filename)
             rel = os.path.relpath(full, root).replace(os.sep, "/")
+            if matches_ignore(rel, patterns):
+                continue
             seen.add(rel)
             process_file(conn, store, dirty, name, root, rel, full, filename)
     conn.commit()
@@ -376,12 +414,13 @@ def run_scan(scan_images, describe):
         for library in libraries:
             name = library.get("name", "")
             root = library.get("path", "")
+            ignore = library.get("ignore", [])
             configured.add(name)
             if not name or not os.path.isdir(root):
                 print("Skipping library (missing folder): " + str(name))
                 continue
             print("Scanning library: " + name)
-            if not scan_library(conn, store, dirty, name, root):
+            if not scan_library(conn, store, dirty, name, root, ignore):
                 aborted = True
                 break
         if aborted:

@@ -37,7 +37,9 @@ From there you can:
   `example_helper.py`.
 - Add the image libraries to monitor. Each library has a name and a folder.
 
-Settings are stored in `config.json`.
+Settings are stored in `config.json`. See [SETTINGS.md](SETTINGS.md) for the
+full format, including options the menu does not edit (such as per-library
+ignore patterns and round-robin endpoints).
 
 ## Scanning
 
@@ -90,5 +92,6 @@ small change only rewrites the files that changed.
 - `scan.py` - scan libraries and request descriptions
 - `serve.py` - search server and static site packager
 - `common.py`, `llm.py`, `images.py` - shared helpers
+- `SETTINGS.md` - reference for every field in `config.json`
 - `data/` - database and thumbnail files
 - `site/` - the packaged static site
