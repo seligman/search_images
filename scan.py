@@ -109,6 +109,7 @@ def request_description(endpoint, helper, image_path, helper_lock=None):
     """
     last_error = None
     for _attempt in range(MAX_DESCRIBE_ATTEMPTS):
+        response = ""
         prompt = DESCRIBE_PROMPT
         path = image_path
         if helper and hasattr(helper, "call_api"):
@@ -120,8 +121,20 @@ def request_description(endpoint, helper, image_path, helper_lock=None):
             if changed is not None:
                 prompt, path = changed
         try:
-            return parse_description(llm.describe_image(endpoint, prompt, path))
+            response = llm.describe_image(endpoint, prompt, path)
+            return parse_description(response)
         except Exception as error:
+            if 'LOG_ERRORS' in os.environ:
+                error_num = 0
+                while True:
+                    fn = "_error_%04d.txt" % (error_num,)
+                    if not os.path.isfile(fn):
+                        break
+                    error_num += 1
+                with open(fn, "wt", encoding="utf-8", newline="") as f:
+                    f.write(str(error) + "\n")
+                    f.write("-" * 100 + "\n")
+                    f.write(str(response))
             last_error = error
     raise Exception("no valid description after %d attempts: %s"
                     % (MAX_DESCRIBE_ATTEMPTS, last_error))

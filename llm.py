@@ -11,6 +11,7 @@ import json
 import os
 import urllib.request
 
+MAX_TOKENS = 5000 # Max size to allow the response
 
 def _mime_for(path):
     ext = os.path.splitext(path)[1].lower()
@@ -51,7 +52,7 @@ def _call_openai(base_url, api_key, model, prompt, encoded, mime):
         headers["Authorization"] = "Bearer " + api_key
     payload = {
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": MAX_TOKENS,
         "messages": [{
             "role": "user",
             "content": [
@@ -74,7 +75,7 @@ def _call_claude(base_url, api_key, model, prompt, encoded, mime):
     }
     payload = {
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": MAX_TOKENS,
         "messages": [{
             "role": "user",
             "content": [
