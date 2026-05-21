@@ -292,6 +292,26 @@ def describe_one(conn, endpoint, helper, row, full, remaining):
         store_description(conn, row, info, remaining)
 
 
+def description_date(row):
+    """Return a timestamp for ordering pending descriptions.
+
+    Uses an EXIF capture date when present and parseable; otherwise falls
+    back to the file's modified time.
+    """
+    try:
+        exif = json.loads(row["exif"] or "{}")
+    except (TypeError, ValueError):
+        exif = {}
+    for field in ("DateTimeOriginal", "DateTime"):
+        value = exif.get(field)
+        if isinstance(value, str):
+            try:
+                return datetime.strptime(value, "%Y:%m:%d %H:%M:%S").timestamp()
+            except ValueError:
+                pass
+    return row["mtime"]
+
+
 def endpoint_list(config):
     """Return the configured endpoints as a list.
 
@@ -380,12 +400,14 @@ def describe_in_parallel(conn, endpoints, helper, roots, rows):
     return aborted
 
 
-def describe_pending(conn, config):
+def describe_pending(conn, config, newest_first=False):
     """Describe images that need it. Returns True if an abort file stopped it."""
     rows = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
     if not rows:
         print("All images already have descriptions.")
         return False
+    if newest_first:
+        rows = sorted(rows, key=description_date, reverse=True)
     endpoints = endpoint_list(config)
     if not endpoints:
         print("No LLM model configured; skipping descriptions. Run settings.py.")
@@ -409,7 +431,7 @@ def describe_pending(conn, config):
     return aborted
 
 
-def run_scan(scan_images, describe):
+def run_scan(scan_images, describe, newest_first=False):
     config = common.load_config()
     libraries = config.get("libraries", [])
     if not libraries:
@@ -449,7 +471,7 @@ def run_scan(scan_images, describe):
                 conn.execute("DELETE FROM images WHERE id = ?", (row["id"],))
         conn.commit()
         rebuild_dirty(conn, store, dirty)
-    if describe and describe_pending(conn, config):
+    if describe and describe_pending(conn, config, newest_first):
         conn.close()
         return
     conn.close()
@@ -462,8 +484,12 @@ def main():
                         help="Skip the index image step, and only run LLM descriptions.")
     parser.add_argument("--no-describe", action="store_true",
                         help="Index images without requesting LLM descriptions.")
+    parser.add_argument("--newest-first", action="store_true",
+                        help="Describe images most-recent first, using EXIF date "
+                             "and falling back to the file's modified time.")
     args = parser.parse_args()
-    run_scan(scan_images=not args.no_scan, describe=not args.no_describe)
+    run_scan(scan_images=not args.no_scan, describe=not args.no_describe,
+             newest_first=args.newest_first)
 
 
 if __name__ == "__main__":
