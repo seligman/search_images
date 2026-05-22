@@ -91,7 +91,14 @@ small change only rewrites the files that changed.
 - `settings.py` - manage settings
 - `scan.py` - scan libraries and request descriptions
 - `serve.py` - search server and static site packager
+- `world_map.py` - render a world map with a pin for each GPS-tagged area
 - `common.py`, `llm.py`, `images.py` - shared helpers
 - `SETTINGS.md` - reference for every field in `config.json`
 - `data/` - database and thumbnail files
 - `site/` - the packaged static site
+
+## Credits
+
+`static/worldmap.jpg` is an equirectangular projection derived from NASA's
+Blue Marble imagery and is in the public domain. Source:
+https://commons.wikimedia.org/wiki/File:Equirectangular-projection.jpg
