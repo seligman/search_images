@@ -9,9 +9,12 @@ with its base URL for llama.cpp.
 import base64
 import json
 import os
+import time
 import urllib.request
 
 MAX_TOKENS = 5000 # Max size to allow the response
+PROPS_MAX_ATTEMPTS = 3
+PROPS_RETRY_DELAY = 1.0
 
 def _mime_for(path):
     ext = os.path.splitext(path)[1].lower()
@@ -105,32 +108,44 @@ _model_name_cache = {}
 
 
 def _try_props(base_url):
-    """Ask a llama.cpp-compatible server for the loaded model's file name."""
+    """Ask a llama.cpp-compatible server for the loaded model's file name.
+
+    Retries on transient errors; raises RuntimeError if every attempt fails.
+    """
     candidates = [base_url]
     # llama.cpp serves /props at the root, but the OpenAI-compatible base_url
     # often ends in /v1 -- try both.
     if base_url.endswith("/v1"):
         candidates.append(base_url[:-3])
-    for url in candidates:
-        try:
-            request = urllib.request.Request(url + "/props", method="GET")
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except Exception:
-            continue
-        for key in ("model_path", "model_alias", "model"):
-            value = data.get(key)
-            if isinstance(value, str) and value:
-                return value.replace("\\", "/").split("/")[-1]
-    return None
+    last_error = None
+    for attempt in range(PROPS_MAX_ATTEMPTS):
+        if attempt > 0:
+            time.sleep(PROPS_RETRY_DELAY)
+        for url in candidates:
+            try:
+                request = urllib.request.Request(url + "/props", method="GET")
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+            except Exception as error:
+                last_error = error
+                continue
+            for key in ("model_path", "model_alias", "model"):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    return value.replace("\\", "/").split("/")[-1]
+            last_error = ValueError("/props response had no model name field")
+    raise RuntimeError("could not read model name from " + base_url
+                       + "/props after " + str(PROPS_MAX_ATTEMPTS)
+                       + " attempts: " + str(last_error))
 
 
 def probe_model_name(endpoint):
     """Return a display name for the model the endpoint is actually serving.
 
     For llama.cpp-style OpenAI-compatible endpoints this asks /props for the
-    loaded weights file; everywhere else (and on any error) it falls back to
-    the model name from the endpoint config. The result is cached per endpoint.
+    loaded weights file and raises if the probe ultimately fails; for other
+    kinds it uses the model name from the endpoint config. Successful results
+    are cached per endpoint.
     """
     kind = endpoint.get("kind", "openai")
     base_url = endpoint.get("base_url", "").rstrip("/")
@@ -140,9 +155,7 @@ def probe_model_name(endpoint):
         return _model_name_cache[key]
     name = configured
     if kind == "openai" and base_url:
-        discovered = _try_props(base_url)
-        if discovered:
-            name = discovered
+        name = _try_props(base_url)
     _model_name_cache[key] = name
     return name
 

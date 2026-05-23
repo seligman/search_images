@@ -183,10 +183,13 @@ body.map-page {
 }
 
 #map-panel-list {
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: 8px;
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    grid-auto-rows: min-content;
     gap: 8px;
 }
 

@@ -486,10 +486,10 @@ def describe_pending(conn, config, newest_first=False):
     for library in config.get("libraries", []):
         roots[library.get("name", "")] = library.get("path", "")
     print("Describing %d image(s)..." % len(rows))
-    for endpoint in endpoints:
-        print("  Using model: " + llm.probe_model_name(endpoint))
     if helper and hasattr(helper, "before_launch"):
         helper.before_launch()
+    for endpoint in endpoints:
+        print("  Using model: " + llm.probe_model_name(endpoint))
     if len(endpoints) > 1:
         aborted = describe_in_parallel(conn, endpoints, helper, roots, rows)
     else:
