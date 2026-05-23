@@ -9,20 +9,71 @@ data entirely in the browser.
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import shutil
 import time
 
 import common
+# world_map is imported lazily inside the functions that need it: it pulls in
+# Pillow, and the original serve.py avoided that at startup so users running
+# the search server on a stdlib-only setup still worked.
 
 EXPORT_STATE_PATH = os.path.join(common.DATA_DIR, "export-state.json")
 TEMPLATE_DIR = os.path.join(common.BASE_DIR, "templates")
 STATIC_DIR = os.path.join(common.BASE_DIR, "static")
-ASSET_FILES = ("style.css", "site.js", "app.js", "detail.js")
+TILES_DIR = os.path.join(common.DATA_DIR, "tiles")
+FALLBACK_BASEMAP = os.path.join(STATIC_DIR, "worldmap.jpg")
+ASSET_FILES = ("style.css", "site.js", "app.js", "detail.js", "map.js")
+TILE_SIZE = 256
 
 
-def render_template_file(name, mode, asset_prefix, data_prefix):
+def tiles_max_zoom():
+    """Return the highest pre-generated zoom level, or None if no tiles."""
+    manifest = os.path.join(TILES_DIR, "manifest.json")
+    if not os.path.isfile(manifest):
+        return None
+    try:
+        with open(manifest, "r") as handle:
+            return int(json.load(handle).get("max_zoom"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _fallback_tile_bytes(zoom, x, y):
+    """Slice a tile out of the small bundled basemap.
+
+    Used when the pre-generated tile pyramid is absent. Always returns
+    something usable so the map page still works without running make_tiles.py.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    if not os.path.isfile(FALLBACK_BASEMAP):
+        return None
+    cols = 2 ** (zoom + 1)
+    rows = 2 ** zoom
+    if x < 0 or x >= cols or y < 0 or y >= rows:
+        return None
+    with Image.open(FALLBACK_BASEMAP) as source:
+        source = source.convert("RGB")
+        src_w, src_h = source.size
+        sx0 = int(round(x * src_w / cols))
+        sx1 = int(round((x + 1) * src_w / cols))
+        sy0 = int(round(y * src_h / rows))
+        sy1 = int(round((y + 1) * src_h / rows))
+        crop = source.crop((sx0, sy0, sx1, sy1))
+        if crop.size != (TILE_SIZE, TILE_SIZE):
+            crop = crop.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+        buffer = io.BytesIO()
+        crop.save(buffer, format="JPEG", quality=82)
+        return buffer.getvalue()
+
+
+def render_template_file(name, mode, asset_prefix, data_prefix,
+                         tiles_max=None, tile_prefix=None):
     """Build a page from a template file, shared by server and static modes."""
     with open(os.path.join(TEMPLATE_DIR, name), "r") as handle:
         html = handle.read()
@@ -33,8 +84,12 @@ def render_template_file(name, mode, asset_prefix, data_prefix):
     }
     if mode == "server":
         app_config["api"] = "/api"
+        app_config["tiles"] = "/tile"
     else:
         app_config["data"] = data_prefix
+        app_config["tiles"] = tile_prefix
+    app_config["tilesMax"] = tiles_max
+    app_config["tileSize"] = TILE_SIZE
     html = html.replace("__ASSET_PREFIX__", asset_prefix)
     html = html.replace("__APP_CONFIG__", json.dumps(app_config))
     return html
@@ -92,20 +147,45 @@ def build_app():
 
     @app.route("/")
     def index():
-        return render_template_file("page.html", "server", "/static/", None)
+        return render_template_file("page.html", "server", "/static/", None,
+                                    tiles_max=tiles_max_zoom())
 
     @app.route("/detail")
     def detail():
-        return render_template_file("detail.html", "server", "/static/", None)
+        return render_template_file("detail.html", "server", "/static/", None,
+                                    tiles_max=tiles_max_zoom())
+
+    @app.route("/map")
+    def map_page():
+        return render_template_file("map.html", "server", "/static/", None,
+                                    tiles_max=tiles_max_zoom())
+
+    @app.route("/api/locations")
+    def api_locations():
+        import world_map
+        rows = world_map.collect_located_images()
+        return jsonify([{"id": i, "lat": lat, "lon": lon}
+                        for i, lat, lon in rows])
+
+    @app.route("/tile/<int:zoom>/<int:x>/<int:y>.jpg")
+    def tile(zoom, x, y):
+        local = os.path.join(TILES_DIR, str(zoom), str(x), "%d.jpg" % y)
+        if os.path.isfile(local):
+            return send_file(local, mimetype="image/jpeg")
+        data = _fallback_tile_bytes(zoom, x, y)
+        if data is None:
+            return Response(status=404)
+        return Response(data, mimetype="image/jpeg")
 
     @app.route("/api/index")
     def api_index():
         conn = common.open_db()
-        rows = conn.execute("SELECT id, name, library, search_text FROM images "
-                            "ORDER BY name").fetchall()
+        rows = conn.execute("SELECT id, name, library, search_text, dhash "
+                            "FROM images ORDER BY name").fetchall()
         conn.close()
         return jsonify([{"id": r["id"], "name": r["name"],
-                         "library": r["library"], "text": r["search_text"]}
+                         "library": r["library"], "text": r["search_text"],
+                         "dhash": r["dhash"]}
                         for r in rows])
 
     @app.route("/api/image/<int:image_id>")
@@ -267,8 +347,8 @@ def package(output_dir):
             "height": row["height"],
             "info": json.loads(row["info"]) if row["info"] else None,
             "exif": json.loads(row["exif"]) if row["exif"] else {},
-            "text": row["search_text"], "thumb": thumb,
-            "image": "images/" + image_name,
+            "text": row["search_text"], "dhash": row["dhash"],
+            "thumb": thumb, "image": "images/" + image_name,
         }
         text = json.dumps(record, sort_keys=True)
         digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -304,15 +384,65 @@ def package(output_dir):
     for asset in ASSET_FILES:
         shutil.copyfile(os.path.join(STATIC_DIR, asset),
                         os.path.join(output_dir, asset))
+
+    import world_map
+    locations = world_map.collect_located_images(conn)
+    write_json(os.path.join(data_dir, "locations.json"),
+               [{"id": i, "lat": lat, "lon": lon}
+                for i, lat, lon in locations])
+
+    tiles_max = export_tiles(output_dir)
+    tile_prefix = "tiles/" if tiles_max is not None else None
+
     with open(os.path.join(output_dir, "index.html"), "w") as handle:
-        handle.write(render_template_file("page.html", "static", "", "data/"))
+        handle.write(render_template_file(
+            "page.html", "static", "", "data/",
+            tiles_max=tiles_max, tile_prefix=tile_prefix))
     with open(os.path.join(output_dir, "detail.html"), "w") as handle:
-        handle.write(render_template_file("detail.html", "static", "", "data/"))
+        handle.write(render_template_file(
+            "detail.html", "static", "", "data/",
+            tiles_max=tiles_max, tile_prefix=tile_prefix))
+    with open(os.path.join(output_dir, "map.html"), "w") as handle:
+        handle.write(render_template_file(
+            "map.html", "static", "", "data/",
+            tiles_max=tiles_max, tile_prefix=tile_prefix))
 
     save_export_state(shards)
     conn.close()
     print("Packaged %d image(s) into %s (%d data shard(s) written)."
           % (len(records), output_dir, written))
+
+
+def export_tiles(output_dir):
+    """Copy data/tiles into the static site. Returns the max zoom, or None.
+
+    When no tile pyramid is present the fallback basemap is sliced into a
+    small zoom-0..3 pyramid so the static map page still works offline.
+    """
+    max_zoom = tiles_max_zoom()
+    dest_root = os.path.join(output_dir, "tiles")
+    if max_zoom is not None:
+        if os.path.isdir(dest_root):
+            shutil.rmtree(dest_root)
+        shutil.copytree(TILES_DIR, dest_root)
+        return max_zoom
+    if not os.path.isfile(FALLBACK_BASEMAP):
+        return None
+    fallback_max = 3
+    for zoom in range(fallback_max + 1):
+        cols = 2 ** (zoom + 1)
+        rows = 2 ** zoom
+        for x in range(cols):
+            for y in range(rows):
+                data = _fallback_tile_bytes(zoom, x, y)
+                if data is None:
+                    return None
+                tile_dir = os.path.join(dest_root, str(zoom), str(x))
+                if not os.path.isdir(tile_dir):
+                    os.makedirs(tile_dir)
+                with open(os.path.join(tile_dir, "%d.jpg" % y), "wb") as handle:
+                    handle.write(data)
+    return fallback_max
 
 
 def main():

@@ -96,16 +96,40 @@ def extract_exif(image):
     return result
 
 
+def compute_dhash(image):
+    """Difference hash: resize to 9x8 grayscale, compare horizontal neighbors.
+
+    Returns a 16-character hex string (64 bits). Robust to small changes in
+    brightness, contrast, and compression; good for spotting near-duplicates.
+    """
+    small = image.convert("L").resize((9, 8), Image.LANCZOS)
+    pixels = list(small.getdata())
+    bits = 0
+    for row in range(8):
+        base = row * 9
+        for col in range(8):
+            bits = (bits << 1) | (1 if pixels[base + col] > pixels[base + col + 1] else 0)
+    return "%016x" % bits
+
+
 def read_image(path):
-    """Return (width, height, jpeg_thumbnail_bytes, exif_dict) for a file."""
+    """Return (width, height, jpeg_thumbnail_bytes, exif_dict, dhash) for a file."""
     with Image.open(path) as image:
         width, height = image.size
         exif = extract_exif(image)
-        thumb = ImageOps.exif_transpose(image).convert("RGB")
+        oriented = ImageOps.exif_transpose(image)
+        dhash = compute_dhash(oriented)
+        thumb = oriented.convert("RGB")
         thumb.thumbnail((common.THUMB_SIZE, common.THUMB_SIZE))
         buffer = io.BytesIO()
         thumb.save(buffer, format="JPEG", quality=85)
-        return width, height, buffer.getvalue(), exif
+        return width, height, buffer.getvalue(), exif, dhash
+
+
+def read_dhash(path):
+    """Open a file and return only its dHash. Used when backfilling."""
+    with Image.open(path) as image:
+        return compute_dhash(ImageOps.exif_transpose(image))
 
 
 def heic_to_jpeg_bytes(path):

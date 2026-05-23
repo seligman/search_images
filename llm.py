@@ -101,6 +101,52 @@ def _call_ollama(base_url, model, prompt, encoded):
     return result["message"]["content"].strip()
 
 
+_model_name_cache = {}
+
+
+def _try_props(base_url):
+    """Ask a llama.cpp-compatible server for the loaded model's file name."""
+    candidates = [base_url]
+    # llama.cpp serves /props at the root, but the OpenAI-compatible base_url
+    # often ends in /v1 -- try both.
+    if base_url.endswith("/v1"):
+        candidates.append(base_url[:-3])
+    for url in candidates:
+        try:
+            request = urllib.request.Request(url + "/props", method="GET")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            continue
+        for key in ("model_path", "model_alias", "model"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                return value.replace("\\", "/").split("/")[-1]
+    return None
+
+
+def probe_model_name(endpoint):
+    """Return a display name for the model the endpoint is actually serving.
+
+    For llama.cpp-style OpenAI-compatible endpoints this asks /props for the
+    loaded weights file; everywhere else (and on any error) it falls back to
+    the model name from the endpoint config. The result is cached per endpoint.
+    """
+    kind = endpoint.get("kind", "openai")
+    base_url = endpoint.get("base_url", "").rstrip("/")
+    configured = endpoint.get("model", "")
+    key = (kind, base_url, configured)
+    if key in _model_name_cache:
+        return _model_name_cache[key]
+    name = configured
+    if kind == "openai" and base_url:
+        discovered = _try_props(base_url)
+        if discovered:
+            name = discovered
+    _model_name_cache[key] = name
+    return name
+
+
 def extract_json(text):
     """Pull a JSON object out of an LLM reply.
 

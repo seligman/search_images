@@ -17,12 +17,16 @@ import os
 
 import common
 
-try:
-    from PIL import Image, ImageDraw, ImageFont
-except ImportError:
-    raise SystemExit(
-        "This tool needs Pillow. Install it with:\n"
-        "    python -m pip install Pillow")
+
+def _pillow():
+    """Lazy Pillow import: this module's data helpers do not need it."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        raise SystemExit(
+            "This tool needs Pillow. Install it with:\n"
+            "    python -m pip install Pillow")
+    return Image, ImageDraw, ImageFont
 
 
 DEFAULT_WIDTH = 1600
@@ -104,13 +108,18 @@ def latlon_to_pixel(lat, lon, width, height):
 
 def collect_locations(conn=None):
     """Return a list of (lat, lon) for every DB image with usable GPS data."""
+    return [(lat, lon) for _id, lat, lon in collect_located_images(conn)]
+
+
+def collect_located_images(conn=None):
+    """Return a list of (id, lat, lon) for every DB image with usable GPS."""
     close_after = False
     if conn is None:
         conn = common.open_db()
         close_after = True
     try:
         rows = conn.execute(
-            "SELECT exif FROM images WHERE exif LIKE '%GPS%'").fetchall()
+            "SELECT id, exif FROM images WHERE exif LIKE '%GPS%'").fetchall()
     finally:
         if close_after:
             conn.close()
@@ -125,7 +134,7 @@ def collect_locations(conn=None):
             continue
         latlon = extract_lat_lon(exif.get("GPS"))
         if latlon:
-            points.append(latlon)
+            points.append((row["id"], latlon[0], latlon[1]))
     return points
 
 
@@ -155,6 +164,7 @@ def cluster_points(points, width, height, radius):
 
 def load_basemap(width, height, basemap_path):
     """Load a base map and resize to (width, height), or build a fallback."""
+    Image, ImageDraw, _ = _pillow()
     if basemap_path and os.path.isfile(basemap_path):
         with Image.open(basemap_path) as src:
             img = src.convert("RGB")
@@ -182,6 +192,7 @@ def _text_size(draw, text, font):
 
 
 def _default_font():
+    _, _, ImageFont = _pillow()
     try:
         return ImageFont.load_default(size=14)
     except TypeError:
@@ -209,6 +220,7 @@ def render_map(width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT,
     `points` may be supplied to skip the database query (useful for tests or
     when the caller already has the coordinates in hand).
     """
+    _, ImageDraw, _ = _pillow()
     if points is None:
         points = collect_locations()
     img = load_basemap(width, height, basemap_path)

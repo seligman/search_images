@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Image Map</title>
+<link rel="stylesheet" href="__ASSET_PREFIX__style.css">
+</head>
+<body class="map-page">
+<div id="map-bar">
+<a id="map-back" href="#">Back to search</a>
+<span id="map-status"></span>
+</div>
+<div id="map-stage">
+<canvas id="map-canvas"></canvas>
+<div id="map-zoom">
+<button id="zoom-in" type="button" aria-label="Zoom in">+</button>
+<button id="zoom-out" type="button" aria-label="Zoom out">-</button>
+</div>
+<div id="map-panel" hidden>
+<div id="map-panel-head">
+<span id="map-panel-title"></span>
+<button id="map-panel-close" type="button" aria-label="Close">x</button>
+</div>
+<div id="map-panel-list"></div>
+</div>
+</div>
+<script>window.APP_CONFIG = __APP_CONFIG__;</script>
+<script src="__ASSET_PREFIX__site.js"></script>
+<script src="__ASSET_PREFIX__map.js"></script>
+</body>
+</html>

@@ -81,31 +81,93 @@ def is_heic_file(name):
     return name.lower().endswith(HEIC_EXTENSIONS)
 
 
+CREATE_IMAGES_SQL = """
+    CREATE TABLE IF NOT EXISTS images (
+        id INTEGER PRIMARY KEY,
+        library TEXT NOT NULL,
+        path TEXT NOT NULL,
+        name TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        thumb_shard INTEGER,
+        thumb_offset INTEGER,
+        thumb_length INTEGER,
+        info TEXT NOT NULL DEFAULT '',
+        search_text TEXT NOT NULL DEFAULT '',
+        exif TEXT NOT NULL DEFAULT '',
+        described INTEGER NOT NULL DEFAULT 0,
+        prompt_ver INTEGER NOT NULL DEFAULT 0,
+        dhash TEXT NOT NULL DEFAULT '',
+        UNIQUE (library, path)
+    )
+"""
+
+EXPECTED_COLUMNS = (
+    "id", "library", "path", "name", "size", "mtime", "ctime",
+    "width", "height", "thumb_shard", "thumb_offset", "thumb_length",
+    "info", "search_text", "exif", "described", "prompt_ver", "dhash",
+)
+
+
+def _table_columns(conn, table):
+    rows = conn.execute("PRAGMA table_info(%s)" % table).fetchall()
+    return [row[1] for row in rows]
+
+
+def _upgrade_db(missing):
+    """Copy images.db to a fresh schema, adding any missing columns.
+
+    The new file is built alongside the old one; both connections are closed
+    before the old file is replaced.
+    """
+    new_path = DB_PATH + ".new"
+    if os.path.exists(new_path):
+        os.remove(new_path)
+    old = sqlite3.connect(DB_PATH)
+    try:
+        existing = _table_columns(old, "images")
+        shared = [c for c in existing if c in EXPECTED_COLUMNS]
+        cols = ",".join(shared)
+        placeholders = ",".join("?" for _ in shared)
+        new = sqlite3.connect(new_path)
+        try:
+            new.execute(CREATE_IMAGES_SQL)
+            cursor = old.execute("SELECT " + cols + " FROM images")
+            while True:
+                batch = cursor.fetchmany(1000)
+                if not batch:
+                    break
+                new.executemany(
+                    "INSERT INTO images (" + cols + ") VALUES ("
+                    + placeholders + ")", batch)
+            new.commit()
+        finally:
+            new.close()
+    finally:
+        old.close()
+    os.remove(DB_PATH)
+    os.rename(new_path, DB_PATH)
+    print("Upgraded database: added column(s) " + ", ".join(missing))
+
+
 def open_db():
     ensure_data_dirs()
+    if os.path.exists(DB_PATH):
+        probe = sqlite3.connect(DB_PATH)
+        try:
+            existing = _table_columns(probe, "images")
+        finally:
+            probe.close()
+        if existing:
+            missing = [c for c in EXPECTED_COLUMNS if c not in existing]
+            if missing:
+                _upgrade_db(missing)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS images (
-            id INTEGER PRIMARY KEY,
-            library TEXT NOT NULL,
-            path TEXT NOT NULL,
-            name TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            mtime REAL NOT NULL,
-            ctime REAL NOT NULL,
-            width INTEGER NOT NULL,
-            height INTEGER NOT NULL,
-            thumb_shard INTEGER,
-            thumb_offset INTEGER,
-            thumb_length INTEGER,
-            info TEXT NOT NULL DEFAULT '',
-            search_text TEXT NOT NULL DEFAULT '',
-            exif TEXT NOT NULL DEFAULT '',
-            described INTEGER NOT NULL DEFAULT 0,
-            UNIQUE (library, path)
-        )
-    """)
+    conn.execute(CREATE_IMAGES_SQL)
     conn.commit()
     return conn
 

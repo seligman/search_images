@@ -95,6 +95,24 @@
         body.appendChild(name);
     }
 
+    var SCORE_LABELS = [
+        ["aesthetic_score", "Aesthetic"],
+        ["sharpness", "Sharpness"],
+        ["exposure_score", "Exposure"],
+        ["watermark_score", "Watermark-free"]
+    ];
+
+    function scoresTable(info) {
+        var pairs = [];
+        SCORE_LABELS.forEach(function (entry) {
+            var value = info[entry[0]];
+            if (typeof value === "number" && isFinite(value)) {
+                pairs.push([entry[1], value.toFixed(2)]);
+            }
+        });
+        return pairs.length ? factsTable(pairs) : null;
+    }
+
     function renderDescription(body, info) {
         if (!info) {
             var none = paragraph("This image has not been described yet.");
@@ -115,6 +133,15 @@
         }
         if (info.text) {
             block.appendChild(section("Text in image", paragraph(info.text)));
+        }
+        var scores = scoresTable(info);
+        if (scores) {
+            block.appendChild(section("Scores", scores));
+        }
+        if (info._model_name) {
+            var credit = paragraph("Described by: " + info._model_name);
+            credit.className = "hint";
+            block.appendChild(credit);
         }
         body.appendChild(section("Description", block));
     }

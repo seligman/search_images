@@ -46,12 +46,51 @@ var SITE = (function () {
             return base + "?id=" + encodeURIComponent(id);
         },
 
+        mapUrl: function () {
+            return cfg.mode === "static" ? "map.html" : "/map";
+        },
+
         thumbUrl: function (rec) {
             return cfg.mode === "static" ? rec.thumb : "/thumb/" + rec.id;
         },
 
         imageUrl: function (rec) {
             return cfg.mode === "static" ? rec.image : "/image/" + rec.id;
+        },
+
+        tileUrl: function (zoom, x, y) {
+            var prefix = cfg.tiles;
+            if (!prefix) {
+                return null;
+            }
+            if (cfg.mode === "static") {
+                return prefix + zoom + "/" + x + "/" + y + ".jpg";
+            }
+            return prefix + "/" + zoom + "/" + x + "/" + y + ".jpg";
+        },
+
+        tilesMax: function () {
+            return typeof cfg.tilesMax === "number" ? cfg.tilesMax : null;
+        },
+
+        tileSize: function () {
+            return cfg.tileSize || 256;
+        },
+
+        loadLocations: function (callback) {
+            if (cfg.mode === "static") {
+                fetch(cfg.data + "locations.json").then(function (response) {
+                    return response.json();
+                }).then(callback).catch(function () {
+                    callback(null);
+                });
+            } else {
+                fetch(cfg.api + "/locations").then(function (response) {
+                    return response.json();
+                }).then(callback).catch(function () {
+                    callback(null);
+                });
+            }
         },
 
         loadIndex: function (callback) {

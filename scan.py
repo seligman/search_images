@@ -25,16 +25,23 @@ import images
 import llm
 
 
-DESCRIBE_PROMPT = (
-    "Look at this image and reply with a single JSON object and nothing else. "
-    "Use exactly these keys:\n"
-    '  "description": two or three sentences describing the image.\n'
-    '  "subjects": a list of the main subjects or objects shown.\n'
-    '  "text": every piece of text visible in the image, transcribed exactly, '
-    "or an empty string if there is no text.\n"
-    '  "tags": a list of short keywords useful for searching.\n'
-    '  "colors": a list of the most prominent colors.\n'
-    "Reply with only the JSON object. Do not wrap it in Markdown code fences.")
+PROMPT_VER = 3
+
+DESCRIBE_PROMPT = """\
+Look at this image and reply with a single JSON object and nothing else. Use exactly these keys:
+  "description": two or three sentences describing the image.
+  "subjects": a list of the main subjects or objects shown.
+  "text": every piece of text visible in the image, transcribed exactly, or an empty string if there is no text.
+  "tags": a list of short keywords useful for searching.
+  "colors": a list of the most prominent colors.
+  "aesthetic_score": a float from 0 to 1 rating overall aesthetic appeal (1 = very appealing).
+  "sharpness": a float from 0 to 1 rating focus and sharpness (1 = razor sharp).
+  "exposure_score": a float from 0 to 1 rating exposure quality (1 = ideal exposure).
+  "watermark_score": a float from 0 to 1 rating freedom from watermarks or text overlays (1 = clean, 0 = heavily watermarked).
+For every score above, higher is better. Reply with only the JSON object. Do not wrap it in Markdown code fences."""
+
+SCORE_FIELDS = ("aesthetic_score", "sharpness", "exposure_score",
+                "watermark_score")
 
 MAX_DESCRIBE_ATTEMPTS = 4
 
@@ -75,6 +82,13 @@ def as_string_list(value):
     return []
 
 
+def as_unit_float(value, name):
+    """Validate a 0..1 subjective score. Clamps slightly out-of-range values."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("response field " + name + " is not a number")
+    return max(0.0, min(1.0, float(value)))
+
+
 def parse_description(reply):
     """Turn an LLM reply into a validated description dict."""
     data = llm.extract_json(reply)
@@ -84,13 +98,16 @@ def parse_description(reply):
     if not isinstance(description, str) or not description.strip():
         raise ValueError("response is missing a text description")
     text = data.get("text")
-    return {
+    result = {
         "description": description.strip(),
         "subjects": as_string_list(data.get("subjects")),
         "text": text.strip() if isinstance(text, str) else "",
         "tags": as_string_list(data.get("tags")),
         "colors": as_string_list(data.get("colors")),
     }
+    for field in SCORE_FIELDS:
+        result[field] = as_unit_float(data.get(field), field)
+    return result
 
 
 def build_search_text(name, path, info):
@@ -152,7 +169,7 @@ def process_file(conn, store, dirty, library, root, rel, full, filename):
     if row and row["size"] == stat.st_size and abs(row["mtime"] - stat.st_mtime) < 1.0:
         return
     try:
-        width, height, thumb, exif = images.read_image(full)
+        width, height, thumb, exif, dhash = images.read_image(full)
     except Exception as error:
         print("  Could not read " + rel + ": " + str(error))
         return
@@ -165,17 +182,17 @@ def process_file(conn, store, dirty, library, root, rel, full, filename):
         conn.execute(
             "UPDATE images SET size=?, mtime=?, ctime=?, width=?, height=?, "
             "thumb_shard=?, thumb_offset=?, thumb_length=?, exif=?, info='', "
-            "search_text=?, described=0 WHERE id=?",
+            "search_text=?, described=0, dhash=? WHERE id=?",
             (stat.st_size, stat.st_mtime, stat.st_ctime, width, height,
-             shard, offset, length, exif_json, search_text, row["id"]))
+             shard, offset, length, exif_json, search_text, dhash, row["id"]))
         print("  Updated " + rel)
     else:
         conn.execute(
             "INSERT INTO images (library, path, name, size, mtime, ctime, "
             "width, height, thumb_shard, thumb_offset, thumb_length, exif, "
-            "search_text) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "search_text, dhash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (library, rel, filename, stat.st_size, stat.st_mtime, stat.st_ctime,
-             width, height, shard, offset, length, exif_json, search_text))
+             width, height, shard, offset, length, exif_json, search_text, dhash))
         print("  Added " + rel)
 
 
@@ -230,6 +247,49 @@ def scan_library(conn, store, dirty, name, root, ignore=None):
     return True
 
 
+def backfill_dhashes(conn, libraries):
+    """Compute the dHash for any rows that lack one.
+
+    Runs once per scan invocation. Existing rows from before the dhash column
+    existed (or rows whose hashing failed previously) are picked up here so the
+    similarity grouping in the search UI works across the whole library.
+    """
+    roots = {}
+    for library in libraries:
+        roots[library.get("name", "")] = library.get("path", "")
+    rows = conn.execute(
+        "SELECT id, library, path FROM images WHERE dhash = ''").fetchall()
+    if not rows:
+        return False
+    print("Computing perceptual hashes for %d image(s)..." % len(rows))
+    done = 0
+    aborted = False
+    for row in rows:
+        if abort_requested():
+            aborted = True
+            break
+        root = roots.get(row["library"])
+        if not root:
+            continue
+        full = os.path.join(root, *row["path"].split("/"))
+        if not os.path.isfile(full):
+            continue
+        if common.is_heic_file(full) and not images.ensure_heif():
+            continue
+        try:
+            dhash = images.read_dhash(full)
+        except Exception as error:
+            print("  Could not hash " + row["path"] + ": " + str(error))
+            continue
+        conn.execute("UPDATE images SET dhash = ? WHERE id = ?",
+                     (dhash, row["id"]))
+        done += 1
+    conn.commit()
+    if done:
+        print("  Hashed %d image(s)." % done)
+    return aborted
+
+
 def rebuild_dirty(conn, store, dirty):
     """Compact the shard files that lost or replaced thumbnails."""
     for index in sorted(dirty):
@@ -266,7 +326,9 @@ def compute_description(endpoint, helper, helper_lock, row, full):
             print("  Could not convert " + row["path"] + ": " + str(error))
             return None
     try:
-        return request_description(endpoint, helper, image_path, helper_lock)
+        info = request_description(endpoint, helper, image_path, helper_lock)
+        info["_model_name"] = llm.probe_model_name(endpoint)
+        return info
     except Exception as error:
         print("  Failed to describe " + row["path"] + ": " + str(error))
         return None
@@ -279,8 +341,9 @@ def store_description(conn, row, info, remaining):
     """Save a computed description. Called only from the main thread."""
     search_text = build_search_text(row["name"], row["path"], info)
     conn.execute(
-        "UPDATE images SET info=?, search_text=?, described=1 WHERE id=?",
-        (json.dumps(info), search_text, row["id"]))
+        "UPDATE images SET info=?, search_text=?, described=1, prompt_ver=? "
+        "WHERE id=?",
+        (json.dumps(info), search_text, PROMPT_VER, row["id"]))
     conn.commit()
     print("%s: %5d left | Described %s"
           % (datetime.now(UTC).strftime("%d %H:%M:%S"), remaining, row["path"]))
@@ -402,12 +465,18 @@ def describe_in_parallel(conn, endpoints, helper, roots, rows):
 
 def describe_pending(conn, config, newest_first=False):
     """Describe images that need it. Returns True if an abort file stopped it."""
-    rows = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
-    if not rows:
+    fresh = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
+    stale = conn.execute(
+        "SELECT * FROM images WHERE described = 1 AND prompt_ver < ?",
+        (PROMPT_VER,)).fetchall()
+    if not fresh and not stale:
         print("All images already have descriptions.")
         return False
     if newest_first:
-        rows = sorted(rows, key=description_date, reverse=True)
+        fresh = sorted(fresh, key=description_date, reverse=True)
+        stale = sorted(stale, key=description_date, reverse=True)
+    # Undescribed images always come before stale-prompt re-describes.
+    rows = list(fresh) + list(stale)
     endpoints = endpoint_list(config)
     if not endpoints:
         print("No LLM model configured; skipping descriptions. Run settings.py.")
@@ -417,6 +486,8 @@ def describe_pending(conn, config, newest_first=False):
     for library in config.get("libraries", []):
         roots[library.get("name", "")] = library.get("path", "")
     print("Describing %d image(s)..." % len(rows))
+    for endpoint in endpoints:
+        print("  Using model: " + llm.probe_model_name(endpoint))
     if helper and hasattr(helper, "before_launch"):
         helper.before_launch()
     if len(endpoints) > 1:
@@ -471,6 +542,10 @@ def run_scan(scan_images, describe, newest_first=False):
                 conn.execute("DELETE FROM images WHERE id = ?", (row["id"],))
         conn.commit()
         rebuild_dirty(conn, store, dirty)
+    if backfill_dhashes(conn, libraries):
+        conn.close()
+        print("Abort requested. Progress saved; run scan.py again to continue.")
+        return
     if describe and describe_pending(conn, config, newest_first):
         conn.close()
         return
