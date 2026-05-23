@@ -4,53 +4,26 @@
 
     var records = [];
 
-    // Lookup table: number of set bits in each 4-bit nibble. Used to total
-    // the Hamming distance between two 16-character hex dhash strings.
-    var NIBBLE_BITS = [0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4];
-
     function el(id) {
         return document.getElementById(id);
     }
 
-    function hammingHex(a, b) {
-        var distance = 0;
-        for (var i = 0; i < 16; i++) {
-            distance += NIBBLE_BITS[parseInt(a.charAt(i), 16)
-                ^ parseInt(b.charAt(i), 16)];
-        }
-        return distance;
-    }
-
     function clusterByDhash(matches) {
-        // Greedy nearest-neighbour chain: pick a seed, then repeatedly append
-        // the unused record with the smallest Hamming distance to the tail.
-        // Records without a dhash drop to the end in their original order.
+        // Sort by dhash treated as a 64-bit integer; identical hashes end up
+        // adjacent and small Hamming distances usually map to small numeric
+        // distances. Hex strings of equal length compare in the same order as
+        // their numeric value, so a plain string sort suffices.
         var hashed = [];
         var unhashed = [];
         matches.forEach(function (rec) {
             (rec.dhash ? hashed : unhashed).push(rec);
         });
-        if (hashed.length < 2) {
-            return hashed.concat(unhashed);
-        }
-        var ordered = [hashed.shift()];
-        while (hashed.length) {
-            var tail = ordered[ordered.length - 1].dhash;
-            var bestIdx = 0;
-            var bestDist = Infinity;
-            for (var i = 0; i < hashed.length; i++) {
-                var d = hammingHex(tail, hashed[i].dhash);
-                if (d < bestDist) {
-                    bestDist = d;
-                    bestIdx = i;
-                    if (d === 0) {
-                        break;
-                    }
-                }
-            }
-            ordered.push(hashed.splice(bestIdx, 1)[0]);
-        }
-        return ordered.concat(unhashed);
+        hashed.sort(function (a, b) {
+            if (a.dhash < b.dhash) return -1;
+            if (a.dhash > b.dhash) return 1;
+            return 0;
+        });
+        return hashed.concat(unhashed);
     }
 
     function setupLibraries() {
