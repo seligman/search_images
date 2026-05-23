@@ -447,21 +447,26 @@ def export_tiles(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Search and package the image database.")
+        description="Search and package the image database.",
+        epilog="Run '%(prog)s <command> --help' for options on a specific command.")
     sub = parser.add_subparsers(dest="command")
+
     serve_parser = sub.add_parser("serve", help="Run the interactive search server.")
-    serve_parser.add_argument("--host", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=5000)
-    package_parser = sub.add_parser("package",
-                                    help="Build a backend-free static site.")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Set the IP to bind to (default: '127.0.0.1')")
+    serve_parser.add_argument("--port", type=int, default=5000, help="Set the port to run on (default: 5000)")
+
+    package_parser = sub.add_parser("package", help="Build a backend-free static site.")
     package_parser.add_argument(
-        "output", nargs="?", default=os.path.join(common.BASE_DIR, "site"),
-        help="Output folder for the static site (default: site).")
+        "output", nargs="?", 
+        default=os.path.join(common.BASE_DIR, "site"),
+        help="Output folder for the static site (default: 'site').")
+
     args = parser.parse_args()
 
     if args.command == "package":
         package(args.output)
         return
+
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 5000)
     app = build_app()
