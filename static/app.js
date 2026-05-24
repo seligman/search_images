@@ -4,15 +4,30 @@
 
     var records = [];
 
+    // Hamming distance threshold for stacking near-duplicates. The dhash is
+    // 64 bits; same image is 0, light edits a few, unrelated images 20+.
+    var CLUSTER_THRESHOLD = 8;
+
     function el(id) {
         return document.getElementById(id);
     }
 
+    function hamming(a, b) {
+        if (!a || !b || a.length !== 16 || b.length !== 16) return 64;
+        var d = 0;
+        for (var i = 0; i < 16; i += 8) {
+            var x = parseInt(a.substr(i, 8), 16) ^ parseInt(b.substr(i, 8), 16);
+            x = x - ((x >>> 1) & 0x55555555);
+            x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+            d += (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+        }
+        return d;
+    }
+
     function clusterByDhash(matches) {
-        // Sort by dhash treated as a 64-bit integer; identical hashes end up
-        // adjacent and small Hamming distances usually map to small numeric
-        // distances. Hex strings of equal length compare in the same order as
-        // their numeric value, so a plain string sort suffices.
+        // Sort by dhash hex (same numeric order as the 64-bit value), then
+        // group adjacent records whose Hamming distance is below the
+        // threshold. Records without a dhash form their own singleton groups.
         var hashed = [];
         var unhashed = [];
         matches.forEach(function (rec) {
@@ -23,7 +38,18 @@
             if (a.dhash > b.dhash) return 1;
             return 0;
         });
-        return hashed.concat(unhashed);
+        var groups = [];
+        var current = null;
+        hashed.forEach(function (rec) {
+            if (current && hamming(rec.dhash, current[current.length - 1].dhash) <= CLUSTER_THRESHOLD) {
+                current.push(rec);
+            } else {
+                current = [rec];
+                groups.push(current);
+            }
+        });
+        unhashed.forEach(function (rec) { groups.push([rec]); });
+        return groups;
     }
 
     function setupLibraries() {
@@ -55,6 +81,60 @@
         return link;
     }
 
+    function buildCollapsed(node, group) {
+        node.innerHTML = "";
+        var front = document.createElement("div");
+        front.className = "stack-front";
+        var img = document.createElement("img");
+        img.loading = "lazy";
+        img.src = SITE.thumbUrl(group[0]);
+        img.alt = group[0].name;
+        front.appendChild(img);
+        node.appendChild(front);
+        var badge = document.createElement("span");
+        badge.className = "stack-count";
+        badge.textContent = "x" + group.length;
+        node.appendChild(badge);
+    }
+
+    function buildExpanded(node, group) {
+        node.innerHTML = "";
+        var head = document.createElement("div");
+        head.className = "stack-head";
+        var label = document.createElement("span");
+        label.textContent = group.length + " similar images";
+        head.appendChild(label);
+        var close = document.createElement("button");
+        close.type = "button";
+        close.className = "stack-close";
+        close.textContent = "Collapse";
+        close.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            node.classList.remove("expanded");
+            buildCollapsed(node, group);
+        });
+        head.appendChild(close);
+        node.appendChild(head);
+        var inner = document.createElement("div");
+        inner.className = "stack-grid";
+        group.forEach(function (rec) {
+            inner.appendChild(tile(rec));
+        });
+        node.appendChild(inner);
+    }
+
+    function stack(group) {
+        var node = document.createElement("div");
+        node.className = "stack";
+        buildCollapsed(node, group);
+        node.addEventListener("click", function () {
+            if (node.classList.contains("expanded")) return;
+            node.classList.add("expanded");
+            buildExpanded(node, group);
+        });
+        return node;
+    }
+
     function message(text) {
         var grid = el("grid");
         grid.innerHTML = "";
@@ -81,14 +161,21 @@
             message(records.length ? "No images match." : "No images yet.");
             return;
         }
-        if (el("cluster").checked) {
-            matches = clusterByDhash(matches);
-        }
         var grid = el("grid");
         grid.innerHTML = "";
-        matches.slice(0, 500).forEach(function (rec) {
-            grid.appendChild(tile(rec));
-        });
+        if (el("cluster").checked) {
+            var groups = clusterByDhash(matches);
+            var shown = 0;
+            for (var i = 0; i < groups.length && shown < 500; i++) {
+                var group = groups[i];
+                grid.appendChild(group.length > 1 ? stack(group) : tile(group[0]));
+                shown += group.length;
+            }
+        } else {
+            matches.slice(0, 500).forEach(function (rec) {
+                grid.appendChild(tile(rec));
+            });
+        }
     }
 
     function init() {
