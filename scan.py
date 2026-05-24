@@ -25,7 +25,7 @@ import images
 import llm
 
 
-PROMPT_VER = 3
+PROMPT_VER = 4
 
 DESCRIBE_PROMPT = """\
 Look at this image and reply with a single JSON object and nothing else. Use exactly these keys:
@@ -42,6 +42,26 @@ For every score above, higher is better. Reply with only the JSON object. Do not
 
 SCORE_FIELDS = ("aesthetic_score", "sharpness", "exposure_score",
                 "watermark_score")
+
+# JSON schema matching parse_description's expected shape. Used to constrain
+# llama.cpp sampling to a valid reply.
+DESCRIBE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "description": {"type": "string", "minLength": 1},
+        "subjects": {"type": "array", "items": {"type": "string"}},
+        "text": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "colors": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["description", "subjects", "text", "tags", "colors"],
+}
+for _field in SCORE_FIELDS:
+    DESCRIBE_SCHEMA["properties"][_field] = {
+        "type": "number", "minimum": 0, "maximum": 1,
+    }
+    DESCRIBE_SCHEMA["required"].append(_field)
 
 MAX_DESCRIBE_ATTEMPTS = 4
 
@@ -138,20 +158,10 @@ def request_description(endpoint, helper, image_path, helper_lock=None):
             if changed is not None:
                 prompt, path = changed
         try:
-            response = llm.describe_image(endpoint, prompt, path)
+            response = llm.describe_image(endpoint, prompt, path, DESCRIBE_SCHEMA)
             return parse_description(response)
         except Exception as error:
-            if 'LOG_ERRORS' in os.environ:
-                error_num = 0
-                while True:
-                    fn = "_error_%04d.txt" % (error_num,)
-                    if not os.path.isfile(fn):
-                        break
-                    error_num += 1
-                with open(fn, "wt", encoding="utf-8", newline="") as f:
-                    f.write(str(error) + "\n")
-                    f.write("-" * 100 + "\n")
-                    f.write(str(response))
+            llm.log_error(response, error)
             last_error = error
     raise Exception("no valid description after %d attempts: %s"
                     % (MAX_DESCRIBE_ATTEMPTS, last_error))
