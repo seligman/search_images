@@ -2,7 +2,7 @@
 """Show current progress of described images in local database."""
 import common
 from scan import PROMPT_VER
-
+from collections import defaultdict
 
 class Grid:
     def __init__(self, headers):
@@ -10,9 +10,12 @@ class Grid:
         self.rows = []
 
     def add_row(self, *values):
-        if len(values) != len(self.headers):
-            raise ValueError("row has %d values, expected %d" % (len(values), len(self.headers)))
-        self.rows.append([str(v) for v in values])
+        if len(values) == 1:
+            self.rows.append(values)
+        else:
+            if len(values) != len(self.headers):
+                raise ValueError(f"row has {len(values)} values, expected {len(self.headers)}")
+            self.rows.append([("-" if v == 0 else f"{v:,}") if isinstance(v, int) else f"{v}" for v in values])
 
     def render(self):
         # chars = "-|+"
@@ -25,11 +28,18 @@ class Grid:
 
         sep = " " + chars[1] + " "
         lines = [" " + sep.join(h.center(w) for h, w in zip(self.headers, widths))]
-        lines.append(chars[0] + (chars[0] + chars[2] + chars[0]).join(chars[0] * w for w in widths) + chars[0])
+        break_line = chars[0] + (chars[0] + chars[2] + chars[0]).join(chars[0] * w for w in widths) + chars[0]
+        lines.append(break_line)
         for row in self.rows:
-            parts = [row[0].ljust(widths[0])]
-            parts.extend(val.rjust(w) for val, w in zip(row[1:], widths[1:]))
-            lines.append(" " + sep.join(parts))
+            if len(row) == 1:
+                if row[0] == "break":
+                    lines.append(break_line)
+                else:
+                    raise Exception("Unknown row type")
+            else:
+                parts = [row[0].ljust(widths[0])]
+                parts.extend(val.rjust(w) for val, w in zip(row[1:], widths[1:]))
+                lines.append(" " + sep.join(parts))
         return "\n".join(lines)
 
     def print(self):
@@ -38,35 +48,35 @@ class Grid:
 
 def main():
     conn = common.open_db()
-    total_count = total_described = total_current = 0
+    totals = defaultdict(int)
+
     sql = ("SELECT library, COUNT(*) AS count, "
            "SUM(described) AS described, "
            "SUM(CASE WHEN described = 1 AND prompt_ver = ? THEN 1 ELSE 0 END) AS current "
            "FROM images GROUP BY library;")
 
-    grid = Grid(["library", "described", "at v=%d" % PROMPT_VER, "left", "total", "done"])
+    grid = Grid(["library", "done", f"at v={PROMPT_VER}", "left", "total", "done"])
 
     for row in conn.execute(sql, (PROMPT_VER,)).fetchall():
-        left = row['count'] - row['described']
         grid.add_row(
             row['library'],
             row['described'],
             row['current'],
-            left,
+            row['count'] - row['current'],
             row['count'],
-            "%.2f%%" % (row['described'] / row['count'] * 100),
+            "-" if row['current'] == 0 else f"{row['current'] / row['count'] * 100:.2f}%", 
         )
-        total_count += row['count']
-        total_described += row['described']
-        total_current += row['current']
+        for key in ['current', 'count', 'described']:
+            totals[key] += row[key]
 
+    grid.add_row("break")
     grid.add_row(
         "  (all)",
-        total_described,
-        total_current,
-        total_count - total_described,
-        total_count,
-        "%.2f%%" % (total_described / total_count * 100),
+        totals['described'],
+        totals['current'],
+        totals['count'] - totals['current'],
+        totals['count'],
+        f"{totals['current'] / totals['count'] * 100:.2f}%",
     )
     grid.print()
 
