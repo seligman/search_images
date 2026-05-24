@@ -112,9 +112,18 @@ def compute_dhash(image):
     return "%016x" % bits
 
 
-def read_image(path):
+def _open_source(path, helper):
+    """Open a source image, going through the helper when it provides bytes."""
+    if helper is not None and getattr(helper, "load_image", None) is not None:
+        data = helper.load_image(path)
+        if data is not None:
+            return Image.open(io.BytesIO(data))
+    return Image.open(path)
+
+
+def read_image(path, helper=None):
     """Return (width, height, jpeg_thumbnail_bytes, exif_dict, dhash) for a file."""
-    with Image.open(path) as image:
+    with _open_source(path, helper) as image:
         width, height = image.size
         exif = extract_exif(image)
         oriented = ImageOps.exif_transpose(image)
@@ -126,24 +135,24 @@ def read_image(path):
         return width, height, buffer.getvalue(), exif, dhash
 
 
-def read_dhash(path):
+def read_dhash(path, helper=None):
     """Open a file and return only its dHash. Used when backfilling."""
-    with Image.open(path) as image:
+    with _open_source(path, helper) as image:
         return compute_dhash(ImageOps.exif_transpose(image))
 
 
-def heic_to_jpeg_bytes(path):
+def heic_to_jpeg_bytes(path, helper=None):
     """Return JPEG bytes converted from a HEIC file."""
-    with Image.open(path) as image:
+    with _open_source(path, helper) as image:
         rgb = ImageOps.exif_transpose(image).convert("RGB")
     buffer = io.BytesIO()
     rgb.save(buffer, format="JPEG", quality=90)
     return buffer.getvalue()
 
 
-def heic_to_temp_jpeg(path):
+def heic_to_temp_jpeg(path, helper=None):
     """Convert a HEIC file to a temporary JPEG file and return its path."""
     handle = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    handle.write(heic_to_jpeg_bytes(path))
+    handle.write(heic_to_jpeg_bytes(path, helper))
     handle.close()
     return handle.name

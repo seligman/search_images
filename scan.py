@@ -158,7 +158,7 @@ def request_description(endpoint, helper, image_path, helper_lock=None):
             if changed is not None:
                 prompt, path = changed
         try:
-            response = llm.describe_image(endpoint, prompt, path, DESCRIBE_SCHEMA)
+            response = llm.describe_image(endpoint, prompt, path, DESCRIBE_SCHEMA, helper)
             return parse_description(response)
         except Exception as error:
             llm.log_error(response, error)
@@ -167,19 +167,18 @@ def request_description(endpoint, helper, image_path, helper_lock=None):
                     % (MAX_DESCRIBE_ATTEMPTS, last_error))
 
 
-def process_file(conn, store, dirty, library, root, rel, full, filename):
+def process_file(conn, store, dirty, library, root, rel, full, filename, helper=None):
     if common.is_heic_file(filename) and not images.ensure_heif():
         return
-    try:
-        stat = os.stat(full)
-    except OSError:
+    stat = common.stat_path(helper, full)
+    if stat is None:
         return
     row = conn.execute("SELECT * FROM images WHERE library = ? AND path = ?",
                         (library, rel)).fetchone()
     if row and row["size"] == stat.st_size and abs(row["mtime"] - stat.st_mtime) < 1.0:
         return
     try:
-        width, height, thumb, exif, dhash = images.read_image(full)
+        width, height, thumb, exif, dhash = images.read_image(full, helper)
     except Exception as error:
         print("  Could not read " + rel + ": " + str(error))
         return
@@ -206,12 +205,12 @@ def process_file(conn, store, dirty, library, root, rel, full, filename):
         print("  Added " + rel)
 
 
-def scan_library(conn, store, dirty, name, root, ignore=None):
+def scan_library(conn, store, dirty, name, root, ignore=None, helper=None):
     """Scan one library. Returns False if an abort file interrupted it."""
     patterns = normalize_ignore(ignore)
     seen = set()
     aborted = False
-    for current, dirs, files in os.walk(root):
+    for current, dirs, files in common.walk_library(helper, root):
         if aborted:
             break
         rel_dir = os.path.relpath(current, root).replace(os.sep, "/")
@@ -239,7 +238,7 @@ def scan_library(conn, store, dirty, name, root, ignore=None):
             if matches_ignore(rel, patterns):
                 continue
             seen.add(rel)
-            process_file(conn, store, dirty, name, root, rel, full, filename)
+            process_file(conn, store, dirty, name, root, rel, full, filename, helper)
     conn.commit()
     if aborted:
         return False
@@ -257,7 +256,7 @@ def scan_library(conn, store, dirty, name, root, ignore=None):
     return True
 
 
-def backfill_dhashes(conn, libraries):
+def backfill_dhashes(conn, libraries, helper=None):
     """Compute the dHash for any rows that lack one.
 
     Runs once per scan invocation. Existing rows from before the dhash column
@@ -282,12 +281,12 @@ def backfill_dhashes(conn, libraries):
         if not root:
             continue
         full = os.path.join(root, *row["path"].split("/"))
-        if not os.path.isfile(full):
+        if common.stat_path(helper, full) is None:
             continue
         if common.is_heic_file(full) and not images.ensure_heif():
             continue
         try:
-            dhash = images.read_dhash(full)
+            dhash = images.read_dhash(full, helper)
         except Exception as error:
             print("  Could not hash " + row["path"] + ": " + str(error))
             continue
@@ -330,7 +329,7 @@ def compute_description(endpoint, helper, helper_lock, row, full):
             print("  Skipping " + row["path"] + " (pillow-heif not installed)")
             return None
         try:
-            temp = images.heic_to_temp_jpeg(full)
+            temp = images.heic_to_temp_jpeg(full, helper)
             image_path = temp
         except Exception as error:
             print("  Could not convert " + row["path"] + ": " + str(error))
@@ -473,7 +472,7 @@ def describe_in_parallel(conn, endpoints, helper, roots, rows):
     return aborted
 
 
-def describe_pending(conn, config, newest_first=False):
+def describe_pending(conn, config, helper, newest_first=False):
     """Describe images that need it. Returns True if an abort file stopped it."""
     fresh = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
     stale = conn.execute(
@@ -491,7 +490,6 @@ def describe_pending(conn, config, newest_first=False):
     if not endpoints:
         print("No LLM model configured; skipping descriptions. Run settings.py.")
         return False
-    helper = common.load_helper(config.get("helper", ""))
     roots = {}
     for library in config.get("libraries", []):
         roots[library.get("name", "")] = library.get("path", "")
@@ -521,6 +519,7 @@ def run_scan(scan_images, describe, newest_first=False):
     if abort_requested():
         print("Abort file present; remove 'abort' or 'abort.txt' first.")
         return
+    helper = common.load_helper(config.get("helper", ""))
     conn = common.open_db()
     if scan_images:
         store = common.ThumbStore(common.THUMB_DIR)
@@ -532,11 +531,12 @@ def run_scan(scan_images, describe, newest_first=False):
             root = library.get("path", "")
             ignore = library.get("ignore", [])
             configured.add(name)
-            if not name or not os.path.isdir(root):
+            helper_walks = helper is not None and hasattr(helper, "walk_library")
+            if not name or (not helper_walks and not os.path.isdir(root)):
                 print("Skipping library (missing folder): " + str(name))
                 continue
             print("Scanning library: " + name)
-            if not scan_library(conn, store, dirty, name, root, ignore):
+            if not scan_library(conn, store, dirty, name, root, ignore, helper):
                 aborted = True
                 break
         if aborted:
@@ -552,11 +552,11 @@ def run_scan(scan_images, describe, newest_first=False):
                 conn.execute("DELETE FROM images WHERE id = ?", (row["id"],))
         conn.commit()
         rebuild_dirty(conn, store, dirty)
-    if backfill_dhashes(conn, libraries):
+    if backfill_dhashes(conn, libraries, helper):
         conn.close()
         print("Abort requested. Progress saved; run scan.py again to continue.")
         return
-    if describe and describe_pending(conn, config, newest_first):
+    if describe and describe_pending(conn, config, helper, newest_first):
         conn.close()
         return
     conn.close()

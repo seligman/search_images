@@ -13,6 +13,8 @@ import time
 import urllib.error
 import urllib.request
 
+import common
+
 MAX_TOKENS = 5000 # Max size to allow the response
 PROPS_MAX_ATTEMPTS = 3
 PROPS_RETRY_DELAY = 1.0
@@ -67,15 +69,14 @@ def _post(url, headers, payload):
         raise
 
 
-def describe_image(endpoint, prompt, image_path, schema=None):
+def describe_image(endpoint, prompt, image_path, schema=None, helper=None):
     """Send one image to the configured endpoint and return the text reply.
 
     When schema (a JSON Schema dict) is given it is used to constrain the
     reply where the endpoint supports it. Only the openai-kind path honors
     this today; claude and ollama rely on the prompt instead.
     """
-    with open(image_path, "rb") as handle:
-        encoded = base64.b64encode(handle.read()).decode("ascii")
+    encoded = base64.b64encode(common.load_image_bytes(helper, image_path)).decode("ascii")
     kind = endpoint.get("kind", "openai")
     model = endpoint.get("model", "")
     base_url = endpoint.get("base_url", "").rstrip("/")

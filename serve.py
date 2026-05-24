@@ -103,6 +103,11 @@ def library_roots():
     return roots
 
 
+def load_helper_for_config():
+    """Load the helper module configured in config.json, or None."""
+    return common.load_helper(common.load_config().get("helper", ""))
+
+
 def disk_path(row, roots):
     root = roots.get(row["library"])
     if not root:
@@ -144,6 +149,7 @@ def build_app():
             "    python -m pip install Flask")
 
     app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
+    helper = load_helper_for_config()
 
     @app.route("/")
     def index():
@@ -220,13 +226,19 @@ def build_app():
         if not row:
             return Response(status=404)
         full = disk_path(row, library_roots())
-        if not full or not os.path.isfile(full):
+        if not full or common.stat_path(helper, full) is None:
             return Response(status=404)
         if common.is_heic_file(full):
             import images
             if images.ensure_heif():
-                return Response(images.heic_to_jpeg_bytes(full),
+                return Response(images.heic_to_jpeg_bytes(full, helper),
                                 mimetype="image/jpeg")
+        # When the helper supplies image bytes the file is not on disk, so
+        # send_file's path-based shortcuts are skipped in that case.
+        if helper is not None and getattr(helper, "load_image", None) is not None:
+            data = helper.load_image(full)
+            if data is not None:
+                return Response(data, mimetype="image/" + image_extension(full))
         return send_file(full)
 
     return app
@@ -299,27 +311,38 @@ def write_json(path, value):
         handle.write("\n")
 
 
-def copy_original(row, roots, dest):
+def copy_original(row, roots, dest, helper=None):
     """Copy (or convert) one original image into the static site folder."""
     source = disk_path(row, roots)
-    if not source or not os.path.isfile(source):
+    if not source:
         return
-    if os.path.exists(dest) and os.path.getmtime(dest) >= os.path.getmtime(source):
+    stat = common.stat_path(helper, source)
+    if stat is None:
+        return
+    if os.path.exists(dest) and os.path.getmtime(dest) >= stat.st_mtime:
         return
     if common.is_heic_file(source):
         import images
         if not images.ensure_heif():
             return
         with open(dest, "wb") as handle:
-            handle.write(images.heic_to_jpeg_bytes(source))
-    else:
-        shutil.copyfile(source, dest)
+            handle.write(images.heic_to_jpeg_bytes(source, helper))
+        return
+    # Skip shutil.copyfile when the helper supplies bytes virtually.
+    if helper is not None and getattr(helper, "load_image", None) is not None:
+        data = helper.load_image(source)
+        if data is not None:
+            with open(dest, "wb") as handle:
+                handle.write(data)
+            return
+    shutil.copyfile(source, dest)
 
 
 def package(output_dir):
     conn = common.open_db()
     store = common.ThumbStore(common.THUMB_DIR)
     roots = library_roots()
+    helper = load_helper_for_config()
     rows = conn.execute("SELECT * FROM images ORDER BY id").fetchall()
 
     images_dir = os.path.join(output_dir, "images")
@@ -333,7 +356,7 @@ def package(output_dir):
     for row in rows:
         image_name = "%d.%s" % (row["id"], image_extension(row["name"]))
         image_names.add(image_name)
-        copy_original(row, roots, os.path.join(images_dir, image_name))
+        copy_original(row, roots, os.path.join(images_dir, image_name), helper)
         thumb = ""
         if row["thumb_shard"] is not None:
             data = store.read(row["thumb_shard"], row["thumb_offset"],

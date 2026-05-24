@@ -184,6 +184,62 @@ def load_helper(path):
     return module
 
 
+def load_image_bytes(helper, path):
+    """Return the raw bytes for a source image file.
+
+    The helper module can supply a `load_image(path)` function that returns
+    the bytes for a source image. If the helper is absent, has no such
+    function, or that function returns None, the file is read from disk.
+    """
+    if helper is not None:
+        func = getattr(helper, "load_image", None)
+        if func is not None:
+            data = func(path)
+            if data is not None:
+                return data
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def walk_library(helper, root):
+    """Yield (dirpath, dirnames, filenames) tuples for a library root.
+
+    The helper module can supply a `walk_library(root)` function that returns
+    an iterator matching os.walk's contract (callers may modify the dirnames
+    list in place to prune the descent). If the helper is absent, has no such
+    function, or that function returns None, os.walk is used.
+    """
+    iterator = None
+    if helper is not None:
+        func = getattr(helper, "walk_library", None)
+        if func is not None:
+            iterator = func(root)
+    if iterator is None:
+        iterator = os.walk(root)
+    for item in iterator:
+        yield item
+
+
+def stat_path(helper, path):
+    """Return an os.stat_result-like object, or None if the path is missing.
+
+    The helper module can supply a `stat(path)` function returning an object
+    with at least st_size, st_mtime, and st_ctime attributes. If the helper
+    is absent, has no such function, or that function returns None, os.stat
+    is used; a missing file is reported as None rather than raising.
+    """
+    if helper is not None:
+        func = getattr(helper, "stat", None)
+        if func is not None:
+            result = func(path)
+            if result is not None:
+                return result
+    try:
+        return os.stat(path)
+    except OSError:
+        return None
+
+
 class ThumbStore:
     """Append-only shard files holding thumbnail bytes.
 
