@@ -3,6 +3,7 @@
 import common
 from scan import PROMPT_VER
 from collections import defaultdict
+import argparse
 
 class Grid:
     def __init__(self, headers):
@@ -46,7 +47,7 @@ class Grid:
         print(self.render())
 
 
-def main():
+def show_counts():
     conn = common.open_db()
     totals = defaultdict(int)
 
@@ -80,6 +81,37 @@ def main():
     )
     grid.print()
 
+
+def show_files():
+    conn = common.open_db()
+    fresh = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
+    stale = conn.execute(
+        "SELECT * FROM images WHERE described = 1 AND prompt_ver < ?",
+        (PROMPT_VER,)).fetchall()
+
+    for i, cur in enumerate(fresh + stale, 1):
+        print(f"{i:7,}: {cur['library']}: {cur['path']}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Show progress on the current work.",
+        # epilog="Run '%(prog)s <command> --help' for options on a specific command.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("counts", help="Show overall counts.")
+
+    sub.add_parser("files", help="Show a list of images that need processing.")
+
+    args = parser.parse_args()
+
+    if args.command == "counts":
+        show_counts()
+    elif args.command == "files":
+        show_files()
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()
