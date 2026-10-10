@@ -56,7 +56,7 @@ Example:
     "kind": "openai",
     "base_url": "http://localhost:8080/",
     "api_key": "",
-    "model": "Gemma 3, 27B"
+    "model": "your-vision-model"
 }
 ```
 
@@ -83,7 +83,7 @@ Optional path to a Python file that wraps the LLM calls. See
 one.  Can be useful, for instance, to start and stop the endpoint automatically.
 
 ```
-"helper": "config_helper.py"
+"helper": "my_helper.py"
 ```
 
 ## libraries
@@ -103,8 +103,8 @@ Minimal example:
 ```
 "libraries": [
     {
-        "name": "Image Library",
-        "path": "C:\\Users\\scott\\Pictures\\Image Library"
+        "name": "Family",
+        "path": "C:\\Photos\\Family"
     }
 ]
 ```
@@ -121,8 +121,8 @@ on every platform:
 
 ```
 {
-    "name": "Image Library",
-    "path": "C:\\Path\\Image Library",
+    "name": "Family",
+    "path": "C:\\Photos\\Family",
     "ignore": [
         "Documents/*"
     ]
@@ -131,8 +131,8 @@ on every platform:
 
 ```
 {
-    "name": "Image Library",
-    "path": "C:\\Path\\Image Library",
+    "name": "Family",
+    "path": "C:\\Photos\\Family",
     "ignore": [
         "Documents\\*"
     ]
@@ -160,21 +160,21 @@ been deleted from disk.
         "kind": "openai",
         "base_url": "http://localhost:8080/",
         "api_key": "",
-        "model": "Gemma 3, 27B"
+        "model": "your-vision-model"
     },
-    "helper": "config_helper.py",
+    "helper": "my_helper.py",
     "libraries": [
         {
-            "name": "Image Library",
-            "path": "C:\\Users\\scott\\Pictures\\Image Library",
+            "name": "Family",
+            "path": "C:\\Photos\\Family",
             "ignore": [
                 "Documents/*",
                 "*.tmp"
             ]
         },
         {
-            "name": "Vegas Trip",
-            "path": "C:\\Users\\scott\\Pictures\\Vegas Trip"
+            "name": "Vacation",
+            "path": "D:\\Photos\\Vacation"
         }
     ]
 }

@@ -97,6 +97,21 @@ small change only rewrites the files that changed.
 - `data/` - database and thumbnail files
 - `site/` - the packaged static site
 
+## Tests
+
+    python -m unittest discover -s tests
+
+`tests/test_repo_hygiene.py` checks that nothing personal (absolute paths,
+host names, model files) is about to be committed. To add your own private
+words to that check, list them one per line in `private-terms.txt` inside
+your `SETTINGS_BASE` folder; that file is never committed.
+
+## License
+
+The code is released under the MIT License; see [LICENSE](LICENSE). The
+sample images are covered by their own licenses, listed in
+[sample/images/CREDITS.md](sample/images/CREDITS.md).
+
 ## Credits
 
 `static/worldmap.jpg` is an equirectangular projection derived from NASA's

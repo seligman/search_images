@@ -1,0 +1,52 @@
+# ---- Personal data: never commit (paths, API keys, photo metadata) ----
+/config.json
+/config.*.json
+/data/
+/local/
+/site/
+/site_*/
+/exports/
+# User helper modules contain machine-specific paths/commands
+/*_helper.py
+!/example_helper.py
+
+# ---- Runtime droppings (some older versions wrote these to the CWD) ----
+abort
+abort.txt
+_error_*.txt
+world_map.png
+*.part
+
+# ---- Databases / SQLite side files ----
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.new
+*.sqlite
+*.sqlite3
+
+# ---- Models: keep outside the repo ----
+*.gguf
+*.safetensors
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.env.*
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Editors / OS / tools ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log
