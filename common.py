@@ -971,12 +971,24 @@ def is_local_endpoint(endpoint):
 
 
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+# Long hexadecimal text (older Azure OpenAI keys are 32 hex digits).
+_HEX_KEY_RE = re.compile(r"^[0-9A-Fa-f]{24,}$")
+# Long runs of letters, digits and -+/= with no underscore (variable names
+# use underscores) and no . \ : (file paths have those).
+_TOKEN_KEY_RE = re.compile(r"^[A-Za-z0-9+/=-]{20,}$")
 
 
 def looks_like_key(text):
     """True for text shaped like an API key rather than a variable or file name."""
     text = (text or "").strip()
     if text.startswith(("sk-", "sk_", "AIza")):
+        return True
+    if "\\" in text or re.match(r"^([A-Za-z]:|~|\.{1,2})?[\\/]", text):
+        return False            # a file path
+    if _HEX_KEY_RE.match(text):
+        return True
+    if (_TOKEN_KEY_RE.match(text) and sum(char.isdigit() for char in text) >= 4
+            and any(char.isalpha() for char in text)):
         return True
     return (len(text) >= 24 and any(char.islower() for char in text)
             and any(char.isupper() for char in text) and any(char.isdigit() for char in text))

@@ -8,14 +8,13 @@
 </head>
 <body>
 <div id="controls">
-<input id="query" type="search" placeholder="Search images..." autofocus>
-<select id="library"></select>
+<input id="query" type="search" placeholder="Search images..." aria-label="Search images" autofocus>
 <label id="cluster-toggle"><input id="cluster" type="checkbox" checked> Group similar</label>
-<a id="map-link" href="#">Map</a>
 </div>
 <div id="grid"></div>
-<script>window.APP_CONFIG = __APP_CONFIG__;</script>
+<script type="application/json" id="app-config">__APP_CONFIG__</script>
 <script src="__ASSET_PREFIX__site.js"></script>
+<script src="__ASSET_PREFIX__shell.js"></script>
 <script src="__ASSET_PREFIX__app.js"></script>
 </body>
 </html>

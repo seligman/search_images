@@ -86,6 +86,9 @@ PROGRESS_SECONDS = 30.0
 # a server the helper's before_launch just started).
 UNREACHABLE_WAIT = 3.0
 STARTUP_WAIT = 180.0
+# How long to wait for a library folder (a network share, say) to answer
+# before images that must be read from it are left for another run.
+FOLDER_CHECK_TIMEOUT = 10.0
 # Repetition guard: a short text field (title, description, ...) in which
 # one word appears more than this many times (and makes up a quarter of the
 # words) is a looping reply, and so is a list more than LIST_OVERFLOW times
@@ -942,7 +945,7 @@ def _utc_now():
 
 def _duration(minutes):
     if minutes < 1:
-        return "under a minute"
+        return "less than a minute"
     if minutes < 60:
         return "%d min" % round(minutes)
     return "%d h %02d min" % divmod(int(round(minutes)), 60)
@@ -1001,33 +1004,43 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
     after_launch runs even when the run fails. sleep is used for retry
     pauses (tests pass a stub).
 
+    Images without a preview are read from their library's folder; when
+    that folder cannot be reached (an offline share) they are left for a
+    later run (skipped_offline) instead of failing one by one.
+
     Summary keys: described, shared (copies that got the same description),
-    failed, skipped, skipped_failed, pending, stale (described with an older
-    prompt and not included), stopped, error, fatal, retired (endpoint
-    names), requests, tokens_in, tokens_out, cost (None when unknown).
+    failed, skipped, skipped_failed, skipped_offline, pending, stale
+    (described with an older prompt and not included), stopped, error,
+    fatal, retired (endpoint names), requests, tokens_in, tokens_out, cost
+    (None when unknown).
     """
     summary = {"described": 0, "shared": 0, "failed": 0, "skipped": 0,
-               "skipped_failed": 0, "pending": 0, "stale": 0, "stopped": False, "error": "",
-               "fatal": False, "retired": [], "requests": 0, "tokens_in": 0,
-               "tokens_out": 0, "cost": None}
+               "skipped_failed": 0, "skipped_offline": 0, "pending": 0, "stale": 0,
+               "stopped": False, "error": "", "fatal": False, "retired": [], "requests": 0,
+               "tokens_in": 0, "tokens_out": 0, "cost": None}
     libraries = selected_libraries(config, library_ids)
     rows, summary["skipped_failed"] = pending_rows(conn, libraries, newest_first,
                                                    retry_failed, redescribe_stale)
+    rows, summary["skipped_offline"] = _drop_unreachable(rows, libraries, ctx, helper)
     if not redescribe_stale:
         summary["stale"] = stale_count(conn, libraries)
     if summary["skipped_failed"]:
-        ctx.log("Skipping %d image(s) that failed %d times; retry them with "
-                "--retry-failed." % (summary["skipped_failed"], MAX_FAILURES))
+        ctx.log("Skipping %d image(s) that failed %d times; Retry failed on the Manage page "
+                "(or scan.py --retry-failed) tries them again."
+                % (summary["skipped_failed"], MAX_FAILURES))
     if summary["stale"]:
-        ctx.log("%d image(s) have descriptions from an older prompt; describe them again "
-                "with --redescribe-stale." % summary["stale"])
+        ctx.log("%d image(s) have descriptions from an older prompt; Re-describe out of date "
+                "on the Manage page (or scan.py --redescribe-stale) updates them."
+                % summary["stale"])
     if limit is not None and len(rows) > max(0, limit):
         ctx.log("Describing %d of %d image(s) (limit)." % (max(0, limit), len(rows)))
         rows = rows[:max(0, limit)]
     summary["pending"] = len(rows)
     if not rows:
-        ctx.log("Nothing to describe (limit 0)." if limit == 0
-                else "All images already have descriptions.")
+        if limit == 0:
+            ctx.log("Nothing to describe (limit 0).")
+        elif not summary["skipped_offline"]:
+            ctx.log("All images already have descriptions.")
         return summary
 
     by_library = {library["id"]: library for library in libraries}
@@ -1108,6 +1121,43 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
     return summary
 
 
+def _drop_unreachable(rows, libraries, ctx, helper=None, timeout=None):
+    """(rows, count): rows without the images that would have to be read from a folder
+    that cannot be reached right now.
+
+    Images with a preview are kept (the preview is in the data folder), and
+    so is everything when the helper reads the originals (load_image). One
+    warning per library says how many images wait for its folder.
+    """
+    if helper is not None and getattr(helper, "load_image", None) is not None:
+        return rows, 0
+    needed = {row["library_id"] for row in rows if row["has_preview"] != 1}
+    if not needed:
+        return rows, 0
+    import library_ops      # only needed here; it imports nothing that needs Pillow
+    timeout = FOLDER_CHECK_TIMEOUT if timeout is None else timeout
+    offline = {}
+    for library in libraries:
+        if library["id"] in needed:
+            root = common.library_root(library)
+            if not library_ops.folder_status(root, timeout=timeout)["reachable"]:
+                offline[library["id"]] = (common.library_label(library), root)
+    if not offline:
+        return rows, 0
+    kept = []
+    waiting = collections.Counter()
+    for row in rows:
+        if row["library_id"] in offline and row["has_preview"] != 1:
+            waiting[row["library_id"]] += 1
+        else:
+            kept.append(row)
+    for library_id, count in waiting.items():
+        label, root = offline[library_id]
+        ctx.log("Library %s: %d image(s) without a preview are left for later: the folder "
+                "%s cannot be reached (offline?)." % (label, count, root or "(none)"), "warn")
+    return kept, sum(waiting.values())
+
+
 class _DescribeRun:
     """The state of one describe_pending() run (used on the calling thread only)."""
 
@@ -1168,6 +1218,12 @@ class _DescribeRun:
         """
         for state in self.endpoints:
             settings = state.settings
+            if settings["preset"] in common.CLOUD_PRESETS and not state.secrets:
+                # Never send pictures to a cloud service without a key.
+                self.retire(state, "no API key is set (%s), so no picture was sent. Set the "
+                            "key on the Settings page or with settings.py."
+                            % common.resolve_api_key(settings)[1])
+                continue
             info = llm.probe(settings)
             if info["loading"] or info["reachable"] is False:
                 wait = (STARTUP_WAIT if info["loading"] or started_by_helper
@@ -1354,7 +1410,8 @@ class _DescribeRun:
             text += ", %.1f images/min" % rate
             remaining = self.total - self.handled
             if remaining > 0 and rate > 0:
-                text += ", about %s left" % _duration(remaining / rate)
+                minutes = remaining / rate
+                text += ", %s%s left" % ("" if minutes < 1 else "about ", _duration(minutes))
         text += ", %d failed" % self.summary["failed"]
         self.ctx.log(text + ".")
 

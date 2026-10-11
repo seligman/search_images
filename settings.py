@@ -21,6 +21,7 @@ import urllib.parse
 
 import common
 import db
+import library_ops
 
 CLEAR = "-"
 # Characters endpoint names may not contain (compare_models.py takes
@@ -258,8 +259,12 @@ def _origin(url):
         return None
 
 
-def _forget_key_if_moved(endpoint, old_url):
-    """Remove a typed API key when the endpoint's address is no longer old_url's."""
+def forget_key_if_moved(endpoint, old_url):
+    """Remove a typed API key when the endpoint's address is no longer old_url's.
+
+    The address counts as moved when the scheme, host or port differs.
+    Returns True if a key was removed.
+    """
     new = common.endpoint_settings(endpoint)["base_url"]
     if endpoint.get("api_key") and _origin(old_url) != _origin(new):
         endpoint.pop("api_key", None)
@@ -280,7 +285,7 @@ def set_base_url(endpoint, url):
         endpoint["base_url"] = url
     else:
         endpoint.pop("base_url", None)
-    return _forget_key_if_moved(endpoint, old)
+    return forget_key_if_moved(endpoint, old)
 
 
 def set_preset(endpoint, preset):
@@ -295,7 +300,7 @@ def set_preset(endpoint, preset):
     old = common.endpoint_settings(endpoint)["base_url"]
     endpoint["preset"] = preset
     endpoint.pop("kind", None)
-    return _forget_key_if_moved(endpoint, old)
+    return forget_key_if_moved(endpoint, old)
 
 
 def _inside(path, folder):
@@ -565,26 +570,34 @@ def library_name_error(config, name, skip=None):
     """Why name cannot be used for a library, or None if it can.
 
     Names must be non-empty and unique (ignoring case). skip is the library
-    being renamed, which may keep its own name.
+    being renamed, which may keep its own name. The web UI uses the same
+    rule (library_ops.library_name_error).
     """
-    name = (name or "").strip()
-    if not name:
-        return "A library needs a name."
-    for library in config.get("libraries", []):
-        if library is not skip and library.get("name", "").strip().casefold() == name.casefold():
-            return "Another library is already called %s." % library.get("name")
-    return None
+    return library_ops.library_name_error(config, name, skip)
+
+
+def library_folder_error(path):
+    """Why a folder cannot be used for a library, or None (see library_ops.path_error).
+
+    Unlike the web UI, a relative path is accepted, as before: it is
+    relative to the folder the tools are run from.
+    """
+    if not (path or "").strip():
+        return "A library needs a folder."
+    return library_ops.path_error(path, require_absolute=False)
 
 
 def add_library(config, path, name=None):
     """Add a library and give it an id; return it.
 
     The name defaults to common.default_library_name(path). Raises
-    ValueError if the folder is empty or the name is missing or taken.
+    ValueError if the folder is empty or cannot be used (inside the data
+    or program folder), or the name is missing or taken.
     """
     path = (path or "").strip()
-    if not path:
-        raise ValueError("A library needs a folder.")
+    error = library_folder_error(path)
+    if error:
+        raise ValueError(error)
     name = (name or "").strip() or common.default_library_name(path)
     error = library_name_error(config, name)
     if error:
@@ -612,8 +625,9 @@ def set_library_folder(config, index, path):
     are kept for files whose relative path is unchanged.
     """
     path = (path or "").strip()
-    if not path:
-        raise ValueError("A library needs a folder.")
+    error = library_folder_error(path)
+    if error:
+        raise ValueError(error)
     library = config["libraries"][index]
     library["path"] = path
     return library
@@ -717,8 +731,15 @@ def manage_libraries(config):
             if not path:
                 print("A folder is required.")
                 continue
-            if not os.path.isdir(os.path.expanduser(path)):
-                print("Warning: that folder cannot be reached right now.")
+            error = library_folder_error(path)
+            if error:
+                print(error)
+                continue
+            warning = library_ops.reachability_warning(path)
+            if warning:
+                print("Warning: " + warning)
+            for warning in library_ops.path_warnings(config, path):
+                print("Warning: " + warning)
             suggested = common.default_library_name(path)
             name = input("Library name [%s]: " % suggested).strip() or suggested
             try:

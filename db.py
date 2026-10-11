@@ -86,6 +86,9 @@ SCHEMA_V1 = (
         seen REAL,
         PRIMARY KEY (library_id, path)
     )""",
+    # Not used any more: the web server's job queue is data/jobs.db (see
+    # jobs.JOBS_SCHEMA), which a running scan never holds up. The table stays
+    # so that this schema version is unchanged.
     """CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         kind TEXT NOT NULL,

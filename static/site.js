@@ -2,11 +2,25 @@
 
    SITE hides the difference between the Flask server (data comes from the
    /api routes) and the packaged static site (data comes from JSON shards).
+   The page settings come from the <script type="application/json"
+   id="app-config"> block the server (or the packager) writes into each page.
 */
 var SITE = (function () {
     "use strict";
 
-    var cfg = window.APP_CONFIG || {};
+    function readConfig() {
+        var node = document.getElementById("app-config");
+        if (node) {
+            try {
+                return JSON.parse(node.textContent) || {};
+            } catch (error) {
+                return {};
+            }
+        }
+        return window.APP_CONFIG || {};
+    }
+
+    var cfg = readConfig();
     var staticRecords = null;
 
     function loadStaticRecords(callback) {
@@ -35,7 +49,14 @@ var SITE = (function () {
 
     return {
         mode: cfg.mode,
+        page: cfg.page || "",
         libraries: cfg.libraries || [],
+        // [{id, name}] of the libraries the page may show.
+        libraryList: cfg.libraryList || [],
+        // admin: Manage and Settings may be used; static: a packaged site.
+        capabilities: cfg.capabilities || {admin: false, static: cfg.mode === "static"},
+        adminApi: cfg.adminApi || null,
+        config: cfg,
 
         homeUrl: function () {
             return cfg.mode === "static" ? "index.html" : "/";

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manage libraries - Image Search</title>
+<link rel="stylesheet" href="__ASSET_PREFIX__style.css">
+</head>
+<body class="admin-page">
+<main id="manage" class="admin-main">
+<div class="page-head">
+<div>
+<h1>Libraries</h1>
+<p class="lead">Folders of pictures that are indexed, described and made searchable.</p>
+</div>
+<div class="page-actions">
+<button type="button" id="process-all" class="button" disabled title="Scan every library that is turned on for new and changed pictures, then describe the new ones">Process all libraries</button>
+<button type="button" id="add-library" class="button primary">Add library</button>
+</div>
+</div>
+<div id="manage-notices"></div>
+<div id="orphans"></div>
+<div class="manage-layout">
+<section id="library-list" aria-label="Libraries">
+<p class="message" id="manage-status">Loading...</p>
+</section>
+<aside id="job-panel" aria-label="Jobs">
+<section class="panel">
+<h2>Current job</h2>
+<div id="job-current" class="job-current"><p class="muted">Loading...</p></div>
+</section>
+<section class="panel" id="job-queue-panel" hidden>
+<h2>Waiting to run</h2>
+<ol id="job-queue" class="job-list"></ol>
+</section>
+<section class="panel">
+<h2>Recent jobs</h2>
+<ol id="job-recent" class="job-list"></ol>
+</section>
+<section class="panel">
+<div class="panel-head">
+<h2>Log</h2>
+<div class="segmented" role="group" aria-label="Show">
+<button type="button" data-filter="all" aria-pressed="true">All</button>
+<button type="button" data-filter="warn" aria-pressed="false">Warnings</button>
+<button type="button" data-filter="error" aria-pressed="false">Errors</button>
+</div>
+</div>
+<div id="job-log" role="log" aria-live="off" tabindex="0"></div>
+</section>
+</aside>
+</div>
+</main>
+<noscript><p>This page needs JavaScript.</p></noscript>
+<script type="application/json" id="app-config">__APP_CONFIG__</script>
+<script src="__ASSET_PREFIX__site.js"></script>
+<script src="__ASSET_PREFIX__shell.js"></script>
+<script src="__ASSET_PREFIX__manage.js"></script>
+</body>
+</html>

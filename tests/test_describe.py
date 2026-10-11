@@ -567,6 +567,47 @@ class DescribeTest(DescribeTestCase):
                          ("describe", 2, 2))
 
 
+    def test_pictures_in_an_offline_folder_wait_for_it(self):
+        away = self.base.library_folder("Away")
+        phone = self.base.library_folder("Phone")
+        self.small_images(2)
+        self.small_images(3, away, prefix="away", first_block=30)
+        self.small_images(2, phone, prefix="phone", first_block=50)
+        self.configure([support.library("Family", self.folder),
+                        support.library("Away", away, previews=False),
+                        support.library("Phone", phone)])
+        self.index()
+        # Both shares go offline: Phone's pictures have previews, Away's do not.
+        support.remove_tree(away)
+        support.remove_tree(phone)
+        summary = self.describe()
+        self.assertEqual((summary["described"], summary["failed"], summary["skipped_offline"]),
+                         (4, 0, 3))
+        self.assertEqual(len(self.server.describe_requests()), 4)
+        attempts = self.attempts()
+        self.assertEqual({attempts[name] for name in attempts if name.startswith("away")}, {0})
+        self.assertEqual(sum(row["described"] for row in self.rows().values()), 4)
+        # One line about the waiting pictures, not one per picture.
+        warnings = [entry["message"] for entry in self.ctx.snapshot(log_tail=5000)["log_tail"]
+                    if entry["level"] == "warn"]
+        self.assertEqual(len([text for text in warnings if "Away" in text]), 1, warnings)
+        self.assertIn("3 image(s) without a preview are left for later", "\n".join(warnings))
+        # Nothing left that can be described now: no misleading "all done".
+        summary = self.describe()
+        self.assertEqual((summary["described"], summary["skipped_offline"]), (0, 3))
+        self.assertNotIn("All images already have descriptions", self.log_text())
+
+    def test_time_left_reads_well(self):
+        self.assertEqual(describe._duration(0.5), "less than a minute")
+        self.small_images(3)
+        self.configure()
+        self.index()
+        with mock.patch.object(describe, "PROGRESS_SECONDS", 0):
+            self.describe()
+        self.assertNotIn("about less than", self.log_text())
+        self.assertNotIn("under a minute", self.log_text())
+
+
 class EndpointTest(DescribeTestCase):
 
     def test_claude_and_ollama_kinds(self):
@@ -698,6 +739,22 @@ class EndpointTest(DescribeTestCase):
         self.assertTrue(self.sleeps)
         self.assertLessEqual(max(self.sleeps), 0.5)
         self.assertEqual(calls, ["before", "after"])
+        self.assertEqual(set(self.attempts().values()), {0})
+
+    def test_a_cloud_service_without_a_key_gets_no_picture(self):
+        self.small_images(2)
+        self.configure(endpoints=[{"name": "cloud", "preset": "openai",
+                                   "base_url": self.server.base_url, "model": "m",
+                                   "api_key_env": "SEARCH_IMAGES_UNSET_TEST_KEY"}],
+                       default_endpoint="cloud")
+        self.index()
+        summary = self.describe()
+        self.assertEqual(self.server.describe_requests(), [])
+        self.assertEqual(summary["retired"], ["cloud"])
+        self.assertEqual(summary["described"], 0)
+        self.assertIn("No usable LLM endpoint", summary["error"])
+        self.assertIn("no API key is set (env SEARCH_IMAGES_UNSET_TEST_KEY not set)",
+                      self.log_text())
         self.assertEqual(set(self.attempts().values()), {0})
 
     def test_unreachable_local_server_is_not_used(self):

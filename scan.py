@@ -151,8 +151,12 @@ class LibraryWalk:
         self.errors.append((rel, _error_text(error)))
 
     def _stop_requested(self):
-        if self.ctx is not None and self.ctx.should_stop():
-            self.stopped = True
+        if self.ctx is not None:
+            # Pausing here is safe: nothing is waiting to be written while
+            # folders are listed.
+            self.ctx.wait_if_paused()
+            if self.ctx.should_stop():
+                self.stopped = True
         return self.stopped
 
     def _folder_done(self):
@@ -646,11 +650,11 @@ class LibraryScan:
                     self.summary["restored"] += 1
                     self._note("found again", "Found again: " + rel)
                     self._wrote()
-                self.ctx.step(item=rel)
+                self.ctx.step(item=rel, quick=True)
                 continue
             if _failed_before(self.failures, rel, size, mtime):
                 self.summary["skipped_failed"] += 1
-                self.ctx.step(item=rel)
+                self.ctx.step(item=rel, quick=True)
                 continue
             yield entry
 
@@ -1207,19 +1211,23 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
 
 def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
         newest_first=None, retry_failed=False, allow_mass_removal=False, helper=None,
-        now=None, verbose=False, redescribe_stale=False, limit=None, endpoint_name=None):
+        now=None, verbose=False, redescribe_stale=False, limit=None, endpoint_name=None,
+        conn=None):
     """Scan (and back-fill) the selected libraries, then describe what needs it.
 
     library_ids limits the run to those library ids (default: every enabled
     library). db.init() must have run in this process. redescribe_stale,
     limit and endpoint_name are passed on to describe.describe_pending.
-    Returns {"libraries": [scan summaries], "describe": describe summary or
-    None, "stopped": bool}.
+    conn is an index.db connection to use (default: one opened and closed
+    here). Returns {"libraries": [scan summaries], "describe": describe
+    summary or None, "stopped": bool}.
     """
     libraries = describe.selected_libraries(config, library_ids)
     summary = {"libraries": [], "describe": None, "stopped": False}
     threads = reader_threads(config)
-    conn = db.connect()
+    own_conn = conn is None
+    if own_conn:
+        conn = db.connect()
     try:
         previews = cache.PreviewStore()
         if scan_images:
@@ -1253,7 +1261,8 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
         elif ctx.should_stop():
             summary["stopped"] = True
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
     return summary
 
 

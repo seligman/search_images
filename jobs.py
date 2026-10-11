@@ -7,11 +7,19 @@ stop. JobContext is the base used by the server; ConsoleContext prints to the
 terminal and also honors abort files. WorkerLock makes sure only one process
 runs jobs at a time.
 
-This module uses only the standard library.
+The web server queues jobs with JobManager: one worker thread runs them one
+at a time from the jobs table in data/jobs.db (so the queue survives a
+restart, and never waits for a scan that is writing index.db), each with a
+UIContext that keeps what the browser shows (progress, rate, ETA, the log
+tail and recent errors).
+
+This module uses only the standard library. The job runners import the
+scanner and the describer (which need Pillow) only when a job runs.
 """
 
 import collections
 import json
+import math
 import os
 import sys
 import threading
@@ -57,6 +65,7 @@ class JobContext:
         self.stage_name = ""
         self.stage_started = self.started
         self.done = 0
+        self.quick = 0          # of done: items that took no real work (see step)
         self.total = 0
         self.item = ""
         self.counts = {}
@@ -89,6 +98,7 @@ class JobContext:
             self.stage_name = name
             self.stage_started = time.time()
             self.done = 0
+            self.quick = 0
             self.total = max(0, int(total or 0))
             self.item = ""
         self._stage_started()
@@ -97,10 +107,16 @@ class JobContext:
         with self._lock:
             self.total = max(0, int(total or 0))
 
-    def step(self, n=1, item=None):
-        """Count n finished items in the current stage."""
+    def step(self, n=1, item=None, quick=False):
+        """Count n finished items in the current stage.
+
+        quick marks items that needed no real work (a file a scan finds
+        unchanged): they count as done but not towards the rate.
+        """
         with self._lock:
             self.done += n
+            if quick:
+                self.quick += n
             if item is not None:
                 self.item = str(item)
         self._progress()
@@ -400,3 +416,1121 @@ class WorkerLock:
 
     def __exit__(self, *exc_info):
         self.release()
+
+
+# ---------------------------------------------------------------------------
+# Jobs run by the web server
+
+JOB_KINDS = ("scan", "describe", "process", "previews", "delete_library")
+ACTIVE_STATES = ("running", "paused", "cancelling")
+FINISHED_STATES = ("done", "failed", "cancelled", "interrupted")
+JOB_STATES = ("queued",) + ACTIVE_STATES + FINISHED_STATES
+# A job in one of these states makes an identical new one unnecessary.
+TWIN_STATES = ("queued", "running", "paused")
+# The stage of a job that waits for another process (scan.py) to finish.
+WAITING_STAGE = "waiting for another scan to finish"
+# How the server's jobs name themselves when they hold the WorkerLock.
+WEB_JOB_LABEL = "web server job"
+LOG_LINES = 1000            # log lines kept for the browser (all jobs together)
+ERROR_LINES = 200           # warnings and errors kept per job
+RATE_WINDOW = 120.0         # seconds over which the rate is measured
+RECENT_JOBS = 20            # finished jobs listed in a snapshot
+SUMMARY_LIST_LIMIT = 20     # list items kept in a stored job summary
+PROGRESS_SAVE_SECONDS = 5.0  # how often a running job's progress is written to jobs.db
+INTERRUPTED_MESSAGE = "The server stopped while this job was running; resume it to continue."
+# Stages as the log names them (the pages use the same words).
+STAGE_LABELS = {
+    "scan": "Looking for new and changed pictures",
+    "previews": "Building previews",
+    "describe": "Describing pictures",
+    "delete": "Deleting indexed data",
+    WAITING_STAGE: "Waiting for another scan to finish",
+}
+# The job queue lives in data/jobs.db, a database of its own: a running scan
+# keeps index.db's write lock almost all the time, and adding, pausing or
+# cancelling a job must never wait for it.
+JOBS_SCHEMA = """CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    library_id TEXT,
+    params TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT '',
+    done INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0,
+    summary TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created REAL NOT NULL,
+    started REAL,
+    finished REAL
+)"""
+
+
+def jobs_db_path():
+    """data/jobs.db, the web server's job queue."""
+    return os.path.join(common.data_dir(), "jobs.db")
+
+
+def connect_jobs_db(path=None):
+    """Open data/jobs.db (created on first use); rows come back as sqlite3.Row."""
+    import db       # imported here: db imports this module
+    conn = db.connect(path or jobs_db_path())
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+                        ).fetchone() is None:
+            conn.execute(JOBS_SCHEMA)
+            conn.commit()
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def stage_label(name):
+    """A stage as the log shows it: "Describing pictures" for "describe"."""
+    if name in STAGE_LABELS:
+        return STAGE_LABELS[name]
+    return name[:1].upper() + name[1:]
+
+
+class JobError(Exception):
+    """A job cannot do what it was asked to; the message is shown to the user."""
+
+
+class LogBuffer:
+    """The last log lines of every job, each with a sequence number.
+
+    The numbers keep increasing across jobs, so a page that polls with the
+    last number it saw gets only the lines it has not shown yet.
+    """
+
+    def __init__(self, limit=LOG_LINES):
+        self._lock = threading.Lock()
+        self._lines = collections.deque(maxlen=limit)
+        self._seq = 0
+
+    def append(self, entry):
+        """Store a copy of entry with the next sequence number; returns the copy."""
+        with self._lock:
+            self._seq += 1
+            entry = dict(entry, seq=self._seq)
+            self._lines.append(entry)
+            return entry
+
+    def since(self, seq=0):
+        """(lines with a sequence number above seq, the latest number).
+
+        A seq above the latest number (the page saw an earlier server
+        process) gives every line still kept.
+        """
+        try:
+            seq = int(seq or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        with self._lock:
+            if seq > self._seq:
+                seq = 0
+            return [dict(entry) for entry in self._lines if entry["seq"] > seq], self._seq
+
+    @property
+    def latest(self):
+        with self._lock:
+            return self._seq
+
+
+class UIContext(JobContext):
+    """A JobContext for the jobs the web server runs (see JobManager).
+
+    Besides the base counters it keeps the rate (items per minute over the
+    last RATE_WINDOW seconds; quick steps, such as files a scan finds
+    unchanged, are left out so they do not make the rest look fast) and an
+    ETA for the current stage; log lines, in a LogBuffer shared by all
+    jobs; the last ERROR_LINES warnings and errors, each with the item being
+    worked on; and a log file (data/logs/job-<id>.log). Text is redacted
+    (common.redact) before it is stored anywhere. saver(stage, done, total),
+    when given, is called every save_interval seconds while items are
+    counted (the manager writes the progress to jobs.db).
+    """
+
+    def __init__(self, job_id=None, name="", buffer=None, log_path=None,
+                 log_limit=LOG_LINES, error_limit=ERROR_LINES, rate_window=RATE_WINDOW,
+                 saver=None, save_interval=PROGRESS_SAVE_SECONDS):
+        JobContext.__init__(self, name, log_limit)
+        self.job_id = job_id
+        self.buffer = buffer if buffer is not None else LogBuffer(log_limit)
+        self.log_path = log_path
+        self.rate_window = rate_window
+        self.saver = saver
+        self.save_interval = save_interval
+        self._last_save = time.monotonic()
+        self._errors = collections.deque(maxlen=error_limit)
+        self._samples = collections.deque([(time.monotonic(), 0)])
+        self._file = None
+        self._file_failed = False
+        self._file_lock = threading.Lock()
+
+    def secrets(self):
+        with self._lock:
+            return list(self._secrets)
+
+    def redact(self, text):
+        """text with API keys (those added with add_secret, and the usual shapes) masked."""
+        return common.redact(text, self.secrets())
+
+    def wait_for_stop(self, timeout):
+        """Sleep up to timeout seconds; returns True early once a stop is requested."""
+        return self._stop.wait(timeout)
+
+    def _emit(self, entry):
+        with self._lock:
+            stage, item = self.stage_name, self.item
+        line = dict(entry, job=self.job_id, stage=stage)
+        self.buffer.append(line)
+        if entry["level"] in ("warn", "error"):
+            with self._lock:
+                self._errors.append(dict(line, item=common.redact(item, self._secrets)))
+        self._write(entry)
+
+    def _write(self, entry):
+        if not self.log_path or self._file_failed:
+            return
+        prefix = {"warn": "Warning: ", "error": "Error: "}.get(entry["level"], "")
+        text = "[%s] %s%s\n" % (datetime.fromtimestamp(entry["time"]).strftime(
+            "%Y-%m-%d %H:%M:%S"), prefix, entry["message"])
+        with self._file_lock:
+            try:
+                if self._file is None:
+                    common.ensure_dir(os.path.dirname(os.path.abspath(self.log_path)))
+                    self._file = open(self.log_path, "a", encoding="utf-8",
+                                      errors="backslashreplace")
+                self._file.write(text)
+                self._file.flush()
+            except OSError:
+                # The job goes on without its log file.
+                self._file_failed = True
+
+    def close(self):
+        """Close the log file (the context stays readable)."""
+        with self._file_lock:
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except OSError:
+                    pass
+                self._file = None
+
+    def _stage_started(self):
+        with self._lock:
+            self._samples.clear()
+            self._samples.append((time.monotonic(), 0))
+            name, total = self.stage_name, self.total
+        self.log(stage_label(name) + (" (%d to do)" % total if total else ""))
+        self._save(force=True)
+
+    def _progress(self):
+        now = time.monotonic()
+        with self._lock:
+            counted = self.done - self.quick
+            # About one sample per second is plenty for a two-minute rate.
+            if len(self._samples) >= 2 and now - self._samples[-2][0] < 1.0:
+                self._samples[-1] = (now, counted)
+            else:
+                self._samples.append((now, counted))
+            cutoff = now - self.rate_window
+            while len(self._samples) > 2 and self._samples[1][0] <= cutoff:
+                self._samples.popleft()
+        self._save()
+
+    def _save(self, force=False):
+        if self.saver is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if not force and now - self._last_save < self.save_interval:
+                return
+            self._last_save = now
+            stage, done, total = self.stage_name, self.done, self.total
+        try:
+            self.saver(stage, done, total)
+        except Exception:
+            pass        # the progress in the table is only a convenience
+
+    def rate(self):
+        """Items per minute in the current stage over the last rate_window seconds, or None.
+
+        Quick steps (step(quick=True)) are not counted.
+        """
+        now = time.monotonic()
+        with self._lock:
+            counted = self.done - self.quick
+            start, start_done = self._samples[0]
+            for when, done in self._samples:
+                if when >= now - self.rate_window:
+                    start, start_done = when, done
+                    break
+            elapsed = now - start
+            if elapsed < 1.0 or counted < start_done:
+                return None
+            return (counted - start_done) * 60.0 / elapsed
+
+    def progress(self):
+        """{stage, done, total, item, rate (per minute), eta (seconds), counts, warnings,
+        errors, paused, stop_requested}."""
+        rate = self.rate()
+        with self._lock:
+            done, total = self.done, self.total
+            data = {"stage": self.stage_name, "done": done, "total": total, "item": self.item,
+                    "counts": dict(self.counts), "warnings": self.warnings,
+                    "errors": self.errors, "paused": self.paused,
+                    "stop_requested": self._stop.is_set()}
+        data["rate"] = round(rate, 1) if rate is not None else None
+        data["eta"] = (int(round((total - done) * 60.0 / rate))
+                       if rate and total > done else None)
+        return data
+
+    def error_list(self):
+        """The last warnings and errors: [{seq, time, level, message, job, stage, item}]."""
+        with self._lock:
+            return [dict(entry) for entry in self._errors]
+
+
+def _json_dict(text):
+    try:
+        value = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def canonical_params(params):
+    """Job parameters as sorted JSON text (how identical jobs are recognised)."""
+    return json.dumps(params or {}, sort_keys=True, ensure_ascii=True)
+
+
+def job_record(row):
+    """A jobs table row as a JSON-friendly dict (params and summary parsed)."""
+    record = {key: row[key] for key in ("id", "kind", "library_id", "state", "stage", "done",
+                                        "total", "error", "created", "started", "finished")}
+    record["params"] = _json_dict(row["params"])
+    record["summary"] = _json_dict(row["summary"])
+    return record
+
+
+def compact_summary(value, secrets=(), depth=0):
+    """A small JSON-friendly copy of a job summary, for the jobs table.
+
+    Numbers, booleans, None and (redacted) strings are kept; tuples become
+    lists; lists are cut to SUMMARY_LIST_LIMIT items; deeper levels than
+    three are dropped; non-finite numbers become None.
+    """
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return common.redact(value, secrets)[:1000]
+    if depth >= 3:
+        return None
+    if isinstance(value, dict):
+        return {str(key): compact_summary(item, secrets, depth + 1)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [compact_summary(item, secrets, depth + 1)
+                for item in list(value)[:SUMMARY_LIST_LIMIT]]
+    return common.redact(str(value), secrets)[:1000]
+
+
+def lock_kind(info):
+    """Who holds the WorkerLock, from its holder info: "server", "cli", "other" or ""."""
+    if not info:
+        return ""
+    owner = str(info.get("owner") or "")
+    if owner.startswith(WEB_JOB_LABEL):
+        return "server"
+    if owner.startswith("scan.py"):
+        return "cli"
+    return "other"
+
+
+def _connect_index_db():
+    import db       # imported here: db imports this module
+    return db.connect()
+
+
+def _load_helper(config):
+    return common.load_helper(config.get("helper", ""))
+
+
+class JobManager:
+    """Runs queued jobs one at a time on a worker thread.
+
+    Jobs are rows in the jobs table of data/jobs.db. enqueue() adds one (an
+    identical job that is already queued or running is not added again);
+    the worker runs them oldest first with the runner for their kind, a
+    plain function run(ctx, conn, config, params, helper=None) whose conn is
+    an index.db connection and whose params include "library_id" (None:
+    every enabled library). Each job holds the WorkerLock while it runs;
+    while another process (a scan.py run) holds it, the next job waits in
+    state "queued" with stage WAITING_STAGE. pause(), resume() and cancel()
+    act at the points where jobs call ctx.should_stop() and
+    ctx.wait_if_paused() (between files and images; a request already sent
+    to an LLM finishes first).
+
+    start() marks jobs that an earlier server process left running as
+    "interrupted" (resume() queues them again: every kind of job can safely
+    run twice) and starts the worker. Only one JobManager per data folder
+    runs at a time (data/jobs.lock); another one stays stopped and says why
+    in its message, and shows the job the other one runs as "remote" (it
+    can neither pause nor cancel it). Tests construct and start managers
+    themselves.
+
+    Two locks: _lock guards what is kept in memory (the current job) and is
+    never held while waiting for a file or the database, so snapshot() is
+    always quick; _queue_lock keeps changes to the jobs table in order, and
+    is taken before _lock when both are needed.
+    """
+
+    def __init__(self, runners=None, poll_interval=2.0, idle_interval=5.0,
+                 config_loader=None, helper_loader=None, connect=None):
+        self.runners = dict(RUNNERS if runners is None else runners)
+        self.poll_interval = poll_interval
+        self.idle_interval = idle_interval
+        self.config_loader = config_loader or common.load_config
+        self.helper_loader = helper_loader or _load_helper
+        self._connect = connect or connect_jobs_db
+        self.buffer = LogBuffer(LOG_LINES)
+        self.message = ""
+        self._lock = threading.RLock()
+        self._queue_lock = threading.RLock()
+        self._wake = threading.Event()
+        self._shutdown = threading.Event()
+        self._thread = None
+        self._current = None
+        self._last_ctx = None
+        self._abort_created = False
+        self._worker_lock = WorkerLock()
+        self._manager_lock = WorkerLock(os.path.join(common.data_dir(), "jobs.lock"))
+
+    # -- starting and stopping ------------------------------------------------
+
+    @property
+    def running(self):
+        """True while the worker thread runs."""
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self):
+        """Start the worker thread. Returns False when another process already runs jobs."""
+        with self._queue_lock:
+            if self.running:
+                return True
+            if not self._manager_lock.acquire("web server jobs"):
+                self.message = ("Another server (%s) runs the jobs of this data folder; jobs "
+                                "queued here are run by it."
+                                % (self._manager_lock.holder() or "another process"))
+                return False
+            self.message = ""
+            self._shutdown.clear()
+            self._mark_interrupted()
+            thread = threading.Thread(target=self._loop, name="job-manager", daemon=True)
+            with self._lock:
+                self._thread = thread
+            thread.start()
+            return True
+
+    def stop(self, timeout=30.0):
+        """Stop the worker; a running job stops at its next safe point, "interrupted"."""
+        with self._lock:
+            thread = self._thread
+            self._shutdown.set()
+            current = self._current
+        if current is not None:
+            current["ctx"].request_stop()
+        self._wake.set()
+        if thread is not None:
+            thread.join(timeout)
+            if thread.is_alive():
+                return False
+        with self._lock:
+            self._thread = None
+        self._manager_lock.release()
+        return True
+
+    def _mark_interrupted(self):
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE jobs SET state = 'interrupted', finished = ?, "
+                    "error = CASE WHEN error = '' THEN ? ELSE error END "
+                    "WHERE state IN ('running', 'paused', 'cancelling')",
+                    (time.time(), INTERRUPTED_MESSAGE))
+        finally:
+            conn.close()
+
+    # -- the queue ------------------------------------------------------------
+
+    def _job(self, conn, job_id):
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return job_record(row) if row is not None else None
+
+    def _twin(self, conn, kind, library_id, key, skip=None):
+        """A queued, running or paused job with the same kind, library and params, or None."""
+        for row in conn.execute("SELECT * FROM jobs WHERE state IN (%s) AND kind = ? "
+                                "AND library_id IS ? ORDER BY id"
+                                % ", ".join("?" * len(TWIN_STATES)),
+                                TWIN_STATES + (kind, library_id)):
+            if row["id"] != skip and canonical_params(_json_dict(row["params"])) == key:
+                return job_record(row)
+        return None
+
+    def enqueue(self, kind, library_id=None, params=None):
+        """Queue a job. Returns (job dict, added).
+
+        added is False when an identical job (same kind, library and
+        params) is already queued, running or paused; that job is returned
+        instead (its "state" says which).
+        """
+        if kind not in self.runners:
+            raise ValueError("Unknown kind of job: %s" % kind)
+        key = canonical_params(params)
+        with self._queue_lock:
+            conn = self._connect()
+            try:
+                twin = self._twin(conn, kind, library_id, key)
+                if twin is not None:
+                    return twin, False
+                with conn:
+                    cursor = conn.execute(
+                        "INSERT INTO jobs (kind, library_id, params, state, created) "
+                        "VALUES (?, ?, ?, 'queued', ?)", (kind, library_id, key, time.time()))
+                job = self._job(conn, cursor.lastrowid)
+            finally:
+                conn.close()
+        self._wake.set()
+        return job, True
+
+    def get(self, job_id):
+        """The job with this id (a dict), or None."""
+        conn = self._connect()
+        try:
+            return self._job(conn, job_id)
+        finally:
+            conn.close()
+
+    def owns(self, job_id):
+        """True when this manager is running the job with this id (or waiting to)."""
+        with self._lock:
+            return self._current is not None and self._current["job"]["id"] == job_id
+
+    def latest_by_library(self):
+        """{library id or None: its latest job} (None: jobs for every library); deletions left out."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE id IN (SELECT MAX(id) FROM jobs WHERE kind <> "
+                "'delete_library' GROUP BY library_id)").fetchall()
+        finally:
+            conn.close()
+        return {row["library_id"]: job_record(row) for row in rows}
+
+    def _update(self, job_id, **values):
+        columns = sorted(values)
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute("UPDATE jobs SET %s WHERE id = ?"
+                             % ", ".join("%s = ?" % column for column in columns),
+                             [values[column] for column in columns] + [job_id])
+        finally:
+            conn.close()
+
+    def _set_active_state(self, job_id, state):
+        """Record running / paused / cancelling, unless the job has finished meanwhile."""
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute("UPDATE jobs SET state = ? WHERE id = ? AND state NOT IN "
+                             "('done', 'failed', 'cancelled', 'interrupted')", (state, job_id))
+        finally:
+            conn.close()
+
+    def _mark_started(self, job_id, state, started):
+        """Record that a job starts. False when it is no longer queued (cancelled elsewhere)."""
+        conn = self._connect()
+        try:
+            with conn:
+                cursor = conn.execute("UPDATE jobs SET state = ?, started = ?, stage = '' "
+                                      "WHERE id = ? AND state = 'queued'",
+                                      (state, started, job_id))
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def _save_progress(self, job_id, stage, done, total):
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute("UPDATE jobs SET stage = ?, done = ?, total = ? WHERE id = ? "
+                             "AND state IN ('queued', 'running', 'paused', 'cancelling')",
+                             (stage, done, total, job_id))
+        finally:
+            conn.close()
+
+    def pause(self, job_id):
+        """Pause the running job with this id. Returns True if it was running."""
+        with self._queue_lock:
+            with self._lock:
+                current = self._current
+                if (current is None or current["job"]["id"] != job_id
+                        or current["state"] != "running" or current["waiting"]):
+                    return False
+                current["state"] = "paused"
+                ctx = current["ctx"]
+            ctx.pause()
+            self._set_active_state(job_id, "paused")
+        ctx.log("Paused; the job waits at the next safe point.")
+        return True
+
+    def resume(self, job_id):
+        """Resume a paused job, or queue an interrupted one again. Returns the job or None."""
+        with self._queue_lock:
+            with self._lock:
+                current = self._current
+                mine = current is not None and current["job"]["id"] == job_id
+                if mine:
+                    if current["state"] != "paused":
+                        return None
+                    current["state"] = "running"
+                    ctx = current["ctx"]
+                    job = dict(current["job"], state="running")
+            if mine:
+                # Recorded before the job carries on.
+                self._set_active_state(job_id, "running")
+                ctx.resume()
+                ctx.log("Resumed.")
+                return job
+            conn = self._connect()
+            try:
+                job = self._job(conn, job_id)
+                if job is None or job["state"] != "interrupted":
+                    return None
+                twin = self._twin(conn, job["kind"], job["library_id"],
+                                  canonical_params(job["params"]), skip=job_id)
+                with conn:
+                    if twin is not None:
+                        conn.execute("UPDATE jobs SET state = 'cancelled', error = ? "
+                                     "WHERE id = ?", ("The same job is already queued or "
+                                                      "running (job %d)." % twin["id"], job_id))
+                    else:
+                        conn.execute(
+                            "UPDATE jobs SET state = 'queued', stage = '', done = 0, "
+                            "total = 0, summary = '{}', error = '', created = ?, "
+                            "started = NULL, finished = NULL WHERE id = ?",
+                            (time.time(), job_id))
+                job = twin or self._job(conn, job_id)
+            finally:
+                conn.close()
+        self._wake.set()
+        return job
+
+    def cancel(self, job_id):
+        """Cancel a job: a queued one at once, a running one at its next safe point.
+
+        An interrupted job is marked cancelled (it is no longer offered for
+        resuming). Returns True if the job could be cancelled.
+        """
+        with self._queue_lock:
+            with self._lock:
+                current = self._current
+                mine = current is not None and current["job"]["id"] == job_id
+                if mine:
+                    if current["state"] == "cancelling":
+                        return True
+                    waiting = current["waiting"] or current["state"] == "queued"
+                    current["state"] = "cancelling"
+                    ctx = current["ctx"]
+            if mine:
+                ctx.request_stop()
+                if not waiting:
+                    self._set_active_state(job_id, "cancelling")
+                ctx.log("Cancelling at the next safe point...")
+                return True
+            conn = self._connect()
+            try:
+                with conn:
+                    cursor = conn.execute(
+                        "UPDATE jobs SET state = 'cancelled', finished = ? "
+                        "WHERE id = ? AND state IN ('queued', 'interrupted')",
+                        (time.time(), job_id))
+                return cursor.rowcount > 0
+            finally:
+                conn.close()
+
+    def cancel_library_jobs(self, library_id):
+        """Cancel the queued jobs of one library (not the running one). Returns how many."""
+        with self._queue_lock:
+            with self._lock:
+                current = self._current
+                skip = current["job"]["id"] if current is not None else -1
+            conn = self._connect()
+            try:
+                with conn:
+                    cursor = conn.execute(
+                        "UPDATE jobs SET state = 'cancelled', finished = ?, error = ? "
+                        "WHERE library_id = ? AND state = 'queued' AND id <> ?",
+                        (time.time(), "The library was removed.", library_id, skip))
+                return cursor.rowcount
+            finally:
+                conn.close()
+
+    # -- the worker -----------------------------------------------------------
+
+    def _system_log(self, message, level="error"):
+        self.buffer.append({"time": time.time(), "level": level, "job": None, "stage": "",
+                            "message": common.redact(message)})
+
+    def _loop(self):
+        while not self._shutdown.is_set():
+            self._cleanup_abort()
+            try:
+                job = self._claim_next()
+            except Exception as error:
+                self._system_log("Could not read the job queue: %s" % error)
+                job = None
+            if job is None:
+                self._wake.wait(self.idle_interval)
+                self._wake.clear()
+                continue
+            try:
+                self._run(job)
+            except Exception as error:
+                # The worker must survive anything a job does.
+                self._system_log("Job %d stopped unexpectedly: %s" % (job["id"], error))
+                with self._lock:
+                    self._current = None
+
+    def _claim_next(self):
+        with self._queue_lock:
+            if self._shutdown.is_set():
+                return None
+            conn = self._connect()
+            try:
+                row = conn.execute("SELECT * FROM jobs WHERE state = 'queued' "
+                                   "ORDER BY created, id LIMIT 1").fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                return None
+            job = job_record(row)
+            job_id = job["id"]
+            log_path = os.path.join(common.logs_dir(), "job-%d.log" % job_id)
+
+            def saver(stage, done, total):
+                self._save_progress(job_id, stage, done, total)
+            ctx = UIContext(job_id, job["kind"], self.buffer, log_path, saver=saver)
+            with self._lock:
+                self._current = {"job": job, "ctx": ctx, "state": "queued", "waiting": False}
+            return job
+
+    def _wait_for_lock(self, current, label):
+        """Take the WorkerLock, waiting while another process holds it. False if stopped first."""
+        ctx = current["ctx"]
+        announced = False
+        try:
+            while True:
+                if ctx.should_stop() or self._shutdown.is_set():
+                    return False
+                if self._worker_lock.acquire(label):
+                    return True
+                if not announced:
+                    announced = True
+                    with self._lock:
+                        current["waiting"] = True
+                    ctx.stage(WAITING_STAGE)
+                    ctx.log("Another job is running: %s. This one starts when it has finished."
+                            % (self._worker_lock.holder() or "another process"), "warn")
+                    self._update(current["job"]["id"], stage=WAITING_STAGE)
+                self._cleanup_abort()
+                ctx.wait_for_stop(self.poll_interval)
+        finally:
+            with self._lock:
+                current["waiting"] = False
+
+    def _run(self, job):
+        with self._lock:
+            current = self._current
+        ctx = current["ctx"]
+        label = "%s %d (%s)" % (WEB_JOB_LABEL, job["id"], job["kind"])
+        state, error, summary = None, "", {}
+        acquired = False
+        try:
+            acquired = self._wait_for_lock(current, label)
+            if not acquired:
+                if current["state"] == "cancelling":
+                    state = "cancelled"
+                else:
+                    # The server is stopping: the job stays queued for next time.
+                    self._release_current(ctx)
+                return
+            with self._queue_lock:
+                with self._lock:
+                    if current["state"] == "queued":
+                        current["state"] = "running"
+                    current["job"]["started"] = time.time()
+                    new_state, started = current["state"], current["job"]["started"]
+                if not self._mark_started(job["id"], new_state, started):
+                    # Cancelled meanwhile, on the page of another server.
+                    ctx.request_stop()
+                    state = "cancelled"
+                    return
+            ctx.log("Started job %d: %s" % (job["id"], job["kind"]))
+            config = self.config_loader()
+            for endpoint in common.endpoint_list(config):
+                ctx.add_secret(common.resolve_api_key(endpoint)[0])
+            helper = self.helper_loader(config)
+            params = dict(job["params"], library_id=job["library_id"])
+            conn = _connect_index_db()
+            try:
+                summary = self.runners[job["kind"]](ctx, conn, config, params, helper=helper)
+            finally:
+                conn.close()
+            summary = summary if isinstance(summary, dict) else {}
+            error = summary.get("error") or ""
+            if ctx.should_stop():
+                state = "interrupted" if self._shutdown.is_set() else "cancelled"
+            else:
+                state = "failed" if error else "done"
+        except JobStopped:
+            state = "interrupted" if self._shutdown.is_set() else "cancelled"
+        except JobError as exc:
+            state, error = "failed", str(exc)
+        except BaseException as exc:
+            # Also SystemExit, which loading a missing helper module raises.
+            state, error = "failed", "%s: %s" % (type(exc).__name__, exc)
+        finally:
+            if acquired:
+                self._worker_lock.release()
+            if state is not None:
+                self._finish(job, ctx, state, error, summary)
+
+    def _finish(self, job, ctx, state, error, summary):
+        error = ctx.redact(error or "")[:1000]
+        if state == "failed":
+            ctx.log("Job failed: %s" % error, "error")
+        elif state == "cancelled":
+            ctx.log("Job cancelled.")
+        elif state == "interrupted":
+            ctx.log("Job interrupted; resume it to continue.", "warn")
+        else:
+            ctx.log("Job finished.")
+        if state == "interrupted" and not error:
+            error = INTERRUPTED_MESSAGE
+        progress = ctx.progress()
+        record = compact_summary(summary, ctx.secrets())
+        try:
+            self._update(job["id"], state=state, stage=progress["stage"], done=progress["done"],
+                         total=progress["total"], error=error, finished=time.time(),
+                         summary=json.dumps(record, allow_nan=False))
+        finally:
+            self._release_current(ctx)
+
+    def _release_current(self, ctx):
+        with self._lock:
+            self._current = None
+            self._last_ctx = ctx
+        ctx.close()
+
+    # -- the other process holding the lock -----------------------------------
+
+    def lock_status(self):
+        """{"busy", "holder" (text), "other" (held by another process or object), "kind"}.
+
+        kind says who holds the lock: "server" (a job of a web server),
+        "cli" (scan.py), "other", or "" when it is free.
+        """
+        if self._worker_lock.held:
+            return {"busy": True, "holder": self._worker_lock.holder(), "other": False,
+                    "kind": "server"}
+        info = self._worker_lock.holder_info()
+        if info is None:
+            return {"busy": False, "holder": "", "other": False, "kind": ""}
+        return {"busy": True, "holder": WorkerLock.describe(info), "other": True,
+                "kind": lock_kind(info)}
+
+    def abort_other(self):
+        """Ask a scan.py run that holds the WorkerLock to stop, by creating data/abort.
+
+        The file is removed again once that process has let go of the lock
+        (scan.py refuses to start while it exists). A job of another web
+        server is not asked (that server does not look for the file; its
+        own Manage page can pause or cancel it). Returns {"requested",
+        "message", "holder"}.
+        """
+        status = self.lock_status()
+        if not status["other"]:
+            message = ("The running job belongs to this server; cancel it instead."
+                       if status["busy"] else "No other scan is running.")
+            return {"requested": False, "message": message, "holder": status["holder"]}
+        if status["kind"] == "server":
+            return {"requested": False, "holder": status["holder"],
+                    "message": "The running job belongs to another web server that uses this "
+                               "data folder (%s); pause or cancel it on that server's Manage "
+                               "page." % status["holder"]}
+        path = common.abort_path()
+        common.ensure_dir(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("Stop requested from the web page at %s\n"
+                         % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        with self._lock:
+            self._abort_created = True
+        self._system_log("Asked %s to stop." % status["holder"], "warn")
+        return {"requested": True, "holder": status["holder"],
+                "message": "Asked %s to stop; it stops after the file it is working on."
+                           % status["holder"]}
+
+    def _cleanup_abort(self):
+        with self._lock:
+            if not self._abort_created:
+                return
+        if self.lock_status()["other"]:
+            return
+        try:
+            os.remove(common.abort_path())
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+        with self._lock:
+            self._abort_created = False
+
+    # -- what the browser shows -----------------------------------------------
+
+    def _remote_job(self, conn):
+        """The job another server runs on this data folder, as a read-only current job."""
+        if self.running:
+            return None
+        row = conn.execute("SELECT * FROM jobs WHERE state IN ('running', 'paused', "
+                           "'cancelling') ORDER BY started DESC, id DESC LIMIT 1").fetchone()
+        if row is None:
+            return None
+        info = self._manager_lock.holder_info()
+        if info is None:
+            return None         # left over from a server that has stopped
+        view = job_record(row)
+        view.update(remote=True, holder=WorkerLock.describe(info), waiting=False,
+                    paused=view["state"] == "paused", item="", rate=None, eta=None,
+                    warnings=0, errors=0)
+        return view
+
+    def snapshot(self, since_seq=0, names=None):
+        """The state of the job system for the browser.
+
+        {"current": the running (or waiting) job with its progress, or None,
+        "queue": queued jobs in order, "recent": the last RECENT_JOBS
+        finished jobs, "log": log lines after since_seq, "seq": the latest
+        log line number, "errors": warnings and errors of the current (or
+        last) job, "lock": lock_status(), "manager": {"running", "message"}}.
+        A job that another server runs is shown as current with "remote":
+        True (and only the progress it saves now and then). names ({library
+        id: name}) fills in each job's "library".
+        """
+        names = names or {}
+        self._cleanup_abort()
+        with self._lock:
+            current = self._current
+            if current is not None:
+                view = dict(current["job"], state=current["state"],
+                            waiting=current["waiting"])
+                ctx = current["ctx"]
+            else:
+                view, ctx = None, self._last_ctx
+        conn = self._connect()
+        try:
+            queue = [job_record(row) for row in conn.execute(
+                "SELECT * FROM jobs WHERE state = 'queued' ORDER BY created, id")]
+            recent = [job_record(row) for row in conn.execute(
+                "SELECT * FROM jobs WHERE state IN ('done', 'failed', 'cancelled', "
+                "'interrupted') ORDER BY COALESCE(finished, created) DESC, id DESC LIMIT ?",
+                (RECENT_JOBS,))]
+            if view is None:
+                view = self._remote_job(conn)
+        finally:
+            conn.close()
+        if view is not None:
+            queue = [job for job in queue if job["id"] != view["id"]]
+            if current is not None:
+                state = view["state"]
+                view.update(current["ctx"].progress())
+                view["state"] = state
+        for job in [view] + queue + recent:
+            if job is not None:
+                library_id = job["library_id"]
+                job["library"] = names.get(library_id, library_id) if library_id else ""
+                if job.get("started") and job.get("finished"):
+                    job["duration"] = max(0.0, job["finished"] - job["started"])
+        lines, seq = self.buffer.since(since_seq)
+        return {"current": view, "queue": queue, "recent": recent, "log": lines, "seq": seq,
+                "errors": ctx.error_list() if ctx is not None else [],
+                "lock": self.lock_status(),
+                "manager": {"running": self.running, "message": self.message}}
+
+    def wait_idle(self, timeout=30.0):
+        """Wait until no job runs or is queued. Returns True if that happened in time."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            # Under the queue lock: a job is either still queued or already current.
+            with self._queue_lock:
+                with self._lock:
+                    idle = self._current is None
+                if idle:
+                    conn = self._connect()
+                    try:
+                        queued = conn.execute(
+                            "SELECT COUNT(*) FROM jobs WHERE state = 'queued'").fetchone()[0]
+                    finally:
+                        conn.close()
+                    if not queued:
+                        return True
+            time.sleep(0.02)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Job runners: run(ctx, conn, config, params, helper=None) -> summary dict.
+# A summary with an "error" marks the job as failed.
+
+def job_libraries(config, params):
+    """The libraries a job works on: its library, or every enabled library.
+
+    Raises JobError when the job's library is gone from the settings or
+    disabled.
+    """
+    library_id = params.get("library_id")
+    if not library_id:
+        return [library for library in common.enabled_libraries(config) if library.get("id")]
+    for library in config.get("libraries", []):
+        if library.get("id") == library_id:
+            if not library.get("enabled", True):
+                raise JobError("Library %s is disabled; enable it first."
+                               % common.library_label(library))
+            return [library]
+    raise JobError("Library %s is no longer in the settings." % library_id)
+
+
+# Scan summary fields worth keeping with a finished job.
+_SCAN_FIELDS = ("library_id", "name", "files", "added", "updated", "changed", "moved",
+                "copied", "unchanged", "restored", "failed", "unsupported", "missing",
+                "excluded", "guarded", "removed_moved", "purged", "offline", "aborted",
+                "complete")
+
+
+def _scan_summary(result, params, offline_fails):
+    libraries = []
+    for item in result.get("libraries", []):
+        entry = {key: item[key] for key in _SCAN_FIELDS if key in item}
+        entry["errors"] = len(item.get("errors") or ())
+        if isinstance(item.get("backfill"), dict):
+            entry["previews"] = {key: item["backfill"].get(key)
+                                 for key in ("needed", "filled", "failed", "panoramas")}
+        libraries.append(entry)
+    summary = {"libraries": libraries, "stopped": bool(result.get("stopped"))}
+    offline = [item.get("name", "") for item in libraries if item.get("offline")]
+    if offline:
+        summary["offline"] = offline
+        if offline_fails and params.get("library_id") and len(libraries) == 1:
+            summary["error"] = ("The folder of %s is not available (offline?); nothing was "
+                                "changed." % offline[0])
+    described = result.get("describe")
+    if isinstance(described, dict):
+        summary["describe"] = described
+        if described.get("error"):
+            summary["error"] = described["error"]
+    return summary
+
+
+def _describe_options(params):
+    limit = params.get("limit")
+    return {"retry_failed": bool(params.get("retry_failed")),
+            "redescribe_stale": bool(params.get("redescribe_stale")),
+            "limit": limit if isinstance(limit, int) and not isinstance(limit, bool) else None,
+            "endpoint_name": params.get("endpoint") or None}
+
+
+def run_scan(ctx, conn, config, params, helper=None):
+    """Scan a library (or every enabled one) and fill in previews; no describing."""
+    import scan
+    libraries = job_libraries(config, params)
+    result = scan.run(config, ctx, library_ids=[library["id"] for library in libraries],
+                      describe_images=False,
+                      allow_mass_removal=bool(params.get("allow_mass_removal")),
+                      helper=helper, conn=conn)
+    return _scan_summary(result, params, offline_fails=True)
+
+
+def run_describe(ctx, conn, config, params, helper=None):
+    """Describe the images of a library (or every enabled one) that need it."""
+    import describe
+    libraries = job_libraries(config, params)
+    return describe.describe_pending(conn, config, ctx, helper=helper,
+                                     library_ids=[library["id"] for library in libraries],
+                                     **_describe_options(params))
+
+
+def run_process(ctx, conn, config, params, helper=None):
+    """Scan, then describe: one library, or every enabled one ("Process all")."""
+    import scan
+    libraries = job_libraries(config, params)
+    options = _describe_options(params)
+    result = scan.run(config, ctx, library_ids=[library["id"] for library in libraries],
+                      allow_mass_removal=bool(params.get("allow_mass_removal")),
+                      helper=helper, conn=conn, **options)
+    return _scan_summary(result, params, offline_fails=False)
+
+
+def run_previews(ctx, conn, config, params, helper=None):
+    """Build missing previews (and other details older rows lack); no scan, no describing."""
+    import cache
+    import scan
+    libraries = job_libraries(config, params)
+    threads = scan.reader_threads(config)
+    walker = getattr(helper, "walk_library", None) if helper is not None else None
+    results = []
+    with cache.ThumbStore() as thumbs:
+        previews = cache.PreviewStore()
+        for library in libraries:
+            if ctx.should_stop():
+                break
+            label = common.library_label(library)
+            root = common.library_root(library)
+            if walker is None and not (root and os.path.isdir(root)):
+                ctx.log("Skipping library %s: the folder %s is not available (offline?)."
+                        % (label, root or "(none)"), "warn")
+                results.append({"library_id": library["id"], "name": label, "offline": True})
+                continue
+            result = scan.backfill(conn, library, ctx, helper, thumbs, previews, threads)
+            result.update(library_id=library["id"], name=label)
+            results.append(result)
+            if result.get("aborted"):
+                break
+    summary = {"libraries": results, "stopped": ctx.should_stop()}
+    if params.get("library_id") and len(results) == 1 and results[0].get("offline"):
+        summary["error"] = "The folder of %s is not available (offline?)." % results[0]["name"]
+    return summary
+
+
+def run_delete_library(ctx, conn, config, params, helper=None):
+    """Delete the indexed data of a library that is no longer in the settings."""
+    import library_ops
+    return library_ops.delete_library_job(ctx, conn, config, params)
+
+
+RUNNERS = {
+    "scan": run_scan,
+    "describe": run_describe,
+    "process": run_process,
+    "previews": run_previews,
+    "delete_library": run_delete_library,
+}

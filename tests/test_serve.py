@@ -62,8 +62,8 @@ def insert_image(conn, library_id, path, **fields):
 
 
 def app_config_of(html):
-    """The APP_CONFIG object injected into a page."""
-    match = re.search(r"window\.APP_CONFIG = (.*?);</script>", html)
+    """The page settings written into a page's JSON block."""
+    match = re.search(r'<script type="application/json" id="app-config">(.*?)</script>', html)
     return strict_json(match.group(1))
 
 
@@ -351,7 +351,7 @@ class ServerTest(ServerFixture, unittest.TestCase):
             self.assertEqual(self.client.get("/api/image/%d" % image_id).status_code, 404)
 
     def test_app_config_cannot_break_out_of_the_script(self):
-        for url, scripts in (("/", 3), ("/detail", 3), ("/map", 3)):
+        for url, scripts in (("/", 4), ("/detail", 4), ("/map", 4)):
             html = self.client.get(url).get_data(as_text=True)
             self.assertNotIn(XSS_NAME, html)
             self.assertNotIn("<script>alert", html)

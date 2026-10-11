@@ -52,21 +52,10 @@
         return groups;
     }
 
-    function setupLibraries() {
-        var select = el("library");
-        if (SITE.libraries.length <= 1) {
-            select.style.display = "none";
-        }
-        var all = document.createElement("option");
-        all.value = "__all__";
-        all.textContent = "All libraries";
-        select.appendChild(all);
-        SITE.libraries.forEach(function (name) {
-            var option = document.createElement("option");
-            option.value = name;
-            option.textContent = name;
-            select.appendChild(option);
-        });
+    // The library picked in the page header (shell.js), by display name;
+    // "" for all libraries.
+    function libraryFilter() {
+        return window.SHELL ? SHELL.libraryName() : "";
     }
 
     function tile(rec) {
@@ -142,14 +131,29 @@
         box.className = "message";
         box.textContent = text;
         grid.appendChild(box);
+        return box;
+    }
+
+    // Nothing indexed yet: on this computer, point to the Manage page.
+    function emptyMessage() {
+        var box = message("No pictures yet.");
+        if (SITE.capabilities.admin && !SITE.capabilities.static) {
+            box.appendChild(document.createTextNode(" "));
+            var link = document.createElement("a");
+            link.href = "/manage";
+            link.textContent = SITE.libraryList.length ? "Scan your libraries on the Manage page"
+                : "Add your first library on the Manage page";
+            box.appendChild(link);
+            box.appendChild(document.createTextNode(" to get started."));
+        }
     }
 
     function update() {
         var query = el("query").value.trim().toLowerCase();
-        var library = el("library").value || "__all__";
+        var library = libraryFilter();
         var terms = query.split(/\s+/).filter(Boolean);
         var matches = records.filter(function (rec) {
-            if (library !== "__all__" && rec.library !== library) {
+            if (library && rec.library !== library) {
                 return false;
             }
             var hay = rec.text || "";
@@ -157,8 +161,13 @@
                 return hay.indexOf(term) >= 0;
             });
         });
+        if (!records.length) {
+            emptyMessage();
+            return;
+        }
         if (!matches.length) {
-            message(records.length ? "No images match." : "No images yet.");
+            message(library && !terms.length ? "No images in this library yet."
+                : "No images match.");
             return;
         }
         var grid = el("grid");
@@ -179,11 +188,11 @@
     }
 
     function init() {
-        setupLibraries();
-        el("map-link").href = SITE.mapUrl();
         el("query").addEventListener("input", update);
-        el("library").addEventListener("change", update);
         el("cluster").addEventListener("change", update);
+        if (window.SHELL) {
+            SHELL.onLibraryChange(update);
+        }
         message("Loading...");
         SITE.loadIndex(function (loaded) {
             if (!loaded) {

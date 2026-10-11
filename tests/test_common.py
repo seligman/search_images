@@ -528,17 +528,24 @@ class ApiKeyTest(support.TempBaseMixin, unittest.TestCase):
                          ("anthropic-key-value", "env ANTHROPIC_API_KEY"))
 
     def test_a_key_pasted_as_a_variable_name_is_never_shown(self):
-        # None of these are real keys: they are made-up values used only by this test.
+        # Not real keys: made-up values shaped like keys, used only by this test
+        # (the hex one has the 32-digit shape of older Azure OpenAI keys).
         for pasted in ("AIzaSyFAKE-pasted-key-0123456789abcdefg", "sk-proj-pastedvalue",
                        "AIzaSyFAKEpastedkey0123456789abcdefgh", "Xy7kQ2mR9pL4vN8wT3zB6cD1",
-                       "has space", "1STARTS_WITH_DIGIT"):
+                       "deadbeef0123456789abcdef01234567", "a1b2c3d4e5f6a7b8c9d0e1f2",
+                       "fakekeyvalue2024abcd0987", "has space", "1STARTS_WITH_DIGIT"):
             with self.subTest(pasted=pasted[:6]):
                 os.environ[pasted.replace(" ", "_")] = "should-not-be-used"
                 self.assertEqual(common.resolve_api_key({"api_key_env": pasted}),
                                  ("", "env (invalid name) not set"))
                 self.assertFalse(common.valid_env_name(pasted))
-        for name in ("OPENAI_API_KEY", "my_key", "_X", "KEY2"):
+        for name in ("OPENAI_API_KEY", "my_key", "_X", "KEY2", "AZURE_OPENAI_API_KEY_2024",
+                     "DEADBEEF", "MYSERVICEKEY", "SERVICE_KEY_20241010_PROD"):
             self.assertTrue(common.valid_env_name(name), name)
+        # Paths of key files do not look like keys.
+        for path in ("C:\\path\\to\\openai-20241010.key", "/home/you/keys/service2024.key",
+                     "keys/azure.key"):
+            self.assertFalse(common.looks_like_key(path), path)
 
     def test_key_files(self):
         self.base.write_file("secret.key", b"\xef\xbb\xbf  file-key-value  \r\n\r\nsecond line\n")

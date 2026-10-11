@@ -33,7 +33,11 @@ script also prints an install command if a package is missing.
 
 ## Setup
 
-Run the settings tool and follow the numbered menu:
+The easiest way is the browser: run `python serve.py`, open the printed
+address, and use the **Settings** page to add an endpoint and the **Manage**
+page to add your libraries (see [Managing libraries in the
+browser](#managing-libraries-in-the-browser)). The console settings tool does
+the same from a numbered menu:
 
     python settings.py
 
@@ -198,6 +202,47 @@ thumbnail to open its detail page with the full description, metadata, and
 EXIF data; click the image there to view it at full size. With several
 libraries you can search all of them or pick one.
 
+## Managing libraries in the browser
+
+The header of every page links to **Manage** and **Settings** when the
+server runs on this computer (the default address, `127.0.0.1`). Everything
+the command line does for libraries can be done there:
+
+- **Manage** lists each library with its folder, whether the folder can be
+  reached, how many pictures are described, waiting, out of date or failed,
+  and the last job. Its buttons scan a library, describe it, do both, retry
+  failed pictures, re-describe pictures described with an older prompt, and
+  build missing previews. **Process all libraries** does a scan and describe
+  of every library that is turned on.
+- **Add library** asks for the folder (type it, or use **Browse...**; a
+  network share is typed as `\\server\share`), suggests a name, shows how
+  many pictures it found, and previews which files the ignore patterns skip.
+  Editing a library can rename it or point it at a moved folder; its
+  descriptions are kept. **Remove** asks you to type the name and whether to
+  keep the indexed data (it can be attached to a library again later) or
+  delete it.
+- The job panel shows the running job with its progress, speed and time
+  left, with **Pause**, **Resume** and **Cancel**; the queue; recent jobs;
+  and the log. Jobs keep running when you close the page, one at a time, and
+  a job cut short by stopping the server can be resumed. A scan started
+  from the command line is shown too, with a button that asks it to stop.
+  The queue is kept in `data/jobs.db`. When two servers use the same data
+  folder, the first one runs the jobs and the other only shows them.
+- **Settings** lists the endpoints with their status (a local server shows
+  whether it is running and which model it loaded), where each API key comes
+  from (never the key itself), and buttons to add, edit, test, remove and
+  make one the default. **Test** describes the bundled sample picture and
+  shows the answer, the time it took and, with prices set, the cost per
+  picture. Before the first describe of a library that uses a cloud service,
+  the page says how many pictures will be sent and where. A cloud service
+  whose API key is not set up is never sent a picture: Manage says what is
+  missing and keeps the describe buttons off.
+
+These pages only answer requests from this computer. When the server is
+started with `--host` so that other computers can search, Manage and
+Settings are turned off. Do not put the server behind a reverse proxy on
+the same computer: every visitor would then look local.
+
 ## Packaging a static site
 
     python serve.py package
@@ -229,6 +274,10 @@ small change only rewrites the files that changed.
 - `describe.py`, `prompts.py` - the describe step and the prompt it sends
 - `compare_models.py` - compare how endpoints describe the same images
 - `serve.py` - search server and static site packager
+- `admin.py`, `library_ops.py` - the Manage and Settings pages' server side
+  (library changes, folder checks, jobs, endpoints)
+- `static/`, `templates/` - the web pages (`shell.js` is the header shared
+  by every page; `manage.js` and `settings.js` run Manage and Settings)
 - `progress.py` - show how many images are described per library, how many
   have descriptions from an older prompt, and which failed
 - `world_map.py` - render a world map with a pin for each GPS-tagged area

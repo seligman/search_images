@@ -1215,6 +1215,38 @@ class WalkTest(support.TempBaseMixin, unittest.TestCase):
         lines = [entry["message"] for entry in ctx.snapshot()["log_tail"]]
         self.assertIn("Listing Walk: 4 folders, 3 image files so far", lines)
 
+    def test_a_paused_job_stops_listing_folders(self):
+        folder = self.base.library_folder("Walk")
+        for index in range(3):
+            write_jpeg(os.path.join(folder, "F%d" % index, "a.jpg"), seed=index)
+        ctx = jobs.JobContext("test")
+        ctx.pause()
+        entries = []
+        thread = threading.Thread(target=lambda: entries.extend(
+            scan.walk_library(folder, [], ctx=ctx, label="Walk")), daemon=True)
+        thread.start()
+        thread.join(0.3)
+        # Paused: the share is left alone until the job is resumed.
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(entries, [])
+        ctx.resume()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(entries), 3)
+
+    def test_unchanged_files_do_not_count_towards_the_rate(self):
+        folder = self.base.library_folder("Family")
+        for index in range(3):
+            write_jpeg(os.path.join(folder, "p%d.jpg" % index), seed=index)
+        self.base.write_config([support.library("Family", folder)])
+        config = common.load_config()
+        db.init(config, log=lambda message: None)
+        scan.run(config, jobs.JobContext("first"), describe_images=False)
+        ctx = jobs.UIContext(1, "scan")
+        scan.run(config, ctx, describe_images=False)
+        # A re-scan finds every file unchanged: all done, but no real work.
+        self.assertEqual((ctx.stage_name, ctx.done, ctx.quick), ("scan", 3, 3))
+
     def test_walk_yields_sizes_and_times(self):
         folder = self.base.library_folder("Walk")
         path = write_jpeg(os.path.join(folder, "A", "one.jpg"), seed=1)

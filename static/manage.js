@@ -1,0 +1,2009 @@
+/* Manage page: the libraries (add, edit, remove, scan, describe), indexed
+   data that has lost its library, and the jobs with their log.
+
+   Everything comes from the admin API (admin.py) through SHELL.admin. The
+   jobs are polled every second while one runs or waits, and every 10
+   seconds otherwise; the library cards are refreshed when a job starts or
+   finishes, and every 10 seconds while one runs. Parts of the page are
+   rebuilt only while no mouse button is down, so a refresh never swallows
+   a click.
+
+   ?dialog=add opens the Add dialog, ?dialog=browse the folder picker, and
+   ?dialog=edit|remove|failures&id=<library id> those dialogs, so they can
+   be linked to. Nothing in the address ever makes the server look at a
+   folder by itself: the folder picker always starts at the drives.
+*/
+(function () {
+    "use strict";
+
+    var el = SHELL.el;
+    var clear = SHELL.clear;
+    var fmt = SHELL.format;
+    var J = SHELL.jobs;
+
+    var POLL_ACTIVE = 1000;
+    var POLL_IDLE = 10000;
+    var STATE_REFRESH = 10000;
+    var STATE_RETRY = 10000;
+    var LOG_LIMIT = 1000;
+    var CLOUD_OK_KEY = "searchImages.cloudOk.";
+    var TEST_COST_KEY = "searchImages.testCost.";
+    var PATH_PLACEHOLDER = "C:\\Photos\\Family  or  \\\\server\\share\\Photos";
+
+    var state = null;           // the last /state reply
+    var snapshot = null;        // the last jobs snapshot
+    var logLines = [];
+    var logSeq = 0;
+    var logFilter = "all";
+    var pollTimer = null;
+    var lastStateAt = 0;
+    var jobKey = null;          // changes when a job starts, finishes or is queued
+    var stateRequest = null;
+    var statusRetries = 0;
+    var activityNodes = {};     // library id -> its card's activity box
+    var pointerDown = false;
+    var deferred = {};          // renders waiting for the mouse button to be released
+    var currentView = null;     // {key, update(job)} of the current-job box
+    var listKeys = {};
+
+    function byId(id) {
+        return document.getElementById(id);
+    }
+
+    /* ---------- Rendering without swallowing clicks ------------------------ */
+
+    function whenIdle(name, render) {
+        if (pointerDown) {
+            deferred[name] = render;
+        } else {
+            render();
+        }
+    }
+
+    document.addEventListener("mousedown", function () {
+        pointerDown = true;
+    }, true);
+    document.addEventListener("mouseup", function () {
+        pointerDown = false;
+        // After the click that this mouseup completes has been handled.
+        window.setTimeout(function () {
+            var pending = deferred;
+            deferred = {};
+            Object.keys(pending).forEach(function (name) {
+                pending[name]();
+            });
+        }, 0);
+    }, true);
+
+    function focusKey(container) {
+        var active = document.activeElement;
+        if (active && container.contains(active) && active.getAttribute("data-key")) {
+            return active.getAttribute("data-key");
+        }
+        return null;
+    }
+
+    function restoreFocus(container, key) {
+        if (!key) {
+            return;
+        }
+        var nodes = container.querySelectorAll("[data-key]");
+        for (var i = 0; i < nodes.length; i++) {
+            if (nodes[i].getAttribute("data-key") === key) {
+                nodes[i].focus();
+                return;
+            }
+        }
+    }
+
+    /* ---------- Small builders ------------------------------------------- */
+
+    function button(text, className, onClick, props) {
+        var node = el("button", {type: "button", className: "button " + (className || ""),
+                                 text: text});
+        Object.keys(props || {}).forEach(function (key) {
+            if (key === "key") {
+                node.setAttribute("data-key", props.key);
+            } else if (props[key] !== undefined) {
+                node[key] = props[key];
+            }
+        });
+        if (onClick) {
+            node.addEventListener("click", onClick);
+        }
+        return node;
+    }
+
+    function progressBar(value, options) {
+        options = options || {};
+        var bar = el("div", {className: "progress-bar"});
+        var box = el("div", {className: "progress", attrs: {role: "progressbar",
+                                                            "aria-label": options.label,
+                                                            "aria-valuemin": "0",
+                                                            "aria-valuemax": "100"}}, [bar]);
+        setProgress(box, value, options);
+        return box;
+    }
+
+    // value: 0..100, or null for "working, amount unknown".
+    function setProgress(box, value, options) {
+        options = options || {};
+        var bar = box.firstChild;
+        box.classList.toggle("indeterminate", value === null && !options.still);
+        box.classList.toggle("done", value === 100 && Boolean(options.doneColor));
+        if (value === null) {
+            bar.style.width = options.still ? "0" : "";
+            box.removeAttribute("aria-valuenow");
+        } else {
+            bar.style.width = value + "%";
+            box.setAttribute("aria-valuenow", String(value));
+        }
+    }
+
+    function notice(kind, content, actions) {
+        var box = el("div", {className: "notice " + (kind || "")});
+        box.appendChild(SHELL.append(el("div", {className: "notice-text"}), content));
+        (actions || []).forEach(function (action) {
+            if (action) {
+                box.appendChild(action);
+            }
+        });
+        return box;
+    }
+
+    // A notice above the libraries that stays until it is dismissed.
+    function showNotice(kind, content) {
+        var holder = byId("manage-notices");
+        var close = button("Dismiss", "small");
+        var box = notice(kind, content, [close]);
+        close.addEventListener("click", function () {
+            holder.removeChild(box);
+        });
+        holder.appendChild(box);
+        return box;
+    }
+
+    function warningList(warnings) {
+        if (warnings.length === 1) {
+            return warnings[0];
+        }
+        return el("ul", {className: "warning-list"}, warnings.map(function (text) {
+            return el("li", {text: text});
+        }));
+    }
+
+    var fieldCount = 0;
+
+    // A labelled field. The label (and the hint) are tied to the control
+    // by id, also when the field holds more than the control (options.div).
+    function field(label, control, options) {
+        options = options || {};
+        fieldCount += 1;
+        var labelId = "manage-field-" + fieldCount;
+        var error = el("span", {className: "field-error", hidden: true,
+                                attrs: {"aria-live": "polite"}});
+        var labelNode = el("span", {className: "field-label", id: labelId}, [label]);
+        if (options.optional) {
+            labelNode.appendChild(el("span", {className: "optional", text: " (optional)"}));
+        }
+        var hint = options.hint ? el("span", {className: "field-hint", id: labelId + "-hint"},
+                                     options.hint) : null;
+        var node = el(options.div ? "div" : "label", {className: "field"}, [
+            labelNode, control, hint, options.after || null, error
+        ]);
+        var target = options.control || control;
+        target.setAttribute("aria-labelledby", labelId);
+        if (hint) {
+            target.setAttribute("aria-describedby", labelId + "-hint");
+        }
+        return {node: node, error: error, control: target};
+    }
+
+    function check(label, checked, hint) {
+        var input = el("input", {type: "checkbox", checked: Boolean(checked)});
+        var node = el("label", {className: "check"}, [
+            input,
+            el("span", null, [label, hint ? el("span", {className: "field-hint", text: hint})
+                                          : null])
+        ]);
+        return {node: node, input: input};
+    }
+
+    function radio(name, label, checked, hint) {
+        var input = el("input", {type: "radio", name: name, checked: Boolean(checked)});
+        var node = el("label", {className: "check"}, [
+            input,
+            el("span", null, [label, hint ? el("span", {className: "field-hint"}, hint) : null])
+        ]);
+        return {node: node, input: input};
+    }
+
+    function resultLine(node, text, kind) {
+        node.hidden = !text;
+        node.className = "result-line" + (kind ? " " + kind : "");
+        node.textContent = text || "";
+    }
+
+    /* ---------- Loading the state ---------------------------------------- */
+
+    function loadState() {
+        if (stateRequest) {
+            return stateRequest;
+        }
+        stateRequest = SHELL.admin("/state?since=" + logSeq, undefined, {quiet: Boolean(state)})
+            .then(function (data) {
+                stateRequest = null;
+                state = data;
+                lastStateAt = Date.now();
+                // The jobs first: the cards show which of their jobs run.
+                applySnapshot(data.jobs, true);
+                whenIdle("libraries", renderLibraries);
+                whenIdle("orphans", renderOrphans);
+                renderNotices();
+                // Folder checks run in the background; ask again for their result.
+                var checking = state.libraries.some(function (lib) {
+                    return lib.enabled !== false && lib.status && lib.status.reachable === null;
+                });
+                if (checking && statusRetries < 15) {
+                    statusRetries += 1;
+                    window.setTimeout(loadState, 2000);
+                } else if (!checking) {
+                    statusRetries = 0;
+                }
+                return data;
+            }, function (error) {
+                stateRequest = null;
+                if (!state) {
+                    var status = byId("manage-status");
+                    if (status) {
+                        status.textContent = "The libraries could not be loaded: " + error.message +
+                            " Trying again every " + (STATE_RETRY / 1000) + " seconds.";
+                    }
+                }
+                throw error;
+            });
+        return stateRequest;
+    }
+
+    function refreshState() {
+        loadState().catch(function () {
+            // Shown already; the next poll tries again.
+        });
+    }
+
+    function findLibrary(id) {
+        var found = null;
+        (state ? state.libraries : []).forEach(function (lib) {
+            if (lib.id === id) {
+                found = lib;
+            }
+        });
+        return found;
+    }
+
+    function enabledLibraries() {
+        return (state ? state.libraries : []).filter(function (lib) {
+            return lib.enabled !== false;
+        });
+    }
+
+    /* ---------- Notices -------------------------------------------------- */
+
+    function renderNotices() {
+        var holder = byId("manage-notices");
+        var old = byId("no-endpoint-notice");
+        if (old) {
+            holder.removeChild(old);
+        }
+        // An endpoint needs at least a model name before it can describe.
+        var usable = state && state.endpoints.some(function (endpoint) {
+            return endpoint.model && endpoint.enabled !== false;
+        });
+        if (state && !usable) {
+            var box = notice("warn", "No AI model is set up yet, so pictures can be indexed " +
+                "and found by file name, but not described. Add an endpoint (a model server " +
+                "on this computer, or a cloud service) in Settings.", [
+                el("a", {className: "button", href: "/settings", text: "Open Settings"})
+            ]);
+            box.id = "no-endpoint-notice";
+            holder.insertBefore(box, holder.firstChild);
+        }
+    }
+
+    /* ---------- Library cards -------------------------------------------- */
+
+    function renderLibraries() {
+        var list = byId("library-list");
+        var key = focusKey(list);
+        clear(list);
+        activityNodes = {};
+        var libraries = state.libraries;
+        byId("process-all").disabled = !enabledLibraries().length;
+        if (!libraries.length) {
+            list.appendChild(el("div", {className: "empty"}, [
+                el("h2", {text: "Add your first library"}),
+                el("p", {text: "A library is a folder of pictures on this computer or on a " +
+                    "network share. Image Search looks through it, makes small previews, and " +
+                    "asks an AI model to describe each picture, so you can search for what " +
+                    "is in them. Your folders are only read, never changed."}),
+                button("Add library", "primary", function () {
+                    openDialog("add");
+                }, {key: "empty-add"})
+            ]));
+        } else {
+            libraries.forEach(function (lib) {
+                list.appendChild(libraryCard(lib));
+            });
+        }
+        updateActivity();
+        restoreFocus(list, key);
+    }
+
+    function statusPill(lib) {
+        if (lib.enabled === false) {
+            return el("span", {className: "pill", text: "Turned off"});
+        }
+        var status = lib.status || {};
+        if (status.reachable === true) {
+            return el("span", {className: "pill ok", text: "Online",
+                               title: "The folder can be reached."});
+        }
+        if (status.reachable === false) {
+            return el("span", {className: "pill bad", text: "Offline",
+                               title: status.message || "The folder cannot be reached."});
+        }
+        return el("span", {className: "pill", text: "Checking...",
+                           title: "Checking whether the folder can be reached."});
+    }
+
+    function enabledSwitch(lib) {
+        var input = el("input", {type: "checkbox", checked: lib.enabled !== false,
+                                 attrs: {"aria-label": lib.name + " turned on"}});
+        input.setAttribute("data-key", lib.id + ":enabled");
+        var label = el("span", {text: lib.enabled !== false ? "On" : "Off"});
+        input.addEventListener("change", function () {
+            input.disabled = true;
+            SHELL.admin("/libraries/" + encodeURIComponent(lib.id), {enabled: input.checked})
+                .then(function () {
+                    SHELL.toast(lib.name + (input.checked ? " is turned on." :
+                        " is turned off: it is not searched and Process all skips it."), "ok");
+                    refreshState();
+                }, function () {
+                    input.checked = !input.checked;
+                    input.disabled = false;
+                });
+        });
+        return el("label", {className: "switch",
+                            title: "Turned-off libraries are not searched and are not scanned"},
+                  [input, el("span", {className: "switch-track"}), label]);
+    }
+
+    function stat(label, value, title, kind) {
+        return el("li", {className: "stat" + (kind ? " " + kind : ""), title: title}, [
+            el("strong", {text: fmt.number(value)}), label
+        ]);
+    }
+
+    function endpointText(lib) {
+        var info = lib.endpoint_info || {};
+        if (!info.ready) {
+            if (info.problem) {
+                return info.problem + " Its pictures are not described until that is fixed.";
+            }
+            if (lib.endpoint && !(info.endpoints || []).length) {
+                return "This library names the endpoint " + lib.endpoint + ", which is " +
+                    "missing or turned off, so its pictures cannot be described.";
+            }
+            return "No AI model is set up to describe this library's pictures yet.";
+        }
+        var text = "Described by " + (lib.endpoint ? info.name : "the default endpoint (" +
+                                      info.name + ")");
+        if (info.cloud) {
+            text += ", which sends pictures to " + info.cloud_hosts.join(", ");
+        }
+        return text + ".";
+    }
+
+    function lastJobLine(lib) {
+        var job = lib.last_job;
+        if (!job) {
+            // A library that is on already says so in its card note.
+            return (lib.counts || {}).total || lib.enabled !== false ? null :
+                el("div", {className: "last-job", text: "Not scanned yet."});
+        }
+        if (!job.finished) {
+            // Running or waiting: the activity box above shows it.
+            return null;
+        }
+        var when = fmt.relative(job.finished);
+        var parts = ["Last job: " + J.kind(job), J.state(job.state)];
+        if (when) {
+            parts.push(when);
+        }
+        var summary = J.summary(job);
+        if (summary) {
+            parts.push(summary);
+        }
+        return el("div", {className: "last-job"}, [
+            parts.join(" \u00b7 "),
+            job.error && job.state !== "interrupted" ?
+                el("div", {className: "error-text", text: job.error}) : null
+        ]);
+    }
+
+    function libraryCard(lib) {
+        var counts = lib.counts || {};
+        var info = lib.endpoint_info || {};
+        var off = lib.enabled === false;
+        var offline = !off && lib.status && lib.status.reachable === false;
+        var card = el("article", {className: "card" + (off ? " is-off" : ""),
+                                  id: "library-" + lib.id});
+        var root = lib.root || lib.path || "";
+
+        card.appendChild(el("div", {className: "card-head"}, [
+            el("h2", {text: lib.name}),
+            statusPill(lib),
+            info.cloud ? el("span", {className: "pill warn plain",
+                                     text: "Sends pictures to " + info.cloud_hosts.join(", "),
+                                     title: "This library is described by a cloud service."})
+                : null,
+            enabledSwitch(lib)
+        ]));
+        card.appendChild(el("div", {className: "path-line"}, [
+            el("span", {className: "path-text", text: root, title: root}),
+            button("Copy", "subtle small", function () {
+                SHELL.copyText(root).then(function (ok) {
+                    SHELL.toast(ok ? "Folder path copied." : "The path could not be copied.",
+                                ok ? "ok" : "error", 3);
+                });
+            }, {key: lib.id + ":copy", title: "Copy the folder path"})
+        ]));
+
+        if (off) {
+            card.appendChild(el("p", {className: "card-note", text: "This library is turned " +
+                "off: it is not searched, and Process all skips it. Turn it on to scan or " +
+                "describe it."}));
+        } else if (offline) {
+            card.appendChild(notice("warn", (lib.status.message || "The folder cannot be " +
+                "reached.") + " Scans skip it and nothing is removed until it is back."));
+        }
+
+        if (counts.present) {
+            var pct = fmt.percent(counts.described, counts.present);
+            card.appendChild(el("div", {className: "described"}, [
+                el("div", {className: "described-line"}, [
+                    el("span", null, [el("strong", {text: fmt.number(counts.described)}),
+                                      " of " + fmt.plural(counts.present, "picture") +
+                                      " described"]),
+                    el("span", {text: pct + "%"})
+                ]),
+                progressBar(pct, {doneColor: true, label: lib.name + ": pictures described"})
+            ]));
+            var stats = el("ul", {className: "stats"});
+            stats.appendChild(stat("to describe", counts.pending,
+                                   "Pictures that have no description yet"));
+            if (counts.stale) {
+                stats.appendChild(stat("out of date", counts.stale, "Described with an " +
+                    "older version of the instructions; Re-describe updates them", "warn"));
+            }
+            if (counts.failed) {
+                stats.appendChild(stat("failed", counts.failed, "Pictures the AI model could " +
+                    "not describe" + (counts.gave_up ? " (" + fmt.number(counts.gave_up) +
+                    " gave up after 3 tries; Retry failed tries them again)" : ""), "bad"));
+            }
+            if (counts.missing) {
+                stats.appendChild(stat("missing", counts.missing, "Files that are no longer " +
+                    "in the folder; they are forgotten after 30 days", "warn"));
+            }
+            if (counts.hidden) {
+                stats.appendChild(stat("hidden", counts.hidden, "Pictures hidden from search"));
+            }
+            card.appendChild(stats);
+        } else if (!off) {
+            card.appendChild(el("p", {className: "card-note", text: counts.missing ?
+                "No pictures are in the folder right now." :
+                "No pictures are indexed yet. Scan + describe finds them and describes them."}));
+        }
+
+        var activity = el("div", {className: "card-activity", hidden: true});
+        activityNodes[lib.id] = activity;
+        card.appendChild(activity);
+        SHELL.append(card, lastJobLine(lib));
+        var endpointNote = el("p", {className: "card-note" + (info.ready ? "" : " card-problem"),
+                                    text: endpointText(lib)},
+                              info.ready ? null : [" ", el("a", {href: "/settings",
+                                                                 text: "Open Settings."})]);
+        card.appendChild(endpointNote);
+        if (info.ready && info.warning) {
+            card.appendChild(el("p", {className: "card-note card-problem", text: info.warning +
+                " Start it before describing; scanning works without it."}));
+        }
+
+        var actions = el("div", {className: "card-actions"});
+        var noModel = !info.ready;
+        var modelTitle = noModel ? (info.problem || "Set up an AI model in Settings first")
+            : undefined;
+
+        // A job button: disabled (and saying so) while the same job is
+        // running or waiting, since starting it again would only repeat it.
+        function jobButton(text, className, kind, params, key, disabled, title) {
+            var busy = busyJob(lib, kind, params);
+            var state = busy ? {queued: "waiting", paused: "paused"}[busy.state] || "running"
+                : "";
+            return button(busy ? text + " (" + state + ")" : text, className, function () {
+                queueJob(kind, lib, params);
+            }, {key: key, disabled: disabled || Boolean(busy),
+                title: busy ? "This job is " + (state === "waiting" ? "waiting to run" : state) +
+                    "; see the job panel" : title});
+        }
+
+        actions.appendChild(jobButton("Scan + describe", "primary", "process", {},
+            lib.id + ":process", off || noModel,
+            modelTitle || "Look for new and changed pictures, then describe the new ones"));
+        actions.appendChild(jobButton("Scan", "", "scan", {}, lib.id + ":scan", off,
+            "Look for new, changed and removed pictures, without describing them"));
+        actions.appendChild(jobButton("Describe", "", "describe", {}, lib.id + ":describe",
+            off || noModel || !counts.pending,
+            modelTitle || (counts.pending ? "Describe the " +
+                fmt.plural(counts.pending, "picture") + " that have no description yet"
+                : "Every picture is described")));
+        if (counts.stale) {
+            actions.appendChild(jobButton("Re-describe out of date (" +
+                fmt.number(counts.stale) + ")", "", "describe", {redescribe_stale: true},
+                lib.id + ":stale", off || noModel,
+                modelTitle || "Describe again the pictures described with older instructions"));
+        }
+        if (counts.failed) {
+            actions.appendChild(jobButton("Retry failed (" + fmt.number(counts.failed) + ")",
+                "", "describe", {retry_failed: true}, lib.id + ":retry", off || noModel,
+                modelTitle || "Try again to describe the pictures that failed"));
+        }
+        if (lib.previews !== false) {
+            actions.appendChild(jobButton("Build previews", "", "previews", {},
+                lib.id + ":previews", off,
+                "Make the screen-sized previews that are still missing"));
+        }
+        actions.appendChild(el("span", {className: "spacer"}));
+        if (counts.failed) {
+            actions.appendChild(button("Failures", "subtle", function () {
+                openDialog("failures", lib.id);
+            }, {key: lib.id + ":failures", title: "List the pictures that could not be described"}));
+        }
+        actions.appendChild(button("Edit", "subtle", function () {
+            openDialog("edit", lib.id);
+        }, {key: lib.id + ":edit", title: "Change the folder, name and other settings"}));
+        actions.appendChild(button("Remove", "subtle danger-text", function () {
+            openDialog("remove", lib.id);
+        }, {key: lib.id + ":remove", title: "Remove this library"}));
+        card.appendChild(actions);
+        return card;
+    }
+
+    // The "running now" / "waiting to run" box of each card, from the jobs.
+    function updateActivity() {
+        var current = snapshot && snapshot.current;
+        var queue = snapshot ? snapshot.queue : [];
+        Object.keys(activityNodes).forEach(function (id) {
+            var box = activityNodes[id];
+            clear(box);
+            var waiting = queue.filter(function (job) {
+                return job.library_id === id;
+            });
+            if (current && current.library_id === id) {
+                var value = current.total ? fmt.percent(current.done, current.total) : null;
+                box.appendChild(el("div", null, [
+                    el("strong", {text: J.state(current.state) + ": " + J.kind(current)}),
+                    " \u00b7 " + J.stage(current.stage, current),
+                    current.total ? " \u00b7 " + J.progress(current) : ""
+                ]));
+                box.appendChild(progressBar(value, {still: current.state !== "running",
+                                                    label: libraryName(id) + ": job progress"}));
+            }
+            if (waiting.length) {
+                box.appendChild(el("div", {text: "Waiting to run: " + waiting.map(function (job) {
+                    return J.kind(job);
+                }).join(", ")}));
+            }
+            box.hidden = !box.firstChild;
+        });
+    }
+
+    function libraryName(id) {
+        var lib = findLibrary(id);
+        return lib ? lib.name : id;
+    }
+
+    /* ---------- Queueing jobs -------------------------------------------- */
+
+    function sameParams(first, second) {
+        var a = first || {};
+        var b = second || {};
+        var keys = Object.keys(a).concat(Object.keys(b));
+        return keys.every(function (key) {
+            return Boolean(a[key]) === Boolean(b[key]) && (a[key] || null) === (b[key] || null);
+        });
+    }
+
+    // The running or waiting job that does the same as kind + params for lib.
+    function busyJob(lib, kind, params) {
+        var jobs = snapshot ? (snapshot.current ? [snapshot.current] : []).concat(snapshot.queue)
+            : [];
+        var found = null;
+        jobs.forEach(function (job) {
+            if (!found && job.kind === kind && job.library_id === lib.id &&
+                    job.state !== "cancelling" && sameParams(job.params, params)) {
+                found = job;
+            }
+        });
+        return found;
+    }
+
+    function cloudKey(lib) {
+        return CLOUD_OK_KEY + lib.id;
+    }
+
+    function cloudConfirmed(lib) {
+        return SHELL.storageGet(cloudKey(lib)) ===
+            (lib.endpoint_info.cloud_hosts || []).join(",");
+    }
+
+    function testCost(lib) {
+        var names = (lib.endpoint_info && lib.endpoint_info.endpoints) || [];
+        var text = names.length ? SHELL.storageGet(TEST_COST_KEY + names[0]) : null;
+        var value = text === null ? NaN : Number(text);
+        return isFinite(value) && value >= 0 ? value : null;
+    }
+
+    // How many pictures a job sends to be described: a number, or null when
+    // only the scan can tell (a library that has not been scanned yet).
+    function jobImages(lib, kind, params) {
+        var counts = lib.counts || {};
+        if (params.retry_failed) {
+            return counts.failed || 0;
+        }
+        if (params.redescribe_stale) {
+            return (counts.stale || 0) + (counts.pending || 0);
+        }
+        if (kind === "process" && !counts.present) {
+            return null;
+        }
+        return counts.pending || 0;
+    }
+
+    // One line of the cloud question: what goes where, and what it costs.
+    function cloudLine(lib, kind, params, found) {
+        var count = jobImages(lib, kind, params);
+        var cost = testCost(lib);
+        var hosts = lib.endpoint_info.cloud_hosts.join(", ");
+        var text;
+        if (count === null) {
+            text = lib.name + ": every picture the scan finds (" + (found ?
+                (found.more ? "at least " : "about ") + fmt.plural(found.count, "picture") +
+                " by the folder check" : "the number is known after the scan") + "), to " +
+                hosts;
+            if (found && cost !== null && found.count) {
+                text += ", about " + money(cost * found.count) + " or more";
+            }
+        } else {
+            text = lib.name + ": " + (kind === "process" ? "about " : "") +
+                fmt.plural(count, "picture") + (kind === "process" ?
+                    " not described yet, plus any new ones the scan finds," : "") + " to " + hosts;
+            if (cost !== null && count) {
+                text += ", about " + money(cost * count);
+            }
+        }
+        if (cost !== null) {
+            text += " (" + money(cost) + " per picture, measured by the last Test)";
+        }
+        return {text: text, costKnown: cost !== null};
+    }
+
+    function money(value) {
+        return "$" + value.toFixed(value < 1 ? 3 : 2);
+    }
+
+    // The first time a library that uses a cloud service is described, say
+    // how many pictures go where (and the cost, when a Test has measured it).
+    // found: {count, more} from the folder check of a library just added.
+    function confirmCloud(kind, libraries, params, found) {
+        if (kind !== "describe" && kind !== "process") {
+            return Promise.resolve(true);
+        }
+        var risky = libraries.filter(function (lib) {
+            return lib.enabled !== false && lib.endpoint_info && lib.endpoint_info.cloud &&
+                !cloudConfirmed(lib);
+        });
+        if (!risky.length) {
+            return Promise.resolve(true);
+        }
+        var unknownCost = false;
+        var items = risky.map(function (lib) {
+            var line = cloudLine(lib, kind, params, found);
+            if (!line.costKnown) {
+                unknownCost = true;
+            }
+            return el("li", {text: line.text});
+        });
+        var message = [
+            el("p", {text: "These libraries are described by a service outside this computer " +
+                "and your network. Each picture is resized and sent there with the " +
+                "describing instructions and the library's context notes. File names, " +
+                "folders and photo details such as the location stay here."}),
+            el("ul", {className: "warning-list"}, items),
+            unknownCost ? el("p", {text: "The service charges for each picture. Test the " +
+                "endpoint on the Settings page to see what one picture costs."}) : null,
+            el("p", {className: "muted", text: "You are asked once for each library."})
+        ];
+        return SHELL.confirm({
+            title: "Send pictures to a cloud service?",
+            message: message,
+            confirmText: "Send pictures"
+        }).then(function (ok) {
+            if (ok) {
+                risky.forEach(function (lib) {
+                    SHELL.storageSet(cloudKey(lib), (lib.endpoint_info.cloud_hosts || []).join(","));
+                });
+            }
+            return ok;
+        });
+    }
+
+    function jobName(kind, lib, params) {
+        return J.title({kind: kind, library_id: lib ? lib.id : null,
+                        library: lib ? lib.name : "", params: params});
+    }
+
+    function queueJob(kind, lib, params, found) {
+        params = params || {};
+        var libraries = lib ? [lib] : enabledLibraries();
+        return confirmCloud(kind, libraries, params, found).then(function (ok) {
+            if (!ok) {
+                return null;
+            }
+            return SHELL.admin("/jobs", {kind: kind, library_id: lib ? lib.id : null,
+                                         params: params}).then(function (reply) {
+                var state = reply.job ? reply.job.state : "";
+                SHELL.toast(reply.added ? jobName(kind, lib, params) + " will start shortly." :
+                            state === "running" || state === "paused" ?
+                                "That job is running already." :
+                                "That job is already waiting to run.",
+                            reply.added ? "ok" : "info", 4);
+                applySnapshot(reply.jobs);
+                return reply;
+            });
+        }).catch(function () {
+            // The message is shown already.
+        });
+    }
+
+    /* ---------- Jobs ----------------------------------------------------- */
+
+    function pollJobs() {
+        window.clearTimeout(pollTimer);
+        SHELL.admin("/jobs?since=" + logSeq, undefined, {quiet: true}).then(function (data) {
+            applySnapshot(data);
+        }, function () {
+            showServerGone();
+            pollTimer = window.setTimeout(pollJobs, POLL_IDLE);
+        });
+    }
+
+    function showServerGone() {
+        if (byId("server-gone")) {
+            return;
+        }
+        var box = notice("error", "The server is not answering. Is it still running? This " +
+                         "page tries again every 10 seconds.");
+        box.id = "server-gone";
+        byId("manage-notices").appendChild(box);
+    }
+
+    function active() {
+        return Boolean(snapshot && (snapshot.current || snapshot.queue.length ||
+                                    (snapshot.lock && snapshot.lock.busy)));
+    }
+
+    function applySnapshot(data, fromState) {
+        if (!data) {
+            return;
+        }
+        var gone = byId("server-gone");
+        if (gone) {
+            gone.parentNode.removeChild(gone);
+        }
+        if (data.seq < logSeq) {
+            // The server was restarted: its log starts again.
+            logLines = [];
+            logSeq = 0;
+            byId("job-log").textContent = "";
+        }
+        var fresh = data.log.filter(function (line) {
+            return line.seq > logSeq;
+        });
+        logSeq = Math.max(logSeq, data.seq);
+        snapshot = data;
+        SHELL.showJobs(data);
+        addLogLines(fresh);
+        whenIdle("jobs", renderJobs);
+        updateActivity();
+
+        var key = [data.current ? data.current.id + ":" + data.current.state : "-",
+                   data.recent.length ? data.recent[0].id + ":" + data.recent[0].state : "-",
+                   data.queue.map(function (job) {
+                       return job.id;
+                   }).join(",")].join("|");
+        if (jobKey !== null && key !== jobKey && !fromState) {
+            refreshState();
+        } else if (data.current && !fromState && Date.now() - lastStateAt > STATE_REFRESH) {
+            refreshState();
+        }
+        jobKey = key;
+        window.clearTimeout(pollTimer);
+        pollTimer = window.setTimeout(pollJobs, active() ? POLL_ACTIVE : POLL_IDLE);
+    }
+
+    function renderJobs() {
+        renderCurrent();
+        renderQueue();
+        renderRecent();
+    }
+
+    function currentKey(data) {
+        var job = data.current;
+        return [job ? job.id : "-", job ? job.state : "-", job && job.waiting ? "w" : "",
+                job && job.remote ? "x" : "",
+                data.lock && data.lock.other ? "o" + (data.lock.kind || "") : "",
+                data.manager.running ? "r" : "", data.manager.message || ""].join("|");
+    }
+
+    function askOtherToStop() {
+        SHELL.admin("/abort-other", {}).then(function (reply) {
+            SHELL.toast(reply.message, reply.requested ? "ok" : "info");
+            pollJobs();
+        });
+    }
+
+    function jobAction(job, action) {
+        return SHELL.admin("/jobs/" + job.id + "/" + action, {}).then(function (reply) {
+            applySnapshot(reply.jobs);
+        }, function () {
+            pollJobs();
+        });
+    }
+
+    function cancelJob(job) {
+        SHELL.confirm({
+            title: "Stop this job?",
+            message: "\u201c" + J.title(job) + "\u201d stops after the picture it is working " +
+                "on. Everything done so far is kept; running the job again carries on " +
+                "where it stopped.",
+            confirmText: "Stop the job",
+            cancelText: "Keep it running"
+        }).then(function (yes) {
+            if (yes) {
+                jobAction(job, "cancel");
+            }
+        });
+    }
+
+    function renderCurrent() {
+        var holder = byId("job-current");
+        var data = snapshot;
+        var key = currentKey(data);
+        if (currentView && currentView.key === key) {
+            currentView.update(data.current);
+            return;
+        }
+        var focus = focusKey(holder);
+        clear(holder);
+        currentView = {key: key, update: function () {}};
+        if (!data.manager.running) {
+            holder.appendChild(notice("error", data.manager.message ||
+                "Jobs are not running in this server process, so queued jobs wait."));
+        }
+        var cli = data.lock && data.lock.other && data.lock.kind !== "server";
+        if (data.lock && data.lock.other) {
+            holder.appendChild(notice("warn", J.otherHolder(data.lock) + " (" +
+                data.lock.holder + "). Jobs started here wait until it finishes." +
+                (cli ? "" : " Pause or cancel it on that server's Manage page."),
+                [cli ? button("Ask it to stop", "small", askOtherToStop, {key: "abort-other"})
+                    : null]));
+        }
+        var job = data.current;
+        if (!job) {
+            var waiting = data.lock && data.lock.other;
+            holder.appendChild(el("p", {className: "muted", text: waiting ?
+                (data.queue.length ? "Queued jobs start when it finishes."
+                    : "No job started from this page is running.") :
+                data.queue.length ? "Starting the next job..." : "Nothing is running. " +
+                "Use the buttons on a library, or Process all libraries, to scan and " +
+                "describe pictures."}));
+            restoreFocus(holder, focus);
+            return;
+        }
+        var title = el("div", {className: "job-title"});
+        var stage = el("div", {className: "job-meta"});
+        var bar = progressBar(null, {label: "Current job progress"});
+        var numbers = el("div", {className: "job-meta"});
+        var item = el("div", {className: "job-item"});
+        var problems = el("div", {className: "job-meta"});
+        holder.appendChild(el("div", {className: "card-head"}, [title,
+            el("span", {className: "pill " + (job.state === "running" ? "info" :
+                                              job.state === "paused" ? "warn" : ""),
+                        text: job.waiting ? "Waiting" : J.state(job.state)})]));
+        holder.appendChild(stage);
+        holder.appendChild(bar);
+        holder.appendChild(numbers);
+        holder.appendChild(item);
+        holder.appendChild(problems);
+        if (job.remote) {
+            holder.appendChild(el("p", {className: "muted", text: "Run by another server that " +
+                "uses the same data folder (" + (job.holder || "another process") + "). Its " +
+                "progress here is updated every few seconds; pause or cancel it on that " +
+                "server's Manage page."}));
+        }
+        var actions = el("div", {className: "actions"});
+        if (job.remote) {
+            // Read-only: the other server owns this job.
+            actions.hidden = true;
+        } else if (job.state === "running" && !job.waiting) {
+            actions.appendChild(button("Pause", "", function () {
+                jobAction(job, "pause");
+            }, {key: "job-pause", title: "Pause after the current picture; Resume carries on"}));
+        }
+        if (job.state === "paused") {
+            actions.appendChild(button("Resume", "primary", function () {
+                jobAction(job, "resume");
+            }, {key: "job-resume"}));
+        }
+        if (job.state !== "cancelling" && !job.remote) {
+            actions.appendChild(button("Cancel", "", function () {
+                cancelJob(job);
+            }, {key: "job-cancel"}));
+        }
+        if (job.waiting && cli) {
+            actions.appendChild(button("Ask the other scan to stop", "", askOtherToStop,
+                                       {key: "job-abort-other"}));
+        }
+        holder.appendChild(actions);
+
+        currentView.update = function (now) {
+            title.textContent = J.title(now);
+            stage.textContent = J.stage(now.stage, now) +
+                (now.state === "cancelling" ? " (stopping at the next safe point)" : "");
+            var value = now.total ? fmt.percent(now.done, now.total) : null;
+            setProgress(bar, now.waiting ? null : value, {still: now.state !== "running" ||
+                                                          now.waiting});
+            numbers.textContent = J.progress(now);
+            numbers.hidden = !numbers.textContent;
+            item.textContent = now.item && now.state === "running" ? "Now: " + now.item : "";
+            item.title = now.item || "";
+            item.hidden = !item.textContent;
+            var parts = [];
+            if (now.warnings) {
+                parts.push(fmt.plural(now.warnings, "warning"));
+            }
+            if (now.errors) {
+                parts.push(fmt.plural(now.errors, "error"));
+            }
+            problems.textContent = parts.length ? parts.join(", ") + " so far (see the log)" : "";
+            problems.hidden = !parts.length;
+            if (now.started) {
+                title.title = "Started " + fmt.relative(now.started);
+            }
+        };
+        currentView.update(job);
+        restoreFocus(holder, focus);
+    }
+
+    function listChanged(name, items) {
+        // The relative times ("5 minutes ago") are part of the key, so the
+        // lists are redrawn when they change.
+        var key = items.map(function (job) {
+            return job.id + ":" + job.state + ":" + (job.finished || "") + ":" + job.library +
+                ":" + fmt.relative(job.finished || job.created);
+        }).join(",");
+        if (listKeys[name] === key) {
+            return false;
+        }
+        listKeys[name] = key;
+        return true;
+    }
+
+    function renderQueue() {
+        var queue = snapshot.queue;
+        byId("job-queue-panel").hidden = !queue.length;
+        if (!listChanged("queue", queue)) {
+            return;
+        }
+        var list = byId("job-queue");
+        var focus = focusKey(list);
+        clear(list);
+        queue.forEach(function (job) {
+            list.appendChild(el("li", null, [
+                el("div", {className: "job-body"}, [
+                    el("div", {className: "job-title", text: J.title(job)}),
+                    el("div", {className: "job-meta", text: "Added " + fmt.relative(job.created)})
+                ]),
+                button("Cancel", "small", function () {
+                    jobAction(job, "cancel");
+                }, {key: "queue-cancel-" + job.id, title: "Take this job out of the queue"})
+            ]));
+        });
+        restoreFocus(list, focus);
+    }
+
+    function stateClass(stateName) {
+        return {done: "ok", failed: "bad", cancelled: "", interrupted: "warn"}[stateName] || "";
+    }
+
+    function renderRecent() {
+        var recent = snapshot.recent;
+        if (!listChanged("recent", recent)) {
+            return;
+        }
+        var list = byId("job-recent");
+        var focus = focusKey(list);
+        clear(list);
+        if (!recent.length) {
+            list.appendChild(el("li", null, [el("p", {className: "muted",
+                                                       text: "No jobs have run yet."})]));
+            return;
+        }
+        recent.forEach(function (job) {
+            var meta = [];
+            if (job.finished) {
+                meta.push(fmt.relative(job.finished));
+            }
+            if (job.duration) {
+                meta.push("took " + fmt.duration(job.duration));
+            }
+            var summary = J.summary(job);
+            if (summary) {
+                meta.push(summary);
+            }
+            var actions = null;
+            if (job.state === "interrupted") {
+                actions = el("div", {className: "actions"}, [
+                    button("Resume", "small primary", function () {
+                        jobAction(job, "resume");
+                    }, {key: "recent-resume-" + job.id,
+                        title: "Run it again; it carries on where it stopped"}),
+                    button("Dismiss", "small", function () {
+                        jobAction(job, "cancel");
+                    }, {key: "recent-dismiss-" + job.id})
+                ]);
+            }
+            list.appendChild(el("li", null, [
+                el("span", {className: "pill " + stateClass(job.state), text: J.state(job.state)}),
+                el("div", {className: "job-body"}, [
+                    el("div", {className: "job-title", text: J.title(job)}),
+                    meta.length ? el("div", {className: "job-meta", text: meta.join(" \u00b7 ")})
+                        : null,
+                    job.error ? el("div", {className: job.state === "interrupted" ? "job-meta"
+                        : "job-error", text: job.error}) : null,
+                    actions
+                ])
+            ]));
+        });
+        restoreFocus(list, focus);
+    }
+
+    /* ---------- Log ------------------------------------------------------ */
+
+    function logVisible(line) {
+        if (logFilter === "error") {
+            return line.level === "error";
+        }
+        if (logFilter === "warn") {
+            return line.level === "warn" || line.level === "error";
+        }
+        return true;
+    }
+
+    function logNode(line) {
+        return el("div", {className: "log-line " + (line.level || "info")}, [
+            el("span", {className: "log-time", text: fmt.clock(line.time)}),
+            line.message
+        ]);
+    }
+
+    function addLogLines(lines) {
+        if (!lines.length) {
+            if (!logLines.length) {
+                showEmptyLog();
+            }
+            return;
+        }
+        var box = byId("job-log");
+        var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+        var empty = box.querySelector(".log-empty");
+        if (empty) {
+            box.removeChild(empty);
+        }
+        lines.forEach(function (line) {
+            logLines.push(line);
+            if (logVisible(line)) {
+                box.appendChild(logNode(line));
+            }
+        });
+        if (logLines.length > LOG_LIMIT) {
+            logLines = logLines.slice(logLines.length - LOG_LIMIT);
+            while (box.childNodes.length > LOG_LIMIT) {
+                box.removeChild(box.firstChild);
+            }
+        }
+        if (atBottom) {
+            box.scrollTop = box.scrollHeight;
+        }
+    }
+
+    function showEmptyLog() {
+        var box = byId("job-log");
+        if (!box.firstChild) {
+            box.appendChild(el("div", {className: "log-empty muted",
+                                       text: "Messages from jobs appear here."}));
+        }
+    }
+
+    function renderLog() {
+        var box = byId("job-log");
+        clear(box);
+        logLines.filter(logVisible).forEach(function (line) {
+            box.appendChild(logNode(line));
+        });
+        if (!box.firstChild) {
+            box.appendChild(el("div", {className: "log-empty muted", text: logLines.length ?
+                "No " + (logFilter === "error" ? "errors" : "warnings") + " so far." :
+                "Messages from jobs appear here."}));
+        }
+        box.scrollTop = box.scrollHeight;
+    }
+
+    function setupLogFilter() {
+        var buttons = document.querySelectorAll("#job-panel .segmented button");
+        Array.prototype.forEach.call(buttons, function (node) {
+            node.addEventListener("click", function () {
+                logFilter = node.getAttribute("data-filter");
+                Array.prototype.forEach.call(buttons, function (other) {
+                    other.setAttribute("aria-pressed", other === node ? "true" : "false");
+                });
+                renderLog();
+            });
+        });
+    }
+
+    /* ---------- Orphans -------------------------------------------------- */
+
+    function renderOrphans() {
+        var holder = byId("orphans");
+        clear(holder);
+        state.orphans.forEach(function (orphan) {
+            var counts = orphan.counts || {};
+            var box = notice("warn", [
+                "Indexed data for \u201c", el("strong", {text: orphan.name}), "\u201d (" +
+                fmt.plural(counts.total || 0, "picture") + ", " +
+                fmt.number(counts.described || 0) + " described) is not attached to any " +
+                "library, so it is not shown in search."
+            ], [
+                button("Re-attach to...", "small", function () {
+                    reattachDialog(orphan);
+                }, {key: "orphan-attach-" + orphan.id, disabled: !state.libraries.length,
+                    title: state.libraries.length ? "Give this data to one of your libraries"
+                        : "Add a library first"}),
+                button("Delete...", "small", function () {
+                    deleteOrphan(orphan);
+                }, {key: "orphan-delete-" + orphan.id})
+            ]);
+            box.classList.add("orphan");
+            holder.appendChild(box);
+        });
+    }
+
+    function reattachDialog(orphan) {
+        var box = SHELL.modal({title: "Re-attach \u201c" + orphan.name + "\u201d"});
+        var select = el("select");
+        state.libraries.forEach(function (lib) {
+            select.appendChild(el("option", {value: lib.id, text: lib.name}));
+        });
+        var picked = field("Attach to", select, {hint: "Its pictures, descriptions and " +
+            "previews become part of this library. This works when the library's folder " +
+            "holds the same pictures, for example after removing a library and adding its " +
+            "folder again."});
+        box.body.appendChild(el("p", {text: "Pictures that the chosen library has indexed " +
+            "already (the same file in the same place) cannot be merged; the server says so " +
+            "before anything changes."}));
+        box.body.appendChild(picked.node);
+        box.button("Cancel", "", box.close);
+        var go = box.button("Re-attach", "primary", function () {
+            go.disabled = true;
+            SHELL.admin("/orphans/" + encodeURIComponent(orphan.id) + "/reattach",
+                        {library_id: select.value}, {quiet: true}).then(function (reply) {
+                box.close();
+                SHELL.toast("Moved " + fmt.plural(reply.moved, "picture") + " to " +
+                            select.options[select.selectedIndex].text + ".", "ok");
+                refreshState();
+            }, function (error) {
+                go.disabled = false;
+                picked.error.textContent = error.message;
+                picked.error.hidden = false;
+            });
+        });
+    }
+
+    function deleteOrphan(orphan) {
+        var counts = orphan.counts || {};
+        SHELL.confirm({
+            title: "Delete the indexed data of \u201c" + orphan.name + "\u201d?",
+            message: [
+                el("p", {text: "This deletes what Image Search stored about " +
+                    fmt.plural(counts.total || 0, "picture") + ": " +
+                    fmt.number(counts.described || 0) + " descriptions, the thumbnails and " +
+                    "the previews. The picture files themselves are not touched."}),
+                el("p", {text: "Describing them again takes time (and money, with a cloud " +
+                    "service). This cannot be undone."})
+            ],
+            typeName: orphan.name,
+            confirmText: "Delete the data",
+            danger: true
+        }).then(function (yes) {
+            if (!yes) {
+                return;
+            }
+            SHELL.admin("/orphans/" + encodeURIComponent(orphan.id) + "/delete",
+                        {confirm_name: orphan.name}).then(function () {
+                SHELL.toast("Deleting the data of " + orphan.name + "...", "ok");
+                pollJobs();
+            });
+        });
+    }
+
+    /* ---------- Add / edit dialog ---------------------------------------- */
+
+    function endpointOptions(select, current) {
+        var seen = {};
+        var groups = {};
+        var defaultName = state.default_endpoint || "";
+        select.appendChild(el("option", {value: "", text: defaultName ?
+            "The default endpoint (" + defaultName + ")" : "The default endpoint (none set)"}));
+        state.endpoints.forEach(function (endpoint) {
+            if (endpoint.group && endpoint.group !== endpoint.name) {
+                groups[endpoint.group] = true;
+            }
+            if (endpoint.enabled === false) {
+                return;
+            }
+            seen[endpoint.name.toLowerCase()] = true;
+            var text = endpoint.name + " \u2014 " + (endpoint.preset_label || endpoint.kind) +
+                (endpoint.model ? ", " + endpoint.model : " (not set up yet)") +
+                (endpoint.local || !endpoint.model ? "" : " (cloud: " + endpoint.host + ")");
+            select.appendChild(el("option", {value: endpoint.name, text: text}));
+        });
+        Object.keys(groups).forEach(function (group) {
+            if (!seen[group.toLowerCase()]) {
+                seen[group.toLowerCase()] = true;
+                select.appendChild(el("option", {value: group, text: "Group " + group +
+                                                 " (its endpoints share the work)"}));
+            }
+        });
+        if (current && !seen[current.toLowerCase()]) {
+            select.appendChild(el("option", {value: current, text: current +
+                                             " (not available: missing or turned off)"}));
+        }
+        select.value = current || "";
+    }
+
+    function endpointByName(name) {
+        var found = null;
+        state.endpoints.forEach(function (endpoint) {
+            if (endpoint.name === name) {
+                found = endpoint;
+            }
+        });
+        return found;
+    }
+
+    function ignoreText(list) {
+        return (list || []).join("\n");
+    }
+
+    function sameIgnore(text, list) {
+        var lines = text.split(/\r?\n/).map(function (line) {
+            return line.trim();
+        }).filter(Boolean);
+        return lines.join("\n") === (list || []).join("\n");
+    }
+
+    // options.browse opens the folder picker straight away (?dialog=browse).
+    function libraryDialog(lib, options) {
+        options = options || {};
+        var adding = !lib;
+        var box = SHELL.modal({
+            title: adding ? "Add a library" : "Edit \u201c" + lib.name + "\u201d",
+            wide: true,
+            onClose: function () {
+                SHELL.setState({dialog: null, id: null});
+                window.clearTimeout(pathTimer);
+                window.clearTimeout(previewTimer);
+            }
+        });
+        var fields = {};
+        var nameTouched = !adding;
+        var pathTimer = null;
+        var previewTimer = null;
+        var checkSeq = 0;
+        var previewSeq = 0;
+        var found = null;           // {path, count, more} from the last folder check
+        var body = box.body;
+
+        // Folder
+        var path = el("input", {type: "text", className: "input mono", spellcheck: false,
+                                value: lib ? lib.path : "", placeholder: PATH_PLACEHOLDER,
+                                autocomplete: "off"});
+        var pathResult = el("div", {className: "result-line", hidden: true,
+                                    attrs: {"aria-live": "polite"}});
+        var relocate = el("span", {className: "field-hint", hidden: true, text: "Moving a " +
+            "library to another folder keeps its descriptions: the next scan matches the " +
+            "pictures by where they are inside the folder."});
+        function chooseFolder(chosen) {
+            path.value = chosen;
+            pathChanged();
+            testPath();
+        }
+        var browse = button("Browse...", "", function () {
+            folderPicker(path.value.trim(), chooseFolder);
+        });
+        var test = button("Test", "", function () {
+            testPath();
+        }, {title: "Check that the folder can be read and count its pictures"});
+        fields.path = field("Folder", el("div", {className: "field-row"}, [path, browse, test]), {
+            div: true,
+            control: path,
+            hint: "The folder that holds the pictures; its sub-folders are included. It is " +
+                "only read, never changed. A network share is typed like \\\\server\\share\\Photos.",
+            after: [pathResult, relocate]
+        });
+        body.appendChild(fields.path.node);
+
+        // Name
+        var name = el("input", {type: "text", className: "input", value: lib ? lib.name : "",
+                                placeholder: "Taken from the folder name", autocomplete: "off"});
+        fields.name = field("Name", name, {hint: "How the library is shown here and when " +
+                                           "searching. Each library needs its own name."});
+        body.appendChild(fields.name.node);
+
+        // Skipping files
+        var ignore = el("textarea", {className: "mono", rows: 3, spellcheck: false,
+                                     value: ignoreText(lib ? lib.ignore : []),
+                                     placeholder: "Screenshots/*\n*.gif"});
+        var previewLine = el("div", {className: "result-line", hidden: true,
+                                     attrs: {"aria-live": "polite"}});
+        var examples = el("ul", {className: "examples", hidden: true});
+        fields.ignore = field("Files and folders to skip", ignore, {
+            optional: true,
+            hint: "One pattern per line, matched against the path inside the library " +
+                "folder: Screenshots/* skips that folder, *.gif skips every GIF file.",
+            after: [previewLine, examples]
+        });
+        var defaults = check("Skip NAS system folders (recommended)",
+                             lib ? lib.default_ignores !== false : true,
+                             "Thumbnail and recycle-bin folders that NAS boxes and Windows " +
+                             "create, such as @eaDir, #recycle and Thumbs.db.");
+        fields.default_ignores = {node: defaults.node, error: el("span"), control: defaults.input};
+        body.appendChild(el("fieldset", {className: "group"}, [
+            el("legend", {text: "Skipping files"}), fields.ignore.node, defaults.node
+        ]));
+
+        // Describing
+        var newest = radio("order", "Newest pictures first", lib ? lib.newest_first !== false : true);
+        var oldest = radio("order", "Oldest pictures first", lib ? lib.newest_first === false : false);
+        var order = el("div", {className: "field"}, [
+            el("span", {className: "field-label", text: "Describe order"}),
+            el("div", {className: "radio-row"}, [newest.node, oldest.node])
+        ]);
+        var endpoint = el("select");
+        endpointOptions(endpoint, lib ? lib.endpoint : "");
+        var endpointNote = el("span", {className: "field-hint"});
+        fields.endpoint = field("AI model (endpoint)", endpoint, {after: endpointNote, hint:
+            "The model that describes this library's pictures. Endpoints are set up on the " +
+            "Settings page."});
+        var metadata = el("select", null, [
+            el("option", {value: "core", text: "Standard (recommended)"}),
+            el("option", {value: "extended", text: "Extended"})
+        ]);
+        metadata.value = lib && lib.metadata === "extended" ? "extended" : "core";
+        fields.metadata = field("Detail", metadata, {hint: "Extended also asks for objects, " +
+            "landmarks, a location guess, the mood and activities. The answers are about a " +
+            "third longer, so describing takes longer and costs more with a cloud service."});
+        var notes = el("textarea", {rows: 2, value: lib ? lib.context_notes || "" : "",
+                                    placeholder: "Example: Photos from a family farm; the dogs " +
+                                                 "are border collies."});
+        fields.context_notes = field("Context notes", notes, {optional: true, hint: "Sent with " +
+            "every picture to the AI model to help it, and may show up in descriptions. " +
+            "Leave out anything private."});
+        body.appendChild(el("fieldset", {className: "group"}, [
+            el("legend", {text: "Describing"}), order,
+            el("div", {className: "field-grid"}, [fields.endpoint.node, fields.metadata.node]),
+            fields.context_notes.node
+        ]));
+
+        // Other
+        var previews = check("Build previews (recommended)", lib ? lib.previews !== false : true,
+                             "Screen-sized copies for fast viewing, about 0.5 MB per picture, " +
+                             "kept in the data folder.");
+        var enabled = check("Turned on", lib ? lib.enabled !== false : true,
+                            "Turned-off libraries are not searched and Process all skips them.");
+        fields.previews = {node: previews.node, error: el("span"), control: previews.input};
+        fields.enabled = {node: enabled.node, error: el("span"), control: enabled.input};
+        var other = el("fieldset", {className: "group"}, [
+            el("legend", {text: "Other"}), previews.node, enabled.node
+        ]);
+        var scanNow = null;
+        if (adding) {
+            scanNow = check("Scan and describe it right away", true,
+                            "You can also start this later with Scan + describe.");
+            other.appendChild(scanNow.node);
+        }
+        body.appendChild(other);
+
+        var general = el("span", {className: "foot-note field-error", hidden: true});
+        box.footer.appendChild(general);
+        box.button("Cancel", "", box.close);
+        var save = box.button(adding ? "Add library" : "Save changes", "primary", submit);
+
+        function updateEndpointNote() {
+            var chosen = endpointByName(endpoint.value || state.default_endpoint || "");
+            if (!chosen || !chosen.model) {
+                endpointNote.textContent = "No AI model is set up for this yet; add one in " +
+                    "Settings before describing. Scanning works without it.";
+                endpointNote.className = "field-hint";
+            } else if (!chosen.local) {
+                endpointNote.textContent = "Sends pictures to " + chosen.host + " (" +
+                    chosen.preset_label + "). Their terms of use apply.";
+                endpointNote.className = "field-hint result-line bad";
+            } else {
+                endpointNote.textContent = "";
+                endpointNote.className = "field-hint";
+            }
+            endpointNote.hidden = !endpointNote.textContent;
+        }
+
+        function pathChanged() {
+            relocate.hidden = adding || path.value.trim() === lib.path;
+            resultLine(pathResult, "");
+        }
+
+        function testPath() {
+            var value = path.value.trim();
+            window.clearTimeout(pathTimer);
+            if (!value) {
+                resultLine(pathResult, "");
+                return;
+            }
+            var seq = ++checkSeq;
+            resultLine(pathResult, "Checking the folder...");
+            SHELL.admin("/paths/check", {path: value}, {quiet: true}).then(function (reply) {
+                if (seq !== checkSeq) {
+                    return;
+                }
+                found = reply.readable && reply.is_dir ?
+                    {path: value, count: reply.sample_images, more: reply.more} : null;
+                if (reply.problem) {
+                    resultLine(pathResult, reply.problem, "bad");
+                } else if (reply.readable && reply.is_dir) {
+                    var count = reply.more ? "at least " + fmt.plural(reply.sample_images,
+                        "picture") + " found (still counting when the check stopped)" :
+                        fmt.plural(reply.sample_images, "picture") + " found";
+                    resultLine(pathResult, reply.sample_images ? "\u2713 Readable \u00b7 " + count
+                        : "Readable, but no pictures were found in it.",
+                        reply.sample_images ? "ok" : "");
+                } else {
+                    resultLine(pathResult, reply.message || "The folder cannot be used.", "bad");
+                }
+                if (!nameTouched && reply.name) {
+                    name.value = reply.name;
+                }
+                if (!reply.problem && reply.readable) {
+                    schedulePreview(0);
+                }
+            }, function (error) {
+                if (seq === checkSeq) {
+                    resultLine(pathResult, error.message, "bad");
+                }
+            });
+        }
+
+        function schedulePreview(delay) {
+            window.clearTimeout(previewTimer);
+            previewTimer = window.setTimeout(runPreview, delay === undefined ? 700 : delay);
+        }
+
+        function runPreview() {
+            var value = path.value.trim();
+            if (!value) {
+                resultLine(previewLine, "");
+                examples.hidden = true;
+                return;
+            }
+            var request = {ignore: ignore.value, default_ignores: defaults.input.checked};
+            if (!adding && value === lib.path) {
+                request.library_id = lib.id;
+            } else {
+                request.path = value;
+            }
+            var seq = ++previewSeq;
+            resultLine(previewLine, "Checking which pictures would be skipped...");
+            SHELL.admin("/ignore-preview", request, {quiet: true}).then(function (reply) {
+                if (seq !== previewSeq) {
+                    return;
+                }
+                var text = reply.skipped ? fmt.plural(reply.skipped, "picture") + " of the " +
+                    fmt.number(reply.scanned) + " checked would be skipped" :
+                    "No pictures would be skipped (" + fmt.number(reply.scanned) + " checked)";
+                text += reply.truncated ? "; only part of the folder was checked in time." : ".";
+                resultLine(previewLine, text, "");
+                clear(examples);
+                (reply.examples || []).forEach(function (example) {
+                    examples.appendChild(el("li", {text: example}));
+                });
+                examples.hidden = !examples.firstChild;
+            }, function (error) {
+                if (seq === previewSeq) {
+                    resultLine(previewLine, error.message, "");
+                    examples.hidden = true;
+                }
+            });
+        }
+
+        function clearErrors() {
+            Object.keys(fields).forEach(function (key) {
+                fields[key].error.hidden = true;
+                fields[key].control.removeAttribute("aria-invalid");
+            });
+            general.hidden = true;
+        }
+
+        function showErrors(error) {
+            var shown = false;
+            Object.keys(error.fields || {}).forEach(function (key) {
+                var target = fields[key];
+                if (target) {
+                    target.error.textContent = error.fields[key];
+                    target.error.hidden = false;
+                    target.control.setAttribute("aria-invalid", "true");
+                    if (!shown) {
+                        target.control.focus();
+                    }
+                    shown = true;
+                }
+            });
+            if (!shown || !Object.keys(error.fields || {}).length) {
+                general.textContent = error.message;
+                general.hidden = false;
+            }
+        }
+
+        function collect() {
+            var data = {
+                path: path.value.trim(),
+                name: name.value.trim(),
+                ignore: ignore.value,
+                default_ignores: defaults.input.checked,
+                newest_first: newest.input.checked,
+                endpoint: endpoint.value,
+                metadata: metadata.value,
+                context_notes: notes.value.trim(),
+                previews: previews.input.checked,
+                enabled: enabled.input.checked
+            };
+            if (adding) {
+                return data;
+            }
+            // Only what changed: a library set up by hand may hold values
+            // (such as a relative folder) that this page would not accept.
+            var original = {
+                path: lib.path, name: lib.name, default_ignores: lib.default_ignores !== false,
+                newest_first: lib.newest_first !== false, endpoint: lib.endpoint || "",
+                metadata: lib.metadata === "extended" ? "extended" : "core",
+                context_notes: lib.context_notes || "", previews: lib.previews !== false,
+                enabled: lib.enabled !== false
+            };
+            Object.keys(original).forEach(function (key) {
+                if (data[key] === original[key]) {
+                    delete data[key];
+                }
+            });
+            if (sameIgnore(data.ignore, lib.ignore)) {
+                delete data.ignore;
+            }
+            return data;
+        }
+
+        function submit() {
+            clearErrors();
+            var data = collect();
+            if (!adding && !Object.keys(data).length) {
+                box.close();
+                return;
+            }
+            save.disabled = true;
+            save.textContent = adding ? "Adding..." : "Saving...";
+            var url = adding ? "/libraries" : "/libraries/" + encodeURIComponent(lib.id);
+            SHELL.admin(url, data, {quiet: true}).then(function (reply) {
+                box.close();
+                var saved = reply.library;
+                SHELL.toast(adding ? "Added the library " + saved.name + "." :
+                            "Saved the changes to " + saved.name + ".", "ok", 4);
+                if (reply.warnings && reply.warnings.length) {
+                    showNotice("warn", [el("strong", {text: saved.name + ": "}),
+                                        warningList(reply.warnings)]);
+                }
+                refreshState();
+                if (adding && scanNow.input.checked && saved.enabled !== false) {
+                    if (saved.endpoint_info && saved.endpoint_info.ready) {
+                        queueJob("process", saved, {},
+                                 found && found.path === data.path ? found : null);
+                    } else {
+                        queueJob("scan", saved, {});
+                    }
+                }
+            }, function (error) {
+                save.disabled = false;
+                save.textContent = adding ? "Add library" : "Save changes";
+                if (error.status !== 409) {
+                    showErrors(error);
+                }
+            });
+        }
+
+        path.addEventListener("input", function () {
+            pathChanged();
+            window.clearTimeout(pathTimer);
+            pathTimer = window.setTimeout(testPath, 1200);
+        });
+        path.addEventListener("change", testPath);
+        path.addEventListener("keydown", function (event) {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                testPath();
+            }
+        });
+        name.addEventListener("input", function () {
+            nameTouched = name.value.trim() !== "";
+        });
+        ignore.addEventListener("input", function () {
+            schedulePreview();
+        });
+        defaults.input.addEventListener("change", function () {
+            schedulePreview(0);
+        });
+        endpoint.addEventListener("change", updateEndpointNote);
+        updateEndpointNote();
+        box.submitOnEnter(function () {
+            if (!save.disabled) {
+                submit();
+            }
+        });
+        if (lib && lib.path) {
+            schedulePreview(0);
+        }
+        if (adding) {
+            path.focus();
+        }
+        if (options.browse) {
+            folderPicker("", chooseFolder);
+        }
+        return box;
+    }
+
+    /* ---------- Folder picker -------------------------------------------- */
+
+    function joinPath(folder, child) {
+        var windows = /^[A-Za-z]:/.test(folder) || folder.indexOf("\\") >= 0;
+        var sep = windows ? "\\" : "/";
+        var base = folder.replace(/[\\/]+$/, "");
+        return base + sep + child;
+    }
+
+    function isFullPath(text) {
+        return /^([A-Za-z]:[\\/]|\\\\|\/|~)/.test(text);
+    }
+
+    function folderPicker(start, onChoose) {
+        var box = SHELL.modal({title: "Choose a folder"});
+        var where = el("input", {type: "text", className: "input mono", spellcheck: false,
+                                 autocomplete: "off", placeholder: "\\\\server\\share"});
+        var go = button("Go", "");
+        var up = button("Up one level", "small");
+        var top = button("This computer", "small");
+        var list = el("ul", {className: "folder-list", attrs: {"aria-label": "Folders"}});
+        var hint = el("span", {className: "field-hint"});
+        var current = null;
+        box.body.appendChild(el("div", {className: "field"}, [
+            el("span", {className: "field-label", text: "Folder"}),
+            el("div", {className: "field-row"}, [where, go]),
+            hint
+        ]));
+        box.body.appendChild(el("div", {className: "actions"}, [up, top]));
+        box.body.appendChild(list);
+        box.button("Cancel", "", box.close);
+        var choose = box.button("Use this folder", "primary", function () {
+            if (current && !current.roots) {
+                box.close();
+                onChoose(current.path);
+            }
+        });
+
+        function note(text) {
+            list.appendChild(el("li", {className: "note", text: text}));
+        }
+
+        function entry(label, target, sub) {
+            var item = el("button", {type: "button"}, [
+                el("span", {className: "folder-icon", attrs: {"aria-hidden": "true"}}),
+                el("span", {text: label}),
+                sub ? el("span", {className: "field-hint", text: sub}) : null
+            ]);
+            item.addEventListener("click", function () {
+                open(target);
+            });
+            list.appendChild(el("li", null, [item]));
+        }
+
+        function open(target) {
+            clear(list);
+            note("Loading...");
+            choose.disabled = true;
+            SHELL.admin("/fs/list", {path: target}, {quiet: true}).then(function (reply) {
+                current = reply;
+                clear(list);
+                where.value = reply.roots ? "" : reply.path;
+                up.disabled = reply.roots;
+                top.disabled = reply.roots;
+                choose.disabled = reply.roots;
+                box.setTitle(reply.roots ? "Choose a folder" : "Choose a folder: " + reply.path);
+                if (reply.roots) {
+                    reply.dirs.forEach(function (root) {
+                        entry(root, root);
+                    });
+                    if (reply.home) {
+                        entry("Your home folder", reply.home, reply.home);
+                    }
+                } else {
+                    reply.dirs.forEach(function (child) {
+                        entry(child, joinPath(reply.path, child));
+                    });
+                    if (!reply.dirs.length) {
+                        note("No sub-folders here. Use this folder, or go up a level.");
+                    }
+                    if (reply.truncated) {
+                        note("Only the first " + fmt.number(reply.dirs.length) + " folders are " +
+                             "shown; type the rest of the path above.");
+                    }
+                }
+                hint.textContent = reply.hint || "Network shares are not listed: type one " +
+                    "above, such as \\\\server\\share, and press Go.";
+            }, function (error) {
+                clear(list);
+                note(error.message);
+                up.disabled = !current || current.roots;
+                top.disabled = false;
+            });
+        }
+
+        go.addEventListener("click", function () {
+            open(where.value.trim());
+        });
+        where.addEventListener("keydown", function (event) {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                open(where.value.trim());
+            }
+        });
+        up.addEventListener("click", function () {
+            open(current && !current.roots ? current.parent || "" : "");
+        });
+        top.addEventListener("click", function () {
+            open("");
+        });
+        hint.textContent = "Network shares are not listed: type one above, such as " +
+            "\\\\server\\share, and press Go.";
+        open(isFullPath(start || "") ? start : "");
+        return box;
+    }
+
+    /* ---------- Remove dialog -------------------------------------------- */
+
+    function removeDialog(lib) {
+        var counts = lib.counts || {};
+        var box = SHELL.modal({
+            title: "Remove \u201c" + lib.name + "\u201d?",
+            onClose: function () {
+                SHELL.setState({dialog: null, id: null});
+            }
+        });
+        var amount = fmt.plural(counts.total || 0, "picture") + ", " +
+            fmt.number(counts.described || 0) + " described";
+        box.body.appendChild(el("p", {text: "The pictures in " + (lib.root || lib.path) +
+            " are not touched. Removing the library only changes what Image Search keeps " +
+            "about them."}));
+        var keep = radio("remove-mode", "Keep the indexed data", true, "The library leaves " +
+            "this page and search, but its data (" + amount + ") stays and can be attached " +
+            "to a library again later.");
+        var drop = radio("remove-mode", "Delete the indexed data", false, [
+            "Deletes the descriptions, thumbnails and previews (" + amount + "). ",
+            el("strong", {text: "This cannot be undone."})
+        ]);
+        box.body.appendChild(el("div", {className: "field"}, [keep.node, drop.node]));
+        var confirmInput = el("input", {type: "text", className: "input", autocomplete: "off",
+                                        spellcheck: false});
+        var confirmField = field("Type the library name (" + lib.name + ") to confirm",
+                                 confirmInput);
+        box.body.appendChild(confirmField.node);
+        box.button("Cancel", "", box.close);
+        var go = box.button("Remove library", "danger", function () {
+            go.disabled = true;
+            SHELL.admin("/libraries/" + encodeURIComponent(lib.id) + "/remove",
+                        {keep_data: keep.input.checked, confirm_name: confirmInput.value},
+                        {quiet: true}).then(function (reply) {
+                box.close();
+                SHELL.toast("Removed " + lib.name + (reply.kept_data ?
+                    "; its data was kept." : reply.job ? "; its data is being deleted." : "."),
+                            "ok");
+                if (reply.warnings && reply.warnings.length) {
+                    showNotice("warn", [el("strong", {text: lib.name + ": "}),
+                                        warningList(reply.warnings)]);
+                }
+                refreshState();
+                pollJobs();
+            }, function (error) {
+                go.disabled = false;
+                if (error.status !== 409) {
+                    confirmField.error.textContent = error.message;
+                    confirmField.error.hidden = false;
+                }
+            });
+        });
+        go.disabled = true;
+        function update() {
+            go.disabled = confirmInput.value.trim().toLowerCase() !== lib.name.trim().toLowerCase();
+            go.textContent = drop.input.checked ? "Remove and delete the data" : "Remove library";
+        }
+        confirmInput.addEventListener("input", update);
+        keep.input.addEventListener("change", update);
+        drop.input.addEventListener("change", update);
+        box.submitOnEnter(function () {
+            if (!go.disabled) {
+                go.click();
+            }
+        });
+        confirmInput.focus();
+        return box;
+    }
+
+    /* ---------- Failures dialog ------------------------------------------ */
+
+    function failuresDialog(lib) {
+        var box = SHELL.modal({
+            title: "Pictures that could not be described: " + lib.name,
+            wide: true,
+            onClose: function () {
+                SHELL.setState({dialog: null, id: null});
+            }
+        });
+        var holder = el("div", {className: "failure-list"}, [el("p", {className: "muted",
+                                                                       text: "Loading..."})]);
+        box.body.appendChild(holder);
+        box.button("Close", "", box.close);
+        var retry = box.button("Retry failed", "primary", function () {
+            box.close();
+            queueJob("describe", lib, {retry_failed: true});
+        });
+        retry.disabled = lib.enabled === false || !(lib.endpoint_info || {}).ready;
+        SHELL.admin("/failures?library=" + encodeURIComponent(lib.id) + "&limit=200")
+            .then(function (rows) {
+                clear(holder);
+                if (!rows.length) {
+                    holder.appendChild(el("p", {className: "muted",
+                                                text: "No picture has failed."}));
+                    retry.disabled = true;
+                    return;
+                }
+                holder.appendChild(el("p", {text: "After 3 failed tries a picture is skipped " +
+                    "until you retry. Common causes: the model server stopped, the picture is " +
+                    "damaged, or the model gave an answer that could not be read."}));
+                var table = el("table", {className: "list"}, [
+                    el("thead", null, [el("tr", null, [
+                        el("th", {text: "Picture"}), el("th", {text: "Tries"}),
+                        el("th", {text: "Error"})
+                    ])])
+                ]);
+                var tbody = el("tbody");
+                rows.forEach(function (row) {
+                    tbody.appendChild(el("tr", null, [
+                        el("td", {className: "mono", text: row.path,
+                                  attrs: {"data-label": "Picture"}}),
+                        el("td", {text: fmt.number(row.attempts), attrs: {"data-label": "Tries"}}),
+                        el("td", {text: row.error || "", attrs: {"data-label": "Error"}})
+                    ]));
+                });
+                table.appendChild(tbody);
+                holder.appendChild(el("div", {className: "table-wrap"}, [table]));
+            }, function (error) {
+                clear(holder);
+                holder.appendChild(el("p", {className: "muted", text: error.message}));
+            });
+        return box;
+    }
+
+    /* ---------- Dialogs from the URL ------------------------------------- */
+
+    function openDialog(kind, id) {
+        var lib = id ? findLibrary(id) : null;
+        if (kind !== "add" && kind !== "browse" && !lib) {
+            return null;
+        }
+        SHELL.setState({dialog: kind === "browse" ? "add" : kind, id: lib ? lib.id : null,
+                        path: null});
+        if (kind === "add") {
+            return libraryDialog(null);
+        }
+        if (kind === "browse") {
+            // Starts at the drives: a folder named in the address is never listed.
+            return libraryDialog(null, {browse: true});
+        }
+        if (kind === "edit") {
+            return libraryDialog(lib);
+        }
+        if (kind === "remove") {
+            return removeDialog(lib);
+        }
+        if (kind === "failures") {
+            return failuresDialog(lib);
+        }
+        return null;
+    }
+
+    /* ---------- Start ---------------------------------------------------- */
+
+    function init() {
+        setupLogFilter();
+        showEmptyLog();
+        byId("add-library").addEventListener("click", function () {
+            openDialog("add");
+        });
+        byId("process-all").addEventListener("click", function () {
+            queueJob("process", null, {});
+        });
+        function firstLoad() {
+            loadState().then(function () {
+                var wanted = SHELL.getState();
+                if (wanted.dialog) {
+                    openDialog(wanted.dialog, wanted.id);
+                }
+            }, function () {
+                // Keep trying until the server answers.
+                window.clearTimeout(pollTimer);
+                pollTimer = window.setTimeout(firstLoad, STATE_RETRY);
+            });
+        }
+        firstLoad();
+        document.addEventListener("visibilitychange", function () {
+            if (!document.hidden && state) {
+                pollJobs();
+            }
+        });
+        // Relative times ("5 minutes ago") and folder status stay current.
+        window.setInterval(function () {
+            if (!document.hidden && state && !active()) {
+                refreshState();
+            }
+        }, 60000);
+    }
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", init);
+    } else {
+        init();
+    }
+})();

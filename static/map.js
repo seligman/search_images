@@ -30,6 +30,8 @@
     var statusBar = document.getElementById("map-status");
 
     var locations = [];
+    var allLocations = [];
+    var emptyText = "";
     var indexById = {};
     var tileCache = {};
     var tileQueue = [];
@@ -274,9 +276,11 @@
         lastClusters = clusterMarkers(markers);
         drawClusters(lastClusters);
         if (statusBar) {
-            statusBar.textContent = locations.length + " geotagged image"
-                + (locations.length === 1 ? "" : "s")
-                + " | zoom " + state.zoom;
+            statusBar.textContent = locations.length
+                ? locations.length + " geotagged image"
+                    + (locations.length === 1 ? "" : "s")
+                    + " | zoom " + state.zoom
+                : emptyText;
         }
     }
 
@@ -555,9 +559,25 @@
 
     /* ---------- Initial data load -------------------------------------- */
 
+    // Only the pins of the library picked in the page header (shell.js).
+    function applyLibrary() {
+        var library = window.SHELL ? SHELL.libraryName() : "";
+        locations = !library ? allLocations : allLocations.filter(function (loc) {
+            var rec = indexById[loc.id];
+            return rec && rec.library === library;
+        });
+        closePanel();
+        emptyText = library ? "No geotagged images found in this library."
+            : "No geotagged images found in the library.";
+        scheduleDraw();
+    }
+
     function init() {
         resize();
         window.addEventListener("resize", resize);
+        if (window.SHELL) {
+            SHELL.onLibraryChange(applyLibrary);
+        }
         SITE.loadIndex(function (records) {
             if (records) {
                 records.forEach(function (rec) {
@@ -565,12 +585,8 @@
                 });
             }
             SITE.loadLocations(function (loaded) {
-                locations = loaded || [];
-                if (!locations.length && statusBar) {
-                    statusBar.textContent =
-                        "No geotagged images found in the library.";
-                }
-                scheduleDraw();
+                allLocations = loaded || [];
+                applyLibrary();
             });
         });
     }

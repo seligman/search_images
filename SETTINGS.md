@@ -1,9 +1,13 @@
 # Settings Reference
 
 All configuration lives in a single JSON file named `config.json`. The
-`settings.py` script is a convenience wrapper that edits the most common
+Manage and Settings pages of the web server (`python serve.py`, then the
+links in the page header) and the `settings.py` script edit the most common
 fields, but the file is just JSON and you can edit it by hand whenever you
-need a setting that the menu does not cover.
+need a setting they do not cover. The pages re-read the file before every
+change, so hand edits are kept; a page that was open while you edited the
+file asks you to reload it before it saves anything. The helper module path
+can only be set in the file or with `settings.py`, never from a web page.
 
 ## Where the file lives
 

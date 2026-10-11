@@ -21,17 +21,19 @@ import sys
 import threading
 import time
 
+import admin
 import cache
 import common
 import db
 import imageinfo
+import jobs
 import prompts
 import world_map
 
 TEMPLATE_DIR = os.path.join(common.BASE_DIR, "templates")
 STATIC_DIR = os.path.join(common.BASE_DIR, "static")
 FALLBACK_BASEMAP = os.path.join(STATIC_DIR, "worldmap.jpg")
-ASSET_FILES = ("style.css", "site.js", "app.js", "detail.js", "map.js")
+ASSET_FILES = ("style.css", "site.js", "shell.js", "app.js", "detail.js", "map.js")
 TILE_SIZE = 256
 # Without a tile pyramid the bundled basemap is sliced into zoom 0..3.
 FALLBACK_MAX_ZOOM = 3
@@ -59,6 +61,16 @@ LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 # Folders directly inside the program folder that git ignores, and that
 # "package" may therefore write to.
 IGNORED_SITE_FOLDERS = ("site", "site_*", "exports")
+# Sent with every page: scripts and styles only from this server (the page
+# settings are a JSON block, not a script), never shown inside a frame, no
+# <base> that could move the scripts' relative addresses, forms only sent
+# here, and no plugins.
+CONTENT_SECURITY_POLICY = ("default-src 'self'; img-src 'self' data: blob:; "
+                           "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; "
+                           "base-uri 'none'; form-action 'self'; object-src 'none'")
+# The name each page template goes by in the page settings ("page").
+PAGE_NAMES = {"page.html": "search", "detail.html": "detail", "map.html": "map",
+              "manage.html": "manage", "settings.html": "settings"}
 
 
 def _images():
@@ -337,23 +349,44 @@ def _fallback_tile_bytes(zoom, x, y):
 # --- Pages -------------------------------------------------------------------
 
 def render_template_file(name, mode, asset_prefix, data_prefix,
-                         tiles_max=None, tile_prefix=None, libraries=None):
+                         tiles_max=None, tile_prefix=None, libraries=None,
+                         capabilities=None):
     """Build a page from a template file, shared by server and static modes.
 
-    libraries is the list of library names for the page's library picker;
-    by default, the enabled libraries in config.json.
+    The page settings go into the template's
+    <script type="application/json" id="app-config"> block, which site.js
+    and shell.js read (a JSON block, unlike an inline script, is allowed by
+    the pages' Content-Security-Policy and also works from file://).
+
+    libraries are the libraries for the page's library picker: {id: name}
+    (or a list of names); by default, the enabled libraries in config.json.
+    capabilities are {"admin": the Manage and Settings pages may be used,
+    "static": a packaged site}; admin is off unless given.
     """
     with open(os.path.join(TEMPLATE_DIR, name), "r", encoding="utf-8") as handle:
         html = handle.read()
     if libraries is None:
-        libraries = list(visible_libraries(common.load_config()).values())
+        libraries = visible_libraries(common.load_config())
+    if isinstance(libraries, dict):
+        library_list = [{"id": library_id, "name": label}
+                        for library_id, label in libraries.items()]
+    else:
+        library_list = [{"id": "", "name": label} for label in libraries]
+    capabilities = dict(capabilities or {})
+    capabilities["admin"] = bool(capabilities.get("admin")) and mode == "server"
+    capabilities["static"] = mode != "server"
     app_config = {
         "mode": mode,
-        "libraries": list(libraries),
+        "page": PAGE_NAMES.get(name, os.path.splitext(name)[0]),
+        "libraries": [item["name"] for item in library_list],
+        "libraryList": library_list,
+        "capabilities": capabilities,
     }
     if mode == "server":
         app_config["api"] = "/api"
         app_config["tiles"] = "/tile"
+        if capabilities["admin"]:
+            app_config["adminApi"] = admin.URL_PREFIX
     else:
         app_config["data"] = data_prefix
         app_config["tiles"] = tile_prefix
@@ -436,16 +469,19 @@ def _source_etag(kind, image_id, stat):
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:24]
 
 
-def build_app(init_db=True, bind_host="127.0.0.1"):
+def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     """Create the Flask app.
 
     The database is prepared here, once (db.init), unless init_db is False
     because the caller already did it. Requests only open connections.
     bind_host is the address the server listens on; requests must name it,
-    or a loopback name, as their host (see trusted_hosts).
+    or a loopback name, as their host (see trusted_hosts). The admin pages
+    and routes (admin.py) only work when bind_host is a loopback address.
+    job_manager is the jobs.JobManager for the admin routes (default: a new
+    one, which main() starts; until then jobs only queue up).
     """
     try:
-        from flask import Flask, Response, g, jsonify, request, send_file
+        from flask import Flask, Response, g, jsonify, redirect, request, send_file
     except ImportError:
         raise SystemExit(
             "This tool needs Flask. Install it with:\n"
@@ -457,6 +493,9 @@ def build_app(init_db=True, bind_host="127.0.0.1"):
     app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
     app.extensions["search_images"] = state
     allowed_hosts = trusted_hosts(bind_host)
+    admin_enabled = admin.is_loopback_host(bind_host)
+    admin.init_app(app, state, job_manager if job_manager is not None else jobs.JobManager(),
+                   allowed_hosts, enabled=admin_enabled)
 
     @app.before_request
     def check_host():
@@ -471,6 +510,13 @@ def build_app(init_db=True, bind_host="127.0.0.1"):
         if conn is None:
             conn = g.db_conn = db.connect()
         return conn
+
+    @app.after_request
+    def page_headers(response):
+        if response.mimetype == "text/html":
+            response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+            response.headers["X-Frame-Options"] = "DENY"
+        return response
 
     @app.teardown_appcontext
     def close_conn(_error):
@@ -526,10 +572,22 @@ def build_app(init_db=True, bind_host="127.0.0.1"):
         return full, stat
 
     def page(name):
-        libraries = list(visible_libraries(state.config()).values())
+        capabilities = {"admin": admin.admin_allowed(request, admin_enabled)}
         return render_template_file(name, "server", "/static/", None,
                                     tiles_max=tiles_max_zoom(),
-                                    libraries=libraries)
+                                    libraries=visible_libraries(state.config()),
+                                    capabilities=capabilities)
+
+    def admin_page(name):
+        if not admin.admin_allowed(request, admin_enabled):
+            return Response("Manage and Settings only work on this computer, when the "
+                            "server listens on localhost.", status=403, mimetype="text/plain")
+        # The query string opens dialogs (?dialog=...). A link on another
+        # site gets the bare page, so it can never start anything there.
+        if request.query_string and request.headers.get("Sec-Fetch-Site") in ("cross-site",
+                                                                              "same-site"):
+            return redirect(request.path, code=303)
+        return page(name)
 
     @app.route("/")
     def index():
@@ -542,6 +600,14 @@ def build_app(init_db=True, bind_host="127.0.0.1"):
     @app.route("/map")
     def map_page():
         return page("map.html")
+
+    @app.route("/manage")
+    def manage_page():
+        return admin_page("manage.html")
+
+    @app.route("/settings")
+    def settings_page():
+        return admin_page("settings.html")
 
     @app.route("/api/locations")
     def api_locations():
@@ -966,7 +1032,7 @@ def package(output_dir=None, force=False, log=print):
         template = "page.html" if page == "index.html" else page
         common.write_file_atomic(os.path.join(output_dir, page), render_template_file(
             template, "static", "", "data/", tiles_max=tiles_max,
-            tile_prefix=tile_prefix, libraries=libraries))
+            tile_prefix=tile_prefix, libraries=names))
 
     save_export_state(output_dir, shards)
     log("Packaged %d image(s) into %s (%d data shard(s) written)."
@@ -1050,11 +1116,25 @@ def main():
         app = build_app(init_db=False, bind_host=host)
     except common.ConfigError as error:
         raise SystemExit("Error: %s" % error)
-    print("Serving on http://%s:%d (press Ctrl+C to stop)" % (host, port))
+    manager = app.extensions["search_images_jobs"]
+    base_url = "http://%s:%d" % ("[%s]" % host if ":" in host else host, port)
+    print("Serving on %s (press Ctrl+C to stop)" % base_url)
+    if admin.is_loopback_host(host):
+        # Jobs run in this process only, never in a reloader's second one.
+        if not manager.start():
+            print("Warning: " + manager.message)
+        print("Manage libraries: %s/manage" % base_url)
+        print("Settings:         %s/settings" % base_url)
+    else:
+        print("Warning: the server listens on %s, so other computers can search the "
+              "pictures. Manage and Settings are turned off; start the server without "
+              "--host to use them." % host)
     # The reloader would start a second process that runs db.init again.
     try:
         app.run(host=host, port=port, use_reloader=False)
     finally:
+        # A running job stops at its next safe point and can be resumed.
+        manager.stop(timeout=5)
         # Closing the shared thumbnail connection lets SQLite tidy up its
         # -wal/-shm files when the server stops (Ctrl+C).
         app.extensions["search_images"].close()

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings - Image Search</title>
+<link rel="stylesheet" href="__ASSET_PREFIX__style.css">
+</head>
+<body class="admin-page">
+<main id="settings" class="admin-main">
+<div class="page-head">
+<div>
+<h1>Settings</h1>
+<p class="lead">The AI models that look at each picture and write its description.</p>
+</div>
+<div class="page-actions">
+<button type="button" id="add-endpoint" class="button primary">Add endpoint</button>
+</div>
+</div>
+<div id="settings-notices"></div>
+<section aria-labelledby="endpoints-title">
+<div class="section-head">
+<div>
+<h2 id="endpoints-title">Endpoints</h2>
+<p class="lead">An endpoint is a model server on this computer or your network (llama.cpp, LM Studio, Ollama, vLLM) or a cloud service (OpenAI, Claude, Gemini and others). Libraries use the default endpoint unless they name another.</p>
+</div>
+</div>
+<div id="endpoint-list"><p class="message" id="settings-status">Loading...</p></div>
+</section>
+</main>
+<noscript><p>This page needs JavaScript.</p></noscript>
+<script type="application/json" id="app-config">__APP_CONFIG__</script>
+<script src="__ASSET_PREFIX__site.js"></script>
+<script src="__ASSET_PREFIX__shell.js"></script>
+<script src="__ASSET_PREFIX__settings.js"></script>
+</body>
+</html>
