@@ -243,7 +243,17 @@ the page header or the filters.
   exported; "Show hidden pictures" in the sidebar brings them back to unhide
   them. **Select** chooses many pictures at once (Shift-click for a range,
   or "Select all") to hide, unhide or copy their file paths.
-- The **Map** shows the located pictures of the current search.
+- The **Map** shows the located pictures of the current search as pins; a
+  pin with a number holds pictures taken close together, which come apart
+  as you zoom in. Click a pin for a list of its pictures: click one to view
+  it, or **Show these in the grid** for a search page with just those
+  pictures, from where **Back to the map** returns to the same place. Drag
+  or use the arrow keys to move the map; the wheel, `+` and `-` or a double
+  click zoom, `Enter` lists the pictures of the pin nearest the middle
+  (ringed while the map has the keyboard focus), and `Esc` closes the list.
+  The address keeps the search, the map's place and the open list, so links
+  and reloads show the same view (after a new search the map fits its
+  pictures); a static export with the map works the same way.
 - While some pictures are not described yet, a note above the results says
   how many: they can only be found by file name, date and camera until then.
 - When nothing matches, the page says what left the pictures out (a filter,
@@ -451,7 +461,8 @@ not allow it for files); over http it can be turned around.
   have descriptions from an older prompt, and which failed
 - `world_map.py` - render a world map with a pin for each GPS-tagged area
 - `make_tiles.py` - download a detailed world image and slice it into map
-  tiles (optional)
+  tiles (optional; run it again after an interruption: it keeps the tiles
+  that are whole and writes the missing or damaged ones)
 - `common.py`, `db.py`, `cache.py`, `jobs.py`, `images.py`, `imageinfo.py`,
   `llm.py` - shared helpers (settings, database, thumbnails and previews,
   job control, image reading, EXIF facts, LLM calls)

@@ -34,6 +34,9 @@ FALLBACK_BASEMAP = os.path.join(STATIC_DIR, "worldmap.jpg")
 TILE_SIZE = 256
 # Without a tile pyramid the bundled basemap is sliced into zoom 0..3.
 FALLBACK_MAX_ZOOM = 3
+# Raise this when _fallback_tile_bytes cuts or encodes the tiles
+# differently: an export then cuts its copies of them again.
+FALLBACK_TILE_VERSION = 1
 # No tile request above this zoom is ever answered, whatever the manifest says.
 TILE_ZOOM_LIMIT = 20
 # How long browsers may reuse thumbnails, previews and originals, and tiles.

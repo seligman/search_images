@@ -11,26 +11,35 @@
 <div id="map-bar">
 <a id="map-back" href="#">Back to search</a>
 <span id="map-search"></span>
-<span id="map-status"></span>
+<span id="map-status" aria-live="polite"></span>
 </div>
 <div id="map-stage">
-<canvas id="map-canvas"></canvas>
+<canvas id="map-canvas" tabindex="0" role="application" aria-roledescription="map" aria-label="Map of the pictures. Arrow keys move it, plus and minus zoom, Enter lists the pictures of the pin nearest the middle."></canvas>
+<span id="map-target" class="visually-hidden" aria-live="polite"></span>
 <div id="map-zoom">
-<button id="zoom-in" type="button" aria-label="Zoom in">+</button>
-<button id="zoom-out" type="button" aria-label="Zoom out">-</button>
+<button id="zoom-in" type="button" aria-label="Zoom in" title="Zoom in (+)">+</button>
+<button id="zoom-out" type="button" aria-label="Zoom out" title="Zoom out (-)">&#8722;</button>
 </div>
-<div id="map-panel" hidden>
+<div id="map-message" role="status" hidden></div>
+<p id="map-note" hidden>Zoomed in past the detail of the map; the pins are still exact.</p>
+<aside id="map-panel" aria-labelledby="map-panel-title" hidden>
 <div id="map-panel-head">
-<span id="map-panel-title"></span>
-<button id="map-panel-close" type="button" aria-label="Close">x</button>
+<h2 id="map-panel-title" tabindex="-1"></h2>
+<button id="map-panel-close" type="button" class="icon-button" aria-label="Close the list" title="Close (Esc)">&times;</button>
 </div>
-<div id="map-panel-list"></div>
+<div id="map-panel-actions">
+<a id="map-panel-grid" class="button primary small">Show these in the grid</a>
+<p id="map-panel-note" hidden></p>
 </div>
+<ul id="map-panel-list" aria-label="Pictures of this place"></ul>
+<button id="map-panel-more" type="button" class="button small" hidden>Show more</button>
+</aside>
 </div>
 <script type="application/json" id="app-config">__APP_CONFIG__</script>
 <script src="__ASSET_PREFIX__site.js"></script>
 <script src="__ASSET_PREFIX__shell.js"></script>
 <script src="__ASSET_PREFIX__search-core.js"></script>
+<script src="__ASSET_PREFIX__viewer.js"></script>
 <script src="__ASSET_PREFIX__map.js"></script>
 </body>
 </html>

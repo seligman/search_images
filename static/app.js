@@ -6,7 +6,9 @@
    browser by SearchCore (search-core.js); viewer.js shows the pictures.
    Everything the page shows (query, filters, sort, grouping, size, the
    open picture) is kept in the address, so a link, a reload or the Back
-   button bring the same view back, scrolled to where it was.
+   button bring the same view back, scrolled to where it was. "Show these
+   in the grid" on the map comes here with the pictures of a pin (ids=,
+   see SITE.idList) and the map's view (view=), for "Back to the map".
 
    The grid is laid out in rows by this script (columns from the width and
    the size slider; a header row per month when sorted by date) and cut
@@ -63,6 +65,7 @@
     var result = null;          // the last SearchCore.search answer
     var display = [];           // [{id, stack: [ids] | null, member: bool}]
     var positions = {};         // id -> place in display
+    var coverOf = {};           // stack member id -> the id of its stack's cover
     var expanded = {};          // stack cover id -> true while opened in the grid
     var layout = null;
     var observer = null;
@@ -102,11 +105,35 @@
         }
     })();
 
+    /* The map's view (state.view, for "Back to the map") belongs to the
+       search the map showed: it is dropped once the query, the filters or
+       the library change, so the map then fits the new results. (Sorting,
+       grouping, the size and leaving out the pictures picked on the map
+       keep it: the map shows the same pictures.) */
+    function mapSearch() {
+        return SITE.searchState.params({q: state.q, lib: SHELL.library(), filters: state.filters,
+                                        hidden: state.hidden, junk: state.junk,
+                                        sensitive: state.sensitive});
+    }
+
+    var viewSearch = "";        // mapSearch() of the search state.view belongs to
+
+    function keepView() {
+        viewSearch = mapSearch();
+    }
+
+    function dropStaleView() {
+        if (state.view && mapSearch() !== viewSearch) {
+            state.view = "";
+        }
+    }
+
     // The state as the address keeps it (defaults left out).
     function urlState() {
         return {q: state.q, lib: SHELL.library(), sort: state.sort, filters: state.filters,
                 group: state.group, size: state.size === "m" ? "" : state.size,
-                hidden: state.hidden, junk: state.junk, sensitive: state.sensitive};
+                hidden: state.hidden, junk: state.junk, sensitive: state.sensitive,
+                ids: state.ids, view: state.view};
     }
 
     // The search state for links to other pages (without the view settings).
@@ -132,6 +159,7 @@
 
     function writeUrl(options) {
         options = options || {};
+        dropStaleView();
         var query = SITE.searchState.params(urlState());
         var id = options.id !== undefined ? options.id : (VIEWER.isOpen() ? VIEWER.current() : null);
         var url = window.location.pathname + (query ? "?" + query : "") +
@@ -172,7 +200,35 @@
         Object.keys(state.filters).forEach(function (key) {
             count += state.filters[key].length;
         });
-        return count + (state.junk ? 1 : 0) + (state.sensitive ? 1 : 0) + (state.hidden ? 1 : 0);
+        return count + (state.junk ? 1 : 0) + (state.sensitive ? 1 : 0) + (state.hidden ? 1 : 0) +
+            (state.ids ? 1 : 0);
+    }
+
+    /* The pictures picked on the map (state.ids): {ids, stale} once the
+       records are there, null for none. A list made for other records (an
+       export made again since) is dropped, with a note. */
+    var pickedCache = {text: null, records: null, value: null};
+
+    function picked() {
+        if (!state.ids || !data) {
+            return null;
+        }
+        if (pickedCache.text !== state.ids || pickedCache.records !== data.records) {
+            pickedCache = {text: state.ids, records: data.records,
+                           value: SITE.idList.decode(state.ids, data.records)};
+        }
+        return pickedCache.value;
+    }
+
+    var droppedPicks = false;
+
+    // Drops a list of picked pictures that cannot be read (before a search).
+    function checkPicked() {
+        var value = picked();
+        if (state.ids && data && (!value || value.stale)) {
+            state.ids = "";
+            droppedPicks = true;
+        }
     }
 
     /* ---------- Data ----------------------------------------------------------- */
@@ -224,6 +280,10 @@
         options.filters = state.filters;
         options.group = state.group;
         options.typing = typing;
+        var chosen = picked();
+        if (chosen && !chosen.stale) {
+            options.ids = chosen.ids;
+        }
         return options;
     }
 
@@ -232,6 +292,7 @@
     function buildDisplay() {
         display = [];
         positions = {};
+        coverOf = {};
         result.items.forEach(function (id) {
             var stack = state.group ? result.groups[String(id)] : null;
             stack = stack && stack.length > 1 ? stack : null;
@@ -244,8 +305,34 @@
         });
         display.forEach(function (entry, index) {
             positions[entry.id] = index;
+            if (entry.stack) {
+                entry.stack.forEach(function (member) {
+                    if (member !== entry.id) {
+                        coverOf[member] = entry.id;
+                    }
+                });
+            }
         });
         focusPos = Math.min(focusPos, Math.max(0, display.length - 1));
+    }
+
+    /* A picture of the results folded into a stack (a stack member, not
+       its cover): its stack is opened in the grid, so the viewer steps
+       through the stack and then on through the results. True when the
+       picture is (now) in the grid. */
+    function reveal(id) {
+        if (positions[id] !== undefined) {
+            return true;
+        }
+        var cover = coverOf[id];
+        if (cover === undefined || expanded[cover]) {
+            return false;
+        }
+        expanded[cover] = true;
+        buildDisplay();
+        relayout(true);
+        renderHead();
+        return positions[id] !== undefined;
     }
 
     function run(options) {
@@ -253,6 +340,8 @@
         if (!data) {
             return;
         }
+        checkPicked();
+        dropStaleView();
         result = SearchCore.search(data.index, state.q, searchOptions());
         buildDisplay();
         trimSelection();
@@ -292,6 +381,7 @@
         options = options || {};
         expanded = {};
         anchor = null;
+        droppedPicks = false;
         run({top: options.top !== false});
         writeUrl({push: options.push === true});
     }
@@ -329,6 +419,7 @@
         state.junk = false;
         state.sensitive = "";
         state.hidden = false;
+        state.ids = "";
         changed();
     }
 
@@ -341,6 +432,7 @@
                                     window.location.href);
         typing = false;
         state.filters = {};
+        state.ids = "";
         state.q = "";
         if (group === "q") {
             state.q = value;
@@ -351,10 +443,13 @@
         changed({push: true});
     }
 
+    // (A new search: without the map's view, see dropStaleView.)
     function chipUrl(group, value) {
         var target = linkState();
         target.q = group === "q" ? value : "";
         target.filters = {};
+        target.ids = "";
+        target.view = "";
         if (group !== "q") {
             target.filters[group] = [value];
         }
@@ -943,10 +1038,23 @@
         }
         byId("result-notes").textContent = notes.length ? "\u00b7 " + notes.join(" \u00b7 ") : "";
         var queryNotes = byId("query-notes");
-        queryNotes.textContent = (result.warnings || []).join(" ");
-        queryNotes.hidden = !(result.warnings || []).length;
+        var warnings = (result.warnings || []).slice();
+        if (droppedPicks) {
+            warnings.push("The pictures picked on the map could not be found any more (the " +
+                          "pictures have changed since): showing the whole search.");
+        }
+        queryNotes.textContent = warnings.join(" ");
+        queryNotes.hidden = !warnings.length;
         var mapLink = byId("map-link");
         var mapUrl = SITE.mapUrl ? SITE.mapUrl(linkState()) : null;
+        if (mapUrl && state.ids) {
+            // Here with the pictures of a pin: back to the map, as it was.
+            mapLink.hidden = false;
+            mapLink.href = mapUrl;
+            clear(mapLink);
+            mapLink.appendChild(el("span", {text: "Back to the map"}));
+            return finishHead();
+        }
         var count = mapUrl && result.total ? located() : 0;
         mapLink.hidden = !count;
         if (count) {
@@ -961,8 +1069,62 @@
             mapLink.appendChild(el("span", {className: "narrow-only",
                                             text: fmt.number(count) + " on the map"}));
         }
+        finishHead();
+    }
+
+    function finishHead() {
         byId("facets-done").textContent = result.total
             ? "Show " + fmt.plural(result.total, "picture") : "No pictures match";
+    }
+
+    /* "Back to the map" right after coming from it goes back in the
+       history: the map is then shown as it was left (its list open). The
+       map's "Show these in the grid" leaves this page's address in
+       sessionStorage (FROM_MAP_KEY, see map.js): pages opened from disk
+       have no referrer. */
+    var FROM_MAP_KEY = "searchImages.fromMap";
+
+    function openedFromMap() {
+        try {
+            var url = window.sessionStorage.getItem(FROM_MAP_KEY);
+            if (url === null) {
+                return false;
+            }
+            window.sessionStorage.removeItem(FROM_MAP_KEY);
+            return url === window.location.href;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    var arrival = {referrer: document.referrer, fromMap: openedFromMap(), query: null};
+
+    function cameFromMap() {
+        if (arrival.fromMap) {
+            return true;
+        }
+        if (!arrival.referrer) {
+            return false;
+        }
+        try {
+            return new URL(arrival.referrer).pathname ===
+                new URL(SITE.mapUrl({}), window.location.href).pathname;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function setupMapLink() {
+        byId("map-link").addEventListener("click", function (event) {
+            if (!state.ids || event.button !== 0 || event.ctrlKey || event.metaKey ||
+                    event.shiftKey || event.altKey ||
+                    SITE.searchState.params(urlState()) !== arrival.query ||
+                    window.history.length < 2 || !cameFromMap()) {
+                return;
+            }
+            event.preventDefault();
+            window.history.back();
+        });
     }
 
     function chipButton(text, onRemove, title) {
@@ -1014,6 +1176,19 @@
                 state.hidden = false;
                 changed();
             }));
+        }
+        var chosen = picked();
+        if (chosen && !chosen.stale) {
+            // (The pictures that are still there: one hidden or removed
+            // since the link was made is not counted.)
+            var pickedCount = chosen.ids.filter(function (id) {
+                return record(id) !== null;
+            }).length;
+            chips.push(chipButton("Picked on the map: " + fmt.plural(pickedCount, "picture"),
+                                  function () {
+                                      state.ids = "";
+                                      changed();
+                                  }, "Show the whole search again"));
         }
         chips.forEach(function (chip) {
             box.appendChild(chip);
@@ -1241,6 +1416,20 @@
             return fmt.plural(count, extra ? extra + " picture" : "picture") +
                 (state.q ? verb + " \u201c" + state.q + "\u201d" : verb + " the search");
         }
+        if (state.ids) {
+            var everywhere = found(function (options) {
+                delete options.ids;
+            });
+            if (everywhere) {
+                reasons.push({text: matching(everywhere) + " but " + isAre(everywhere) +
+                                    " not among the pictures picked on the map.",
+                              label: "Show all of them",
+                              run: function () {
+                                  state.ids = "";
+                                  changed();
+                              }});
+            }
+        }
         var hasFilters = Object.keys(state.filters).some(function (key) {
             return state.filters[key].length;
         });
@@ -1381,7 +1570,12 @@
         }
         var cols = Math.max(1, Math.floor((width + gap) / (minimum + gap)));
         var tile = Math.floor((width - gap * (cols - 1)) / cols);
-        var dated = result.sort === "newest" || result.sort === "oldest";
+        // Month headers when sorted by date -- unless no picture has a date
+        // (then a lone "No date" header would say nothing).
+        var dated = (result.sort === "newest" || result.sort === "oldest") &&
+            display.some(function (entry) {
+                return monthKey(record(entry.id)) !== "";
+            });
         var counts = {};            // month -> pictures (a stack counts all of its own)
         var runs = {};              // display index where a month starts -> its tiles
         if (dated) {
@@ -2236,6 +2430,9 @@
             writeUrl({id: null});
             return;
         }
+        if (reveal(id) && VIEWER.isOpen()) {
+            VIEWER.update(viewerIds());
+        }
         if (VIEWER.isOpen()) {
             VIEWER.show(id);
             return;
@@ -2331,7 +2528,10 @@
         if ("scrollRestoration" in window.history) {
             window.history.scrollRestoration = "manual";
         }
+        keepView();
         setupControls();
+        setupMapLink();
+        arrival.query = SITE.searchState.params(urlState());
         renderControls();
         grid.addEventListener("click", gridClick);
         grid.addEventListener("keydown", gridKeydown);
@@ -2377,6 +2577,7 @@
             var sameSearch = SITE.searchState.params(wanted) === SITE.searchState.params(urlState());
             if (!sameSearch) {
                 state = wanted;
+                keepView();
                 if (!state.size) {
                     state.size = "m";
                 }

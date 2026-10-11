@@ -645,6 +645,90 @@ class MakeTilesTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual(sorted(os.listdir(os.path.join(tiles, "1", "3"))), ["0.jpg", "1.jpg"])
         self.assertEqual(serve.tiles_max_zoom(), 1)
 
+    def gradient(self):
+        from PIL import Image
+        source = Image.new("RGB", (1024, 512))
+        source.putdata([(x % 256, y % 256, (x + y) % 256)
+                        for y in range(512) for x in range(1024)])
+        return source
+
+    def test_an_interrupted_run_leaves_no_half_written_tile(self):
+        import make_tiles
+        source = self.gradient()
+        real_replace = os.replace
+        calls = []
+
+        def interrupted(src, dst):
+            calls.append(dst)
+            if len(calls) == 3:
+                raise KeyboardInterrupt()
+            real_replace(src, dst)
+
+        with mock.patch.object(make_tiles.os, "replace", side_effect=interrupted):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(KeyboardInterrupt):
+                    make_tiles.slice_zoom(source, 1, 80, False)
+        # The tile being written when it stopped is not there under its name
+        # (only its temporary file); the ones before it are whole.
+        stopped = calls[2]
+        self.assertFalse(os.path.exists(stopped))
+        self.assertTrue(os.path.exists(stopped + ".part"))
+        import imageinfo
+        for done in calls[:2]:
+            self.assertTrue(imageinfo.jpeg_file_complete(done), done)
+        # The next run removes the temporary file and fills the gaps.
+        self.assertEqual(make_tiles.remove_partial_files(), 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            counts = make_tiles.slice_zoom(source, 1, 80, False)
+        self.assertEqual(counts, {"written": 6, "repaired": 0, "kept": 2})
+        self.assertFalse(os.path.exists(stopped + ".part"))
+        for x in range(4):
+            for y in range(2):
+                self.assertTrue(imageinfo.jpeg_file_complete(make_tiles.tile_path(1, x, y)))
+
+    def test_a_rerun_repairs_tiles_cut_short(self):
+        import imageinfo
+        import make_tiles
+        source = self.gradient()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(make_tiles.slice_zoom(source, 1, 80, False),
+                             {"written": 8, "repaired": 0, "kept": 0})
+        # One tile cut short (as an older version left it when stopped while
+        # writing in place), one emptied, one filled with zeros by the disk.
+        paths = [make_tiles.tile_path(1, x, y) for x in range(4) for y in range(2)]
+        with open(paths[0], "rb") as handle:
+            whole = handle.read()
+        with open(paths[0], "wb") as handle:
+            handle.write(whole[:len(whole) // 2])
+        open(paths[3], "wb").close()
+        with open(paths[5], "wb") as handle:
+            handle.write(b"\0" * len(whole))
+        kept = {path: os.stat(path).st_mtime_ns for path in paths}
+        self.assertFalse(imageinfo.jpeg_file_complete(paths[0]))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            counts = make_tiles.slice_zoom(source, 1, 80, False)
+        self.assertEqual(counts, {"written": 0, "repaired": 3, "kept": 5})
+        self.assertIn("3 repaired", output.getvalue())
+        for index, path in enumerate(paths):
+            self.assertTrue(imageinfo.jpeg_file_complete(path), path)
+            if index not in (0, 3, 5):
+                self.assertEqual(os.stat(path).st_mtime_ns, kept[path], path)
+        with open(paths[0], "rb") as handle:
+            self.assertEqual(handle.read(), whole)
+        # --force writes every tile again.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(make_tiles.slice_zoom(source, 1, 80, True)["written"], 8)
+
+    def test_only_its_own_temporary_files_are_removed(self):
+        import make_tiles
+        tiles = common.ensure_dir(os.path.join(common.tiles_dir(), "2", "1"))
+        for name in ("3.jpg.part", "notes.part", "3.jpg"):
+            with open(os.path.join(tiles, name), "wb") as handle:
+                handle.write(b"x")
+        self.assertEqual(make_tiles.remove_partial_files(), 1)
+        self.assertEqual(sorted(os.listdir(tiles)), ["3.jpg", "notes.part"])
+
 
 if __name__ == "__main__":
     unittest.main()

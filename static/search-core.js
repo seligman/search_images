@@ -41,6 +41,8 @@
                          information (default: include them)
               junk       true: leave out pictures flagged accidental or
                          blurry
+              ids        a list of picture ids: only these can match (the
+                         pictures picked on the map)
               typing     true while the query is still being typed: the
                          last word may be the start of a longer word (see
                          parse)
@@ -2267,6 +2269,18 @@ var SearchCore = (function () {
         var alive = this.visibility(opts, parsed.wantsHidden);
         var score = new Float64Array(n);
         var r;
+        if (Array.isArray(opts.ids)) {
+            var picked = new Uint8Array(n);
+            for (var p = 0; p < opts.ids.length; p++) {
+                var at = this.position[String(opts.ids[p])];
+                if (at !== undefined) {
+                    picked[at] = 1;
+                }
+            }
+            for (r = 0; r < n; r++) {
+                alive[r] &= picked[r];
+            }
+        }
         for (var c = 0; c < parsed.clauses.length; c++) {
             var clause = parsed.clauses[c];
             var scores;

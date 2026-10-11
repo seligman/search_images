@@ -423,7 +423,14 @@ class ExportFixture(unittest.TestCase):
             if rel.endswith((".html", ".js", ".css", ".txt")) or rel == export.MARKER:
                 text = data.decode("utf-8").lower()
                 for value in texts:
-                    self.assertNotIn(value.lower(), text, "%s in %s" % (value, rel))
+                    value = value.lower()
+                    if re.match(r"^[a-z_]+$", value):
+                        # A plain word must not appear as a word; random picture
+                        # ids (such as "y4ngpszba747") may contain its letters.
+                        pattern = r"(?<![a-z0-9_])%s(?![a-z0-9_])" % re.escape(value)
+                        self.assertIsNone(re.search(pattern, text), "%s in %s" % (value, rel))
+                    else:
+                        self.assertNotIn(value, text, "%s in %s" % (value, rel))
                 self.assertIsNone(re.search(r"\b[a-z]:(\\\\|\\|/)", text), rel)
                 self.assertNotIn("\\\\\\\\", text, rel)
             elif rel.endswith(".jpg"):
@@ -1037,6 +1044,114 @@ class ExportTest(ExportFixture):
         self.assertFalse([rel for rel in files if rel.startswith("tiles/")
                           or rel in ("map.html", "assets/map.js", "data/locations.js")])
         self.assert_private(out)
+
+    def tile_writes(self):
+        """Counts the tiles the export writes (or reads to compare) while patched."""
+        written = []
+        real = export.Writer.write
+
+        def spy(writer, rel, data, sig=None):
+            if rel.startswith("tiles/"):
+                written.append(rel)
+            return real(writer, rel, data, sig)
+
+        return written, mock.patch.object(export.Writer, "write", spy)
+
+    def test_map_tiles_are_copied_only_when_they_changed(self):
+        # A small pyramid (zoom 0 and 1) in the data folder, one tile cut short.
+        tiles = common.tiles_dir()
+        self.addCleanup(support.remove_tree, tiles)
+        sources = {}
+        for zoom in (0, 1):
+            for x in range(2 ** (zoom + 1)):
+                for y in range(2 ** zoom):
+                    buffer = io.BytesIO()
+                    Image.new("RGB", (256, 256), (zoom * 90, x * 40, y * 90)).save(
+                        buffer, format="JPEG", quality=70)
+                    rel = "%d/%d/%d.jpg" % (zoom, x, y)
+                    sources[rel] = buffer.getvalue()
+        sources["1/3/1.jpg"] = sources["1/3/1.jpg"][:200]
+        for rel, data in sources.items():
+            path = os.path.join(tiles, *rel.split("/"))
+            common.ensure_dir(os.path.dirname(path))
+            with open(path, "wb") as handle:
+                handle.write(data)
+        with open(os.path.join(tiles, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump({"max_zoom": 1, "tile_size": 256}, handle)
+        out = self.out("tiled")
+        warnings = []
+        ctx = jobs.JobContext("test")
+        real_log = ctx.log
+        ctx.log = lambda message, level="info": (warnings.append(message) if level == "warn"
+                                                 else None, real_log(message, level))
+        written, patch = self.tile_writes()
+        with patch:
+            self.export(out, {"location": True}, ctx=ctx)
+        files = files_of(out)
+        copied = sorted(rel for rel in files if rel.startswith("tiles/"))
+        self.assertEqual(copied, sorted("tiles/" + rel for rel in sources if rel != "1/3/1.jpg"))
+        self.assertEqual(len(written), 9)
+        for rel in copied:
+            with open(os.path.join(out, *rel.split("/")), "rb") as handle:
+                self.assertEqual(handle.read(), sources[rel[len("tiles/"):]], rel)
+        self.assertTrue(any("1 map tile(s)" in text and "make_tiles.py" in text
+                            for text in warnings), warnings)
+        config = json.loads(re.search(r'id="app-config">(.*?)</script>',
+                                      open(os.path.join(out, "map.html"),
+                                           encoding="utf-8").read()).group(1))
+        self.assertEqual(config["tilesMax"], 1)
+        self.assertEqual(config["tiles"], "tiles/")
+        # Again: not one tile is read or written.
+        del written[:]
+        with patch:
+            summary = self.export(out, {"location": True})
+        self.assertEqual(written, [])
+        self.assertEqual(summary["written"], 0)
+        self.assertEqual({rel: value for rel, value in files_of(out).items()
+                          if rel.startswith("tiles/")},
+                         {rel: files[rel] for rel in copied})
+        # One tile changed, one repaired (make_tiles.py again), one gone:
+        # just those change in the export.
+        changed = io.BytesIO()
+        Image.new("RGB", (256, 256), (250, 250, 0)).save(changed, format="JPEG")
+        repaired = io.BytesIO()
+        Image.new("RGB", (256, 256), (0, 250, 250)).save(repaired, format="JPEG")
+        time.sleep(0.02)
+        with open(os.path.join(tiles, "1", "0", "0.jpg"), "wb") as handle:
+            handle.write(changed.getvalue())
+        with open(os.path.join(tiles, "1", "3", "1.jpg"), "wb") as handle:
+            handle.write(repaired.getvalue())
+        os.remove(os.path.join(tiles, "1", "2", "1.jpg"))
+        with patch:
+            summary = self.export(out, {"location": True})
+        self.assertEqual(sorted(written), ["tiles/1/0/0.jpg", "tiles/1/3/1.jpg"])
+        after = files_of(out)
+        self.assertNotIn("tiles/1/2/1.jpg", after)
+        with open(os.path.join(out, "tiles", "1", "3", "1.jpg"), "rb") as handle:
+            self.assertEqual(handle.read(), repaired.getvalue())
+        for rel in copied:
+            if rel not in ("tiles/1/0/0.jpg", "tiles/1/3/1.jpg", "tiles/1/2/1.jpg"):
+                self.assertEqual(after[rel], files[rel], rel)
+
+    def test_the_small_map_is_cut_into_tiles_once(self):
+        import serve
+        out = self.out("small-map")
+        self.export(out, {"location": True})
+        tiles = sorted(rel for rel in files_of(out) if rel.startswith("tiles/"))
+        # Zoom 0 to 3 of the bundled map: 2 + 8 + 32 + 128 tiles.
+        self.assertEqual(len(tiles), 170)
+        written, patch = self.tile_writes()
+        with patch, mock.patch.object(serve, "_fallback_tile_bytes",
+                                      side_effect=AssertionError("cut again")):
+            summary = self.export(out, {"location": True})
+        self.assertEqual(written, [])
+        self.assertEqual(summary["written"], 0)
+        # Once the cutting changes (its version is raised), they are cut again.
+        written, patch = self.tile_writes()
+        with patch, mock.patch.object(serve, "FALLBACK_TILE_VERSION",
+                                      serve.FALLBACK_TILE_VERSION + 1):
+            self.export(out, {"location": True})
+        self.assertEqual(len(written), 170)
 
     def test_title_credits_and_indexing(self):
         out = self.out("titled")

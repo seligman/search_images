@@ -98,6 +98,8 @@
                 var target = SITE.searchState.read();
                 target.q = group === "q" ? value : "";
                 target.filters = {};
+                target.ids = "";
+                target.view = "";           // (a new search: the map fits it)
                 if (group !== "q") {
                     target.filters[group] = [value];
                 }

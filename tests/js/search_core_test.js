@@ -898,6 +898,27 @@ test("a group whose cover does not match shows its best match", function () {
     assert.deepStrictEqual(single.groups, {});
 });
 
+test("only the pictures picked on the map (ids)", function () {
+    var picked = search(FACET_RECORDS, "", {ids: [2, 4, 6, 99]});
+    assert.deepStrictEqual(picked.items, [6, 4, 2]);
+    assert.strictEqual(picked.total, 3);
+    // Facets count those pictures only.
+    assert.deepStrictEqual(counts(picked, "type"), {photo: 2, screenshot: 1});
+    // With a query, filters and hiding: all of them still apply.
+    assert.deepStrictEqual(items(FACET_RECORDS, "beach", {ids: [1, 2, 3]}), [2, 1]);
+    assert.deepStrictEqual(items(FACET_RECORDS, "", {ids: [1, 2, 4], filters: {type: ["photo"]}}),
+                           [2, 1]);
+    assert.deepStrictEqual(items(FACET_RECORDS, "", {ids: [4, 5], library: "lib_a"}), []);
+    // Ids come as numbers or as text; an empty list finds nothing, no list everything.
+    assert.deepStrictEqual(items(FACET_RECORDS, "", {ids: ["5", "1"]}), [5, 1]);
+    assert.deepStrictEqual(items(FACET_RECORDS, "", {ids: []}), []);
+    assert.strictEqual(search(FACET_RECORDS, "", {ids: null}).total, 6);
+    // Stacks: the members picked are grouped as usual.
+    var grouped = search(GROUP_RECORDS, "", {group: true, ids: [10, 13, 14]});
+    assert.deepStrictEqual(grouped.items, [13, 14]);
+    assert.deepStrictEqual(grouped.groups, {13: [13, 10]});
+});
+
 test("grouping follows the relevance order", function () {
     var records = [
         {i: 1, d: "lake", dk: "2024-01-01", dg: 2},

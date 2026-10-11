@@ -39,11 +39,21 @@
 
    Search state in the address (SITE.searchState)
      read(search)  -> {q, lib, sort, filters: {group: [values]}, group,
-                       size, hidden, junk, sensitive} from a query string
-                       (default: the page's)
+                       size, hidden, junk, sensitive, ids, view} from a
+                       query string (default: the page's)
      params(state) -> the query string for a state ("" when all default)
      The facet selections use the group names of SearchCore.FACETS as
      parameter names, one per value: ?q=beach&type=photo&tags=sunset.
+     ids holds the pictures picked on the map ("Show these in the grid"),
+     written by SITE.idList.encode; view the map's centre and zoom
+     ("lat,lon,zoom"), so the search page can lead back to the same place.
+     The map itself never takes ids (mapUrl leaves them out).
+
+   SITE.idList.encode(ids, records) -> the ids value for a list of picture
+     ids; SITE.idList.decode(text, records) -> {ids: [...], stale} (stale:
+     the value was made for other records, see there), or null when it is
+     not a valid value. records are the records of loadIndex.
+     SITE.idList.maxLength() is the longest value an address may carry here.
 
    A static export (export.py) writes data/manifest.js
    (window.SEARCH_DATA_MANIFEST = {shards: [...], details: [...],
@@ -98,9 +108,30 @@ var SITE = (function () {
     // At most this many values per facet group are taken from an address.
     var MAX_VALUES = 50;
 
+    // The longest ids value read from an address (see idList).
+    var MAX_IDS_TEXT = 200000;
+    var IDS_RE = /^[0-9a-z]+(?:[._-][0-9a-z]+)*$/;
+    // "lat,lon,zoom" of the map (see readView).
+    var VIEW_RE = /^(-?\d{1,3}(?:\.\d{1,8})?),(-?\d{1,3}(?:\.\d{1,8})?),(\d{1,2})$/;
+
     function emptyState() {
         return {q: "", lib: "", sort: "", filters: {}, group: true, size: "",
-                hidden: false, junk: false, sensitive: ""};
+                hidden: false, junk: false, sensitive: "", ids: "", view: ""};
+    }
+
+    // A map view from an address: "lat,lon,zoom" with the latitude within
+    // the poles, the longitude within one turn and a whole zoom; "" if not.
+    function readView(value) {
+        var match = VIEW_RE.exec(String(value || ""));
+        if (!match) {
+            return "";
+        }
+        var lat = Number(match[1]);
+        var lon = Number(match[2]);
+        if (!(lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180)) {
+            return "";
+        }
+        return match[1] + "," + match[2] + "," + Number(match[3]);
     }
 
     function readSearchState(search) {
@@ -130,6 +161,9 @@ var SITE = (function () {
         state.junk = params.get("junk") === "1";
         var sensitive = params.get("sensitive");
         state.sensitive = SENSITIVE.indexOf(sensitive) >= 0 ? sensitive : "";
+        var ids = params.get("ids") || "";
+        state.ids = ids.length <= MAX_IDS_TEXT && IDS_RE.test(ids) ? ids : "";
+        state.view = readView(params.get("view"));
         return state;
     }
 
@@ -168,7 +202,172 @@ var SITE = (function () {
         if (state.hidden) {
             params.set("hidden", "1");
         }
+        if (typeof state.ids === "string" && state.ids && IDS_RE.test(state.ids)) {
+            params.set("ids", state.ids);
+        }
+        var view = readView(state.view);
+        if (view) {
+            params.set("view", view);
+        }
         return params.toString();
+    }
+
+    /* ---------- Lists of pictures in an address (idList) --------------------- */
+
+    /* Whole numbers >= 0 as short text: sorted, runs of consecutive numbers
+       as one token, each token the gap since the previous run in base 36,
+       with "-" and the run's length - 1 for a run: [5, 6, 7, 10] ->
+       "5-2.2". Only letters, digits, "." and "-" (none of them escaped in
+       an address). */
+    function encodeNumbers(numbers) {
+        var list = numbers.filter(function (value) {
+            return typeof value === "number" && value >= 0 && value % 1 === 0 &&
+                value <= 9007199254740991;
+        }).sort(function (a, b) {
+            return a - b;
+        });
+        var tokens = [];
+        var previous = -1;
+        var k = 0;
+        while (k < list.length) {
+            var start = list[k];
+            var end = start;
+            k += 1;
+            while (k < list.length && list[k] <= end + 1) {
+                end = Math.max(end, list[k]);
+                k += 1;
+            }
+            var token = (start - previous - 1).toString(36);
+            if (end > start) {
+                token += "-" + (end - start).toString(36);
+            }
+            tokens.push(token);
+            previous = end;
+        }
+        return tokens.join(".");
+    }
+
+    // At most this many pictures in one list.
+    var MAX_PICKED = 100000;
+
+    // The numbers of encodeNumbers' text, or null when it is not such text
+    // (or names a number >= limit, or more than MAX_PICKED numbers).
+    function decodeNumbers(text, limit) {
+        if (typeof text !== "string" || !/^[0-9a-z]+(?:-[0-9a-z]+)?(?:\.[0-9a-z]+(?:-[0-9a-z]+)?)*$/
+                .test(text)) {
+            return null;
+        }
+        var out = [];
+        var previous = -1;
+        var tokens = text.split(".");
+        for (var k = 0; k < tokens.length; k++) {
+            var parts = tokens[k].split("-");
+            var start = previous + 1 + parseInt(parts[0], 36);
+            var end = start + (parts.length > 1 ? parseInt(parts[1], 36) : 0);
+            if (!isFinite(end) || end >= limit || out.length + (end - start) >= MAX_PICKED) {
+                return null;
+            }
+            for (var value = start; value <= end; value++) {
+                out.push(value);
+            }
+            previous = end;
+        }
+        return out;
+    }
+
+    // A short check value of a list of strings (FNV-1a, in base 36).
+    function checkValue(list) {
+        var hash = 2166136261;
+        for (var k = 0; k < list.length; k++) {
+            var text = list[k] + "\n";
+            for (var c = 0; c < text.length; c++) {
+                hash ^= text.charCodeAt(c);
+                hash = Math.imul(hash, 16777619) >>> 0;
+            }
+        }
+        return (hash >>> 0).toString(36);
+    }
+
+    var orderCache = {records: null, length: -1, order: null};
+
+    /* An export's pictures in a fixed order (their ids sorted), with a check
+       value of that order: a picture is named by its place in it, so a
+       list of hundreds of export ids still fits in an address. */
+    function recordOrder(records) {
+        if (orderCache.records === records && orderCache.length === records.length) {
+            return orderCache.order;
+        }
+        var ids = records.map(function (rec) {
+            return String(recordId(rec));
+        }).sort();
+        var place = {};
+        ids.forEach(function (id, index) {
+            place[id] = index;
+        });
+        var order = {ids: ids, place: place, check: checkValue(ids)};
+        orderCache = {records: records, length: records.length, order: order};
+        return order;
+    }
+
+    // ids -> the ids value of an address ("" for none). The server's ids
+    // are numbers; an export names its pictures by their place in
+    // recordOrder ("<check>_<places>").
+    function encodeIdList(ids, records) {
+        ids = Array.isArray(ids) ? ids : [];
+        if (!ids.length) {
+            return "";
+        }
+        if (!isStatic) {
+            return encodeNumbers(ids.map(function (id) {
+                return typeof id === "number" ? id : /^\d{1,15}$/.test(String(id)) ? Number(id) : -1;
+            }));
+        }
+        var order = recordOrder(records || []);
+        var places = [];
+        ids.forEach(function (id) {
+            var place = order.place[String(id)];
+            if (place !== undefined) {
+                places.push(place);
+            }
+        });
+        return places.length ? order.check + "_" + encodeNumbers(places) : "";
+    }
+
+    function decodeIdList(text, records) {
+        if (typeof text !== "string" || !text) {
+            return null;
+        }
+        if (!isStatic) {
+            var numbers = decodeNumbers(text, 9007199254740991);
+            return numbers ? {ids: numbers, stale: false} : null;
+        }
+        var at = text.indexOf("_");
+        if (at <= 0) {
+            return null;
+        }
+        var order = recordOrder(records || []);
+        var places = decodeNumbers(text.slice(at + 1), Math.max(order.ids.length, 1));
+        if (!places) {
+            return text.slice(0, at) === order.check ? null : {ids: [], stale: true};
+        }
+        if (text.slice(0, at) !== order.check) {
+            return {ids: [], stale: true};
+        }
+        return {ids: places.map(function (place) {
+            var id = order.ids[place];
+            return /^\d+$/.test(id) ? Number(id) : id;
+        }), stale: false};
+    }
+
+    // The longest ids value to put in an address: web servers refuse
+    // addresses longer than about 8,000 characters (a static host), the
+    // program's own server takes about 64,000; from disk there is no limit.
+    function maxIdsLength() {
+        if (!isStatic) {
+            return 30000;
+        }
+        var protocol = root.location && root.location.protocol;
+        return protocol === "file:" ? 100000 : 6000;
     }
 
     function withQuery(base, query) {
@@ -726,6 +925,12 @@ var SITE = (function () {
             empty: emptyState,
             FACET_KEYS: FACET_KEYS
         },
+        idList: {
+            encode: encodeIdList,
+            decode: decodeIdList,
+            numbers: {encode: encodeNumbers, decode: decodeNumbers},
+            maxLength: maxIdsLength
+        },
         homeUrl: function () {
             return isStatic ? "index.html" : "/";
         },
@@ -734,11 +939,17 @@ var SITE = (function () {
             var base = (isStatic ? "detail.html" : "/detail") + "?id=" + encodeURIComponent(id);
             return withQuery(base, searchParams(state));
         },
+        // (Without the pictures picked on the map: the map shows the whole search.)
         mapUrl: function (state) {
             if (!hasMap()) {
                 return null;
             }
-            return withQuery(isStatic ? "map.html" : "/map", searchParams(state));
+            var copy = {};
+            Object.keys(state || {}).forEach(function (key) {
+                copy[key] = state[key];
+            });
+            copy.ids = "";
+            return withQuery(isStatic ? "map.html" : "/map", searchParams(copy));
         },
         hasMap: hasMap,
         thumbUrl: thumbUrl,

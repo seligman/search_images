@@ -2381,11 +2381,21 @@ class _Export:
         return "window.SEARCH_DATA_MANIFEST = %s;\n" % _js_json(manifest)
 
     def tiles(self):
-        """Write the map tiles (with location only); returns the highest zoom, or None."""
+        """Write the map tiles (with location only); returns the highest zoom, or None.
+
+        Incremental like every file of the export (Writer): a tile whose
+        source is unchanged since the last export (same size and time of
+        the file in data/tiles, or the same bundled basemap) is neither
+        read nor written again, so a second export of a pyramid of 11,000
+        tiles costs a stat per tile. A tile of the pyramid that is cut
+        short (an interrupted make_tiles.py) is left out -- the map shows
+        a coarser tile in its place -- with a warning.
+        """
         import serve
         max_zoom = serve.tiles_max_zoom()
         if max_zoom is not None:
             source = common.tiles_dir()
+            damaged = 0
             for folder, _dirs, names in os.walk(source):
                 for name in sorted(names):
                     if not name.endswith(".jpg"):
@@ -2396,17 +2406,36 @@ class _Export:
                         continue
                     stat = os.stat(path)
                     sig = "tile:%d:%d" % (stat.st_size, stat.st_mtime_ns)
-                    if not self.writer.current(rel, sig):
-                        with open(path, "rb") as handle:
-                            self.writer.write(rel, handle.read(), sig)
+                    if self.writer.current(rel, sig):
+                        continue
+                    with open(path, "rb") as handle:
+                        data = handle.read()
+                    if not imageinfo.jpeg_complete(data):
+                        damaged += 1
+                        continue
+                    self.writer.write(rel, data, sig)
+            if damaged:
+                self.ctx.log("%d map tile(s) in %s are damaged (cut short) and were left out; "
+                             "run make_tiles.py again to repair them." % (damaged, source),
+                             "warn")
             return max_zoom
+        # No pyramid: the tiles the server cuts from the bundled small map.
+        try:
+            stat = os.stat(serve.FALLBACK_BASEMAP)
+        except OSError:
+            return None
+        sig = "basemap:%d:%d:%d:%d" % (stat.st_size, stat.st_mtime_ns, serve.TILE_SIZE,
+                                       serve.FALLBACK_TILE_VERSION)
         for zoom in range(serve.FALLBACK_MAX_ZOOM + 1):
             for x in range(2 ** (zoom + 1)):
                 for y in range(2 ** zoom):
+                    rel = "tiles/%d/%d/%d.jpg" % (zoom, x, y)
+                    if self.writer.current(rel, sig):
+                        continue
                     data = serve._fallback_tile_bytes(zoom, x, y)
                     if data is None:
                         return None
-                    self.writer.write("tiles/%d/%d/%d.jpg" % (zoom, x, y), data)
+                    self.writer.write(rel, data, sig)
         return serve.FALLBACK_MAX_ZOOM
 
     # -- the zip --------------------------------------------------------------

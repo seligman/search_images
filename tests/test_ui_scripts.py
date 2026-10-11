@@ -5,7 +5,8 @@ address), static/viewer.js (the picture viewer, information pane and 360
 degree view), static/app.js (the search page), static/detail.js and
 static/map.js.
 
-Their page-free parts are tested under Node.js by tests/js/ui_test.js (a
+Their page-free parts are tested under Node.js by tests/js/ui_test.js and
+tests/js/map_test.js (the map's projection, pins, wheel and views) (a
 development tool only; skipped when `node` is not installed), including a
 check that site.js turns the server's full records (/api/image) into the
 same compact records /api/index sends. The checks here read the scripts as
@@ -35,6 +36,7 @@ except ImportError:
 
 STATIC = os.path.join(support.REPO, "static")
 NODE_TESTS = os.path.join(support.REPO, "tests", "js", "ui_test.js")
+MAP_TESTS = os.path.join(support.REPO, "tests", "js", "map_test.js")
 NODE = shutil.which("node")
 SCRIPTS = ("site.js", "viewer.js", "app.js", "detail.js", "map.js")
 
@@ -56,8 +58,8 @@ def scripts_of(html):
     return re.findall(r'<script[^>]*\ssrc="([^"]+)"', html)
 
 
-def run_node(*args):
-    result = subprocess.run([NODE, NODE_TESTS] + list(args), cwd=support.REPO,
+def run_node(*args, script=NODE_TESTS):
+    result = subprocess.run([NODE, script] + list(args), cwd=support.REPO,
                             capture_output=True, timeout=300)
     return result.returncode, (result.stdout + result.stderr).decode("utf-8", "replace")
 
@@ -102,7 +104,7 @@ class PageScriptSourceTest(unittest.TestCase):
         self.assertIn("document.createTextNode(part.text)", viewer)
 
     def test_shared_scripts_also_load_under_node(self):
-        for name, global_name in (("site.js", "SITE"), ("viewer.js", "VIEWER")):
+        for name, global_name in (("site.js", "SITE"), ("viewer.js", "VIEWER"), ("map.js", "MAP")):
             text = read(STATIC, name)
             self.assertIn("var %s = (function () {" % global_name, text)
             self.assertIn("module.exports = %s;" % global_name, text)
@@ -123,6 +125,40 @@ class PageScriptSourceTest(unittest.TestCase):
         self.assertIn('SHELL.admin("/images/" + encodeURIComponent(id) + "/open-folder", {})',
                       viewer)
 
+    def test_the_map_view_belongs_to_one_search(self):
+        # The search page drops the map's view once its search changes
+        # (every change goes through run() and writeUrl()), and links that
+        # start a new search leave it out, so the map then fits the new
+        # results instead of opening where the old ones were.
+        app = read(STATIC, "app.js")
+        for name in ("function run(options)", "function writeUrl(options)"):
+            body = app[app.index(name):]
+            body = body[:body.index("\n    }\n")]
+            self.assertIn("dropStaleView();", body, name)
+        self.assertEqual(app.count("keepView();"), 2)       # at the start and on Back
+        for name, text in (("app.js", app), ("detail.js", read(STATIC, "detail.js")),
+                           ("map.js", read(STATIC, "map.js"))):
+            chip = text[text.index("chipUrl"):]
+            chip = chip[:chip.index("return SITE.searchUrl(target);")]
+            self.assertRegex(chip, r'target\.view = "";', name)
+
+    def test_the_map_takes_the_focus_and_leaves_a_way_back(self):
+        code = read(STATIC, "map.js")
+        # A click or a touch moves the focus to the map (its keys work then).
+        for event in ("mousedown", "touchstart"):
+            handler = code[code.index('canvas.addEventListener("%s"' % event):]
+            handler = handler[:handler.index("\n        }")]
+            self.assertIn("takeFocus();", handler, event)
+        # "Show these in the grid" tells the search page where it came from
+        # (pages opened from disk have no referrer), under the same key.
+        key = re.search(r'var FROM_MAP_KEY = "([^"]+)";', code).group(1)
+        self.assertIn('var FROM_MAP_KEY = "%s";' % key, read(STATIC, "app.js"))
+        self.assertIn("window.sessionStorage.setItem(FROM_MAP_KEY, gridLink.href)", code)
+        # The open list is kept in the address, for Back without the
+        # browser's page cache.
+        self.assertIn("SHELL.setState({pin: formatPoint(", code)
+        self.assertIn("SHELL.setState({pin: null});", code)
+
     def test_the_grid_keeps_only_nearby_thumbnails(self):
         app = read(STATIC, "app.js")
         self.assertIn("new IntersectionObserver(onIntersect", app)
@@ -135,6 +171,13 @@ class PageScriptNodeTest(unittest.TestCase):
 
     def test_page_free_parts(self):
         code, output = run_node()
+        self.assertEqual(code, 0, "\n" + output)
+        self.assertRegex(output, r"(\d+) of \1 passed")
+
+    def test_map_parts(self):
+        # Projection and the repeating world, pins across the date line and
+        # while panning, the wheel, fitting the view.
+        code, output = run_node(script=MAP_TESTS)
         self.assertEqual(code, 0, "\n" + output)
         self.assertRegex(output, r"(\d+) of \1 passed")
 
@@ -248,10 +291,26 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
         self.assertNotIn("dog", html)
 
     def test_map_page_searches_too(self):
-        html = self.page("/map?q=beach")
+        html = self.page("/map?q=beach&view=10,20,3")
         self.assertEqual(scripts_of(html), ["/static/site.js", "/static/shell.js",
-                                            "/static/search-core.js", "/static/map.js"])
-        self.assertIn('id="map-search"', html)
+                                            "/static/search-core.js", "/static/viewer.js",
+                                            "/static/map.js"])
+        for element in ("map-search", "map-status", "map-canvas", "map-message", "map-panel",
+                        "map-panel-title", "map-panel-grid", "map-panel-list", "map-panel-more",
+                        "zoom-in", "zoom-out", "map-panel-close", "map-target"):
+            self.assertIn('id="%s"' % element, html)
+        self.assertNotIn("beach", html)
+        # The buttons with a symbol say in words what they do.
+        for button in re.findall(r"<button[^>]*>[^<]*</button>", html):
+            if "map-panel-more" not in button:
+                self.assertIn("aria-label=", button)
+        self.assertIn('aria-live="polite"', html)
+        self.assertIn('<canvas id="map-canvas" tabindex="0"', html)
+        # Screen readers pass the map's keys on (it is not a still picture)
+        # and read out which pin Enter would open.
+        self.assertIn('role="application" aria-roledescription="map"', html)
+        self.assertNotIn('role="img"', html)
+        self.assertRegex(html, r'<span id="map-target" class="visually-hidden" aria-live="polite">')
 
     def test_pages_name_no_favicon_file(self):
         # An empty data: icon, so browsers do not ask the server for one.

@@ -76,6 +76,33 @@ def sniff_mime(data):
     return None
 
 
+def jpeg_complete(data):
+    """True if data looks like a whole JPEG file.
+
+    It must start with the start-of-image marker and end with the
+    end-of-image marker: a file cut short (a write that was interrupted, or
+    a disk that lost its last blocks) lacks the end, and a file the system
+    sized but never filled ends in zeros. Only the first and last bytes are
+    looked at, so the check is cheap enough for thousands of map tiles.
+    """
+    return len(data) >= 4 and bytes(data[:3]) == b"\xff\xd8\xff" and bytes(data[-2:]) == b"\xff\xd9"
+
+
+def jpeg_file_complete(path):
+    """jpeg_complete() for a file, reading only its first and last bytes."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(3)
+            size = handle.seek(0, os.SEEK_END)
+            if size < 4:
+                return False
+            handle.seek(size - 2)
+            tail = handle.read(2)
+    except OSError:
+        return False
+    return jpeg_complete(head + tail)
+
+
 def browser_can_display(mime):
     """True if browsers show this MIME type directly (no conversion needed)."""
     return mime in BROWSER_MIME_TYPES

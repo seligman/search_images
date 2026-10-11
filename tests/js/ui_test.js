@@ -18,11 +18,12 @@ var SearchCore = require(path.join(STATIC, "search-core.js"));
 var VIEWER = require(path.join(STATIC, "viewer.js"));
 
 // site.js reads its settings once, when it loads: load it afresh for a
-// given page configuration.
-function loadSite(config) {
+// given page configuration (and protocol of the page's address).
+function loadSite(config, protocol) {
     var file = require.resolve(path.join(STATIC, "site.js"));
     delete require.cache[file];
-    global.window = config ? {APP_CONFIG: config, location: {search: ""}} : undefined;
+    global.window = config ? {APP_CONFIG: config,
+                              location: {search: "", protocol: protocol || "http:"}} : undefined;
     try {
         return require(file);
     } finally {
@@ -44,7 +45,8 @@ test("the address keeps a search and reads it back", function () {
     var state = {q: "red car \"on the beach\" -dog", lib: "lib_family1", sort: "oldest",
                  filters: {type: ["photo", "doc:receipt"], tags: ["sun & sea", "a=b"],
                            year: ["2019"]},
-                 group: false, size: "l", hidden: true, junk: true, sensitive: "show"};
+                 group: false, size: "l", hidden: true, junk: true, sensitive: "show",
+                 ids: "5-2.2", view: "-17.5,179.9,4"};
     var query = SITE.searchState.params(state);
     var back = SITE.searchState.read("?" + query);
     assert.deepStrictEqual(back, state);
@@ -77,6 +79,100 @@ test("values the page does not know are ignored", function () {
     }
     assert.strictEqual(SITE.searchState.read("?" + many.join("&")).filters.tags.length, 50);
     assert.strictEqual(SITE.searchState.read("?q=" + "x".repeat(5000)).q.length, 2000);
+});
+
+test("the map's view and the pictures picked on it travel in the address", function () {
+    var state = SITE.searchState.read("?q=beach&ids=0-4.a&view=48.8566,2.3522,7");
+    assert.strictEqual(state.ids, "0-4.a");
+    assert.strictEqual(state.view, "48.8566,2.3522,7");
+    // The search page and the pages it links to keep both...
+    assert.strictEqual(SITE.searchUrl(state), "/?q=beach&ids=0-4.a&view=48.8566%2C2.3522%2C7");
+    assert.strictEqual(SITE.detailUrl(3, state),
+                       "/detail?id=3&q=beach&ids=0-4.a&view=48.8566%2C2.3522%2C7");
+    // ... the map shows the whole search, at that view.
+    assert.strictEqual(SITE.mapUrl(state), "/map?q=beach&view=48.8566%2C2.3522%2C7");
+    assert.strictEqual(state.ids, "0-4.a");
+    // Anything else is ignored.
+    ["view=91,0,3", "view=0,181,3", "view=1,2", "view=a,b,c", "view=1,2,3.5", "view=1,2,123"]
+        .forEach(function (bad) {
+            assert.strictEqual(SITE.searchState.read("?" + bad).view, "", bad);
+        });
+    ["ids=1,2", "ids=../x", "ids=A", "ids=1..2", "ids=" + "1.".repeat(120000) + "1"]
+        .forEach(function (bad) {
+            assert.strictEqual(SITE.searchState.read("?" + bad).ids, "", bad.slice(0, 20));
+        });
+    assert.strictEqual(SITE.searchState.read("?view=-0.5,-180,0").view, "-0.5,-180,0");
+    assert.strictEqual(SITE.searchState.params({ids: "x y", view: "nowhere"}), "");
+});
+
+test("lists of numbers in an address are short", function () {
+    var numbers = SITE.idList.numbers;
+    assert.strictEqual(numbers.encode([10, 5, 7, 6, 6]), "5-2.2");
+    assert.deepStrictEqual(numbers.decode("5-2.2", 100), [5, 6, 7, 10]);
+    assert.strictEqual(numbers.encode([]), "");
+    assert.strictEqual(numbers.encode([0]), "0");
+    // Gaps and runs in base 36: thousands of ids in a few characters each.
+    var many = [];
+    for (var k = 0; k < 3000; k++) {
+        many.push(100000 + k * 7 + (k % 3));
+    }
+    var text = numbers.encode(many);
+    assert.ok(text.length < 3 * many.length, text.length);
+    assert.deepStrictEqual(numbers.decode(text, Infinity), many.slice().sort(function (a, b) {
+        return a - b;
+    }));
+    var run = [];
+    for (var m = 0; m < 5000; m++) {
+        run.push(m + 42);
+    }
+    assert.strictEqual(numbers.encode(run), "16-3uv");
+    // Not such a list, or one that names too much: null.
+    ["", "-1", "1..2", "1-", "A", "1,2", "zzzzzzzzzzzz"].forEach(function (bad) {
+        assert.strictEqual(numbers.decode(bad, 1000000), null, bad);
+    });
+    assert.strictEqual(numbers.decode("0-zzzzzz", Infinity), null);
+    assert.strictEqual(numbers.decode("5", 5), null);
+    assert.deepStrictEqual(numbers.decode("4", 5), [4]);
+});
+
+test("the server names picked pictures by their ids", function () {
+    var text = SITE.idList.encode([12, 3, 4, 5, "40"], []);
+    assert.strictEqual(text, "3-2.6.r");
+    assert.deepStrictEqual(SITE.idList.decode(text, []), {ids: [3, 4, 5, 12, 40], stale: false});
+    assert.strictEqual(SITE.idList.decode("x_1", []), null);
+    assert.strictEqual(SITE.idList.encode([], []), "");
+    assert.strictEqual(SITE.idList.maxLength(), 30000);
+});
+
+test("an export names picked pictures by their place, and notices a new export", function () {
+    var site = loadSite({mode: "static", data: "data/", tiles: "tiles/", page: "map",
+                         capabilities: {admin: false, static: true}});
+    var records = [];
+    for (var k = 0; k < 400; k++) {
+        records.push({i: "x" + ("00000" + (k * 7919 % 400)).slice(-5) + "abcdef"});
+    }
+    var picked = records.slice(100, 160).map(function (rec) {
+        return rec.i;
+    });
+    var text = site.idList.encode(picked, records);
+    assert.ok(/^[0-9a-z]+_[0-9a-z.-]+$/.test(text), text);
+    // Much shorter than the ids themselves.
+    assert.ok(text.length < picked.join(".").length / 3, text);
+    var back = site.idList.decode(text, records);
+    assert.strictEqual(back.stale, false);
+    assert.deepStrictEqual(back.ids.slice().sort(), picked.slice().sort());
+    // The same pictures in another order (shards loaded otherwise): the same.
+    assert.deepStrictEqual(site.idList.decode(text, records.slice().reverse()).ids.sort(),
+                           picked.slice().sort());
+    // Made again with other pictures: the places name others, so the list is stale.
+    var other = records.slice(1).concat([{i: "znewpicture1"}]);
+    assert.deepStrictEqual(site.idList.decode(text, other), {ids: [], stale: true});
+    assert.strictEqual(site.idList.decode("nonsense", records), null);
+    assert.strictEqual(site.idList.encode(["not-there"], records), "");
+    // A static host takes short addresses only; from disk anything goes.
+    assert.strictEqual(site.idList.maxLength(), 6000);
+    var disk = loadSite({mode: "static", data: "data/", capabilities: {static: true}}, "file:");
+    assert.strictEqual(disk.idList.maxLength(), 100000);
 });
 
 test("the address uses the facet groups of the search engine", function () {

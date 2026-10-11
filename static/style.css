@@ -159,12 +159,27 @@ a {
     display: none !important;
 }
 
+/* Read by screen readers, not shown. */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
 /* World-map page */
 
 body.map-page {
     padding: 0;
     margin: 0;
     height: 100vh;
+    height: 100dvh;         /* (phones: without the part the toolbars cover) */
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -188,13 +203,15 @@ body.map-page {
 #map-status {
     color: var(--text-muted);
     font-size: 13px;
+    margin-left: auto;
 }
 
 #map-stage {
     position: relative;
     flex: 1 1 auto;
+    min-height: 0;
     overflow: hidden;
-    background: #0c1118;
+    background: #1a2c3d;
 }
 
 #map-canvas {
@@ -206,8 +223,23 @@ body.map-page {
     cursor: grab;
 }
 
+#map-canvas.over-pin {
+    cursor: pointer;
+}
+
 #map-canvas:active {
     cursor: grabbing;
+}
+
+#map-canvas:focus-visible {
+    outline: 3px solid var(--accent);
+    outline-offset: -3px;
+}
+
+/* Clicked or touched since it got the focus (map.js): no ring until a key
+   is used again. */
+#map-canvas.pointer-used:focus-visible {
+    outline: none;
 }
 
 #map-zoom {
@@ -222,58 +254,152 @@ body.map-page {
 #map-zoom button {
     width: 36px;
     height: 36px;
+    font: inherit;
     font-size: 20px;
+    line-height: 1;
     background: var(--surface);
     color: var(--text);
     border: 1px solid var(--border-strong);
     border-radius: 6px;
     cursor: pointer;
     opacity: 0.94;
+    box-shadow: var(--shadow);
 }
 
+#map-zoom button:hover {
+    background: var(--surface-2);
+}
+
+#map-zoom button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* Zoomed in past the map tiles' detail. */
+#map-note {
+    position: absolute;
+    left: 12px;
+    bottom: 12px;
+    margin: 0;
+    padding: 4px 10px;
+    max-width: calc(100% - 24px);
+    font-size: 12px;
+    color: #e8edf3;
+    background: rgba(12, 17, 24, 0.72);
+    border-radius: 12px;
+    white-space: normal;
+    pointer-events: none;
+}
+
+body.map-panel-open #map-note {
+    left: 344px;
+}
+
+/* "Could not load" and "no located pictures": a card over the map. */
+#map-message {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(420px, calc(100% - 32px));
+    padding: 18px 20px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+    text-align: center;
+}
+
+#map-message h2 {
+    margin: 0 0 6px;
+    font-size: 17px;
+}
+
+#map-message p {
+    margin: 0 0 6px;
+    color: var(--text-muted);
+    white-space: normal;
+}
+
+.map-message-actions {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+/* The list of a pin's pictures: a side panel (a sheet at the foot on phones). */
 #map-panel {
     position: absolute;
     top: 12px;
     left: 12px;
     bottom: 12px;
-    width: 280px;
+    width: 320px;
     max-width: calc(100% - 24px);
     background: var(--surface);
+    color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
     display: flex;
     flex-direction: column;
-    opacity: 0.97;
+    overflow: hidden;
 }
 
 #map-panel-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
+    gap: 8px;
+    padding: 10px 10px 8px 14px;
 }
 
 #map-panel-title {
+    margin: 0;
+    font-size: 16px;
     font-weight: 600;
 }
 
-#map-panel-close {
-    background: transparent;
+#map-panel-title:focus {
+    outline: none;
+}
+
+#map-panel-title:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+#map-panel-actions {
+    padding: 0 14px 10px;
+    border-bottom: 1px solid var(--border);
+}
+
+#map-panel-grid {
+    width: 100%;
+}
+
+#map-panel-grid.is-disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+#map-panel-note {
+    margin: 6px 0 0;
+    font-size: 12px;
     color: var(--text-muted);
-    border: none;
-    cursor: pointer;
-    font-size: 16px;
-    line-height: 1;
+    white-space: normal;
 }
 
 #map-panel-list {
-    flex: 1;
+    flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
-    padding: 8px;
+    margin: 0;
+    padding: 10px;
+    list-style: none;
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
     grid-auto-rows: min-content;
     gap: 8px;
 }
@@ -281,12 +407,21 @@ body.map-page {
 .map-panel-item {
     display: flex;
     flex-direction: column;
-    gap: 4px;
     color: inherit;
     text-decoration: none;
     background: var(--surface-2);
     border-radius: 6px;
     overflow: hidden;
+    height: 100%;
+}
+
+.map-panel-item:hover {
+    background: var(--surface-3);
+}
+
+.map-panel-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
 }
 
 .map-panel-item img {
@@ -294,13 +429,68 @@ body.map-page {
     aspect-ratio: 1 / 1;
     object-fit: cover;
     display: block;
+    background: var(--tile);
 }
 
-.map-panel-item span {
+.map-panel-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 5px 7px 7px;
+    min-width: 0;
+}
+
+.map-panel-name {
     font-size: 12px;
-    padding: 0 6px 6px;
+    line-height: 1.3;
+    color: var(--text);
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow-wrap: anywhere;
+}
+
+.map-panel-date {
+    font-size: 11px;
     color: var(--text-muted);
-    word-break: break-all;
+}
+
+#map-panel-more {
+    margin: 0 10px 10px;
+}
+
+@media (max-width: 600px) {
+    #map-panel {
+        top: auto;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: auto;
+        max-width: none;
+        height: 58%;
+        border-radius: 12px 12px 0 0;
+        border-bottom: none;
+    }
+
+    #map-panel-list {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+        padding: 8px;
+    }
+
+    .map-panel-name {
+        font-size: 11px;
+    }
+
+    /* The list covers the foot of the map: the zoom buttons stay above it. */
+    body.map-panel-open #map-zoom {
+        top: 8px;
+    }
+
+    body.map-panel-open #map-note {
+        display: none;
+    }
 }
 
 /* Text helpers shared by the pages */
@@ -2950,6 +3140,21 @@ body.no-pictures #search-layout {
 
     body.search-page #shell-header nav a,
     body.detail-page #shell-header nav a {
+        padding: 5px 8px;
+    }
+
+    /* The map page too: the map gets the height. */
+    body.map-page #shell-header {
+        min-height: 0;
+        padding: 8px 12px 6px;
+        gap: 6px 10px;
+    }
+
+    body.map-page .shell-title {
+        display: none;
+    }
+
+    body.map-page #shell-header nav a {
         padding: 5px 8px;
     }
 
