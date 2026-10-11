@@ -12,7 +12,9 @@ and Insta360 `.insp` photos. RAW files (`.dng`, `.arw`, ...) are not indexed.
 equirectangular, or from a known 360 camera) and unstitched Insta360 frames
 holding two fisheye circles. The latter are stitched into a panorama for the
 preview (and for the LLM), and thumbnails show a normal-looking view of the
-front of the scene.
+front of the scene. Each 360-degree photo larger than its 2048 px preview
+also gets a panorama up to 4096 px wide (made from the full-size original)
+so the 360 view stays sharp.
 
 ## Where files are stored
 
@@ -197,10 +199,90 @@ private.
     python serve.py
 
 This starts a local web server. Open the printed address in a browser. The
-search page shows a grid of thumbnails that filters as you type. Click a
-thumbnail to open its detail page with the full description, metadata, and
-EXIF data; click the image there to view it at full size. With several
-libraries you can search all of them or pick one.
+search page shows a grid of thumbnails that filters as you type, best
+matches first (newest first when there is nothing to look for), with the
+months labelled when sorted by date (months of a few pictures share a row).
+The grid keeps growing as you scroll; there is no limit on the number of
+results. With several libraries you can search all of them or pick one in
+the page header or the filters.
+
+- **Filters** (the sidebar; on a phone a drawer, which also holds the sort
+  order and the other view settings) count the matching pictures by
+  library, type, people, setting, time of day, event, year (and month),
+  camera, tags, subjects, animals, food, vehicles and colors.
+  Values of one filter are alternatives, different filters must all match;
+  the chosen ones show above the results with a button to remove each.
+  "Hide blurry and accidental shots" and "Hide sensitive pictures" (on by
+  default: explicit and graphic pictures) are there too.
+- **Group similar** shows near-duplicates (and exact copies) as one stack
+  with a "x3" badge; click the badge to see them all. The stack shows its
+  best picture: the best looking and sharpest, then the largest, then an
+  original (with a camera name and the earliest date) rather than a copy.
+  Pictures whose camera (or file name) dates them are only stacked when
+  they were taken the same day (or within 12 hours across midnight), and
+  then rather with each other than with a look-alike dated only by its
+  file; pictures dated only by their file need a closer match. Shots of a
+  burst or an exposure bracket (taken within two seconds) may differ a
+  little more. Documents and screenshots are only stacked with exact
+  copies, as different pages look alike to the comparison.
+- **The viewer** opens when you click a thumbnail: the picture at screen
+  size, arrow keys (or swiping) for the next and previous result, zoom with
+  the wheel, a pinch or a double click, and the information pane (`i`):
+  date, camera settings, the description and text in the picture with your
+  search words marked, clickable tags and other facts (each starts a search),
+  quality, and "More like this". 360-degree photos can be looked around in
+  by dragging (the flat panorama when the browser cannot show that).
+  "Details page" opens the same on a page of its own, to link to.
+- **The address** holds the search, the filters, the sort order and the open
+  picture, so links, reloads and the Back button bring the same view back.
+- **Keyboard**: `/` jumps to the search box, `Esc` clears it or closes the
+  viewer, arrow keys move between thumbnails and `Enter` opens one.
+- **On this computer** (the Manage capability) the viewer can also copy the
+  picture's file path, show it in the file manager, describe it again, and
+  hide it. Hidden pictures no longer show in searches and are never
+  exported; "Show hidden pictures" in the sidebar brings them back to unhide
+  them. **Select** chooses many pictures at once (Shift-click for a range,
+  or "Select all") to hide, unhide or copy their file paths.
+- The **Map** shows the located pictures of the current search.
+- While some pictures are not described yet, a note above the results says
+  how many: they can only be found by file name, date and camera until then.
+- When nothing matches, the page says what left the pictures out (a filter,
+  "Hide sensitive pictures", the library) with a button to change it, or
+  suggests a spelling.
+
+### Search syntax
+
+Type words to find the pictures that have all of them: in the title,
+description, tags, subjects, the text in the picture and the other fields.
+Capitals, accents and plurals do not matter (`cafe` finds "Café", `cats`
+finds "cat"). While you are still typing, the last word also finds longer
+words that start with it (`sunse` finds "sunset"); after `Enter`, and in
+links, only whole words count. Small words such as "the" and "of", and
+filler such as "my", "show me" or "pictures of", are skipped
+(`pictures of my dog` searches for `dog`). A word in the title counts more
+than a word in the description, a year (`receipt 2019`) prefers pictures
+taken that year, and pictures that contain your words in the same order
+come first.
+
+- `"red car"` - the words together, in this order
+- `beach -dog` - leave out pictures with a word (or `-"a phrase"`)
+- `cat OR dog` (or `cat or dog`) - either word
+- `tag:beach` - a word in one field: `tag`, `subject`, `title`, `text` (the
+  text in the picture), `description`, `scene`, `animal`, `food`,
+  `vehicle`, `color`, `camera`, `folder`, `file`
+- `type:screenshot` - a kind of picture: `photo`, `screenshot`, `document`,
+  `scan`, `artwork`, `receipt`, `chat`, `whiteboard`, `menu`, `ticket`, ...
+- `people:none` - how many people: `none`, `1`, `2`, `3-5`, `6-10`,
+  `crowd` or `any`; `beach no people` works too, and the word `people`
+  finds every picture with people in it
+- `year:2019`, `year:2015-2019` - taken in those years
+- `before:2019-06`, `after:2019` - taken before June 2019, or from 2020 on
+  (`YYYY`, `YYYY-MM` or `YYYY-MM-DD`)
+- `has:text`, `has:gps` - with text in the picture, with a GPS position
+  (also `has:people`, `has:animals`)
+- `is:360`, `is:duplicate`, `is:undescribed` - 360-degree photos, pictures
+  with near-duplicates, pictures not described yet
+- `lib:name` - only the pictures of one library
 
 ## Managing libraries in the browser
 
@@ -274,10 +356,16 @@ small change only rewrites the files that changed.
 - `describe.py`, `prompts.py` - the describe step and the prompt it sends
 - `compare_models.py` - compare how endpoints describe the same images
 - `serve.py` - search server and static site packager
+- `search_index.py` - the compact search records the search page downloads
+  and searches in the browser, and the groups of near-duplicate pictures
 - `admin.py`, `library_ops.py` - the Manage and Settings pages' server side
   (library changes, folder checks, jobs, endpoints)
 - `static/`, `templates/` - the web pages (`shell.js` is the header shared
-  by every page; `manage.js` and `settings.js` run Manage and Settings)
+  by every page; `site.js` is where the pages get their data, from the
+  server or from a static export; `search-core.js` is the search engine and
+  `viewer.js` the picture viewer, both shared with a static export;
+  `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
+  `manage.js` and `settings.js` run Manage and Settings)
 - `progress.py` - show how many images are described per library, how many
   have descriptions from an older prompt, and which failed
 - `world_map.py` - render a world map with a pin for each GPS-tagged area
@@ -287,12 +375,16 @@ small change only rewrites the files that changed.
   `llm.py` - shared helpers (settings, database, thumbnails and previews,
   job control, image reading, EXIF facts, LLM calls)
 - `SETTINGS.md` - reference for every field in `config.json`
-- `data/` - database, thumbnails, previews and the default static site
-  export (`data/exports/site/`)
+- `data/` - database, thumbnails, previews, the default static site
+  export (`data/exports/site/`) and cached near-duplicate groups
+  (`data/cache/`, rebuilt when missing)
 
 ## Tests
 
     python -m unittest discover -s tests
+
+The page scripts' own tests (`tests/js/`) run as part of this when Node.js
+is installed, and are skipped when it is not.
 
 `tests/test_repo_hygiene.py` checks that nothing personal (absolute paths,
 host names, model files) is about to be committed. To add your own private

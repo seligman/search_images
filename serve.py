@@ -8,6 +8,7 @@ data entirely in the browser.
 
 import argparse
 import base64
+import contextlib
 import fnmatch
 import hashlib
 import io
@@ -28,12 +29,14 @@ import db
 import imageinfo
 import jobs
 import prompts
+import search_index
 import world_map
 
 TEMPLATE_DIR = os.path.join(common.BASE_DIR, "templates")
 STATIC_DIR = os.path.join(common.BASE_DIR, "static")
 FALLBACK_BASEMAP = os.path.join(STATIC_DIR, "worldmap.jpg")
-ASSET_FILES = ("style.css", "site.js", "shell.js", "app.js", "detail.js", "map.js")
+ASSET_FILES = ("style.css", "site.js", "shell.js", "search-core.js", "viewer.js", "app.js",
+               "detail.js", "map.js")
 TILE_SIZE = 256
 # Without a tile pyramid the bundled basemap is sliced into zoom 0..3.
 FALLBACK_MAX_ZOOM = 3
@@ -238,11 +241,6 @@ def projection_of(row):
     return projection if projection in imageinfo.PROJECTIONS_360 else ""
 
 
-def index_flags(row):
-    """Extra keys of a row's /api/index record: {"p": "360"} for a 360 photo."""
-    return {"p": "360"} if projection_of(row) else {}
-
-
 def detail_record(row, library_name):
     """Build the full metadata record used by the detail page."""
     exif = load_json(row["exif"], {})
@@ -264,6 +262,7 @@ def detail_record(row, library_name):
         "camera": row["camera"],
         "lat": finite(row["lat"]),
         "lon": finite(row["lon"]),
+        "hidden": bool(row["hidden"]),
         "info": load_json(row["info"], None),
         "exif": exif if isinstance(exif, dict) else {},
         "provenance": provenance_record(row["provenance"]),
@@ -404,16 +403,34 @@ class ServerState:
 
     The config is re-read when config.json changes, so library renames and
     enable/disable show up without a restart. The thumbnail store keeps one
-    connection that all request threads share.
+    connection that all request threads share. index answers /api/index
+    (search_index.IndexService).
     """
 
     def __init__(self, helper=None):
         self.helper = helper
         self.previews = cache.PreviewStore()
+        self.index = search_index.IndexService()
         self._lock = threading.Lock()
         self._config = None
         self._config_key = None
         self._thumbs = None
+        self._pano_locks = {}       # image id -> [lock, users]
+
+    @contextlib.contextmanager
+    def pano_lock(self, image_id):
+        """Held while making the pano of one image, so two requests do not both make it."""
+        with self._lock:
+            entry = self._pano_locks.setdefault(image_id, [threading.Lock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._lock:
+                entry[1] -= 1
+                if not entry[1]:
+                    self._pano_locks.pop(image_id, None)
 
     def config(self):
         try:
@@ -441,6 +458,7 @@ class ServerState:
             return self._thumbs
 
     def close(self):
+        self.index.close()
         with self._lock:
             if self._thumbs is not None:
                 self._thumbs.close()
@@ -544,11 +562,15 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         private_cache(response)
         return response.make_conditional(request)
 
+    def is_admin():
+        return admin.admin_allowed(request, admin_enabled)
+
     def visible_row(image_id, columns):
         """The row (columns plus library_id) if the image may be shown, else None.
 
-        Missing and hidden images, and those of disabled or unknown
-        libraries, are treated as if they did not exist.
+        Missing images, and those of disabled or unknown libraries, are
+        treated as if they did not exist; so are hidden images, except for
+        the admin (who must see them to unhide them).
         """
         if image_id > MAX_IMAGE_ID:
             return None
@@ -556,8 +578,8 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         if columns != "*":
             columns = "library_id, " + columns
         row = get_conn().execute(
-            "SELECT %s FROM images WHERE id = ? "
-            "AND missing_since IS NULL AND hidden = 0" % columns,
+            "SELECT %s FROM images WHERE id = ? AND missing_since IS NULL%s"
+            % (columns, "" if is_admin() else " AND hidden = 0"),
             (image_id,)).fetchone()
         if row is None or row["library_id"] not in names:
             return None
@@ -572,14 +594,14 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         return full, stat
 
     def page(name):
-        capabilities = {"admin": admin.admin_allowed(request, admin_enabled)}
+        capabilities = {"admin": is_admin()}
         return render_template_file(name, "server", "/static/", None,
                                     tiles_max=tiles_max_zoom(),
                                     libraries=visible_libraries(state.config()),
                                     capabilities=capabilities)
 
     def admin_page(name):
-        if not admin.admin_allowed(request, admin_enabled):
+        if not is_admin():
             return Response("Manage and Settings only work on this computer, when the "
                             "server listens on localhost.", status=403, mimetype="text/plain")
         # The query string opens dialogs (?dialog=...). A link on another
@@ -637,18 +659,19 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
 
     @app.route("/api/index")
     def api_index():
-        names = visible_libraries(state.config())
-        rows = query_visible(get_conn(), names,
-                             "id, library_id, name, path, info, dhash, taken_at, projection",
-                             order_by="name")
-        return jsonify([{"id": r["id"], "name": r["name"],
-                         "library": names[r["library_id"]],
-                         **index_flags(r),
-                         "text": search_text(r["name"], r["path"],
-                                             load_json(r["info"]), r["taken_at"],
-                                             projection_of(r)),
-                         "dhash": r["dhash"]}
-                        for r in rows])
+        # ?lib=<library id> or all (the default): see search_index for the records.
+        config = state.config()
+        names = visible_libraries(config)
+        wanted = request.args.get("lib", "all")
+        if wanted not in ("", "all"):
+            if wanted not in names:
+                return jsonify({"error": "There is no enabled library with that id."}), 404
+            names = {wanted: names[wanted]}
+        status, body, headers = state.index.respond(
+            get_conn(), config, names, include_hidden=is_admin(),
+            accept_gzip=request.accept_encodings.quality("gzip") > 0,
+            etag_matches=request.if_none_match.contains_weak)
+        return Response(body, status=status, headers=headers, mimetype="application/json")
 
     @app.route("/api/image/<int:image_id>")
     def api_image(image_id):
@@ -701,6 +724,71 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         if not data:
             return not_found()
         return send_bytes(data, imageinfo.sniff_mime(data) or "image/jpeg", etag)
+
+    @app.route("/pano/<int:image_id>")
+    def pano(image_id):
+        # The large panorama of a 360 photo (cache.PreviewStore), for the
+        # 360 view; 404 for any other picture, and for a 360 photo not
+        # larger than its preview (which is then the whole picture).
+        row = visible_row(image_id, "id, path, name, width, height, has_preview, projection")
+        if row is None or row["projection"] not in imageinfo.PROJECTIONS_360:
+            return not_found()
+        images = _images()
+        if images is not None and not images.has_pano(row["width"], row["height"]):
+            return not_found()
+        # A pano on disk is trusted like the preview it belongs to: the
+        # scanner writes (or removes) it whenever it writes the preview.
+        path = None
+        if row["has_preview"] == 1:
+            try:
+                path = state.previews.pano_path_for(row["library_id"], row["id"])
+            except ValueError:
+                path = None
+        if path and os.path.isfile(path):
+            return private_cache(send_file(path, mimetype="image/jpeg", max_age=CACHE_SECONDS))
+        # Not made yet (a row scanned before panos existed): make it from
+        # the original now, and keep it when previews are kept.
+        full, stat = original_path(row)
+        if full is None:
+            return not_found()
+        etag = _source_etag("pano", row["id"], stat)
+        if request.if_none_match.contains(etag):
+            return not_modified(etag)
+        if images is None:
+            return not_found()
+        with state.pano_lock(row["id"]):
+            if path and os.path.isfile(path):
+                # Another request made it meanwhile.
+                return private_cache(send_file(path, mimetype="image/jpeg",
+                                               max_age=CACHE_SECONDS))
+            try:
+                result = images.read_image(full, state.helper, want_preview=False,
+                                           want_pano=True, mtime=stat.st_mtime)
+            except images.ImageReadError as error:
+                print("Could not make the 360-degree panorama of image %d: %s"
+                      % (row["id"], error))
+                return not_found()
+            data = result.get("pano")
+            if not data:
+                return not_found()
+            library = common.get_library(state.config(), row["library_id"]) or {}
+            if path and library.get("previews", True):
+                # Kept only while the library keeps previews (a preview made
+                # before they were turned off stays, but nothing new is
+                # stored), and while the index still describes this content,
+                # so an original changed since the last scan leaves nothing
+                # behind.
+                current = get_conn().execute(
+                    "SELECT content_hash, has_preview FROM images WHERE id = ?",
+                    (row["id"],)).fetchone()
+                if (current is not None and current["has_preview"] == 1
+                        and current["content_hash"] == result["content_hash"]):
+                    try:
+                        state.previews.write_pano(row["library_id"], row["id"], data)
+                    except OSError as error:
+                        print("Could not save the 360-degree panorama of image %d: %s"
+                              % (row["id"], error))
+        return send_bytes(data, "image/jpeg", etag)
 
     @app.route("/image/<int:image_id>")
     def image(image_id):

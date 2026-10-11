@@ -1270,9 +1270,8 @@ def insta360_exif(name="IMG_20190514_142301_00_001.insp"):
     return exif
 
 
-def dual_fisheye_jpeg(exif=None):
-    frame = imagegen.dual_fisheye_image((1024, 512),
-                                        offsets=images.INSTA360_PARAMS["offsets"])
+def dual_fisheye_jpeg(exif=None, size=(1024, 512)):
+    frame = imagegen.dual_fisheye_image(size, offsets=images.INSTA360_PARAMS["offsets"])
     return imagegen.jpeg_bytes(frame, exif)
 
 
@@ -1323,6 +1322,128 @@ class PanoramaScanTest(ScanTestCase):
         self.assertEqual(self.thumb_size(rows["wide.jpg"]["id"]), (320, 160))
         self.scan()
         self.assertEqual(self.reads, [])
+
+    def panos(self):
+        """{image id: pano size} of the library's pano files."""
+        store = cache.PreviewStore()
+        found = {}
+        for image_id in store.stored_ids(self.LIBRARY)[1]:
+            with Image.open(io.BytesIO(store.read_pano(self.LIBRARY, image_id))) as image:
+                found[image_id] = image.size
+        return found
+
+    def write_360_set(self, size=(2400, 1200)):
+        """Two 360 photos (larger than a preview by default) and a wide photo."""
+        self.write("IMG_20190514_142301_00_001.insp", dual_fisheye_jpeg(insta360_exif(), size))
+        self.write("pano.jpg", imagegen.jpeg_with_xmp(imagegen.equirect_image(size),
+                                                      imagegen.gpano_xmp()))
+        self.write("wide.jpg", imagegen.jpeg_bytes(imagegen.equirect_image((800, 400))))
+
+    def test_360_photos_get_a_pano_next_to_their_preview(self):
+        self.write_360_set()
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        rows = self.rows()
+        self.assertEqual(self.panos(),
+                         {rows["IMG_20190514_142301_00_001.insp"]["id"]: (2400, 1200),
+                          rows["pano.jpg"]["id"]: (2400, 1200)})
+        self.assertEqual(self.preview_size(rows["pano.jpg"]["id"]), (2048, 1024))
+        self.assertEqual(cache.PreviewStore().stored_ids(self.LIBRARY)[0],
+                         {row["id"] for row in rows.values()})
+        self.scan()
+        self.assertEqual(self.reads, [])
+
+    def test_360_photos_no_larger_than_a_preview_need_no_pano(self):
+        # Their preview is already all of them; the backfill does not ask
+        # for a pano either.
+        self.write_360_set(size=(1024, 512))
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        rows = self.rows()
+        self.assertEqual(rows["IMG_20190514_142301_00_001.insp"]["projection"], "dual_fisheye")
+        self.assertEqual(rows["pano.jpg"]["projection"], "equirectangular")
+        self.assertEqual(self.panos(), {})
+        self.assertEqual(self.scan()["backfill"]["needed"], 0)
+        self.assertEqual(self.reads, [])
+
+    def test_no_panos_without_previews(self):
+        self.write_360_set()
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY,
+                                        previews=False)])
+        self.scan()
+        self.assertEqual(self.panos(), {})
+        self.assertEqual(self.scan()["backfill"]["needed"], 0)
+
+    def test_previews_turned_off_later_do_not_ask_for_panos(self):
+        self.write_360_set()
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        for image_id in self.panos():
+            cache.PreviewStore().delete_pano(self.LIBRARY, image_id)
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY,
+                                        previews=False)])
+        self.assertEqual(self.scan()["backfill"]["needed"], 0)
+        self.assertEqual(self.reads, [])
+
+    def test_panos_follow_their_pictures(self):
+        self.write_360_set()
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        rows = self.rows()
+        insp_id = rows["IMG_20190514_142301_00_001.insp"]["id"]
+        pano_id = rows["pano.jpg"]["id"]
+        # New content at the same path that is no 360 photo: no pano.
+        path = self.write("pano.jpg", imagegen.jpeg_bytes(imagegen.equirect_image((800, 400))))
+        os.utime(path, (time.time() + 5, time.time() + 5))
+        summary = self.scan()
+        self.assertEqual(summary["changed"], 1)
+        self.assertEqual(self.rows()["pano.jpg"]["projection"], "")
+        self.assertEqual(set(self.panos()), {insp_id})
+        self.assertTrue(cache.PreviewStore().exists(self.LIBRARY, pano_id))
+        # A purged picture takes its pano along.
+        os.remove(os.path.join(self.folder, "IMG_20190514_142301_00_001.insp"))
+        self.scan()
+        self.assertEqual(set(self.panos()), {insp_id})
+        self.scan(now=time.time() + 31 * DAY)
+        self.assertNotIn("IMG_20190514_142301_00_001.insp", self.rows())
+        self.assertEqual(self.panos(), {})
+        self.assertFalse(cache.PreviewStore().exists(self.LIBRARY, insp_id))
+
+    def test_backfill_makes_missing_panos(self):
+        self.write_360_set()
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        rows = self.rows()
+        store = cache.PreviewStore()
+        # Previews made before panos existed.
+        for image_id in self.panos():
+            store.delete_pano(self.LIBRARY, image_id)
+        summary = self.scan()
+        self.assertEqual(sorted(os.path.basename(path) for path in self.reads),
+                         ["IMG_20190514_142301_00_001.insp", "pano.jpg"])
+        self.assertEqual(summary["backfill"]["panos"], 2)
+        self.assertEqual(set(self.panos()), {rows["IMG_20190514_142301_00_001.insp"]["id"],
+                                             rows["pano.jpg"]["id"]})
+        self.assertIn("(2 with a large panorama for the 360 view)", self.log_text())
+        self.scan()
+        self.assertEqual(self.reads, [])
+
+    def test_a_pano_that_cannot_be_written_is_not_left_behind(self):
+        self.write_360_set()
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        pano_id = self.rows()["pano.jpg"]["id"]
+        path = self.write("pano.jpg", imagegen.jpeg_with_xmp(
+            imagegen.equirect_image((2400, 1200), marker=True), imagegen.gpano_xmp()))
+        os.utime(path, (time.time() + 5, time.time() + 5))
+        with mock.patch.object(cache.PreviewStore, "write_pano",
+                               side_effect=OSError("disk full")):
+            self.scan()
+        self.assertNotIn(pano_id, self.panos())
+        self.assertTrue(cache.PreviewStore().exists(self.LIBRARY, pano_id))
+        self.assertEqual(self.rows()["pano.jpg"]["has_preview"], 1)
+        self.assertIn("Could not save the 360-degree panorama of pano.jpg: disk full",
+                      self.log_text())
 
     def build_v1_database(self, files):
         """index.db and thumbs.db as version 1 left them, one row per file."""

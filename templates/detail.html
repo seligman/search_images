@@ -4,16 +4,26 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Image Details</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="__ASSET_PREFIX__style.css">
 </head>
-<body>
+<body class="detail-page">
 <div id="detail">
-<a id="back" href="#">Back to search</a>
-<div id="detail-body"></div>
+<div id="detail-top">
+<a id="back" class="button" href="#">Back to search</a>
+</div>
+<div id="detail-message" class="notice" hidden></div>
+<div id="detail-stage-wrap">
+<div id="detail-stage"></div>
+<div id="detail-tools"></div>
+</div>
+<aside id="detail-info" aria-label="Information"></aside>
 </div>
 <script type="application/json" id="app-config">__APP_CONFIG__</script>
 <script src="__ASSET_PREFIX__site.js"></script>
 <script src="__ASSET_PREFIX__shell.js"></script>
+<script src="__ASSET_PREFIX__search-core.js"></script>
+<script src="__ASSET_PREFIX__viewer.js"></script>
 <script src="__ASSET_PREFIX__detail.js"></script>
 </body>
 </html>

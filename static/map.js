@@ -277,9 +277,8 @@
         drawClusters(lastClusters);
         if (statusBar) {
             statusBar.textContent = locations.length
-                ? locations.length + " geotagged image"
-                    + (locations.length === 1 ? "" : "s")
-                    + " | zoom " + state.zoom
+                ? locations.length.toLocaleString() + " picture"
+                    + (locations.length === 1 ? "" : "s") + " with a location"
                 : emptyText;
         }
     }
@@ -357,23 +356,25 @@
 
     function openPanel(cluster) {
         panel.hidden = false;
-        panelTitle.textContent = cluster.ids.length + " image"
+        panelTitle.textContent = cluster.ids.length + " picture"
             + (cluster.ids.length === 1 ? "" : "s");
-        panelList.innerHTML = "";
+        while (panelList.firstChild) {
+            panelList.removeChild(panelList.firstChild);
+        }
         cluster.ids.forEach(function (id) {
             var rec = indexById[id];
             if (!rec) {
                 return;
             }
             var link = document.createElement("a");
-            link.href = SITE.detailUrl(id);
+            link.href = SITE.detailUrl(id, searchLinkState());
             link.className = "map-panel-item";
             var img = document.createElement("img");
             img.loading = "lazy";
             img.src = SITE.thumbUrl(rec);
-            img.alt = rec.name;
+            img.alt = "";
             var label = document.createElement("span");
-            label.textContent = rec.name;
+            label.textContent = rec.t || rec.n || "Picture";
             link.appendChild(img);
             link.appendChild(label);
             panelList.appendChild(link);
@@ -551,42 +552,106 @@
     });
     document.getElementById("map-panel-close").addEventListener(
         "click", closePanel);
-    document.getElementById("map-back").addEventListener(
-        "click", function (event) {
-            event.preventDefault();
-            window.location.href = SITE.homeUrl();
+    /* ---------- Following the search ------------------------------------ */
+
+    // The search of the search page (q, filters, ... in the address): only
+    // the located pictures that match it are pinned.
+    var search = SITE.searchState.read();
+    var adminOn = Boolean(SITE.capabilities.admin) && !SITE.capabilities.static;
+    var searchIndex = null;
+    var indexLibraries = [];
+    var loadFailed = false;
+
+    function searchLinkState() {
+        var state = SITE.searchState.read();
+        state.lib = window.SHELL ? SHELL.library() : state.lib;
+        state.size = "";
+        return state;
+    }
+
+    // "beach - Type: Photos - Year: 2019": what the search asks for, in words.
+    function searchSummary() {
+        var parts = [];
+        if (search.q) {
+            parts.push("\u201c" + search.q + "\u201d");
+        }
+        var labels = {};
+        SearchCore.FACETS.forEach(function (facet) {
+            labels[facet.key] = facet.label;
         });
+        Object.keys(search.filters).forEach(function (group) {
+            search.filters[group].forEach(function (value) {
+                var label = group === "library" ? value : SearchCore.facetLabel(group, value);
+                indexLibraries.forEach(function (library) {
+                    if (group === "library" && library.id === value) {
+                        label = library.name;
+                    }
+                });
+                parts.push((labels[group] || group) + ": " + label);
+            });
+        });
+        return parts.join(" \u00b7 ");
+    }
 
-    /* ---------- Initial data load -------------------------------------- */
-
-    // Only the pins of the library picked in the page header (shell.js).
-    function applyLibrary() {
-        var library = window.SHELL ? SHELL.libraryName() : "";
-        locations = !library ? allLocations : allLocations.filter(function (loc) {
-            var rec = indexById[loc.id];
-            return rec && rec.library === library;
+    function applySearch() {
+        var library = window.SHELL ? SHELL.library() : "";
+        var matching = null;
+        if (searchIndex) {
+            var found = SearchCore.search(searchIndex, search.q, {
+                library: library || "", libraries: indexLibraries, filters: search.filters,
+                hidden: adminOn && search.hidden, sensitive: search.sensitive || undefined,
+                junk: search.junk, group: false, sort: "newest"
+            });
+            matching = {};
+            found.items.forEach(function (id) {
+                matching[id] = true;
+            });
+        }
+        locations = allLocations.filter(function (loc) {
+            return matching ? matching[loc.id] === true : true;
         });
         closePanel();
-        emptyText = library ? "No geotagged images found in this library."
-            : "No geotagged images found in the library.";
+        var summary = searchSummary();
+        document.getElementById("map-search").textContent = summary ? "Showing: " + summary : "";
+        document.getElementById("map-back").href = SITE.searchUrl(searchLinkState());
+        var searchLink = window.SHELL && SHELL.navLink ? SHELL.navLink("search") : null;
+        if (searchLink) {
+            searchLink.href = SITE.searchUrl(searchLinkState());
+        }
+        if (loadFailed) {
+            emptyText = "The pictures could not be loaded. Is the server still running?";
+        } else if (summary || library) {
+            emptyText = "None of the pictures that match have a location.";
+        } else {
+            emptyText = "No pictures with a location yet.";
+        }
         scheduleDraw();
     }
+
+    /* ---------- Initial data load -------------------------------------- */
 
     function init() {
         resize();
         window.addEventListener("resize", resize);
         if (window.SHELL) {
-            SHELL.onLibraryChange(applyLibrary);
+            SHELL.onLibraryChange(applySearch);
         }
-        SITE.loadIndex(function (records) {
-            if (records) {
-                records.forEach(function (rec) {
-                    indexById[rec.id] = rec;
+        SITE.loadIndex(function (data) {
+            if (data) {
+                data.records.forEach(function (rec) {
+                    indexById[rec.i] = rec;
                 });
+                indexLibraries = data.libraries || [];
+                searchIndex = SearchCore.prepare(data.records);
+            } else {
+                loadFailed = true;
             }
             SITE.loadLocations(function (loaded) {
+                if (!loaded) {
+                    loadFailed = true;
+                }
                 allLocations = loaded || [];
-                applyLibrary();
+                applySearch();
             });
         });
     }

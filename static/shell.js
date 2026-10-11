@@ -798,9 +798,55 @@ var SHELL = (function () {
 
     /* ---------- Header --------------------------------------------------- */
 
-    function link(text, href, current) {
+    function link(text, href, name) {
         return el("a", {text: text, href: href,
-                        attrs: {"aria-current": current ? "page" : null}});
+                        attrs: {"aria-current": page === name ? "page" : null, "data-page": name}});
+    }
+
+    // The header link to another page ("search", "map", ...), or null; the
+    // search and map pages point it at the current search.
+    function navLink(name) {
+        var header = document.getElementById("shell-header");
+        return header ? header.querySelector('nav a[data-page="' + name + '"]') : null;
+    }
+
+    /* ---------- Colour theme --------------------------------------------- */
+
+    // "" follows the system (prefers-color-scheme); "light" or "dark" is a
+    // choice kept in localStorage and set as <html data-theme="...">.
+    var THEME_KEY = "searchImages.theme";
+    var THEMES = ["", "light", "dark"];
+    var THEME_LABELS = {"": "Theme: automatic", light: "Theme: light", dark: "Theme: dark"};
+
+    function currentTheme() {
+        var theme = storageGet(THEME_KEY) || "";
+        return THEMES.indexOf(theme) >= 0 ? theme : "";
+    }
+
+    function applyTheme(theme) {
+        if (theme) {
+            document.documentElement.setAttribute("data-theme", theme);
+        } else {
+            document.documentElement.removeAttribute("data-theme");
+        }
+    }
+
+    function themeButton() {
+        var button = el("button", {type: "button", id: "shell-theme", className: "shell-theme"});
+        function show() {
+            var theme = currentTheme();
+            button.setAttribute("data-theme-choice", theme || "auto");
+            button.title = THEME_LABELS[theme] + " (click to change)";
+            button.setAttribute("aria-label", THEME_LABELS[theme]);
+        }
+        button.addEventListener("click", function () {
+            var next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
+            storageSet(THEME_KEY, next);
+            applyTheme(next);
+            show();
+        });
+        show();
+        return button;
     }
 
     function buildHeader() {
@@ -811,13 +857,14 @@ var SHELL = (function () {
         var home = site.homeUrl ? site.homeUrl() : "/";
         header.appendChild(el("a", {className: "shell-title", href: home, text: "Image Search"}));
         var nav = el("nav", {attrs: {"aria-label": "Pages"}});
-        nav.appendChild(link("Search", home, page === "search"));
-        if (site.mapUrl) {
-            nav.appendChild(link("Map", site.mapUrl(), page === "map"));
+        nav.appendChild(link("Search", home, "search"));
+        var mapHref = site.mapUrl ? site.mapUrl() : null;
+        if (mapHref) {
+            nav.appendChild(link("Map", mapHref, "map"));
         }
         if (adminOn) {
-            nav.appendChild(link("Manage", "/manage", page === "manage"));
-            nav.appendChild(link("Settings", "/settings", page === "settings"));
+            nav.appendChild(link("Manage", "/manage", "manage"));
+            nav.appendChild(link("Settings", "/settings", "settings"));
         }
         header.appendChild(nav);
         header.appendChild(el("span", {className: "shell-spacer"}));
@@ -832,8 +879,12 @@ var SHELL = (function () {
         if (switcher) {
             header.appendChild(switcher);
         }
+        header.appendChild(themeButton());
         document.body.insertBefore(header, document.body.firstChild);
     }
+
+    // As early as possible, so the page is not drawn in the other theme first.
+    applyTheme(currentTheme());
 
     function start() {
         currentLibrary = initialLibrary();
@@ -884,6 +935,15 @@ var SHELL = (function () {
         onLibraryChange: function (handler) {
             libraryHandlers.push(handler);
         },
+        // Pick a library as if the switcher had been used ("" = all).
+        setLibrary: function (key) {
+            var select = document.getElementById("shell-library");
+            if (select) {
+                select.value = findLibrary(key) ? key : "";
+            }
+            setLibrary(key, false);
+        },
+        navLink: navLink,
         configToken: function () {
             return configToken;
         },

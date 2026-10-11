@@ -4,6 +4,7 @@ The database is filled directly through db/cache (no scanning), inside a
 temporary SETTINGS_BASE.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -34,6 +35,8 @@ else:
 
 XSS_NAME = "</script><script>alert(1)</script>"
 NOW = 1700000000.0
+# A request from another computer: no admin rights, so no hidden pictures.
+REMOTE = {"REMOTE_ADDR": "192.0.2.5"}
 
 
 def quiet(*_args, **_kwargs):
@@ -133,44 +136,54 @@ class ServerTest(ServerFixture, unittest.TestCase):
         response = self.client.get(url)
         return response, strict_json(response.get_data(as_text=True))
 
-    def test_index_lists_only_present_visible_images(self):
-        response, records = self.get_json("/api/index")
+    def index_records(self, url="/api/index", **kwargs):
+        response = self.client.get(url, **kwargs)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(sorted(r["id"] for r in records), sorted([self.visible, self.xss]))
-        record = [r for r in records if r["id"] == self.visible][0]
-        self.assertEqual(set(record), {"id", "name", "library", "text", "dhash"})
-        self.assertEqual(record["library"], "Family")
-        self.assertEqual(record["name"], "beach.jpg")
-        self.assertEqual(record["dhash"], "0884422110884422")
-        text = record["text"]
-        self.assertEqual(text, text.lower())
-        for word in ("beach.jpg", "holidays/beach.jpg", "a sunny beach", "dog", "sand", "sea", "blue"):
-            self.assertIn(word, text)
-        self.assertNotIn("test-model", text)
-        xss = [r for r in records if r["id"] == self.xss][0]
-        self.assertEqual(xss["library"], XSS_NAME)
+        payload = strict_json(response.get_data(as_text=True))
+        return payload, {record["i"]: record for record in payload["records"]}
 
-    def test_index_text_covers_version_5_descriptions(self):
+    def test_index_lists_only_present_visible_images(self):
+        payload, records = self.index_records(environ_base=REMOTE)
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["libraries"], [{"id": "lib_family1", "name": "Family"},
+                                                {"id": "lib_xss0001", "name": XSS_NAME}])
+        self.assertEqual(sorted(records), sorted([self.visible, self.xss]))
+        record = records[self.visible]
+        self.assertEqual(record["l"], "lib_family1")
+        self.assertEqual(record["n"], "beach.jpg")
+        self.assertEqual(record["f"], "holidays")
+        self.assertEqual(record["d"], "A Sunny Beach")
+        self.assertEqual(record["s"], ["Dog"])
+        self.assertEqual(record["g"], ["sand", "sea"])
+        self.assertEqual(record["c"], ["blue"])
+        self.assertEqual(record["v4"], 1)
+        self.assertNotIn("test-model", json.dumps(payload))
+        self.assertEqual(records[self.xss]["l"], "lib_xss0001")
+        # The admin (this computer) also gets hidden pictures, marked, to unhide them.
+        _payload, records = self.index_records()
+        self.assertEqual(sorted(records), sorted([self.visible, self.hidden, self.xss]))
+        self.assertEqual(records[self.hidden]["h"], 1)
+        self.assertNotIn("h", records[self.visible])
+
+    def test_index_records_cover_version_5_descriptions(self):
         info = {"title": "Toddler blowing out birthday candles", "description": "A party.",
                 "photo_type": "photo", "document_type": "none", "setting": "indoor",
                 "scene": "dining room", "time_of_day": "unknown", "event": "birthday",
-                "animals": ["beagle"], "food": ["chocolate cake"], "vehicles": [],
-                "people_descriptors": ["toddler in a party hat"], "tags": ["cake"],
-                "text": "HAPPY BIRTHDAY", "colors": ["yellow"], "_model_name": "test-model"}
+                "people": "3-5", "animals": ["beagle"], "food": ["chocolate cake"],
+                "vehicles": [], "people_descriptors": ["toddler in a party hat"],
+                "tags": ["cake"], "text": "HAPPY BIRTHDAY", "colors": ["yellow"],
+                "_model_name": "test-model"}
         image_id = insert_image(self.conn, "lib_family1", "2021/Party/cake.jpg", described=1,
                                 prompt_ver=5, info=json.dumps(info),
-                                taken_at="2021-03-07T18:00:00")
-        _response, records = self.get_json("/api/index")
-        text = [r["text"] for r in records if r["id"] == image_id][0]
-        for word in ("toddler blowing out birthday candles", "indoor", "dining room",
-                     "birthday", "beagle", "chocolate cake", "toddler in a party hat",
-                     "happy birthday", "photo", "2021", "march", "party", "cake.jpg"):
-            self.assertIn(word, text)
-        for word in ("unknown", "none", "test-model"):
-            self.assertNotIn(word, text)
-        # The older (version 4) row also gets its capture month.
-        older = [r["text"] for r in records if r["id"] == self.visible][0]
-        self.assertIn("2019 may", older)
+                                taken_at="2021-03-07T18:00:00", dhash="")
+        _payload, records = self.index_records()
+        self.assertEqual(records[image_id], {
+            "i": image_id, "l": "lib_family1", "n": "cake.jpg", "f": "2021/Party",
+            "t": "Toddler blowing out birthday candles", "d": "A party.", "o": "HAPPY BIRTHDAY",
+            "sc": "dining room", "a": ["beagle"], "fo": ["chocolate cake"],
+            "pd": ["toddler in a party hat"], "g": ["cake"], "c": ["yellow"], "st": "indoor",
+            "ev": "birthday", "ty": "photo", "pp": "3-5", "dk": "2021-03-07",
+            "ts": "2021-03-07T18:00:00", "w": 64, "hgt": 48, "ds": 1})
 
     def test_api_image_shows_public_provenance_only(self):
         provenance = {"model": "model.gguf", "endpoint": "local", "seconds": 2.5,
@@ -193,9 +206,11 @@ class ServerTest(ServerFixture, unittest.TestCase):
         common.get_library(config, "lib_disabled")["enabled"] = True
         common.get_library(config, "lib_disabled")["name"] = "Renamed"
         common.save_config(config)
-        _response, records = self.get_json("/api/index")
-        by_id = {r["id"]: r["library"] for r in records}
-        self.assertEqual(by_id, {self.disabled: "Renamed", self.xss: XSS_NAME})
+        payload, records = self.index_records()
+        self.assertEqual({image_id: record["l"] for image_id, record in records.items()},
+                         {self.disabled: "lib_disabled", self.xss: "lib_xss0001"})
+        self.assertEqual(payload["libraries"], [{"id": "lib_disabled", "name": "Renamed"},
+                                                {"id": "lib_xss0001", "name": XSS_NAME}])
 
     def test_thumb_has_etag_and_answers_304(self):
         response = self.client.get("/thumb/%d" % self.visible)
@@ -207,8 +222,12 @@ class ServerTest(ServerFixture, unittest.TestCase):
         again = self.client.get("/thumb/%d" % self.visible, headers={"If-None-Match": etag})
         self.assertEqual(again.status_code, 304)
         self.assertEqual(again.data, b"")
-        for image_id in (self.missing, self.hidden, self.disabled, self.orphan, 999):
+        for image_id in (self.missing, self.disabled, self.orphan, 999):
             self.assertEqual(self.client.get("/thumb/%d" % image_id).status_code, 404, image_id)
+        # Hidden pictures are only shown to the admin (on this computer).
+        self.assertEqual(self.client.get("/thumb/%d" % self.hidden,
+                                         environ_base=REMOTE).status_code, 404)
+        self.assertEqual(self.client.get("/thumb/%d" % self.hidden).status_code, 200)
         self.assertEqual(self.client.get("/thumb/%d" % (2 ** 70)).status_code, 404)
 
     def test_preview_serves_the_stored_file(self):
@@ -347,11 +366,18 @@ class ServerTest(ServerFixture, unittest.TestCase):
         self.assertEqual(record["camera"], "Acme One")
         self.assertEqual((record["lat"], record["lon"]), (48.85, 2.35))
         self.assertEqual(record["info"]["tags"], ["Sand", "sea"])
-        for image_id in (self.missing, self.hidden, self.disabled, 999):
+        for image_id in (self.missing, self.disabled, 999):
             self.assertEqual(self.client.get("/api/image/%d" % image_id).status_code, 404)
+        self.assertFalse(record["hidden"])
+        self.assertEqual(self.client.get("/api/image/%d" % self.hidden,
+                                         environ_base=REMOTE).status_code, 404)
+        _response, hidden = self.get_json("/api/image/%d" % self.hidden)
+        self.assertTrue(hidden["hidden"])
 
     def test_app_config_cannot_break_out_of_the_script(self):
-        for url, scripts in (("/", 4), ("/detail", 4), ("/map", 4)):
+        # The page settings block plus the page's scripts (site, shell, the
+        # search engine, the viewer, the page's own).
+        for url, scripts in (("/", 6), ("/detail", 6), ("/map", 5)):
             html = self.client.get(url).get_data(as_text=True)
             self.assertNotIn(XSS_NAME, html)
             self.assertNotIn("<script>alert", html)
@@ -562,7 +588,7 @@ class PanoramaServerTest(PanoramaFixture, unittest.TestCase):
         return strict_json(response.get_data(as_text=True))
 
     def test_index_marks_360_photos(self):
-        records = {r["id"]: r for r in self.get_json("/api/index")}
+        records = {r["i"]: r for r in self.get_json("/api/index")["records"]}
         self.assertEqual(records[self.dual]["p"], "360")
         self.assertEqual(records[self.stitched]["p"], "360")
         for image_id in (self.unchecked, self.visible):
@@ -576,6 +602,130 @@ class PanoramaServerTest(PanoramaFixture, unittest.TestCase):
         # "?" (not checked yet) is not shown as anything.
         self.assertEqual(self.get_json("/api/image/%d" % self.unchecked)["projection"], "")
         self.assertEqual(self.get_json("/api/image/%d" % self.visible)["projection"], "")
+
+
+@unittest.skipIf(flask is None or Image is None, "Flask or Pillow is not installed")
+class PanoRouteTest(PanoramaFixture, unittest.TestCase):
+    """/pano/<id>: the large panorama of a 360 photo for the 360 view."""
+
+    def setUp(self):
+        super().setUp()
+        self.app = serve.build_app(init_db=False)
+        self.app.testing = True
+        self.addCleanup(self.app.extensions["search_images"].close)
+        self.client = self.app.test_client()
+        self.store = cache.PreviewStore()
+        # (Larger than a preview: smaller 360 photos have no pano.)
+        self.pano_bytes = imagegen.jpeg_with_xmp(imagegen.equirect_image((2400, 1200)),
+                                                 imagegen.gpano_xmp())
+        self.write_original("360/pano.jpg", self.pano_bytes)
+        frame = imagegen.dual_fisheye_image((2304, 1152))
+        exif = imagegen.make_exif(make="Arashi Vision", model="Insta360 OneR", offset=None)
+        self.write_original("360/IMG_20190514_142301_00_001.insp",
+                            imagegen.jpeg_bytes(frame, exif))
+        self.hidden_pano = insert_image(self.conn, "lib_family1", "360/secret.jpg", hidden=1,
+                                        width=2400, height=1200, projection="equirectangular")
+        self.write_original("360/secret.jpg", self.pano_bytes)
+
+    def set_row(self, image_id, **values):
+        columns = sorted(values)
+        self.conn.execute("UPDATE images SET %s WHERE id = ?"
+                          % ", ".join("%s = ?" % column for column in columns),
+                          [values[column] for column in columns] + [image_id])
+        self.conn.commit()
+
+    def size_of(self, response):
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "image/jpeg")
+        with Image.open(io.BytesIO(response.data)) as image:
+            return image.size
+
+    def test_only_360_photos_have_one(self):
+        for image_id in (self.visible, self.unchecked, self.missing, self.disabled,
+                         self.orphan, 999999, 2 ** 63):
+            self.assertEqual(self.client.get("/pano/%d" % image_id).status_code, 404, image_id)
+        # Hidden pictures: for the admin only, as everywhere.
+        self.assertEqual(self.client.get("/pano/%d" % self.hidden_pano,
+                                         environ_base=REMOTE).status_code, 404)
+        self.assertEqual(self.size_of(self.client.get("/pano/%d" % self.hidden_pano)),
+                         (2400, 1200))
+        # A 360 photo no larger than its preview has none (the preview is
+        # all of it), without reading the original.
+        self.set_row(self.stitched, width=2048, height=1024)
+        with mock.patch.object(serve._images(), "read_image") as read:
+            self.assertEqual(self.client.get("/pano/%d" % self.stitched).status_code, 404)
+        read.assert_not_called()
+
+    def test_the_stored_pano_is_served(self):
+        self.set_row(self.stitched, has_preview=1)
+        self.store.write_pano("lib_family1", self.stitched, b"\xff\xd8\xff\xe0stored pano")
+        response = self.client.get("/pano/%d" % self.stitched)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "image/jpeg")
+        self.assertEqual(response.data, b"\xff\xd8\xff\xe0stored pano")
+        self.assertIn("private", response.headers["Cache-Control"])
+
+    def test_a_missing_pano_is_made_once_and_kept(self):
+        digest = hashlib.sha1(self.pano_bytes).hexdigest()
+        self.set_row(self.stitched, has_preview=1, content_hash=digest)
+        calls = []
+        real = serve._images().read_image
+
+        def counting(*args, **kwargs):
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+        with mock.patch.object(serve._images(), "read_image", counting):
+            self.assertEqual(self.size_of(self.client.get("/pano/%d" % self.stitched)),
+                             (2400, 1200))
+            self.assertTrue(self.store.pano_exists("lib_family1", self.stitched))
+            self.assertEqual(self.size_of(self.client.get("/pano/%d" % self.stitched)),
+                             (2400, 1200))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["want_pano"])
+        self.assertFalse(calls[0]["want_preview"])
+        # An unstitched original is stitched.
+        self.set_row(self.dual, has_preview=1)
+        self.assertEqual(self.size_of(self.client.get("/pano/%d" % self.dual)), (2304, 1152))
+
+    def test_a_pano_is_only_kept_for_the_content_the_index_knows(self):
+        # The original changed since the last scan (another content hash),
+        # or previews are not kept (no flag): served, but not stored.
+        self.set_row(self.stitched, has_preview=1, content_hash="0" * 40)
+        self.assertEqual(self.size_of(self.client.get("/pano/%d" % self.stitched)), (2400, 1200))
+        self.assertFalse(self.store.pano_exists("lib_family1", self.stitched))
+        self.set_row(self.stitched, has_preview=0,
+                     content_hash=hashlib.sha1(self.pano_bytes).hexdigest())
+        # A file without the flag is never trusted.
+        self.store.write_pano("lib_family1", self.stitched, b"\xff\xd8\xff\xe0old pano")
+        self.assertEqual(self.size_of(self.client.get("/pano/%d" % self.stitched)), (2400, 1200))
+        self.assertEqual(self.store.read_pano("lib_family1", self.stitched),
+                         b"\xff\xd8\xff\xe0old pano")
+
+    def test_nothing_new_is_stored_while_previews_are_off(self):
+        # Previews made while they were on keep their flag; with previews
+        # turned off, panos are made each time and never stored.
+        self.base.write_config([
+            support.library("Family", self.family_dir, id="lib_family1", previews=False),
+            support.library("Old", self.other_dir, id="lib_disabled", enabled=False),
+        ])
+        self.set_row(self.stitched, has_preview=1,
+                     content_hash=hashlib.sha1(self.pano_bytes).hexdigest())
+        for _ in range(2):
+            self.assertEqual(self.size_of(self.client.get("/pano/%d" % self.stitched)),
+                             (2400, 1200))
+            self.assertFalse(self.store.pano_exists("lib_family1", self.stitched))
+        # One stored while they were on is still used.
+        self.store.write_pano("lib_family1", self.stitched, b"\xff\xd8\xff\xe0stored pano")
+        self.assertEqual(self.client.get("/pano/%d" % self.stitched).data,
+                         b"\xff\xd8\xff\xe0stored pano")
+
+    def test_no_original_no_pano(self):
+        os.remove(os.path.join(self.family_dir, "360", "pano.jpg"))
+        self.assertEqual(self.client.get("/pano/%d" % self.stitched).status_code, 404)
+        self.write_original("360/pano.jpg", b"not an image at all")
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.client.get("/pano/%d" % self.stitched).status_code, 404)
+        self.assertIn("Could not make the 360-degree panorama", printed.call_args[0][0])
 
 
 class PanoramaPackageTest(PanoramaFixture, unittest.TestCase):

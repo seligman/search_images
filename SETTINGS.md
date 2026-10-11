@@ -261,7 +261,10 @@ A list of folders to scan. Each library is one object:
 - `enabled` - `false` stops scanning the library and hides it from search;
   its indexed images are kept.
 - `previews` - `true` (the default) keeps a 2048 px preview of every image
-  in the data folder, used by the detail page and for describing.
+  in the data folder, used by the detail page and for describing, and for
+  larger 360-degree photos also a panorama up to 4096 px wide for the 360
+  view. With `false` they are made from the original each time they are
+  shown.
 - `newest_first` - describe the most recently taken images first (default
   `true`).
 - `endpoint` - the endpoint (or group) that describes this library's

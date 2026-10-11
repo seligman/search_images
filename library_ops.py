@@ -16,6 +16,8 @@ This module uses only the standard library.
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 
@@ -853,3 +855,63 @@ def delete_library_job(ctx, conn, config, params):
         ctx.log("Deleted %d image(s) of %s." % (result["deleted"], stored))
     result["name"] = stored
     return result
+
+
+# ---------------------------------------------------------------------------
+# One picture's file
+
+REVEAL_TIMEOUT = 5.0        # seconds to look for a file before showing it
+
+
+def library_file(root, rel_path):
+    """The full path of a picture from its library folder and its stored relative path.
+
+    None when either is empty or the relative path would lead outside the
+    folder (an absolute path, a drive, or ".." parts): the result is always
+    inside root.
+    """
+    if not root or not isinstance(rel_path, str) or not rel_path:
+        return None
+    parts = [part for part in rel_path.replace("\\", "/").split("/") if part not in ("", ".")]
+    # (A colon is part of some file names elsewhere, but on Windows it
+    # names a drive or a data stream.)
+    if not parts or any(part == ".." or (os.name == "nt" and ":" in part) for part in parts):
+        return None
+    full = os.path.normpath(os.path.join(root, *parts))
+    if not is_within(full, root) or _comparable(full) == _comparable(root):
+        return None
+    return full
+
+
+def reveal_command(path, platform=None):
+    """The command that shows a file in the system's file manager.
+
+    Windows: Explorer with the file selected (a command line, quoted the
+    way Explorer reads it). macOS: Finder with the file selected. Others:
+    the file's folder, opened with xdg-open.
+    """
+    platform = platform or sys.platform
+    if platform == "win32":
+        return 'explorer /select,"%s"' % path
+    if platform == "darwin":
+        return ["open", "-R", path]
+    return ["xdg-open", os.path.dirname(path) or os.sep]
+
+
+def reveal_file(path, timeout=REVEAL_TIMEOUT):
+    """Show a picture's file in the file manager (Explorer, Finder or the folder).
+
+    The file must exist; a folder that does not answer within timeout
+    seconds (an offline share) raises TimedOut. Raises LibraryError (404)
+    for a missing file and (501) when the file manager cannot be started.
+    Returns at once: the file manager is not waited for.
+    """
+    if not run_with_timeout(os.path.isfile, timeout, path):
+        raise LibraryError("The file is not there any more: %s" % path, status=404)
+    try:
+        process = subprocess.Popen(reveal_command(path), close_fds=True)
+    except OSError as error:
+        raise LibraryError("The file manager could not be started: %s" % error, status=501)
+    # Collect the exit status when it ends, so no zombie or warning is left.
+    threading.Thread(target=process.wait, name="reveal-file", daemon=True).start()
+    return process

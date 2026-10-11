@@ -4,17 +4,66 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Image Search</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="__ASSET_PREFIX__style.css">
 </head>
-<body>
-<div id="controls">
-<input id="query" type="search" placeholder="Search images..." aria-label="Search images" autofocus>
-<label id="cluster-toggle"><input id="cluster" type="checkbox" checked> Group similar</label>
+<body class="search-page">
+<div id="search-bar">
+<div id="search-row" role="search">
+<div id="search-box">
+<input id="query" type="search" placeholder="Search pictures" aria-label="Search pictures" autocomplete="off" spellcheck="false" enterkeyhint="search">
+<button id="syntax-button" type="button" class="icon-button" aria-label="Search tips" aria-expanded="false" aria-controls="syntax-help" title="Search tips">?</button>
+<div id="syntax-help" class="popover" hidden></div>
 </div>
-<div id="grid"></div>
+<button id="facets-button" type="button" class="button tool-button" aria-controls="facets" aria-expanded="false">Filters <span id="facets-count" class="count-badge" hidden></span></button>
+</div>
+<div id="search-tools">
+<label class="tool"><span class="tool-label">Sort</span>
+<select id="sort">
+<option value="relevance">Best match</option>
+<option value="newest">Newest first</option>
+<option value="oldest">Oldest first</option>
+<option value="name">File name</option>
+<option value="quality">Best looking</option>
+</select></label>
+<label class="tool tool-check"><input id="group" type="checkbox"> Group similar</label>
+<label class="tool tool-size"><span class="tool-label">Size</span><input id="size" type="range" min="0" max="2" step="1" aria-label="Thumbnail size"></label>
+<button id="select-button" type="button" class="button tool-button" aria-pressed="false" hidden>Select</button>
+</div>
+</div>
+<div id="index-banner" class="notice warn" hidden></div>
+<div id="search-layout">
+<aside id="facets" aria-labelledby="facets-title">
+<div id="facets-head">
+<h2 id="facets-title">Filters</h2>
+<button id="facets-close" type="button" class="icon-button" aria-label="Close the filters">&times;</button>
+</div>
+<div id="drawer-tools" hidden></div>
+<div id="facet-list"></div>
+<div id="facets-foot">
+<button id="facets-done" type="button" class="button primary">Show the pictures</button>
+</div>
+</aside>
+<main id="results">
+<div id="results-head">
+<h1 id="result-count" aria-live="polite"></h1>
+<span id="result-notes"></span>
+<a id="map-link" class="button subtle small" hidden></a>
+</div>
+<p id="query-notes" hidden></p>
+<div id="active-filters" hidden></div>
+<div id="selection-bar" hidden></div>
+<div id="month-bar" aria-hidden="true"><span id="month-label" hidden></span></div>
+<div id="grid" aria-label="Pictures"></div>
+<div id="empty" hidden></div>
+</main>
+</div>
+<div id="facets-backdrop" hidden></div>
 <script type="application/json" id="app-config">__APP_CONFIG__</script>
 <script src="__ASSET_PREFIX__site.js"></script>
 <script src="__ASSET_PREFIX__shell.js"></script>
+<script src="__ASSET_PREFIX__search-core.js"></script>
+<script src="__ASSET_PREFIX__viewer.js"></script>
 <script src="__ASSET_PREFIX__app.js"></script>
 </body>
 </html>

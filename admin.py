@@ -63,15 +63,19 @@ KEY_FILE_TIMEOUT = 2.0      # seconds a save waits to look at a key file
 REGISTER_WAIT = 2.0         # seconds a save waits to record library names in index.db
 REGISTER_RETRY = 5.0        # seconds between later tries when that had to wait
 REGISTER_TRIES = 60
+HIDE_LIMIT = 10000          # pictures one hide/unhide (or paths) request may name
+DESCRIBE_IDS_LIMIT = 1000   # pictures one describe job may name
+ID_CHUNK = 500              # ids per SQL statement (older SQLite allows 999 parameters)
+IMAGE_ID_MAX = 2 ** 63 - 1  # SQLite integers are 64-bit
 # Parameters each kind of job accepts (all optional).
 JOB_PARAMS = {
     "scan": ("allow_mass_removal",),
-    "describe": ("retry_failed", "redescribe_stale", "limit", "endpoint"),
+    "describe": ("retry_failed", "redescribe_stale", "limit", "endpoint", "ids", "force"),
     "process": ("allow_mass_removal", "retry_failed", "redescribe_stale", "limit", "endpoint"),
     "previews": (),
     "delete_library": ("confirm_name",),
 }
-BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale")
+BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force")
 ENDPOINT_TEXT_FIELDS = ("label", "kind", "preset", "base_url", "model", "api_key_env",
                         "api_key_file", "group")
 # number fields: (type, minimum, maximum or None)
@@ -330,6 +334,34 @@ def find_library(config, library_id):
         if library.get("id") == library_id:
             return library
     raise AdminError(404, "There is no library with the id %s." % library_id)
+
+
+def image_ids(value, limit, name="ids"):
+    """The image ids sent in a request: a list of whole numbers, without repeats, in order.
+
+    Raises AdminError for anything else, an empty list, or more than limit ids.
+    """
+    if not isinstance(value, list) or not value:
+        raise AdminError(400, "Send %s as a list of picture ids." % name,
+                         {name: "A list of picture ids."})
+    if len(value) > limit:
+        raise AdminError(400, "At most %d pictures can be sent at a time; send them in parts."
+                         % limit, {name: "Too many."})
+    result = []
+    seen = set()
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or not 0 < item <= IMAGE_ID_MAX:
+            raise AdminError(400, "Picture ids are whole numbers.", {name: "Not a picture id."})
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def id_chunks(ids):
+    """ids in slices of at most ID_CHUNK."""
+    for start in range(0, len(ids), ID_CHUNK):
+        yield ids[start:start + ID_CHUNK]
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +838,31 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
             if not library.get("enabled", True):
                 raise AdminError(400, "Library %s is disabled; enable it first."
                                  % common.library_label(library))
+        if params.get("ids") is not None:
+            cleaned["ids"] = describable_ids(config, library_id,
+                                             image_ids(params["ids"], DESCRIBE_IDS_LIMIT))
+        if cleaned.get("force") and "ids" not in cleaned:
+            # Describing a whole library again is "Re-describe stale" (or a
+            # new prompt version), never a single click.
+            raise AdminError(400, "force only works with ids: the pictures to describe again.",
+                             {"force": "Needs ids."})
         return cleaned
+
+    def describable_ids(config, library_id, ids):
+        """The ids (sorted) of present pictures in enabled libraries (library_id's, when given)."""
+        allowed = {library["id"] for library in common.enabled_libraries(config)
+                   if library.get("id") and library_id in (None, library["id"])}
+        found = []
+        conn = get_conn()
+        for part in id_chunks(ids):
+            found.extend(row["id"] for row in conn.execute(
+                "SELECT id, library_id FROM images WHERE missing_since IS NULL AND id IN (%s)"
+                % ",".join("?" * len(part)), part) if row["library_id"] in allowed)
+        if not found:
+            raise AdminError(404, "None of these pictures can be described: they are gone, or "
+                                  "their library is disabled or not set up.",
+                             {"ids": "No such pictures."})
+        return sorted(found)
 
     def check_orphan_delete(config, library_id, confirm):
         conn = get_conn()
@@ -1081,6 +1137,73 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
         params = clean_job(config, "describe", library_id, {"retry_failed": True})
         job, added = manager.enqueue("describe", library_id, params)
         return jsonify({"job": job, "added": added}), 202
+
+    # -- pictures -------------------------------------------------------------
+
+    @bp.route("/images/hide", methods=["POST"])
+    def hide_images():
+        """{ids, hidden}: hide pictures from searches (and exports), or show them again."""
+        data = body()
+        ids = image_ids(data.get("ids"), HIDE_LIMIT)
+        hidden = data.get("hidden")
+        if not isinstance(hidden, bool):
+            raise AdminError(400, "hidden must be true or false.",
+                             {"hidden": "Must be true or false."})
+        conn = get_conn()
+        found = changed = 0
+        try:
+            with conn:
+                for part in id_chunks(ids):
+                    marks = ",".join("?" * len(part))
+                    found += conn.execute("SELECT COUNT(*) FROM images WHERE id IN (%s)" % marks,
+                                          part).fetchone()[0]
+                    changed += conn.execute(
+                        "UPDATE images SET hidden = ? WHERE hidden <> ? AND id IN (%s)" % marks,
+                        [int(hidden), int(hidden)] + part).rowcount
+        except sqlite3.OperationalError as error:
+            raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
+        return jsonify({"hidden": hidden, "changed": changed, "found": found,
+                        "unknown": len(ids) - found})
+
+    def picture_file(config, image_id):
+        """The full path of a present picture of a configured library; AdminError 404 otherwise."""
+        row = get_conn().execute("SELECT id, library_id, path FROM images "
+                                 "WHERE id = ? AND missing_since IS NULL",
+                                 (image_id,)).fetchone() if image_id <= IMAGE_ID_MAX else None
+        library = next((item for item in config.get("libraries", [])
+                        if row is not None and item.get("id") == row["library_id"]), None)
+        full = (library_ops.library_file(common.library_root(library), row["path"])
+                if library is not None else None)
+        if full is None:
+            raise AdminError(404, "There is no picture %d in a configured library." % image_id)
+        return full
+
+    @bp.route("/images/<int:image_id>/open-folder", methods=["POST"])
+    def open_folder(image_id):
+        """Show a picture's file in Explorer (Finder; elsewhere its folder).
+
+        The file is found from the image id alone; nothing in the request
+        names a path.
+        """
+        body()
+        full = picture_file(state.config(), image_id)
+        try:
+            library_ops.reveal_file(full)
+        except library_ops.TimedOut:
+            raise AdminError(504, "The folder did not answer (an offline share?).")
+        return jsonify({"ok": True, "id": image_id})
+
+    @bp.route("/images/paths", methods=["POST"])
+    def image_paths():
+        """{ids}: the full paths of pictures ("Copy path"), in the order asked."""
+        config = state.config()
+        result, unknown = [], []
+        for image_id in image_ids(body().get("ids"), HIDE_LIMIT):
+            try:
+                result.append({"id": image_id, "path": picture_file(config, image_id)})
+            except AdminError:
+                unknown.append(image_id)
+        return jsonify({"paths": result, "unknown": unknown})
 
     # -- endpoints ------------------------------------------------------------
 

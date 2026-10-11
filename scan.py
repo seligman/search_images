@@ -3,8 +3,9 @@
 
 For each enabled library this lists the image files and reads every new or
 changed one exactly once. That single read gives the thumbnail (stored in
-data/thumbs.db), a 2048 px preview (data/previews/), the cleaned EXIF data,
-dHash, content hash, capture date, camera and GPS position, all stored in
+data/thumbs.db), a 2048 px preview (data/previews/; for a 360-degree photo
+also a 4096 px panorama for the 360 view), the cleaned EXIF data, dHash,
+content hash, capture date, camera and GPS position, all stored in
 data/index.db. Unchanged files are not read again.
 
 Descriptions are never thrown away by accident:
@@ -361,10 +362,14 @@ def _missing_decoder(error):
 
 
 def _read_original(root, rel, helper, want_previews, mtime):
-    """Worker thread: images.read_image() for one file. Returns (result, error); never raises."""
+    """Worker thread: images.read_image() for one file. Returns (result, error); never raises.
+
+    With previews, a 360-degree photo also gets its pano (see cache.PreviewStore).
+    """
     full = os.path.join(root, *rel.split("/"))
     try:
-        return images.read_image(full, helper, want_preview=want_previews, mtime=mtime), None
+        return images.read_image(full, helper, want_preview=want_previews, mtime=mtime,
+                                 want_pano=want_previews), None
     except Exception as error:
         return None, error
 
@@ -400,12 +405,35 @@ def _update_row(conn, image_id, values, extra=""):
 
 
 def _delete_preview(previews, library_id, image_id, ctx):
-    """Remove a preview file (best effort; a failure is only logged)."""
+    """Remove a preview file and its pano (best effort; a failure is only logged)."""
     try:
-        previews.delete(library_id, image_id)
+        previews.delete_both(library_id, image_id)
     except OSError as error:
         ctx.log("Could not delete the preview of image %d: %s"
                 % (image_id, _error_text(error)), "warn")
+
+
+def _store_pano(previews, library_id, image_id, pano, ctx, rel):
+    """After a new preview was written: write its pano, or remove an older one.
+
+    pano is the read_image() result's pano (None when the picture is not a
+    360 photo). Returns True if a pano was written. A pano that cannot be
+    written is removed rather than left showing older content; the server
+    makes it again when it is asked for.
+    """
+    try:
+        if pano:
+            previews.write_pano(library_id, image_id, pano)
+            return True
+        previews.delete_pano(library_id, image_id)
+    except OSError as error:
+        try:
+            previews.delete_pano(library_id, image_id)
+        except OSError:
+            pass
+        ctx.log("Could not save the 360-degree panorama of %s: %s"
+                % (rel, _error_text(error)), "warn")
+    return False
 
 
 class _CommitTimer:
@@ -820,6 +848,9 @@ class LibraryScan:
                 self.conn.execute("UPDATE images SET has_preview = 0 WHERE id = ?", (image_id,))
                 self.ctx.log("Could not save the preview of %s: %s"
                              % (rel, _error_text(error)), "warn")
+            else:
+                _store_pano(self.previews, self.library_id, image_id, result.get("pano"),
+                            self.ctx, rel)
         self._wrote()
 
     def _insert(self, rel, size, mtime, ctime, metadata, has_preview, now):
@@ -1061,21 +1092,7 @@ def scan_library(conn, library, ctx, helper=None, thumbs=None, previews=None,
 
 def preview_ids(previews, library_id):
     """The ids of images that have a preview file in a library (one listing per bucket)."""
-    found = set()
-    try:
-        buckets = [entry.path for entry in os.scandir(previews.library_dir(library_id))
-                   if entry.is_dir()]
-    except OSError:
-        return found
-    for bucket in buckets:
-        try:
-            for entry in os.scandir(bucket):
-                stem, ext = os.path.splitext(entry.name)
-                if ext == ".jpg" and stem.isdigit():
-                    found.add(int(stem))
-        except OSError:
-            pass
-    return found
+    return previews.stored_ids(library_id)[0]
 
 
 _BACKFILL_SQL = """
@@ -1091,11 +1108,13 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     this reads each such original once and fills them in, with fresh EXIF
     facts and thumbnail. Rows whose projection is "?" (stored before 360
     photos were recognised) are read again the same way, which gives 360
-    photos their panorama preview, front-view thumbnail and dHash. Rows of
-    files the ignore patterns now exclude are left alone. It runs as stage
-    "previews", can be stopped at any point and continues where it left off.
-    Returns a summary dict:
-    {needed, filled, failed, changed, unsupported, aborted, panoramas}.
+    photos their panorama preview, front-view thumbnail and dHash; so are
+    360 photos with a preview but no pano (stored before panos were made;
+    only those larger than their preview get one, see images.has_pano).
+    Rows of files the ignore patterns now exclude are left alone. It runs
+    as stage "previews", can be stopped at any point and continues where
+    it left off. Returns a summary dict:
+    {needed, filled, failed, changed, unsupported, aborted, panoramas, panos}.
     """
     own_thumbs = thumbs is None
     thumbs = thumbs or cache.ThumbStore()
@@ -1113,9 +1132,9 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
     patterns = common.ignore_patterns(library)
     want_previews = bool(library.get("previews", True))
     summary = {"needed": 0, "filled": 0, "failed": 0, "changed": 0, "unsupported": 0,
-               "aborted": False, "panoramas": 0}
+               "aborted": False, "panoramas": 0, "panos": 0}
     redescribe = []
-    on_disk = preview_ids(previews, library_id)
+    on_disk, panos_on_disk = previews.stored_ids(library_id)
     failures = _load_failures(conn, library_id)
     needed = []
     for row in conn.execute(_BACKFILL_SQL, (library_id,)).fetchall():
@@ -1127,7 +1146,11 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
             has_preview = False
         if (row["content_hash"] and row["dhash"] and row["width"] > 0 and row["height"] > 0
                 and (has_preview or not want_previews)
-                and row["projection"] != images.PROJECTION_UNKNOWN):
+                and row["projection"] != images.PROJECTION_UNKNOWN
+                and not (want_previews and has_preview
+                         and row["projection"] in images.PROJECTIONS_360
+                         and images.has_pano(row["width"], row["height"])
+                         and row["id"] not in panos_on_disk)):
             continue
         if excluded_by_ignores(row["path"], patterns):
             continue
@@ -1177,6 +1200,10 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
                     values["has_preview"] = 0
                     ctx.log("Could not save the preview of %s: %s"
                             % (row["path"], _error_text(error)), "warn")
+                else:
+                    if _store_pano(previews, library_id, row["id"], result.get("pano"), ctx,
+                                   row["path"]):
+                        summary["panos"] += 1
             _update_row(conn, row["id"], values)
             thumbs.put(row["id"], result["thumb"], commit=False)
             summary["filled"] += 1
@@ -1194,8 +1221,10 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
     finally:
         timer.commit()
     if summary["panoramas"]:
-        ctx.log("%d 360-degree photo(s) recognised in %s."
-                % (summary["panoramas"], common.library_label(library)))
+        made = (" (%d with a large panorama for the 360 view)" % summary["panos"]
+                if want_previews else "")
+        ctx.log("%d 360-degree photo(s) recognised in %s%s."
+                % (summary["panoramas"], common.library_label(library), made))
     if redescribe:
         # Their descriptions were made from the two raw fisheye circles.
         ctx.log("%d described image(s) turned out to be unstitched 360-degree photos (%s%s); "

@@ -116,6 +116,41 @@ class PreviewStoreTest(support.TempBaseMixin, unittest.TestCase):
         self.assertIsNone(store.read("lib_00000001", 1500))
         self.assertEqual(store.read("lib_00000002", 7), b"\xff\xd8another library")
 
+    def test_panos_live_next_to_their_previews(self):
+        store = cache.PreviewStore(self.base.join("p"))
+        self.assertEqual(store.pano_path_for("lib_00000001", 12345),
+                         os.path.join(store.root, "lib_00000001", "012", "12345.pano.jpg"))
+        with self.assertRaises(ValueError):
+            store.pano_path_for("../x", 1)
+        self.assertIsNone(store.read_pano("lib_00000001", 7))
+        self.assertFalse(store.pano_exists("lib_00000001", 7))
+        store.write("lib_00000001", 7, b"\xff\xd8preview")
+        path = store.write_pano("lib_00000001", 7, b"\xff\xd8pano")
+        self.assertEqual(path, store.pano_path_for("lib_00000001", 7))
+        store.write("lib_00000001", 8, b"\xff\xd8preview only")
+        store.write_pano("lib_00000001", 1009, b"\xff\xd8pano only")
+        self.assertEqual(store.read_pano("lib_00000001", 7), b"\xff\xd8pano")
+        self.assertEqual(store.read("lib_00000001", 7), b"\xff\xd8preview")
+        self.assertTrue(store.pano_exists("lib_00000001", 7))
+        self.assertEqual(sorted(os.listdir(os.path.dirname(path))),
+                         ["7.jpg", "7.pano.jpg", "8.jpg"])
+        # One listing tells previews and panos apart.
+        self.assertEqual(store.stored_ids("lib_00000001"), ({7, 8}, {7, 1009}))
+        self.assertEqual(store.stored_ids("lib_00000003"), (set(), set()))
+        # A preview is never deleted without its pano.
+        self.assertTrue(store.delete_both("lib_00000001", 7))
+        self.assertFalse(store.exists("lib_00000001", 7))
+        self.assertFalse(store.pano_exists("lib_00000001", 7))
+        self.assertFalse(store.delete_both("lib_00000001", 7))
+        self.assertTrue(store.delete_both("lib_00000001", 1009))
+        self.assertFalse(store.delete_pano("lib_00000001", 8))
+        store.write_pano("lib_00000001", 8, b"\xff\xd8pano")
+        self.assertTrue(store.delete_pano("lib_00000001", 8))
+        self.assertTrue(store.exists("lib_00000001", 8))
+        store.write_pano("lib_00000001", 8, b"\xff\xd8pano")
+        self.assertTrue(store.delete_library("lib_00000001"))
+        self.assertIsNone(store.read_pano("lib_00000001", 8))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1355,6 +1355,83 @@ class CommandLineTest(DescribeTestCase):
         self.assertEqual(sum(row["described"] for row in self.rows().values()), 1)
 
 
+class ChosenPicturesTest(DescribeTestCase):
+    """describe_pending(ids=..., force=...): the Re-describe button of the viewer."""
+
+    def ids(self):
+        return {path: row["id"] for path, row in self.rows().items()}
+
+    def titles(self):
+        return {path: json.loads(row["info"])["title"] if row["info"] else None
+                for path, row in self.rows().items()}
+
+    def test_only_the_chosen_pictures(self):
+        self.small_images(3)
+        self.configure()
+        self.index()
+        ids = self.ids()
+        summary = self.describe(ids=[ids["photo1.jpg"]])
+        self.assertEqual(summary["described"], 1)
+        self.assertEqual(len(self.server.describe_requests()), 1)
+        self.assertEqual({path: row["described"] for path, row in self.rows().items()},
+                         {"photo0.jpg": 0, "photo1.jpg": 1, "photo2.jpg": 0})
+        # Without force a described picture is left alone.
+        summary = self.describe(ids=[ids["photo1.jpg"]])
+        self.assertEqual((summary["described"], summary["pending"], summary["stale"]),
+                         (0, 0, 0))
+        self.assertEqual(len(self.server.describe_requests()), 1)
+        self.assertIn("chosen pictures", self.log_text())
+        # force without ids is no way to describe a whole library again.
+        summary = self.describe(force=True, limit=0)
+        self.assertEqual(summary["pending"], 0)
+
+    def test_force_describes_them_again(self):
+        self.small_images(3)
+        self.configure()
+        self.index()
+        self.describe()
+        ids = self.ids()
+        old = self.rows()
+        # One of them had given up after failing too often.
+        self.execute("UPDATE images SET described = 0, info = '', describe_attempts = ? "
+                     "WHERE path = 'photo2.jpg'", (describe.MAX_FAILURES,))
+        self.server.queue(reply(title="Described again"), reply(title="Described again"))
+        requests = len(self.server.describe_requests())
+        summary = self.describe(ids=[ids["photo0.jpg"], ids["photo2.jpg"]], force=True)
+        self.assertEqual((summary["described"], summary["skipped_failed"]), (2, 0))
+        self.assertEqual(len(self.server.describe_requests()), requests + 2)
+        titles = self.titles()
+        self.assertEqual((titles["photo0.jpg"], titles["photo2.jpg"]),
+                         ("Described again", "Described again"))
+        rows = self.rows()
+        self.assertEqual(rows["photo1.jpg"]["info"], old["photo1.jpg"]["info"])
+        self.assertEqual(rows["photo2.jpg"]["describe_attempts"], 0)
+
+    def test_chosen_copies_share_the_new_description(self):
+        self.small_images(1)
+        os.makedirs(os.path.join(self.folder, "Copy"))
+        with open(os.path.join(self.folder, "photo0.jpg"), "rb") as handle:
+            data = handle.read()
+        for name in ("Copy/photo0.jpg", "Copy/again.jpg"):
+            with open(os.path.join(self.folder, *name.split("/")), "wb") as handle:
+                handle.write(data)
+        self.configure()
+        self.index()
+        self.describe()
+        ids = self.ids()
+        requests = len(self.server.describe_requests())
+        self.server.queue(reply(title="Described again"))
+        summary = self.describe(ids=[ids["photo0.jpg"], ids["Copy/photo0.jpg"]], force=True)
+        # One request: the chosen copy gets the same new description; the
+        # copy nobody chose keeps its own.
+        self.assertEqual((summary["described"], summary["shared"]), (1, 1))
+        self.assertEqual(len(self.server.describe_requests()), requests + 1)
+        titles = self.titles()
+        self.assertEqual((titles["photo0.jpg"], titles["Copy/photo0.jpg"]),
+                         ("Described again", "Described again"))
+        self.assertNotEqual(titles["Copy/again.jpg"], "Described again")
+
+
 class LlmTest(unittest.TestCase):
 
     def test_mime_is_sniffed_from_the_bytes(self):

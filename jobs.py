@@ -1434,7 +1434,8 @@ def _scan_summary(result, params, offline_fails):
         entry["errors"] = len(item.get("errors") or ())
         if isinstance(item.get("backfill"), dict):
             entry["previews"] = {key: item["backfill"].get(key)
-                                 for key in ("needed", "filled", "failed", "panoramas")}
+                                 for key in ("needed", "filled", "failed", "panoramas",
+                                             "panos")}
         libraries.append(entry)
     summary = {"libraries": libraries, "stopped": bool(result.get("stopped"))}
     offline = [item.get("name", "") for item in libraries if item.get("offline")]
@@ -1471,11 +1472,19 @@ def run_scan(ctx, conn, config, params, helper=None):
 
 
 def run_describe(ctx, conn, config, params, helper=None):
-    """Describe the images of a library (or every enabled one) that need it."""
+    """Describe the images of a library (or every enabled one) that need it.
+
+    params "ids" (image ids) limits the job to those pictures, and "force"
+    then describes them again even when they have a description.
+    """
     import describe
     libraries = job_libraries(config, params)
+    ids = params.get("ids")
+    ids = [image_id for image_id in ids if isinstance(image_id, int)] if isinstance(
+        ids, list) else None
     return describe.describe_pending(conn, config, ctx, helper=helper,
                                      library_ids=[library["id"] for library in libraries],
+                                     ids=ids, force=bool(params.get("force")),
                                      **_describe_options(params))
 
 

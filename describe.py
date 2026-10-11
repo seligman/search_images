@@ -583,7 +583,7 @@ _PENDING_SQL = """
 
 
 def pending_rows(conn, libraries, newest_first=None, retry_failed=False,
-                 redescribe_stale=False):
+                 redescribe_stale=False, ids=None, force=False):
     """The images to describe, in order. Returns (rows, skipped_failed).
 
     Images that have never been described come first; then, only when
@@ -597,13 +597,27 @@ def pending_rows(conn, libraries, newest_first=None, retry_failed=False,
     out, and so are images that failed MAX_FAILURES times unless
     retry_failed is set; those are counted in skipped_failed. Hidden images
     are described too.
+
+    ids (image ids) limits the images to those. With ids, force also
+    takes the ones that already have a description, and the ones that
+    failed too often (someone asked for exactly these pictures); force
+    without ids changes nothing.
     """
     fresh, stale = [], []
     skipped_failed = 0
-    sql = _PENDING_SQL % ("prompt_ver < ?" if redescribe_stale else "0")
+    wanted = set(ids) if ids is not None else None
+    force = bool(force) and wanted is not None
+    if force:
+        retry_failed = True
+    sql = _PENDING_SQL % ("1" if force else "prompt_ver < ?" if redescribe_stale else "0")
     for library in libraries:
-        args = (library["id"], PROMPT_VER) if redescribe_stale else (library["id"],)
+        args = ((library["id"], PROMPT_VER) if redescribe_stale and not force
+                else (library["id"],))
         rows = conn.execute(sql, args).fetchall()
+        if wanted is not None:
+            # Filtered here, not in SQL: up to 1000 ids would pass the
+            # parameter limit of older SQLite versions.
+            rows = [row for row in rows if row["id"] in wanted]
         if not retry_failed:
             kept = [row for row in rows if row["describe_attempts"] < MAX_FAILURES]
             skipped_failed += len(rows) - len(kept)
@@ -883,22 +897,24 @@ _STORE_SQL = """
     WHERE id = ? AND content_hash = ?"""
 
 # Exact copies (same content hash) that still need a description get the
-# same one, so each picture is only sent once.
+# same one, so each picture is only sent once (the WHERE clause is added).
 _SHARE_SQL = """
     UPDATE images SET info = ?, described = 1, prompt_ver = ?, provenance = ?,
         describe_attempts = 0, describe_error = '', updated = ?
-    WHERE content_hash = ? AND id <> ? AND missing_since IS NULL"""
+    WHERE """
 
 
-def store_description(conn, row, info, provenance, library_ids=None, include_stale=False):
+def store_description(conn, row, info, provenance, library_ids=None, include_stale=False,
+                      also_ids=None):
     """Save a description for a row and its exact copies. Returns (stored, shared).
 
     Copies only get it when they have no description yet (or, with
-    include_stale, one from an older prompt), and only in library_ids when
-    given: libraries that would ask for the same thing (metadata profile
-    and context notes). stored is False when the row changed or vanished
-    while it was being described (its content hash no longer matches);
-    nothing is saved then.
+    include_stale, one from an older prompt, or when their id is in
+    also_ids: pictures someone asked to describe again), and only in
+    library_ids when given: libraries that would ask for the same thing
+    (metadata profile and context notes). stored is False when the row
+    changed or vanished while it was being described (its content hash no
+    longer matches); nothing is saved then.
     """
     now = time.time()
     info_text = json.dumps(info, ensure_ascii=False, allow_nan=False)
@@ -907,18 +923,30 @@ def store_description(conn, row, info, provenance, library_ids=None, include_sta
                                        row["id"], row["content_hash"])).rowcount == 1
     shared = 0
     if stored and row["content_hash"] and (library_ids is None or library_ids):
-        sql = _SHARE_SQL
-        args = [info_text, PROMPT_VER, provenance_text, now, row["content_hash"], row["id"]]
+        values = [info_text, PROMPT_VER, provenance_text, now]
+        where = "content_hash = ? AND id <> ? AND missing_since IS NULL"
+        where_args = [row["content_hash"], row["id"]]
         if library_ids is not None:
             library_ids = list(library_ids)
-            sql += " AND library_id IN (%s)" % ",".join("?" * len(library_ids))
-            args += library_ids
+            where += " AND library_id IN (%s)" % ",".join("?" * len(library_ids))
+            where_args += library_ids
+        forced = []
+        if also_ids:
+            # Copies the update below leaves alone (their description is
+            # current) that were asked to be described again.
+            current = " AND described = 1" + (" AND prompt_ver >= ?" if include_stale else "")
+            forced = [found[0] for found in conn.execute(
+                "SELECT id FROM images WHERE " + where + current,
+                where_args + ([PROMPT_VER] if include_stale else []))
+                if found[0] in also_ids]
         if include_stale:
-            sql += " AND (described = 0 OR prompt_ver < ?)"
-            args.append(PROMPT_VER)
+            where += " AND (described = 0 OR prompt_ver < ?)"
+            where_args.append(PROMPT_VER)
         else:
-            sql += " AND described = 0"
-        shared = conn.execute(sql, args).rowcount
+            where += " AND described = 0"
+        shared = conn.execute(_SHARE_SQL + where, values + where_args).rowcount
+        for image_id in forced:
+            shared += conn.execute(_SHARE_SQL + "id = ?", values + [image_id]).rowcount
     conn.commit()
     return stored, max(0, shared)
 
@@ -990,14 +1018,19 @@ class _Endpoint:
 
 def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_first=None,
                      retry_failed=False, redescribe_stale=False, limit=None,
-                     endpoint_name=None, previews=None, sleep=time.sleep):
+                     endpoint_name=None, previews=None, sleep=time.sleep, ids=None,
+                     force=False):
     """Describe the images that need it. Returns a summary dict.
 
     conn is an index.db connection; ctx a jobs.JobContext. Only enabled
     libraries are described (limited to library_ids when given): images
     without a description, plus those described with an older prompt when
-    redescribe_stale is set (see pending_rows), at most limit of them. Each
-    library uses its own endpoint(s) unless endpoint_name names an endpoint
+    redescribe_stale is set (see pending_rows), at most limit of them.
+    ids (image ids) limits the run to those pictures; with ids, force
+    describes them again even when they have a description (the
+    "Re-describe this picture" button), and exact copies among them get
+    the new description too. Each library uses its own endpoint(s)
+    unless endpoint_name names an endpoint
     or group for all of them. Stops early, keeping every saved description,
     when ctx asks to stop, on a fatal error, or when no usable endpoint is
     left. The helper's before_launch and after_launch hooks bracket the run;
@@ -1019,10 +1052,16 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
                "stopped": False, "error": "", "fatal": False, "retired": [], "requests": 0,
                "tokens_in": 0, "tokens_out": 0, "cost": None}
     libraries = selected_libraries(config, library_ids)
+    if ids is not None:
+        ids = {image_id for image_id in ids
+               if isinstance(image_id, int) and not isinstance(image_id, bool)}
+    force = bool(force) and ids is not None
     rows, summary["skipped_failed"] = pending_rows(conn, libraries, newest_first,
-                                                   retry_failed, redescribe_stale)
+                                                   retry_failed, redescribe_stale,
+                                                   ids=ids, force=force)
     rows, summary["skipped_offline"] = _drop_unreachable(rows, libraries, ctx, helper)
-    if not redescribe_stale:
+    if not redescribe_stale and ids is None:
+        # (Not for a run over chosen pictures: the hint is about the library.)
         summary["stale"] = stale_count(conn, libraries)
     if summary["skipped_failed"]:
         ctx.log("Skipping %d image(s) that failed %d times; Retry failed on the Manage page "
@@ -1039,6 +1078,9 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
     if not rows:
         if limit == 0:
             ctx.log("Nothing to describe (limit 0).")
+        elif ids is not None and not summary["skipped_offline"]:
+            ctx.log("Nothing to describe: the chosen pictures already have descriptions, "
+                    "are gone, or belong to a disabled library.")
         elif not summary["skipped_offline"]:
             ctx.log("All images already have descriptions.")
         return summary
@@ -1090,6 +1132,7 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
 
     run = _DescribeRun(conn, ctx, summary, helper, previews or cache.PreviewStore(), sleep)
     run.redescribe_stale = redescribe_stale
+    run.force_ids = ids if force else None
     # Exact copies only share a description within libraries that ask for
     # the same thing (metadata profile and context notes).
     for library in config.get("libraries", []):
@@ -1173,6 +1216,7 @@ class _DescribeRun:
         self.previews = previews
         self.sleep = sleep
         self.redescribe_stale = False
+        self.force_ids = None                      # ids described again on request
         self.share_ids = {}                        # (profile, user text) -> library ids
         self.endpoints = []
         self.by_name = {}
@@ -1585,7 +1629,8 @@ class _DescribeRun:
         signature = (task.profile, task.user_text)
         stored, shared = store_description(self.conn, row, info, provenance,
                                            library_ids=self.share_ids.get(signature, []),
-                                           include_stale=self.redescribe_stale)
+                                           include_stale=self.redescribe_stale,
+                                           also_ids=self.force_ids)
         if stored:
             self.summary["described"] += 1
             self.summary["shared"] += shared

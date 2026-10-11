@@ -51,9 +51,11 @@ def page_config(html):
 
 
 def assets_of(html):
-    """The local files a page loads: script src and stylesheet href values."""
-    return (re.findall(r'<script[^>]*\ssrc="([^"]+)"', html)
-            + re.findall(r'<link[^>]*\shref="([^"]+)"', html))
+    """The local files a page loads: script src and stylesheet href values
+    (not data: addresses, such as the empty icon)."""
+    return [url for url in (re.findall(r'<script[^>]*\ssrc="([^"]+)"', html)
+                            + re.findall(r'<link[^>]*\shref="([^"]+)"', html))
+            if not url.startswith("data:")]
 
 
 def ids_looked_up(script):

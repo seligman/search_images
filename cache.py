@@ -4,7 +4,8 @@
 ThumbStore keeps the small (320 px) thumbnails as BLOBs in data/thumbs.db,
 so a reader never sees a half-written thumbnail and nothing is ever
 rewritten in place. PreviewStore keeps the larger (2048 px) previews as plain
-JPEG files under data/previews/<library id>/<bucket>/<image id>.jpg.
+JPEG files under data/previews/<library id>/<bucket>/<image id>.jpg, and next
+to them the 4096 px panoramas of 360-degree photos (<image id>.pano.jpg).
 
 This module uses only the standard library.
 """
@@ -15,6 +16,9 @@ import threading
 
 import common
 import db
+
+# The file name ending of a 360 photo's larger panorama (see PreviewStore).
+PANO_SUFFIX = ".pano.jpg"
 
 
 class ThumbStore:
@@ -109,6 +113,11 @@ class PreviewStore:
     thousand files each. Previews are JPEGs, except for screenshots and
     drawings whose JPEG would be larger than a PNG (see images.read_image);
     the name stays .jpg, so readers sniff the type (imageinfo.sniff_mime).
+
+    A 360-degree photo also has a larger panorama for the 360 view, its
+    "pano" (images.PANO_EDGE wide, always a JPEG), next to its preview as
+    <image id>.pano.jpg. A pano belongs to its preview: it is written with
+    it, and whoever deletes a preview deletes the pano too (delete_both).
     """
 
     def __init__(self, root=None):
@@ -119,38 +128,110 @@ class PreviewStore:
             raise ValueError("invalid library id: %r" % (library_id,))
         return os.path.join(self.root, library_id)
 
-    def path_for(self, library_id, image_id):
+    def _path(self, library_id, image_id, suffix):
         image_id = int(image_id)
         if image_id < 0:
             raise ValueError("invalid image id: %r" % (image_id,))
         return os.path.join(self.library_dir(library_id), "%03d" % (image_id // 1000),
-                            "%d.jpg" % image_id)
+                            "%d%s" % (image_id, suffix))
 
-    def write(self, library_id, image_id, data):
-        """Store a preview (atomically: readers see the old file or the new one). Returns its path."""
-        path = self.path_for(library_id, image_id)
+    def path_for(self, library_id, image_id):
+        return self._path(library_id, image_id, ".jpg")
+
+    def pano_path_for(self, library_id, image_id):
+        return self._path(library_id, image_id, PANO_SUFFIX)
+
+    @staticmethod
+    def _write(path, data):
         common.ensure_dir(os.path.dirname(path))
         common.write_file_atomic(path, data)
         return path
 
-    def read(self, library_id, image_id):
-        """The preview bytes, or None if there is no preview."""
+    @staticmethod
+    def _read(path):
         try:
-            with open(self.path_for(library_id, image_id), "rb") as handle:
+            with open(path, "rb") as handle:
                 return handle.read()
         except FileNotFoundError:
             return None
+
+    @staticmethod
+    def _remove(path):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def write(self, library_id, image_id, data):
+        """Store a preview (atomically: readers see the old file or the new one). Returns its path."""
+        return self._write(self.path_for(library_id, image_id), data)
+
+    def read(self, library_id, image_id):
+        """The preview bytes, or None if there is no preview."""
+        return self._read(self.path_for(library_id, image_id))
 
     def exists(self, library_id, image_id):
         return os.path.isfile(self.path_for(library_id, image_id))
 
     def delete(self, library_id, image_id):
         """Remove one preview. Returns True if a file was removed."""
+        return self._remove(self.path_for(library_id, image_id))
+
+    def write_pano(self, library_id, image_id, data):
+        """Store the pano of a 360 photo (atomically, like write()). Returns its path."""
+        return self._write(self.pano_path_for(library_id, image_id), data)
+
+    def read_pano(self, library_id, image_id):
+        """The pano bytes, or None if there is no pano."""
+        return self._read(self.pano_path_for(library_id, image_id))
+
+    def pano_exists(self, library_id, image_id):
+        return os.path.isfile(self.pano_path_for(library_id, image_id))
+
+    def delete_pano(self, library_id, image_id):
+        """Remove one pano. Returns True if a file was removed."""
+        return self._remove(self.pano_path_for(library_id, image_id))
+
+    def delete_both(self, library_id, image_id):
+        """Remove an image's preview and its pano. Returns True if a file was removed.
+
+        Both are tried even when removing the first fails (the first
+        OSError is raised afterwards).
+        """
+        removed = False
+        failure = None
+        for path in (self.path_for(library_id, image_id),
+                     self.pano_path_for(library_id, image_id)):
+            try:
+                removed = self._remove(path) or removed
+            except OSError as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
+        return removed
+
+    def stored_ids(self, library_id):
+        """(ids with a preview, ids with a pano) of a library: one listing per bucket folder."""
+        previews, panos = set(), set()
         try:
-            os.remove(self.path_for(library_id, image_id))
-            return True
-        except FileNotFoundError:
-            return False
+            buckets = [entry.path for entry in os.scandir(self.library_dir(library_id))
+                       if entry.is_dir()]
+        except OSError:
+            return previews, panos
+        for bucket in buckets:
+            try:
+                for entry in os.scandir(bucket):
+                    name = entry.name
+                    if name.endswith(PANO_SUFFIX):
+                        stem = name[:-len(PANO_SUFFIX)]
+                        if stem.isdigit():
+                            panos.add(int(stem))
+                    elif name.endswith(".jpg") and name[:-4].isdigit():
+                        previews.add(int(name[:-4]))
+            except OSError:
+                pass
+        return previews, panos
 
     def delete_library(self, library_id):
         """Remove every preview of a library. Returns True if anything was removed."""

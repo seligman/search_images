@@ -14,7 +14,9 @@ converts originals a browser cannot show (HEIC, TIFF, ...) to JPEG.
 360-degree photos are recognised by detect_projection(). Unstitched
 dual-fisheye frames (Insta360 .insp) are stitched into an equirectangular
 panorama by dual_fisheye_to_equirect(), and front_view() cuts a natural
-looking picture from a panorama for the thumbnail.
+looking picture from a panorama for the thumbnail. read_image(want_pano=True)
+also makes a larger panorama of a 360 photo (PANO_EDGE wide) for the
+interactive 360 view.
 
 The EXIF helpers (sanitize_exif, parse_capture_date, exif_gps_to_decimal,
 camera_name, exif_metadata) and sniff_mime() live in imageinfo.py, which needs
@@ -54,6 +56,16 @@ THUMB_SIZE = 320          # thumbnails fit in a THUMB_SIZE x THUMB_SIZE box
 THUMB_QUALITY = 85
 PREVIEW_EDGE = 2048       # long edge of the cached preview
 PREVIEW_QUALITY = 85
+# A 360-degree photo also gets a larger panorama ("pano") for the 360 view:
+# a whole panorama stretched across the screen needs about twice the
+# preview's pixels to look sharp. This wide, never upscaled, and only when
+# that is larger than the preview (see has_pano). A trade-off rather than
+# all the detail there is: an unstitched frame 6000 px wide holds about 15
+# pixels per degree in the middle of each lens, against 11 here, but a
+# wider pano takes longer to download on a phone, and some phones cannot
+# show a picture wider than 4096 px in the 360 view.
+PANO_EDGE = 4096
+PANO_QUALITY = 85
 BROWSER_QUALITY = 90      # full-size JPEGs made for formats browsers cannot show
 # At most this many pixels (summed over all threads) are decoded at full size
 # at the same time. Decoding takes several bytes per pixel, so this bounds the
@@ -287,6 +299,15 @@ def _orientation_method(image):
         return _ORIENTATION_METHODS.get(int(value))
     except Exception:
         return None
+
+
+def has_pano(width, height):
+    """True if a 360-degree photo of this (displayed) size gets a pano.
+
+    Only one larger than PREVIEW_EDGE does: for a smaller one the preview
+    is already the whole picture.
+    """
+    return max(int(width or 0), int(height or 0)) > PREVIEW_EDGE
 
 
 def _fit_size(size, edge):
@@ -999,7 +1020,7 @@ def _stitched_original(data, size_for, known=False):
 
 
 def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
-               mtime=None):
+               mtime=None, want_pano=False):
     """Read an original once and return everything the index stores about it.
 
     The bytes come from helper.load_image(path) when the helper provides
@@ -1023,6 +1044,14 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
                         lenses for dual_fisheye), the thumbnail and dHash
                         show its front view (front_view()) and width x
                         height is the panorama's 2:1 size.
+        pano            for a 360-degree photo larger than the preview
+                        (has_pano) when want_pano is set: JPEG bytes of
+                        the equirectangular panorama, PANO_EDGE wide
+                        (never upscaled; no EXIF), for the 360 view; else
+                        None. A dual-fisheye frame is then decoded
+                        at full size and stitched at that width (the
+                        preview is that panorama made smaller), so the
+                        pano holds the detail of the original.
     mtime (the file's modification time) is only used when neither EXIF nor
     the file name gives a capture date; when omitted it is looked up.
     Raises ImageReadError (SourceReadError for I/O errors) when the file
@@ -1039,17 +1068,27 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
             exif = extract_exif(image)
             xmp = _image_xmp(image, data)
             maybe_360 = _may_be_360(image, exif, xmp, name)
+            # A possible 360 photo is decoded large enough for its pano.
+            pano_edge = int(PANO_EDGE) if want_pano and maybe_360 else 0
+            stitch_edge = max(working_edge, pano_edge)
             # A dual-fisheye frame is decoded larger: its circles are
             # stretched over the whole panorama.
             maybe_dual = maybe_360 and _is_unstitched_original(exif, name)
-            decode_edge = _fisheye_source_edge(working_edge) if maybe_dual else working_edge
+            decode_edge = _fisheye_source_edge(stitch_edge) if maybe_dual else stitch_edge
             with _decoded(image, lambda w, h: _fit_size((w, h), decode_edge),
                           resize=not maybe_dual) as (working, (width, height), icc):
                 projection = detect_projection(working, exif, xmp, name) if maybe_360 else ""
                 if projection == PROJECTION_DUAL_FISHEYE:
                     # The panorama is as wide as the frame (never upscaled).
-                    working = dual_fisheye_to_equirect(working, min(working_edge, width))
+                    working = dual_fisheye_to_equirect(working, min(stitch_edge, width))
                     height = max(1, int(round(width / 2.0)))
+                pano = None
+                if projection and pano_edge and has_pano(width, height):
+                    pano_size = _fit_size((width, height), pano_edge)
+                    pano_image = working
+                    if pano_image.size != pano_size:
+                        pano_image = working.resize(pano_size, _LANCZOS, reducing_gap=2.0)
+                    pano = _encode_jpeg(pano_image, PANO_QUALITY, icc)
                 working_size = _fit_size((width, height), working_edge)
                 if working.size != working_size:
                     working = working.resize(working_size, _LANCZOS, reducing_gap=2.0)
@@ -1087,7 +1126,7 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
     result = {
         "width": width, "height": height, "thumb": thumb, "preview": preview,
         "exif": exif, "dhash": dhash, "content_hash": content_hash,
-        "mime": mime, "projection": projection,
+        "mime": mime, "projection": projection, "pano": pano,
     }
     result.update(meta)
     return result

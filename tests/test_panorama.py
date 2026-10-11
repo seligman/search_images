@@ -538,6 +538,93 @@ class ReadImage360Test(unittest.TestCase):
         small = images.read_image(self.big, preview_edge=600)
         self.assertEqual(self.open(small["preview"]).size, (600, 300))
 
+    def red_centroid_near(self, image, x, y, reach=120):
+        """red_centroid() of the part of a large image around (x, y), in its coordinates."""
+        left, top = max(0, int(x) - reach), max(0, int(y) - reach)
+        found = red_centroid(image.crop((left, top, int(x) + reach, int(y) + reach)))
+        return None if found is None else (found[0] + left, found[1] + top)
+
+    def test_pano_is_stitched_once_from_the_whole_frame(self):
+        params = images.INSTA360_PARAMS
+        size = (4800, 2400)
+        x, y = lens_position(0, 0, size, params)
+        frame = imagegen.dual_fisheye_image(size, offsets=params["offsets"],
+                                            markers=[(x, y, 30)])
+        insta = exif_of("Arashi Vision", "Insta360 OneR", ONE_R_INSP["ImageDescription"])
+        path = imagegen.write_bytes(self.dir, "IMG_20190514_142301_00_009.insp",
+                                    imagegen.jpeg_bytes(frame, insta, quality=85))
+        calls = []
+        real = images.dual_fisheye_to_equirect
+
+        def spy(image, out_width=images.PREVIEW_EDGE, params=params):
+            calls.append((image.size, out_width))
+            return real(image, out_width, params)
+        with mock.patch.object(images, "dual_fisheye_to_equirect", spy):
+            result = images.read_image(path, want_pano=True)
+        # One decode at full size and one stitch at the pano's width: the
+        # pano is not a larger copy of the 2048 px preview.
+        self.assertEqual(calls, [(size, images.PANO_EDGE)])
+        self.assertEqual(result["projection"], "dual_fisheye")
+        self.assertEqual((result["width"], result["height"]), size)
+        pano = self.open(result["pano"])
+        self.assertEqual((pano.format, pano.size), ("JPEG", (4096, 2048)))
+        self.assertNotIn("exif", pano.info)
+        centre = self.red_centroid_near(pano, 2048, 1024)
+        self.assertAlmostEqual(centre[0], 2048, delta=6)
+        self.assertAlmostEqual(centre[1], 1024, delta=6)
+        # The preview and thumbnail are made from it, as without a pano.
+        preview = self.open(result["preview"])
+        self.assertEqual(preview.size, (2048, 1024))
+        centre = self.red_centroid_near(preview, 1024, 512)
+        self.assertAlmostEqual(centre[0], 1024, delta=3)
+        self.assertAlmostEqual(centre[1], 512, delta=3)
+        self.assertEqual(self.open(result["thumb"]).size, (320, 240))
+        plain = images.read_image(path)
+        self.assertIsNone(plain["pano"])
+        self.assertEqual(self.open(plain["preview"]).size, (2048, 1024))
+        self.assertLessEqual(hamming(result["dhash"], plain["dhash"]), 4)
+
+    def test_a_pano_only_when_larger_than_the_preview(self):
+        # A small 360 photo's preview is already all of it.
+        for path in (self.insp, self.equirect):
+            result = images.read_image(path, want_pano=True)
+            self.assertIn(result["projection"], images.PROJECTIONS_360)
+            self.assertIsNone(result["pano"])
+        self.assertFalse(images.has_pano(2048, 1024))
+        self.assertFalse(images.has_pano(0, 0))
+        self.assertTrue(images.has_pano(2050, 1025))
+        # A larger one gets a pano, never upscaled.
+        data = imagegen.jpeg_with_xmp(imagegen.equirect_image((2400, 1200)),
+                                      imagegen.gpano_xmp())
+        path = imagegen.write_bytes(self.dir, "mid-pano.jpg", data)
+        result = images.read_image(path, want_pano=True)
+        self.assertEqual(self.open(result["pano"]).size, (2400, 1200))
+        self.assertEqual(self.open(result["preview"]).size, (2048, 1024))
+
+    def test_large_stitched_panorama_pano(self):
+        data = imagegen.jpeg_with_xmp(imagegen.equirect_image((5000, 2500), marker=True),
+                                      imagegen.gpano_xmp(), quality=85)
+        path = imagegen.write_bytes(self.dir, "large-pano.jpg", data)
+        result = images.read_image(path, want_pano=True)
+        self.assertEqual(result["projection"], "equirectangular")
+        self.assertEqual((result["width"], result["height"]), (5000, 2500))
+        pano = self.open(result["pano"])
+        self.assertEqual(pano.size, (4096, 2048))
+        centre = self.red_centroid_near(pano, 2048, 1024)
+        self.assertAlmostEqual(centre[0], 2048, delta=4)
+        self.assertEqual(self.open(result["preview"]).size, (2048, 1024))
+
+    def test_only_360_photos_get_a_pano(self):
+        photo = imagegen.write_bytes(self.dir, "photo.jpg", imagegen.jpeg_bytes(
+            imagegen.marker_image((64, 48))))
+        for path in (self.wide, photo):
+            result = images.read_image(path, want_pano=True)
+            self.assertEqual(result["projection"], "")
+            self.assertIsNone(result["pano"])
+        # Only when asked for.
+        self.assertIsNone(images.read_image(self.big)["pano"])
+        self.assertIsNotNone(images.read_image(self.big, want_pano=True)["pano"])
+
     def test_stitched_panorama(self):
         result = images.read_image(self.equirect)
         self.assertEqual(result["projection"], "equirectangular")
