@@ -59,6 +59,7 @@ class JobContextTest(unittest.TestCase):
 
     def test_log_is_bounded_and_redacted(self):
         ctx = jobs.JobContext(log_limit=5)
+        # Not real secrets: made-up values used only by this test.
         ctx.add_secret("super-secret-value")
         for n in range(10):
             ctx.log("line %d" % n)

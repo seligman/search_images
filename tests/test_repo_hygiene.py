@@ -5,7 +5,7 @@ Every file that git would commit (tracked files plus untracked files that are
 not ignored) is checked for things that usually point at one person's
 machine: absolute drive or UNC paths that are not documentation
 placeholders, user-profile paths, non-loopback IP addresses, and model file
-names.
+names. Text files must also use LF line endings only.
 
 You can also keep a private list of words that must never appear in the repo
 (a NAS name, a share, library names, ...). Put one term per line in either of
@@ -177,6 +177,24 @@ class RepoHygieneTest(unittest.TestCase):
                         failures.append("%s:%d: private term %r" % (name, number, term))
         self.assertEqual(failures, [], "\n" + "\n".join(failures))
 
+    def test_text_files_use_lf_line_endings(self):
+        # LF only (no CR anywhere), whatever editor or git settings were used,
+        # so diffs stay clean. Unlike the checks above this includes this file.
+        failures = []
+        for name in self.files:
+            if name.lower().endswith(BINARY_EXTENSIONS):
+                continue
+            path = os.path.join(REPO, name)
+            if not os.path.isfile(path):
+                continue
+            with open(path, "rb") as handle:
+                data = handle.read()
+            if b"\0" in data[:4096] or b"\r" not in data:
+                continue
+            line = data[:data.index(b"\r")].count(b"\n") + 1
+            failures.append("%s:%d: CR (Windows) line ending; use LF only" % (name, line))
+        self.assertEqual(failures, [], "\n" + "\n".join(failures))
+
     def test_gitignore_covers_personal_data(self):
         must_ignore = [
             "config.json", "data/images.db", "data/thumbs/thumb-0000.dat",
@@ -204,6 +222,7 @@ class ScannerSelfTest(unittest.TestCase):
     """Make sure the patterns above catch what they are meant to catch."""
 
     def test_detects_leaks(self):
+        # The key-like values below are made up to test the scanner; none is a real key.
         leaky = [
             r'"path": "C:\\Users\\alice\\Pictures\\Trip"',
             r"see \\fileserver\photos\2019",
@@ -217,6 +236,7 @@ class ScannerSelfTest(unittest.TestCase):
             self.assertTrue(scan_line(line), line)
 
     def test_allows_placeholders(self):
+        # The key-like values below are made up to test the scanner; none is a real key.
         clean = [
             r'"path": "C:\\Photos\\Family"',
             r"\\server\share\Pictures",

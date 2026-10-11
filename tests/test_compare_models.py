@@ -25,6 +25,7 @@ import llm
 import prompts
 import scan
 
+# Not a real key: a made-up value used to check that keys never leak.
 SECRET = "sk-test-compare-0123456789abcdef"
 
 

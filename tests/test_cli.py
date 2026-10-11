@@ -18,6 +18,7 @@ import progress
 import settings
 import world_map
 
+# Not a real key: a made-up value used to check that keys never leak.
 SECRET = "sk-test-0123456789abcdefSECRET"
 NOW = 1700000000.0
 
@@ -312,6 +313,7 @@ class SettingsTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual(config["default_endpoint"], "gpu-b")
 
     def test_a_key_typed_as_a_variable_name_is_not_saved(self):
+        # Not a real key: a made-up value used only by this test.
         pasted = "AIzaSyFAKE-pasted-key-0123456789abcdefg"
         config = {"endpoints": [{"name": "g", "preset": "gemini", "model": "m"}]}
         endpoint = config["endpoints"][0]
@@ -455,6 +457,7 @@ class SettingsTest(support.TempBaseMixin, unittest.TestCase):
             prompts.append(prompt)
             return answers.pop(0)
 
+        # Not a real key: a made-up value used only by this test.
         answers = ["", "-", "sk-new-key-value-1234"]
         with mock.patch("getpass.getpass", fake_getpass), \
                 mock.patch("builtins.input", side_effect=AssertionError("echoed input")):

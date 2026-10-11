@@ -467,6 +467,7 @@ class ApiKeyTest(support.TempBaseMixin, unittest.TestCase):
             os.environ.pop(name, None)
 
     def test_lookup_order(self):
+        # None of these are real keys: they are made-up values used only by this test.
         key_file = self.base.write_file("keys/llm.key", "file-key-value\n")
         endpoint = {"preset": "openai", "api_key_env": "TEST_SEARCH_IMAGES_KEY",
                     "api_key_file": key_file, "api_key": "config-key-value"}
@@ -488,6 +489,7 @@ class ApiKeyTest(support.TempBaseMixin, unittest.TestCase):
         del endpoint["api_key_env"]
         self.assertEqual(resolve(endpoint), ("preset-key-value", "env OPENAI_API_KEY"))
         self.assertEqual(resolve({"kind": "claude"}), ("", "none"))
+        # Not a real key: a made-up value used only by this test.
         os.environ["ANTHROPIC_API_KEY"] = "anthropic-key-value"
         self.assertEqual(resolve({"kind": "claude"}), ("anthropic-key-value",
                                                        "env ANTHROPIC_API_KEY"))
@@ -499,6 +501,7 @@ class ApiKeyTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual(resolve(None), ("", "none"))
 
     def test_usual_variable_only_for_the_presets_own_service(self):
+        # None of these are real keys: they are made-up values used only by this test.
         os.environ["ANTHROPIC_API_KEY"] = "anthropic-key-value"
         os.environ["OPENAI_API_KEY"] = "openai-key-value"
         os.environ["AZURE_OPENAI_API_KEY"] = "azure-key-value"
@@ -525,6 +528,7 @@ class ApiKeyTest(support.TempBaseMixin, unittest.TestCase):
                          ("anthropic-key-value", "env ANTHROPIC_API_KEY"))
 
     def test_a_key_pasted_as_a_variable_name_is_never_shown(self):
+        # None of these are real keys: they are made-up values used only by this test.
         for pasted in ("AIzaSyFAKE-pasted-key-0123456789abcdefg", "sk-proj-pastedvalue",
                        "AIzaSyFAKEpastedkey0123456789abcdefgh", "Xy7kQ2mR9pL4vN8wT3zB6cD1",
                        "has space", "1STARTS_WITH_DIGIT"):
@@ -791,6 +795,7 @@ class HelperTest(support.TempBaseMixin, unittest.TestCase):
 class RedactTest(unittest.TestCase):
 
     def test_masks_credential_shapes(self):
+        # Not real secrets: made-up values used only by this test.
         cases = [
             ("Authorization: Bearer abc.DEF-123_xyz", "abc.DEF-123_xyz"),
             ("x-api-key: k-123456789", "k-123456789"),
@@ -809,6 +814,7 @@ class RedactTest(unittest.TestCase):
         self.assertIn("&alt=json", common.redact(cases[3][0]))
 
     def test_masks_given_secrets(self):
+        # Not a real key: a made-up value used only by this test.
         key = "my-very-secret-key"
         text = "request failed (key %s) at http://127.0.0.1:8080/" % key
         result = common.redact(text, [key, None, "", "ab"])

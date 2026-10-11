@@ -30,6 +30,7 @@ import llm
 import prompts
 import scan
 
+# Not a real key: a made-up value used to check that keys never leak.
 SECRET = "sk-test-0123456789abcdefSECRETKEY"
 KEY_VARIABLES = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
                  "OPENROUTER_API_KEY", "AZURE_OPENAI_API_KEY")
@@ -272,6 +273,7 @@ class DescribeTest(DescribeTestCase):
 
     def test_content_retries_of_cloud_and_ollama_endpoints(self):
         self.small_images(1)
+        # Not a real key: a made-up value used only by this test.
         cloud = self.endpoint(preset="openai", api_key="test-key-0101")
         self.configure(endpoint=cloud)
         self.index()
@@ -573,6 +575,7 @@ class EndpointTest(DescribeTestCase):
         self.index()
         for kind in ("claude", "ollama"):
             with self.subTest(kind=kind):
+                # Not a real key: a made-up value used only by this test.
                 self.config["endpoint"] = self.endpoint(kind=kind, base_url=self.server.root_url,
                                                         api_key="secret-key-123")
                 self.execute("UPDATE images SET described = 0, info = ''")
@@ -857,6 +860,7 @@ class EndpointTest(DescribeTestCase):
             "code": 403, "message": 'Your chosen model requires moderation and your input '
                                     'was flagged for "sexual"',
             "metadata": {"reasons": ["sexual"], "flagged_input": "..."}}})
+        # Not a real key: a made-up value used only by this test.
         self.configure(endpoint=self.endpoint(preset="openrouter", api_key="test-key-0303",
                                               concurrency=1))
         self.index()

@@ -155,6 +155,7 @@ class OpenAIRequestTest(LlmTestCase):
         }
         for preset, (tokens, template) in cases.items():
             with self.subTest(preset=preset):
+                # Not a real key: a made-up value used only by this test.
                 self.describe(self.endpoint(preset=preset, api_key="test-key-0001"))
                 request = self.last()
                 payload = request["payload"]
@@ -238,6 +239,7 @@ class OpenAIRequestTest(LlmTestCase):
 class ClaudeRequestTest(LlmTestCase):
 
     def test_request_shape(self):
+        # Not a real key: a made-up value used only by this test.
         endpoint = self.endpoint("claude", model="claude-haiku-5-5", api_key="test-key-0002")
         reply = self.describe(endpoint)
         self.assertEqual(reply["text"], REPLY)
@@ -605,6 +607,7 @@ class ErrorTest(LlmTestCase):
         # A redirect would carry the key headers (and the picture) elsewhere.
         collector = fake_llm.FakeLLM().start()
         self.addCleanup(collector.stop)
+        # Not a real key: a made-up value used only by this test.
         key = "test-key-redirect-0001"
         for status in (301, 302, 303, 307, 308):
             with self.subTest(status=status):
@@ -627,6 +630,7 @@ class ErrorTest(LlmTestCase):
         self.assertTrue(self.server.requests)
 
     def test_keys_are_masked_before_error_texts_are_cut(self):
+        # Not a real key: a made-up value used only by this test.
         key = "SENTINELKEY9f8e7d6c5b4a3210fedcba"
         endpoint = self.endpoint(api_key=key)
         for start in range(llm.ERROR_TEXT_LIMIT - 12, llm.ERROR_TEXT_LIMIT + 2):
@@ -655,6 +659,7 @@ class ErrorTest(LlmTestCase):
         self.assertIn("base URL", str(error))
 
     def test_keys_never_appear_in_errors_or_logs(self):
+        # None of these are real keys: they are made-up values used only by this test.
         keys = ("plain-secret-value-123", "sk-proj-abcdefghijklmnopqrstuvwxyz0123")
         for key in keys:
             with self.subTest(key=key[:6]):
@@ -685,6 +690,7 @@ class ErrorTest(LlmTestCase):
         self.assertEqual(llm.explain_error(error, endpoint),
                          "The OpenAI endpoint 'cloud' rejected the API key (401). "
                          "No API key is set.")
+        # Not a real key: a made-up value used only by this test.
         os.environ["OPENAI_API_KEY"] = "test-key-0006"
         endpoint["api_key_env"] = "OPENAI_API_KEY"
         self.server.queue(fake_llm.unauthorized())
@@ -829,6 +835,7 @@ class ProbeTest(LlmTestCase):
     def test_llamacpp_props(self):
         self.server.props_data = {"model_path": "C:\\path\\to\\model.gguf", "total_slots": 4,
                                   "modalities": {"vision": True}}
+        # Not a real key: a made-up value used only by this test.
         endpoint = self.endpoint(api_key="test-key-0003")
         info = llm.probe(endpoint)
         self.assertEqual(info, {"model": "model.gguf", "slots": 4, "vision": True,
@@ -926,6 +933,7 @@ class WaitUntilReadyTest(LlmTestCase):
 class TestEndpointTest(LlmTestCase):
 
     def test_success(self):
+        # Not a real key: a made-up value used only by this test.
         endpoint = self.endpoint(api_key="test-key-0004", price_in=1.0, price_out=2.0)
         result = llm.test_endpoint(endpoint, JPEG)
         self.assertTrue(result["ok"], result)
@@ -992,6 +1000,7 @@ class ListModelsTest(LlmTestCase):
     def test_each_kind(self):
         self.assertEqual(llm.list_models(self.endpoint()), ["fake-model", "other-model"])
         self.assertEqual(self.server.requests[-1]["path"], "/v1/models")
+        # Not a real key: a made-up value used only by this test.
         claude = self.endpoint("claude", api_key="test-key-0005")
         self.assertEqual(llm.list_models(claude), ["fake-model", "other-model"])
         request = self.server.requests[-1]
