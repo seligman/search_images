@@ -1,0 +1,266 @@
+/* Tests for static/export-review.js: the words and rules of the Manage
+   page's Export dialog (what the options mean, which pictures they leave
+   out, choosing pictures one by one, and the summaries).
+
+   Run by tests/test_admin_export.py with a JSON file that lists what
+   export.py knows (its options, the picture types, the reasons it gives),
+   or directly:
+       node tests/js/export_review_test.js [expected.json]
+   Prints one line per test and exits with status 1 when any test fails.
+*/
+"use strict";
+
+var assert = require("assert");
+var fs = require("fs");
+var path = require("path");
+
+var R = require(path.join(__dirname, "..", "..", "static", "export-review.js"));
+var expected = process.argv[2] ? JSON.parse(fs.readFileSync(process.argv[2], "utf8")) : null;
+
+var tests = [];
+
+function test(name, body) {
+    tests.push({name: name, body: body});
+}
+
+function defaults() {
+    return {title: "", images: "web", location: false, file_names: false, folders: false,
+            exclude_types: ["screenshot", "document"], exclude_private: true,
+            exclude_sensitive: true, exclude_undescribed: true, include_ids: [],
+            exclude_ids: [], credits: "", zip: false, allow_indexing: false};
+}
+
+var SHOT = {id: 4, reason: "private", reasons: ["private", "screenshot"], title: "Chat"};
+var SCAN = {id: 7, reason: "scan", reasons: ["scan"], title: "Old letter"};
+var BLANK = {id: 9, reason: "undescribed", reasons: ["undescribed"], title: ""};
+var RACY = {id: 2, reason: "sensitive", reasons: ["sensitive"], title: "Beach"};
+var CHOSEN = {id: 11, reason: "included", reasons: [], title: "Sunset"};
+var MENU = {id: 13, reason: "writing", reasons: ["writing"], title: "Menu"};
+var OLD = {id: 15, reason: "unchecked", reasons: ["unchecked"], title: "Old one"};
+var RECEIPT = {id: 17, reason: "document", reasons: ["document"], title: "Receipt"};
+
+/* ---------- The words cover what export.py knows ---------------------------- */
+
+test("every option has words", function () {
+    var keys = Object.keys(R.OPTIONS).sort();
+    if (expected) {
+        assert.deepStrictEqual(keys, expected.options.filter(function (key) {
+            return key !== "include_ids" && key !== "exclude_ids";
+        }).sort());
+    }
+    ["web", "original", "none"].forEach(function (mode) {
+        assert.ok(R.OPTIONS.images[mode].label && R.OPTIONS.images[mode].hint, mode);
+    });
+    keys.forEach(function (key) {
+        if (key !== "images") {
+            assert.ok(R.OPTIONS[key].label && R.OPTIONS[key].hint, key);
+        }
+    });
+});
+
+test("the picture types offered and every reason have words", function () {
+    Object.keys(R.TYPES).forEach(function (type) {
+        assert.ok(R.TYPES[type].label && R.TYPES[type].hint, type);
+        if (expected) {
+            assert.ok(expected.photo_types.indexOf(type) >= 0, type);
+        }
+    });
+    var reasons = expected ? expected.reasons : ["private", "sensitive", "undescribed"];
+    reasons.forEach(function (reason) {
+        var words = R.REASONS[reason];
+        assert.ok(words && words.one && words.many, reason);
+    });
+    // Words the owner sees never contain markup.
+    JSON.stringify([R.OPTIONS, R.TYPES, R.REASONS]).replace(/[<>]/g, function (found) {
+        // Only the zip hint names a file pattern with angle brackets.
+        assert.ok(R.OPTIONS.zip.hint.indexOf(found) >= 0, found);
+    });
+});
+
+/* ---------- Which pictures are published ------------------------------------ */
+
+test("the options decide, unless a picture was chosen", function () {
+    var options = defaults();
+    assert.deepStrictEqual(R.activeReasons(SHOT, options), ["private", "screenshot"]);
+    assert.strictEqual(R.published(SHOT, options), false);
+    assert.strictEqual(R.published(SCAN, options), true);
+    assert.strictEqual(R.published(BLANK, options), false);
+    assert.strictEqual(R.published(CHOSEN, options), true);
+    options.exclude_private = false;
+    assert.deepStrictEqual(R.activeReasons(SHOT, options), ["screenshot"]);
+    options.exclude_types = [];
+    assert.strictEqual(R.published(SHOT, options), true);
+    options.exclude_undescribed = false;
+    assert.strictEqual(R.published(BLANK, options), true);
+    options.exclude_ids = [9];
+    assert.strictEqual(R.published(BLANK, options), false);
+    options = defaults();
+    options.include_ids = [9];
+    assert.strictEqual(R.published(BLANK, options), true);
+    // Pictures with writing are only shown; older descriptions count as
+    // not checked, like pictures not described yet.
+    options = defaults();
+    assert.strictEqual(R.published(MENU, options), true);
+    assert.deepStrictEqual(R.activeReasons(OLD, options), ["unchecked"]);
+    assert.strictEqual(R.published(OLD, options), false);
+    options.exclude_undescribed = false;
+    assert.strictEqual(R.published(OLD, options), true);
+});
+
+test("a picture chosen despite its flags is left out again by a new one", function () {
+    var options = defaults();
+    // Published while it was not described yet ...
+    options.include_ids = [[9, ["undescribed"]]];
+    assert.strictEqual(R.published(BLANK, options), true);
+    assert.deepStrictEqual(R.newFlags(BLANK, options), []);
+    // ... then described: it shows private information.
+    var now = {id: 9, reason: "private", reasons: ["private", "document"], title: "Statement"};
+    assert.strictEqual(R.published(now, options), false);
+    assert.deepStrictEqual(R.newFlags(now, options), ["private", "document"]);
+    // Choosing it again keeps its flags of now.
+    var again = R.choose(options, now, true);
+    assert.deepStrictEqual(again.include_ids, [[9, ["private", "document"]]]);
+    assert.strictEqual(R.published(now, again), true);
+    assert.deepStrictEqual(R.newFlags(now, again), []);
+    // A flag that the options do not leave out does not count.
+    options.exclude_private = false;
+    options.exclude_types = [];
+    assert.strictEqual(R.published(now, options), true);
+    // A plain id (from the API or an older version): whatever the flags.
+    options = defaults();
+    options.include_ids = [9];
+    assert.strictEqual(R.published(now, options), true);
+    assert.deepStrictEqual(R.newFlags(now, options), []);
+});
+
+test("choices are counted without asking the server again", function () {
+    var options = defaults();
+    var reply = {
+        options: options,
+        counts: {total: 10, exported: 5, needs_folder: 5, unavailable: 5,
+                 by_reason: {"private": 1, undescribed: 1, sensitive: 1, hidden: 2}},
+        size_estimate: 1000,
+        size_parts: {thumbs: 100, images: 800, panos: 0, data: 100},
+        flagged: [
+            {id: 4, reasons: ["private", "screenshot"], excluded: true, bytes: 50,
+             parts: {thumbs: 10, images: 40}, needs_folder: true},
+            {id: 7, reasons: ["scan"], excluded: false, bytes: 70,
+             parts: {thumbs: 10, images: 60}, needs_folder: true},
+            {id: 9, reasons: ["undescribed"], excluded: true, bytes: 30,
+             parts: {thumbs: 10, images: 20}, needs_folder: false}
+        ]
+    };
+    assert.deepStrictEqual(R.recount(reply, options).counts, reply.counts);
+    var chosen = R.choose(R.choose(options, reply.flagged[0], true), reply.flagged[1], false);
+    var after = R.recount(reply, chosen);
+    assert.strictEqual(after.counts.exported, 5);
+    assert.deepStrictEqual(after.counts.by_reason, {undescribed: 1, sensitive: 1, hidden: 2,
+                                                    excluded: 1});
+    assert.strictEqual(after.size_estimate, 1000 + 50 - 70);
+    assert.deepStrictEqual(after.size_parts, {thumbs: 100, images: 780, panos: 0, data: 100});
+    assert.strictEqual(after.counts.needs_folder, 5);
+    chosen = R.choose(chosen, reply.flagged[2], true);
+    after = R.recount(reply, chosen);
+    assert.strictEqual(after.counts.exported, 6);
+    assert.strictEqual(after.size_estimate, 1000 + 50 - 70 + 30);
+    assert.ok(!("undescribed" in after.counts.by_reason));
+    // The reply itself is not changed.
+    assert.strictEqual(reply.counts.exported, 5);
+    assert.strictEqual(reply.counts.by_reason["private"], 1);
+});
+
+test("choosing a picture only lists it when the rules decide otherwise", function () {
+    var options = defaults();
+    var chosen = R.choose(options, SHOT, true);
+    assert.deepStrictEqual(chosen.include_ids, [[4, ["private", "screenshot"]]]);
+    assert.deepStrictEqual(chosen.exclude_ids, []);
+    assert.strictEqual(R.published(SHOT, chosen), true);
+    // The options passed in are not changed.
+    assert.deepStrictEqual(options.include_ids, []);
+    var back = R.choose(chosen, SHOT, false);
+    assert.deepStrictEqual(back.include_ids, []);
+    assert.deepStrictEqual(back.exclude_ids, []);
+    assert.strictEqual(R.published(SHOT, back), false);
+    // A scan is published by the rules: leaving it out lists it.
+    var out = R.choose(back, SCAN, false);
+    assert.deepStrictEqual(out.exclude_ids, [7]);
+    assert.strictEqual(R.published(SCAN, out), false);
+    out = R.choose(R.choose(out, RACY, true), BLANK, true);
+    assert.deepStrictEqual(out.include_ids, [[2, ["sensitive"]], [9, ["undescribed"]]]);
+    // A plain id of an older version is replaced, not doubled.
+    var older = defaults();
+    older.include_ids = [9, 12];
+    assert.deepStrictEqual(R.choose(older, BLANK, true).include_ids,
+                           [[9, ["undescribed"]], 12]);
+    assert.deepStrictEqual(R.choose(out, SCAN, true).exclude_ids, []);
+    assert.strictEqual(out.images, "web");
+});
+
+/* ---------- The review grid and the summaries -------------------------------- */
+
+test("flagged pictures are grouped, most serious first", function () {
+    var groups = R.groups([BLANK, SCAN, CHOSEN, SHOT, RACY, MENU, OLD, RECEIPT]);
+    assert.deepStrictEqual(groups.map(function (group) {
+        return group.key;
+    }), ["private", "sensitive", "document", "scan", "writing", "unchecked", "undescribed",
+         "chosen"]);
+    groups.forEach(function (group) {
+        assert.ok(group.title && group.hint, group.key);
+    });
+    assert.deepStrictEqual(groups[0].items, [SHOT]);
+    assert.strictEqual(groups[0].title, "Private information");
+    assert.ok(groups[0].hint);
+    assert.deepStrictEqual(R.groups([]), []);
+    assert.strictEqual(R.reasonWords(SHOT.reasons), "private information, screenshot");
+    assert.strictEqual(R.reasonWords(["meme", "odd"]), "meme, odd");
+});
+
+test("counts, size and details in words", function () {
+    var counts = {total: 1699, exported: 312, by_reason: {
+        undescribed: 1204, screenshot: 31, hidden: 3, "private": 1, excluded: 2, failed: 4,
+        unchecked: 1}};
+    assert.strictEqual(R.headline(counts), "312 of 1,699 pictures will be published.");
+    assert.deepStrictEqual(R.leftOut(counts), [
+        "1 picture with private information", "31 screenshots",
+        "1 picture described by an older version (not checked)",
+        "1,204 pictures not described yet", "2 pictures you left out",
+        "3 hidden pictures (never published)", "4 failed"]);
+    assert.strictEqual(R.headline({total: 0, exported: 0}),
+                       "This library has no pictures to publish yet.");
+    assert.ok(/No picture/.test(R.headline({total: 4, exported: 0})));
+    assert.strictEqual(R.sizeText({size_estimate: 170000000, size_parts: {
+        thumbs: 12000000, images: 150000000, panos: 0, data: 8000000}}),
+        "About 162 MB: thumbnails 11 MB, pictures 143 MB, pages and data 7.6 MB.");
+    assert.strictEqual(R.sizeText({size_estimate: 2048, size_parts: {data: 2048}}),
+                       "About 2.0 KB.");
+    assert.strictEqual(R.sizeText(null), "");
+    assert.strictEqual(R.bytes(512), "512 bytes");
+    var options = defaults();
+    assert.strictEqual(R.detailsText(options), "Published with each picture: its title, " +
+        "description, tags, any text read in the picture, the day it was taken (from the " +
+        "camera or the file name) and camera model and settings. Not its file name, " +
+        "folder or location.");
+    options.file_names = options.folders = true;
+    assert.ok(/Not its location\.$/.test(R.detailsText(options)), R.detailsText(options));
+    options.location = true;
+    assert.ok(/file name, folder and location\.$/.test(R.detailsText(options)));
+    // Only this computer can open the site the command serves.
+    assert.strictEqual(R.serveCommand("C:\\Photos\\Family"),
+                       "python -m http.server --bind 127.0.0.1 --directory " +
+                       "\"C:\\Photos\\Family\"");
+});
+
+/* ---------- Run ------------------------------------------------------------------ */
+
+var failed = 0;
+tests.forEach(function (item) {
+    try {
+        item.body();
+        console.log("ok   " + item.name);
+    } catch (error) {
+        failed += 1;
+        console.log("FAIL " + item.name + "\n" + (error && error.stack || error));
+    }
+});
+console.log((tests.length - failed) + " of " + tests.length + " passed");
+process.exit(failed ? 1 : 0);

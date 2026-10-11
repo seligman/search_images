@@ -279,6 +279,46 @@ A list of folders to scan. Each library is one object:
   letters". It can help the descriptions, but it is sent to the endpoint's
   service, so do not put anything private here. Names of people in the
   notes are not used to identify anyone.
+- `export` - optional saved options for publishing the library as a static
+  website (see README, "Publishing a library"). The Export dialog on the
+  Manage page writes them when an export starts (only the options that
+  differ from the defaults are stored). Every option may be left out; the
+  defaults publish as little as possible:
+  - `title` - the site's name; blank (the default) uses the library name.
+  - `images` - `"web"` (the default: 2048 px pictures), `"original"` (the
+    originals with their metadata removed; HEIC, HEIF, AVIF and TIFF become
+    JPEG, BMP becomes PNG) or `"none"` (thumbnails only).
+  - `location` - `true` adds GPS positions (rounded to about 10 m), the map,
+    and the AI model's separate landmark and place-guess fields (extended
+    metadata); default `false`. Titles and descriptions are published as
+    written either way, and can name a place a picture shows.
+  - `file_names`, `folders` - `true` publishes file names or folder names
+    (searchable); default `false`.
+  - `exclude_types` - picture types left out; default
+    `["screenshot", "document"]` (the others are `scan`, `artwork`, `meme`,
+    `diagram`, `photo` and `other`). A picture whose document type is a
+    receipt, letter, form, ticket or handwriting also counts as a
+    `document`, and one showing a chat, web page or app as a `screenshot`,
+    whatever its photo type.
+  - `exclude_private`, `exclude_sensitive`, `exclude_undescribed` - leave
+    out pictures flagged as showing private information (or an ID card),
+    as suggestive, explicit or graphic, or not checked yet (not described,
+    or described by the older version 4 prompt, which did not look for
+    private or sensitive content); all `true` by default.
+  - `include_ids` - pictures published although the rules above leave them
+    out: `[id, ["flag", ...]]` publishes a picture while it has no flag that
+    leaves it out other than those (the Export dialog stores the flags the
+    picture had when you chose it, so a new flag leaves it out again); a
+    plain id publishes it whatever its flags. Flags: `private`,
+    `sensitive`, a picture type, `writing`, `unchecked`, `undescribed`.
+  - `exclude_ids` - picture ids left out whatever the rules above say.
+    Hidden pictures are never published.
+  - `credits` - a line of plain text shown at the foot of the pages.
+  - `zip` - `true` also writes `<folder>.zip` next to the output folder.
+  - `allow_indexing` - `true` lets search engines index the pages
+    (default `false`: the pages and a `robots.txt` ask them not to list
+    the pages or their pictures; anyone with the address can still open
+    them).
 
 A library removed from the file is not deleted from the database: its images
 stay there, unused, until you delete them or attach them to a library again.

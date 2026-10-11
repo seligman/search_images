@@ -263,8 +263,15 @@ class RecordTest(IndexFixture, unittest.TestCase):
                     activities=["running"])
         image_id = insert_image(self.conn, "lib_family1", "2019/Paris/IMG_1.jpg", described=1,
                                 prompt_ver=5, info=info, taken_at="2019-05-14T14:23:01",
-                                lat=48.85, lon=2.35, camera="Acme One")
+                                taken_source="exif", lat=48.85, lon=2.35, camera="Acme One")
         hidden = insert_image(self.conn, "lib_family1", "secret.jpg", hidden=1)
+        # A date from the file's time is a file time: never in an export.
+        filed = insert_image(self.conn, "lib_family1", "copied.jpg", described=1, prompt_ver=5,
+                             info=info, taken_at="2026-10-11T08:00:00", taken_source="mtime")
+        self.assertEqual(self.records()[filed]["dk"], "2026-10-11")
+        self.assertNotIn("dk", self.records(for_export=True)[filed])
+        self.conn.execute("DELETE FROM images WHERE id = ?", (filed,))
+        self.conn.commit()
         records = self.records(for_export=True)
         self.assertEqual(sorted(records), [image_id])
         record = records[image_id]

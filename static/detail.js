@@ -122,7 +122,7 @@
             VIEWER.renderInfo(byId("detail-info"), rec, detail, context);
         }
         render();
-        document.title = (rec.t || rec.n || "Picture") + " - Image Search";
+        document.title = (rec.t || rec.n || "Picture") + " - " + (SITE.title || "Image Search");
         document.addEventListener("keydown", function (event) {
             var tag = event.target && event.target.tagName;
             if (event.ctrlKey || event.metaKey || event.altKey || tag === "INPUT" ||

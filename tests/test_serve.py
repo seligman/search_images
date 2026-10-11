@@ -1,4 +1,4 @@
-"""Tests for serve.py: the search server's routes and the static site packager.
+"""Tests for serve.py: the search server's routes and the "package" command.
 
 The database is filled directly through db/cache (no scanning), inside a
 temporary SETTINGS_BASE.
@@ -20,6 +20,7 @@ import support
 import cache
 import common
 import db
+import export
 import serve
 
 try:
@@ -440,15 +441,31 @@ class ServerTest(ServerFixture, unittest.TestCase):
 
 
 class PackageTest(ServerFixture, unittest.TestCase):
+    """"serve.py package" exports one library with export.py (tested in test_export)."""
+
+    def setUp(self):
+        super().setUp()
+        if imagegen is not None:
+            # A thumbnail an export can use (the fixture's are not JPEGs).
+            self.thumbs.put(self.visible, imagegen.jpeg_bytes(imagegen.marker_image((64, 48))))
 
     def package(self, output, **kwargs):
         return serve.package(output, log=quiet, **kwargs)
 
+    def test_needs_a_library_when_several_are_enabled(self):
+        out = self.base.join("site")
+        with self.assertRaises(export.ExportError) as caught:
+            self.package(out)
+        self.assertIn("--library", str(caught.exception))
+        with self.assertRaises(export.ExportError):
+            self.package(out, library="No such library")
+        self.assertFalse(os.path.exists(out))
+
     def test_refuses_a_non_empty_folder_without_marker(self):
         out = self.base.make_dir("staging")
         keep = self.base.write_file("staging/images/photo.jpg", b"precious")
-        with self.assertRaises(serve.ExportError) as caught:
-            self.package(out)
+        with self.assertRaises(export.ExportError) as caught:
+            self.package(out, library="Family")
         self.assertIn("not empty", str(caught.exception))
         self.assertEqual(sorted(os.listdir(out)), ["images"])
         with open(keep, "rb") as handle:
@@ -460,10 +477,10 @@ class PackageTest(ServerFixture, unittest.TestCase):
         # nothing is written.)
         config = common.load_config()
         for name in ("export", "docs", "photos_site", os.path.join("static", "site")):
-            with self.assertRaises(serve.ExportError, msg=name):
-                serve.check_export_dir(os.path.join(common.BASE_DIR, name), config)
+            with self.assertRaises(export.ExportError, msg=name):
+                export.check_output_dir(os.path.join(common.BASE_DIR, name), config)
         for name in ("site", "site_example", "exports", os.path.join("site", "deeper")):
-            serve.check_export_dir(os.path.join(common.BASE_DIR, name), config)
+            export.check_output_dir(os.path.join(common.BASE_DIR, name), config)
 
     def test_tilde_library_paths_are_expanded(self):
         home = self.base.make_dir("home")
@@ -473,88 +490,60 @@ class PackageTest(ServerFixture, unittest.TestCase):
             self.assertEqual(serve.library_roots(config),
                              {"lib_home0001": os.path.join(home, "Pictures")})
             # The export guard sees the real folder too.
-            with self.assertRaises(serve.ExportError):
-                serve.check_export_dir(os.path.join(home, "Pictures", "site"), config)
+            with self.assertRaises(export.ExportError):
+                export.check_output_dir(os.path.join(home, "Pictures", "site"), config)
 
     def test_refuses_folders_that_overlap_libraries_or_data(self):
         for out in (os.path.join(self.family_dir, "site"), self.base.path,
                     os.path.dirname(self.family_dir), common.tiles_dir(),
-                    common.data_dir()):
-            with self.assertRaises(serve.ExportError, msg=out):
-                self.package(out)
+                    common.data_dir(), common.exports_dir()):
+            with self.assertRaises(export.ExportError, msg=out):
+                self.package(out, library="Family")
         self.assertFalse(os.path.exists(os.path.join(self.family_dir, "site")))
 
-    def test_force_accepts_an_older_site(self):
-        out = self.base.make_dir("old-site")
-        self.base.write_file("old-site/index.html", "old")
-        result = self.package(out, force=True)
-        self.assertEqual(result["count"], 2)
-        self.assertTrue(os.path.isfile(os.path.join(out, serve.EXPORT_MARKER)))
-
-    def test_packages_into_an_empty_folder_and_updates_it(self):
+    @unittest.skipIf(imagegen is None, "Pillow is not installed")
+    def test_exports_the_chosen_library_only(self):
         out = self.base.join("site")
-        result = self.package(out)
-        self.assertEqual(result["count"], 2)
-        self.assertTrue(os.path.isfile(os.path.join(out, serve.EXPORT_MARKER)))
-        for name in ("index.html", "detail.html", "map.html", "site.js", "detail.js",
-                     "data/manifest.json", "data/locations.json", "data/data-0000.json"):
+        # The visible picture has an older (version 4) description, which
+        # did not look for private content: left out unless asked for.
+        result = self.package(out, library="lib_family1")
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(result["excluded"], {"hidden": 1, "unchecked": 1})
+        result = self.package(out, library="lib_family1",
+                              options={"exclude_undescribed": False})
+        # The visible picture; the missing and the hidden one stay out.
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["excluded"], {"hidden": 1})
+        self.assertTrue(os.path.isfile(os.path.join(out, export.MARKER)))
+        for name in ("index.html", "detail.html", "assets/site.js", "assets/shell.js",
+                     "data/manifest.js", "data/index-000.js"):
             self.assertTrue(os.path.isfile(os.path.join(out, *name.split("/"))), name)
-
-        with open(os.path.join(out, "data", "manifest.json"), encoding="utf-8") as handle:
-            manifest = strict_json(handle.read())
-        self.assertEqual(manifest["count"], 2)
-        self.assertEqual(manifest["libraries"], ["Family", XSS_NAME])
-        with open(os.path.join(out, "data", "data-0000.json"), encoding="utf-8") as handle:
-            records = {r["id"]: r for r in strict_json(handle.read())}
-        self.assertEqual(sorted(records), sorted([self.visible, self.xss]))
-        record = records[self.visible]
-        self.assertEqual(record["library"], "Family")
-        self.assertIsNone(record["exif"]["FNumber"])
-        self.assertEqual(record["taken_at"], "2019-05-14T14:23:01")
-        self.assertIn("a sunny beach", record["text"])
-        self.assertTrue(record["thumb"].startswith("data:image/jpeg;base64,"))
-        self.assertEqual(record["image"], "images/%d.jpg" % self.visible)
-        with open(os.path.join(out, "data", "locations.json"), encoding="utf-8") as handle:
-            self.assertEqual(strict_json(handle.read()),
-                             [{"id": self.visible, "lat": 48.85, "lon": 2.35}])
         with open(os.path.join(out, "index.html"), encoding="utf-8") as handle:
             html = handle.read()
         self.assertNotIn(XSS_NAME, html)
-        self.assertEqual(app_config_of(html)["libraries"], ["Family", XSS_NAME])
-        if imagegen is not None:
-            copied = os.path.join(out, "images", "%d.jpg" % self.visible)
-            with open(copied, "rb") as handle, \
-                    open(os.path.join(self.family_dir, "holidays", "beach.jpg"), "rb") as original:
-                self.assertEqual(handle.read(), original.read())
-            self.assertEqual(result["copies"]["copied"], 1)
-        # The xss row has no original on disk: reported, not fatal.
-        self.assertEqual(result["copies"]["missing"], 1)
+        config = app_config_of(html)
+        self.assertEqual(config["libraries"], ["Family"])
+        self.assertEqual(config["mode"], "static")
 
-        # A second run into the (now marked) folder only removes what is stale.
-        self.base.write_file("site/images/99999.jpg", b"stale")
-        self.base.write_file("site/notes.txt", b"mine")
-        again = self.package(out)
-        self.assertEqual(again["written"], 0)
-        self.assertFalse(os.path.exists(os.path.join(out, "images", "99999.jpg")))
-        self.assertTrue(os.path.isfile(os.path.join(out, "notes.txt")))
-
+    @unittest.skipIf(imagegen is None, "Pillow is not installed")
     def test_default_output_is_in_the_data_folder(self):
-        result = self.package(None)
-        expected = os.path.join(common.data_dir(), "exports", "site")
+        result = self.package(None, library="Family")
+        expected = os.path.join(common.data_dir(), "exports", "family")
         self.assertEqual(result["output"], expected)
         self.assertTrue(os.path.isfile(os.path.join(expected, "index.html")))
 
-    @unittest.skipIf(imagegen is None, "Pillow is not installed")
-    def test_failed_copy_leaves_no_partial_file(self):
-        image_id = insert_image(self.conn, "lib_family1", "broken.tif")
-        self.write_original("broken.tif", b"II*\x00 not really a tiff")
+    def test_a_picture_that_cannot_be_read_is_skipped(self):
+        insert_image(self.conn, "lib_family1", "broken.tif", described=1, prompt_ver=5,
+                     info=json.dumps({"title": "Broken", "photo_type": "photo"}))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")     # Pillow complains about the bad file
-            result = self.package(self.base.join("site"))
-        self.assertEqual(result["copies"]["failed"], 1)
-        images_dir = self.base.join("site", "images")
-        self.assertNotIn("%d.jpg" % image_id, os.listdir(images_dir))
-        self.assertEqual([name for name in os.listdir(images_dir) if "tmp" in name], [])
+            self.write_original("broken.tif", b"II*\x00 not really a tiff")
+            result = self.package(self.base.join("site"), library="Family",
+                                  options={"exclude_undescribed": False})
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["count"], 1)
+        names = os.listdir(self.base.join("site", "data"))
+        self.assertEqual([name for name in names if "tmp" in name], [])
 
 
 class PanoramaFixture(ServerFixture):
@@ -731,20 +720,26 @@ class PanoRouteTest(PanoramaFixture, unittest.TestCase):
 class PanoramaPackageTest(PanoramaFixture, unittest.TestCase):
 
     def test_insp_originals_become_jpg_files(self):
-        self.assertEqual(serve.image_extension("IMG_1.insp"), "jpg")
-        self.assertEqual(serve.image_extension("IMG_1.INSP"), "jpg")
-        self.assertEqual(serve.image_extension("photo.png"), "png")
+        if imagegen is None:
+            self.skipTest("Pillow is not installed")
+        data = imagegen.jpeg_bytes(imagegen.marker_image((64, 48)))
+        self.assertEqual(export.original_picture(data)[1], "jpg")
 
+    @unittest.skipIf(imagegen is None, "Pillow is not installed")
     def test_records_carry_the_projection(self):
-        self.write_original("360/IMG_20190514_142301_00_001.insp", b"\xff\xd8\xff\xe0 jpeg")
+        thumb = imagegen.jpeg_bytes(imagegen.marker_image((64, 32)))
+        for image_id in (self.dual, self.stitched, self.unchecked):
+            self.thumbs.put(image_id, thumb)
         out = self.base.join("site")
-        serve.package(out, log=quiet)
-        with open(os.path.join(out, "data", "data-0000.json"), encoding="utf-8") as handle:
-            records = {r["id"]: r for r in strict_json(handle.read())}
-        self.assertEqual(records[self.dual]["projection"], "dual_fisheye")
-        self.assertEqual(records[self.dual]["image"], "images/%d.jpg" % self.dual)
-        self.assertTrue(os.path.isfile(os.path.join(out, "images", "%d.jpg" % self.dual)))
-        self.assertEqual(records[self.unchecked]["projection"], "")
+        serve.package(out, library="Family", log=quiet,
+                      options={"images": "none", "exclude_undescribed": False})
+        with open(os.path.join(out, "data", "index-000.js"), encoding="utf-8") as handle:
+            text = handle.read()
+        records = strict_json(text[text.index("["):text.rindex("]") + 1])
+        marked = sorted(record.get("p", "") for record in records)
+        # The dual-fisheye and the stitched one are 360 photos; the
+        # unchecked row is not. (The beach's thumbnail is no JPEG: skipped.)
+        self.assertEqual(marked, ["", "360", "360"])
 
 
 if __name__ == "__main__":

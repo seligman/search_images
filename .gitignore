@@ -5,6 +5,8 @@
 /local/
 /site/
 /site_*/
+/site.zip
+/site_*.zip
 /exports/
 # User helper modules contain machine-specific paths/commands
 /*_helper.py

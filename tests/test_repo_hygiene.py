@@ -198,8 +198,9 @@ class RepoHygieneTest(unittest.TestCase):
     def test_gitignore_covers_personal_data(self):
         must_ignore = [
             "config.json", "data/images.db", "data/thumbs/thumb-0000.dat",
-            "site/index.html", "exports/x/index.html", "abort", "abort.txt",
-            "_error_0001.txt", "world_map.png", "__pycache__/x.cpython-314.pyc",
+            "site/index.html", "site.zip", "site_demo.zip", "exports/x/index.html",
+            "abort", "abort.txt", "_error_0001.txt", "world_map.png",
+            "__pycache__/x.cpython-314.pyc",
             "my_helper.py", "local/config.json", "models/x.gguf",
             # Key files a user might create next to config.json.
             "openai.key", "keys/openai.txt", "anthropic_key.txt", "api-key.txt",

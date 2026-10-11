@@ -221,6 +221,22 @@ var SHELL = (function () {
         return two(date.getHours()) + ":" + two(date.getMinutes()) + ":" + two(date.getSeconds());
     }
 
+    // "512 bytes", "4.2 KB", "162 MB", "1.3 GB".
+    function bytes(value) {
+        var n = Number(value);
+        if (!isFinite(n) || n < 0) {
+            return "";
+        }
+        var units = ["bytes", "KB", "MB", "GB", "TB"];
+        var unit = 0;
+        while (n >= 1024 && unit < units.length - 1) {
+            n /= 1024;
+            unit += 1;
+        }
+        return (unit === 0 ? String(Math.round(n)) : n.toFixed(n < 10 ? 1 : 0)) + " " +
+            units[unit];
+    }
+
     function percent(part, whole) {
         if (!whole) {
             return 0;
@@ -239,7 +255,8 @@ var SHELL = (function () {
         describe: "Describe",
         process: "Scan + describe",
         previews: "Build previews",
-        delete_library: "Delete indexed data"
+        delete_library: "Delete indexed data",
+        export: "Export"
     };
     var STATE_LABELS = {
         queued: "Waiting",
@@ -255,13 +272,17 @@ var SHELL = (function () {
         scan: "Looking for new and changed pictures",
         previews: "Building previews",
         describe: "Describing pictures",
-        delete: "Deleting indexed data"
+        delete: "Deleting indexed data",
+        export: "Exporting pictures",
+        zip: "Writing the zip file"
     };
     var STAGE_VERBS = {
         scan: "Scanning",
         previews: "Building previews for",
         describe: "Describing",
-        delete: "Deleting the data of"
+        delete: "Deleting the data of",
+        export: "Exporting",
+        zip: "Zipping the export of"
     };
     var WAITING_STAGE = "waiting for another scan to finish";
 
@@ -393,6 +414,15 @@ var SHELL = (function () {
         }
         if (totals.deleted !== undefined) {
             parts.push(plural(totals.deleted, "picture") + " deleted");
+        }
+        if (job.kind === "export" && typeof summary.count === "number") {
+            parts.push(plural(summary.count, "picture") + " exported");
+            if (summary.bytes) {
+                parts.push(bytes(summary.bytes));
+            }
+            if (summary.failed) {
+                parts.push(number(summary.failed) + " could not be read");
+            }
         }
         if (summary.offline && summary.offline.length) {
             parts.push("offline: " + summary.offline.join(", "));
@@ -855,7 +885,8 @@ var SHELL = (function () {
         }
         var header = el("header", {id: "shell-header"});
         var home = site.homeUrl ? site.homeUrl() : "/";
-        header.appendChild(el("a", {className: "shell-title", href: home, text: "Image Search"}));
+        header.appendChild(el("a", {className: "shell-title", href: home,
+                                    text: site.title || "Image Search"}));
         var nav = el("nav", {attrs: {"aria-label": "Pages"}});
         nav.appendChild(link("Search", home, "search"));
         var mapHref = site.mapUrl ? site.mapUrl() : null;
@@ -953,7 +984,8 @@ var SHELL = (function () {
             duration: duration,
             relative: relative,
             clock: clock,
-            percent: percent
+            percent: percent,
+            bytes: bytes
         },
         jobs: {
             kind: jobKind,

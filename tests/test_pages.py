@@ -167,7 +167,14 @@ class ScriptTest(unittest.TestCase):
         for name in ("manage.js", "settings.js"):
             text = read(STATIC, name)
             used = set(re.findall(r"\bwanted\.([A-Za-z_]+)", text))
-            self.assertLessEqual(used, {"dialog", "id", "name"}, name)
+            self.assertLessEqual(used, {"dialog", "id", "name", "step"}, name)
+        # The Export dialog's step only picks what it shows (the review, or
+        # the last result); an export starts with its button alone.
+        self.assertIn("openDialog(wanted.dialog, wanted.id, wanted.step)", manage)
+        self.assertEqual(re.findall(r'options\.step === "([a-z]+)"', manage),
+                         ["done", "done", "review"])
+        self.assertEqual(manage.count('{kind: "export"'), 1)
+        self.assertIn('var go = box.button("Export", "primary", startExport);', manage)
         settings = read(STATIC, "settings.js")
         self.assertIn("openDialog(wanted.dialog, wanted.name, true)", settings)
         self.assertIn("testEndpoint(endpoint, {ask: fromAddress})", settings)
@@ -189,16 +196,22 @@ class ExportPageTest(support.TempBaseMixin, unittest.TestCase):
         db.init(log=quiet)
         output = self.base.join("data", "exports", "site")
         serve.package(output, log=quiet)
-        for page in ("index.html", "detail.html", "map.html"):
+        for page in ("index.html", "detail.html"):
             html = read(output, page)
             for asset in assets_of(html):
                 self.assertFalse(asset.startswith("/"), asset)
+                # Asked for with the hash of the file's contents (?v=...).
+                asset, _sep, version = asset.partition("?v=")
+                self.assertRegex(version, r"^[0-9a-f]{10}$", asset)
                 self.assertTrue(os.path.isfile(os.path.join(output, asset)), asset)
             config = page_config(html)
-            self.assertEqual(config["capabilities"], {"admin": False, "static": True})
+            self.assertIs(config["capabilities"]["admin"], False)
+            self.assertIs(config["capabilities"]["static"], True)
             self.assertNotIn("adminApi", config)
-        # The admin pages and their scripts are not part of an export.
-        for name in ("manage.html", "settings.html", "manage.js", "settings.js"):
+        # The admin pages and their scripts are not part of an export (nor,
+        # without location, the map).
+        for name in ("manage.html", "settings.html", "manage.js", "settings.js",
+                     "assets/manage.js", "assets/settings.js", "map.html", "assets/map.js"):
             self.assertFalse(os.path.exists(os.path.join(output, name)), name)
 
 

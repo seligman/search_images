@@ -71,13 +71,21 @@ class PathRulesTest(support.TempBaseMixin, unittest.TestCase):
         self.assertFalse(library_ops.is_within(BS * 2 + "server" + BS + drive[0] + "$" + rest,
                                                data))
 
-    def test_export_settings_are_not_taken_yet(self):
+    def test_export_settings_are_checked(self):
         family = self.base.library_folder("Family")
         config = {"libraries": [support.library("Family", family, id="lib_family1")]}
         library = config["libraries"][0]
-        changes, _warnings = library_ops.clean_library_fields(config, {"export": {}}, library)
-        self.assertEqual(changes, {"export": {}})
-        for value in ({"output": family}, [], "x", None):
+        # Replaced as a whole; only what differs from the defaults is kept.
+        for value, stored in (({}, {}), (None, {}), ({"images": "web", "zip": False}, {}),
+                              ({"images": "original", "title": "  My   site "},
+                               {"images": "original", "title": "My site"}),
+                              ({"exclude_types": ["screenshot"], "include_ids": [3, 2, 3]},
+                               {"exclude_types": ["screenshot"], "include_ids": [2, 3]})):
+            changes, _warnings = library_ops.clean_library_fields(config, {"export": value},
+                                                                  library)
+            self.assertEqual(changes, {"export": stored}, value)
+        for value in ({"output": family}, [], "x", {"images": "huge"}, {"zip": "yes"},
+                      {"exclude_types": ["selfie"]}, {"include_ids": ["1"]}):
             with self.assertRaises(library_ops.LibraryError) as caught:
                 library_ops.clean_library_fields(config, {"export": value}, library)
             self.assertIn("export", caught.exception.fields)

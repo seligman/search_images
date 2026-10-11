@@ -1191,6 +1191,44 @@ def to_browser_jpeg(path, helper=None, quality=BROWSER_QUALITY):
                         lambda w, h: (w, h))
 
 
+def jpeg_from_bytes(data, quality=BROWSER_QUALITY):
+    """Full-size, upright JPEG bytes of image bytes in any format this can read.
+
+    No EXIF is copied (a non-sRGB colour profile is kept). Used by the
+    static export for pictures whose metadata cannot be removed in place.
+    Raises ImageReadError if the bytes cannot be decoded.
+    """
+    return _render_jpeg(bytes(data), quality, lambda w, h: (w, h))
+
+
+def png_from_bytes(data):
+    """PNG bytes of image bytes (a BMP, ...): the same pixels, with no metadata.
+
+    Used by the static export for lossless originals in formats whose
+    metadata cannot be removed in place (a BMP can name a colour profile
+    file, and keep bytes after its pixels). Raises ImageReadError if the
+    bytes cannot be decoded.
+    """
+    image = _open_image(bytes(data))
+    try:
+        with image:
+            with _decode_budget.hold(image.size[0] * image.size[1]):
+                image.load()
+                frame = image
+                if frame.mode not in ("1", "L", "LA", "P", "RGB", "RGBA"):
+                    frame = to_rgb(frame)
+                buffer = io.BytesIO()
+                frame.save(buffer, "PNG")
+                return buffer.getvalue()
+    except ImageReadError:
+        raise
+    except Image.DecompressionBombError as error:
+        raise ImageReadError("image is too large to decode safely (%s)"
+                             % _error_text(error)) from error
+    except Exception as error:
+        raise ImageReadError("cannot decode image (%s)" % _error_text(error)) from error
+
+
 # ---------------------------------------------------------------------------
 # EXIF
 

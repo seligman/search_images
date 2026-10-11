@@ -295,7 +295,8 @@ the command line does for libraries can be done there:
   and the last job. Its buttons scan a library, describe it, do both, retry
   failed pictures, re-describe pictures described with an older prompt, and
   build missing previews. **Process all libraries** does a scan and describe
-  of every library that is turned on.
+  of every library that is turned on. **Export...** publishes a library as
+  a static website (see "Publishing a library").
 - **Add library** asks for the folder (type it, or use **Browse...**; a
   network share is typed as `\\server\share`), suggests a name, shows how
   many pictures it found, and previews which files the ignore patterns skip.
@@ -325,29 +326,107 @@ started with `--host` so that other computers can search, Manage and
 Settings are turned off. Do not put the server behind a reverse proxy on
 the same computer: every visitor would then look local.
 
-## Packaging a static site
+## Publishing a library
 
-    python serve.py package
-    python serve.py package site_example
+A library can be exported as a static website: the same search, viewer and
+detail pages, searching in the browser with no server. It works on any
+static web host, and when opened from disk (double-click `index.html`).
 
-The first form builds the site in `data/exports/site/` inside the data folder.
-The second builds it in the named folder instead, which must be new, empty,
-or an earlier export: the command marks the folders it creates and refuses to
-write into any other non-empty folder, because updating a site deletes stale
-files in it. Use `--force` to update a site built by an older version, which
-has no such mark. Inside the program folder only `site/`, `site_<name>/` and
-`exports/` are accepted (git ignores those), so your photos never end up in a
-commit. Re-running the command updates an existing package in place.
+On the Manage page, **Export...** on a library opens a dialog:
 
-The result works without a server. Serve the folder with any static web
-server, for example:
+1. **Options**, in plain words: web-size pictures, originals (with their
+   hidden details removed) or thumbnails only; what to leave out
+   (screenshots, documents, scans, pictures flagged as private or sensitive,
+   pictures not checked yet); whether to also publish file names, folder
+   names or locations; and the site's title, a footer line, the output
+   folder, a zip file and search-engine indexing. The line at the bottom
+   counts the pictures that would be published.
+2. **Review what will be published**: how many pictures, the estimated
+   size (and a warning when the folder's disk has less room, or when the
+   library's folder is offline and pictures need it), how many are left
+   out and why, and the pictures the AI model flagged, grouped by reason.
+   Untick **Publish** to leave a picture out, or tick it to publish one the
+   options leave out; a picture opens in a new tab to read its
+   description. A picture you chose to publish is left out again when it
+   gets a new flag later (say it is described again and shows private
+   information), and the review says so.
+3. **Export** saves the options with the library (`export` in
+   `config.json`) and runs the export as a job: the dialog and the job
+   panel show its progress (**Stop export** stops it). When it is done the
+   dialog shows the folder, **Open folder**, and how to publish it. The
+   library card then shows the last export, with **Open folder** and **How
+   to publish**.
 
-    python -m http.server --directory site_example
+The same from the command line:
 
-It looks and behaves like the live version, searching the data in the browser.
-The search data is split into files no larger than 10 MB, and full-size images
-are copied into the site's `images/` folder. Re-running `package` after a
-small change only rewrites the files that changed.
+    python export.py --library Family
+    python serve.py package --library Family site_example
+
+`serve.py package` without `--library` exports the only enabled library.
+One export runs at a time (`data/export.lock`), whether started on the
+Manage page or from the command line. Both print what was left out and
+why, and exit with status 1 when pictures could not be exported (2 when
+the export was stopped).
+
+The site goes to `data/exports/<library name>/` in the data folder, or to
+the folder given (the dialog's Folder, `--out` for `export.py` or the
+folder after `package`), which must be new, empty, or an
+earlier export of the same library: an export marks the folder it writes
+(a `.search-images-export` file holding only a random id) and later
+removes only files it made itself (the list is kept in
+`data/exports/state/`, never in the site). Each library needs a folder of
+its own. Inside the program folder only `site/`, `site_<name>/` and
+`exports/` are accepted (git ignores those), so your photos never end up in
+a commit. Re-running an export only rewrites what changed. An export that
+cannot read any picture (say the library's drive is not connected, and
+originals were asked for) stops before it changes the folder, and one that
+cannot write (a full disk, no access) stops at once; both say so in plain
+words.
+
+What is published follows the library's `export` options (see SETTINGS.md),
+changed for one run by these switches:
+
+- `--images web` (the default) publishes 2048 px pictures, `original` the
+  originals with their metadata removed (HEIC and TIFF become JPEG, BMP
+  becomes PNG), and `none` thumbnails only.
+- Left out unless asked for: pictures not checked yet
+  (`--include-undescribed`: not described yet, or described by an older
+  version that did not look for private or sensitive content), screenshots
+  and documents (`--include-screenshots`, `--include-documents`; a picture
+  counts as a document or a screenshot when the AI model saw a receipt,
+  letter, form, ticket, handwriting or a chat, web page or app on it,
+  whatever kind of picture it called it), pictures flagged as private or
+  sensitive (`--include-private`, `--include-sensitive`), file names
+  (`--file-names`), folder names (`--folders`), and GPS positions with the
+  map (`--location`, which also adds the AI model's separate landmark and
+  place-guess fields). Hidden pictures are never published.
+- Titles, descriptions, tags and the text read from pictures are published
+  as the AI model wrote them: they can name people or places a picture
+  shows, whatever the options say. Read through what you publish.
+- Never published: paths, file times (a picture without a date from the
+  camera or its file name is published without a date), content hashes,
+  the model that described the pictures and its costs, other libraries, or
+  endpoint settings. The pictures carry no EXIF, XMP, IPTC or text
+  metadata (an original JPEG keeps its orientation; a colour profile keeps
+  its colours but loses its texts), and their ids do not reveal the
+  database's. Each picture shows its title, description, tags, the text
+  read in it, the day it was taken and the camera model and settings.
+- `--zip` also writes `<folder>.zip` next to the folder. The pages ask
+  search engines not to list them or their pictures (and a `robots.txt`
+  says the same), but anyone who has the address can open the site.
+
+Try the site with any static web server, for example:
+
+    python -m http.server --bind 127.0.0.1 --directory data/exports/family
+
+and open http://localhost:8000/ (with `--bind 127.0.0.1` only this computer
+can open it). To publish it, copy everything in the
+folder to any host that serves plain files (GitHub Pages, Netlify, your own
+web server); nothing needs to be installed there. Export again after
+describing more pictures: only what changed is written.
+
+Opened from disk, the 360-degree view shows the flat panorama (browsers do
+not allow it for files); over http it can be turned around.
 
 ## Files
 
@@ -355,7 +434,8 @@ small change only rewrites the files that changed.
 - `scan.py` - scan libraries, then request descriptions
 - `describe.py`, `prompts.py` - the describe step and the prompt it sends
 - `compare_models.py` - compare how endpoints describe the same images
-- `serve.py` - search server and static site packager
+- `serve.py` - search server (and `package`, a shortcut to `export.py`)
+- `export.py` - publish one library as a static website
 - `search_index.py` - the compact search records the search page downloads
   and searches in the browser, and the groups of near-duplicate pictures
 - `admin.py`, `library_ops.py` - the Manage and Settings pages' server side
@@ -365,7 +445,8 @@ small change only rewrites the files that changed.
   server or from a static export; `search-core.js` is the search engine and
   `viewer.js` the picture viewer, both shared with a static export;
   `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
-  `manage.js` and `settings.js` run Manage and Settings)
+  `manage.js` and `settings.js` run Manage and Settings, and
+  `export-review.js` holds the rules and words of the Export dialog)
 - `progress.py` - show how many images are described per library, how many
   have descriptions from an older prompt, and which failed
 - `world_map.py` - render a world map with a pin for each GPS-tagged area
@@ -375,8 +456,9 @@ small change only rewrites the files that changed.
   `llm.py` - shared helpers (settings, database, thumbnails and previews,
   job control, image reading, EXIF facts, LLM calls)
 - `SETTINGS.md` - reference for every field in `config.json`
-- `data/` - database, thumbnails, previews, the default static site
-  export (`data/exports/site/`) and cached near-duplicate groups
+- `data/` - database, thumbnails, previews, static exports
+  (`data/exports/<library name>/`, and what each export wrote in
+  `data/exports/state/`) and cached near-duplicate groups
   (`data/cache/`, rebuilt when missing)
 
 ## Tests

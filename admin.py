@@ -32,6 +32,7 @@ import copy
 import ipaddress
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import threading
@@ -40,6 +41,7 @@ import urllib.parse
 
 import common
 import db
+import export
 import jobs
 import library_ops
 import llm
@@ -74,8 +76,10 @@ JOB_PARAMS = {
     "process": ("allow_mass_removal", "retry_failed", "redescribe_stale", "limit", "endpoint"),
     "previews": (),
     "delete_library": ("confirm_name",),
+    "export": ("options", "save_options", "out_dir"),
 }
-BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force")
+BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force", "save_options")
+EXPORT_FOLDER_TIMEOUT = 5.0  # seconds to look at an export's output folder
 ENDPOINT_TEXT_FIELDS = ("label", "kind", "preset", "base_url", "model", "api_key_env",
                         "api_key_file", "group")
 # number fields: (type, minimum, maximum or None)
@@ -325,7 +329,25 @@ def library_view(config, library, counts, latest, status, endpoint_info=None):
     view["last_job"] = own
     view["endpoint_info"] = (endpoint_info if endpoint_info is not None
                              else library_endpoint_info(config, library))
+    view["export_info"] = export_view(config, library)
     return view
+
+
+def export_view(config, library):
+    """A library's export for the Manage page.
+
+    {"options": its saved export options with every default filled in,
+    "default_output": the folder an export goes to unless another one is
+    chosen, "last": export.last_export() (None before the first export)}.
+    """
+    return {"options": export.library_options(library),
+            "default_output": export.default_output_dir(config, library),
+            "last": export.last_export(library.get("id")) if library.get("id") else None}
+
+
+def options_error(error):
+    """An AdminError for export options that cannot be used (export.OptionsError)."""
+    return AdminError(400, "Some export options cannot be used: %s." % error, error.errors)
 
 
 def find_library(config, library_id):
@@ -830,6 +852,9 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
                 raise AdminError(400, "No enabled endpoint or group is called %s." % name,
                                  {"endpoint": "Unknown endpoint."})
             cleaned["endpoint"] = name.strip()
+        if kind == "export" and not library_id:
+            raise AdminError(400, "An export is made of one library; choose which.",
+                             {"library_id": "Choose a library."})
         if kind == "delete_library":
             check_orphan_delete(config, library_id, params.get("confirm_name"))
             cleaned["confirm_name"] = db.library_names(get_conn()).get(library_id) or library_id
@@ -847,6 +872,77 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
             raise AdminError(400, "force only works with ids: the pictures to describe again.",
                              {"force": "Needs ids."})
         return cleaned
+
+    def export_target(config, library, out_dir):
+        """(output folder, default folder) of an export: out_dir when given, else the default."""
+        default = export.default_output_dir(config, library)
+        if out_dir is None or out_dir == "":
+            return default, default
+        full = library_ops.expand_path(out_dir) if isinstance(out_dir, str) else ""
+        if (not library_ops.is_full_path(full) or library_ops.is_device_path(out_dir)
+                or library_ops.unc_without_share(full)):
+            problem = "Type the whole path of a folder, such as %s." % library_ops.FULL_PATH_EXAMPLES
+            raise AdminError(400, problem, {"out_dir": problem})
+        return os.path.abspath(full), default
+
+    def export_job(config, library_id, params, save):
+        """Check an export job's params: (params to store, options to save or None).
+
+        options override the library's saved export options; with save
+        they become the saved ones (and the job uses what is saved when it
+        starts). out_dir is the output folder (default: the library's
+        folder in data/exports), which must be one an export of this
+        library may write to (export.check_output_dir) and where files can
+        be made (export.check_writable).
+        """
+        library = find_library(config, library_id)
+        options = params.get("options")
+        if options is not None and not isinstance(options, dict):
+            raise AdminError(400, "Send the export options as an object.",
+                             {"options": "Must be an object."})
+        try:
+            merged = export.library_options(library, options)
+        except export.OptionsError as error:
+            raise options_error(error)
+        cleaned = {}
+        if options and not save:
+            cleaned["options"] = {key: merged[key] for key in options}
+        target, default = export_target(config, library, params.get("out_dir"))
+        if os.path.normcase(target) != os.path.normcase(os.path.abspath(default)):
+            cleaned["out_dir"] = target
+
+        def check():
+            export.check_output_dir(target, config, library["id"])
+            export.check_writable(target)
+            if merged["zip"]:
+                export.check_zip_path(export.zip_path_for(target), config)
+        try:
+            library_ops.run_with_timeout(check, EXPORT_FOLDER_TIMEOUT)
+        except library_ops.TimedOut:
+            raise AdminError(504, "The output folder did not answer within %g seconds (an "
+                                  "offline share?)." % EXPORT_FOLDER_TIMEOUT,
+                             {"out_dir": "Does not answer."})
+        except export.ExportError as error:
+            raise AdminError(400, str(error), {"out_dir": str(error)})
+        except OSError as error:
+            message = export.os_error_text(error, target)
+            raise AdminError(400, message, {"out_dir": message})
+        return cleaned, ((options or {}) if save else None)
+
+    def free_space(folder):
+        """Free bytes on the disk of folder (or of the nearest folder above it), or None."""
+        def look():
+            path = folder
+            while not os.path.isdir(path):
+                parent = os.path.dirname(path)
+                if parent == path:
+                    return None
+                path = parent
+            return shutil.disk_usage(path).free
+        try:
+            return library_ops.run_with_timeout(look, EXPORT_FOLDER_TIMEOUT)
+        except (library_ops.TimedOut, OSError):
+            return None
 
     def describable_ids(config, library_id, ids):
         """The ids (sorted) of present pictures in enabled libraries (library_id's, when given)."""
@@ -1075,8 +1171,23 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
         kind = data.get("kind")
         library_id = data.get("library_id") or None
         params = clean_job(config, kind, library_id, data.get("params"))
+        answer = {}
+        if kind == "export":
+            params, save = export_job(config, library_id, data.get("params") or {},
+                                      params.pop("save_options", False))
+            if save is not None:
+                def mutate(fresh):
+                    library = find_library(fresh, library_id)
+                    try:
+                        library["export"] = export.options_to_save(
+                            export.library_options(library, save))
+                    except export.OptionsError as error:
+                        raise options_error(error)
+                    return fresh
+                config, answer["config_token"] = write_config(mutate, token_of(data))
         job, added = manager.enqueue(kind, library_id, params)
-        return jsonify({"job": job, "added": added, "jobs": snapshot(config)}), 202
+        answer.update(job=job, added=added, jobs=snapshot(config))
+        return jsonify(answer), 202
 
     @bp.route("/jobs/<int:job_id>/<action>", methods=["POST"])
     def job_action(job_id, action):
@@ -1204,6 +1315,103 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
             except AdminError:
                 unknown.append(image_id)
         return jsonify({"paths": result, "unknown": unknown})
+
+    # -- exports --------------------------------------------------------------
+
+    def export_options_arg(data):
+        options = data.get("options")
+        if options is not None and not isinstance(options, dict):
+            raise AdminError(400, "Send the export options as an object.",
+                             {"options": "Must be an object."})
+        return options
+
+    @bp.route("/libraries/<library_id>/export/preview", methods=["POST"])
+    def export_preview(library_id):
+        """{options, flagged, out_dir}: what an export would publish (export.preview_export).
+
+        options change the library's saved ones for this answer only
+        (nothing is saved); flagged: false leaves out the list of flagged
+        pictures (for a quick count). With out_dir (the folder the dialog
+        would export to; blank: the default) the answer holds free_bytes,
+        the free space on its disk (None when unknown). Whether the
+        library's folder can be read comes from the Manage page's folder
+        checks (never waited for here). The answer also holds export_view().
+        """
+        data = body()
+        config = state.config()
+        library = find_library(config, library_id)
+        options = export_options_arg(data)
+        reachable = folder_status(library).get("reachable")
+        try:
+            result = export.preview_export(get_conn(), config, library["id"], options,
+                                           reachable=reachable is not False)
+        except export.OptionsError as error:
+            raise options_error(error)
+        except export.ExportError as error:
+            raise AdminError(400, str(error))
+        if data.get("flagged") is False:
+            result.pop("flagged", None)
+        if "out_dir" in data:
+            target, _default = export_target(config, library, data.get("out_dir"))
+            result["free_bytes"] = free_space(target)
+        view = export_view(config, library)
+        result.update(default_output=view["default_output"], last=view["last"],
+                      saved_options=view["options"])
+        return jsonify(result)
+
+    @bp.route("/libraries/<library_id>/export/options", methods=["POST"])
+    def export_options(library_id):
+        """{options}: change a library's saved export options (those sent; the rest stay)."""
+        data = body()
+        options = export_options_arg(data)
+        if options is None:
+            raise AdminError(400, "Send the export options to save.", {"options": "Required."})
+
+        def mutate(config):
+            library = find_library(config, library_id)
+            try:
+                merged = export.library_options(library, options)
+            except export.OptionsError as error:
+                raise options_error(error)
+            library["export"] = export.options_to_save(merged)
+            return config, library, merged
+
+        (config, library, merged), token = write_config(mutate, token_of(data))
+        return jsonify({"options": merged, "saved": library["export"],
+                        "export_info": export_view(config, library), "config_token": token})
+
+    @bp.route("/exports/<library_id>/open-folder", methods=["POST"])
+    def open_export_folder(library_id):
+        """Show a library's exported site in the file manager.
+
+        The folder is the one its last export wrote (from the export state
+        in the data root), else its default folder; nothing in the request
+        names a path.
+        """
+        body()
+        config = state.config()
+        find_library(config, library_id)
+        gone = ("The folder of the last export (%s) is not there any more: it was moved or "
+                "deleted, or its drive is not connected.")
+        try:
+            folder, missing = library_ops.run_with_timeout(
+                export.last_export_dir, EXPORT_FOLDER_TIMEOUT, config, library_id)
+            if folder is None:
+                raise AdminError(404, "This library has not been exported yet.")
+            if missing:
+                raise AdminError(404, gone % folder)
+            index = os.path.join(folder, "index.html")
+            if library_ops.run_with_timeout(os.path.isfile, EXPORT_FOLDER_TIMEOUT, index):
+                library_ops.reveal_file(index, EXPORT_FOLDER_TIMEOUT)
+            else:
+                library_ops.open_folder(folder, EXPORT_FOLDER_TIMEOUT)
+        except library_ops.TimedOut:
+            raise AdminError(504, "The export folder did not answer (an offline share?).")
+        except library_ops.LibraryError as error:
+            if error.status != 404:
+                raise
+            raise AdminError(404, gone % folder)
+        return jsonify({"ok": True, "path": folder})
 
     # -- endpoints ------------------------------------------------------------
 

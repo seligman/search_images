@@ -34,6 +34,9 @@
      SITE.imageUrl(record)         the original (or what an export ships), or null
      SITE.tileUrl(z, x, y), SITE.tilesMax(), SITE.tileSize()   map tiles
 
+   SITE.title is the name of the site ("Image Search", or an export's
+   title); SITE.originalLabel the words of the link to SITE.imageUrl.
+
    Search state in the address (SITE.searchState)
      read(search)  -> {q, lib, sort, filters: {group: [values]}, group,
                        size, hidden, junk, sensitive} from a query string
@@ -42,12 +45,22 @@
      The facet selections use the group names of SearchCore.FACETS as
      parameter names, one per value: ?q=beach&type=photo&tags=sunset.
 
-   A static export (checkpoint 1e) writes data/manifest.js
-   (window.SEARCH_DATA_MANIFEST = {shards: [...], libraries, ...}) and index
-   shards (SEARCH_DATA.push([...records])) that are loaded with <script>
-   tags, so the pages also work when opened from disk. Packages made by
-   older versions (manifest.json and data-NNNN.json) still load over http;
-   their records are turned into compact ones here.
+   A static export (export.py) writes data/manifest.js
+   (window.SEARCH_DATA_MANIFEST = {shards: [...], details: [...],
+   libraries, locations, ...}), index shards (SEARCH_DATA.push([...records]))
+   and detail shards (SEARCH_DATA.detail({id: details})), and with the map
+   data/locations.js (SEARCH_DATA.locations([{id, lat, lon}])). They are
+   loaded with <script> tags (never fetch), so the pages also work when
+   opened from disk. The details of a picture are in the detail shard
+   detailShard() names, which is loaded when they are first wanted. An
+   exported picture is images/<id>.jpg, or images/<id>.<rec.ix>; one with
+   rec.pn has a large panorama in panos/<id>.jpg. The data files are asked
+   for with the hash of their contents (manifest.versions, and the page's
+   dataVersion for manifest.js), so a browser never mixes files of two
+   exports from its cache. When a data file cannot be loaded, the next
+   loadIndex() tries again. Packages made by older versions
+   (manifest.json and data-NNNN.json) still load over http; their records
+   are turned into compact ones here.
 
    Also loads under Node for the tests (no document there).
 */
@@ -213,7 +226,9 @@ var SITE = (function () {
             if (capabilities.images === false) {
                 return null;
             }
-            return staticPrefix.images + encodeURIComponent(recordId(rec)) + ".jpg";
+            var extension = rec && typeof rec.ix === "string" && /^[a-z0-9]{1,5}$/.test(rec.ix)
+                ? rec.ix : "jpg";
+            return staticPrefix.images + encodeURIComponent(recordId(rec)) + "." + extension;
         }
         return "/image/" + encodeURIComponent(recordId(rec));
     }
@@ -232,9 +247,8 @@ var SITE = (function () {
 
     // The large panorama of a 360-degree photo (rec.p "360"); null for
     // other pictures, for a 360-degree photo no larger than its preview
-    // (which is then the whole picture), and in an export that ships no
-    // panoramas (it says so with capabilities.panos; panoramas live in
-    // panos/<id>.jpg).
+    // (which is then the whole picture), and in an export for a picture
+    // without one (rec.pn: it has panos/<id>.jpg).
     function panoUrl(rec) {
         if (!rec || typeof rec !== "object" || rec.p !== "360") {
             return null;
@@ -247,7 +261,7 @@ var SITE = (function () {
             return null;
         }
         if (isStatic) {
-            if (capabilities.panos !== true) {
+            if (capabilities.panos !== true || rec.pn !== 1) {
                 return null;
             }
             return staticPrefix.panos + encodeURIComponent(recordId(rec)) + ".jpg";
@@ -412,6 +426,10 @@ var SITE = (function () {
                 resolve();
             };
             script.onerror = function () {
+                // (A later try adds a new one.)
+                if (script.parentNode) {
+                    script.parentNode.removeChild(script);
+                }
                 reject(new Error("Could not load " + src));
             };
             document.head.appendChild(script);
@@ -419,7 +437,53 @@ var SITE = (function () {
     }
 
     var staticData = null;        // promise of the static index
+    var staticManifest = null;    // the export's manifest, once loaded
     var staticDetails = {};       // id -> full record (older packages, detail shards)
+    var staticScripts = {};       // data script name -> promise of it being loaded
+    var staticLocations = null;   // [{id, lat, lon}] once data/locations.js has run
+
+    // The address of a data script: with the hash of its contents when
+    // the manifest has one (export.py, "versions").
+    function versioned(path, version) {
+        return typeof version === "string" && /^[0-9a-f]{1,40}$/.test(version)
+            ? path + "?v=" + version : path;
+    }
+
+    function dataUrl(name) {
+        var versions = staticManifest && staticManifest.versions;
+        return versioned((cfg.data || "data/") + name,
+                         versions && typeof versions === "object" ? versions[name] : null);
+    }
+
+    // The letters of the export's picture ids (export.XID_ALPHABET).
+    var XID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+
+    /* The detail shard of an exported picture: the export spreads the
+       details over manifest.details by the first four characters of the
+       id (export.bucket_of does the same sum). */
+    function detailShard(manifest, id) {
+        var list = manifest && Array.isArray(manifest.details) ? manifest.details : [];
+        if (!list.length) {
+            return null;
+        }
+        var text = String(id);
+        var value = 0;
+        for (var k = 0; k < 4 && k < text.length; k++) {
+            value = value * 32 + Math.max(XID_ALPHABET.indexOf(text.charAt(k)), 0);
+        }
+        return list[value % list.length];
+    }
+
+    // A data script of the export, loaded once (again after a failure).
+    function loadDataScript(name) {
+        if (!staticScripts[name]) {
+            staticScripts[name] = loadScript(dataUrl(name)).catch(function (error) {
+                delete staticScripts[name];
+                throw error;
+            });
+        }
+        return staticScripts[name];
+    }
 
     // Shards of a static export: data/manifest.js, then the scripts it lists.
     function loadScriptExport() {
@@ -437,17 +501,24 @@ var SITE = (function () {
                 Object.keys(map || {}).forEach(function (id) {
                     staticDetails[id] = map[id];
                 });
+            },
+            locations: function (list) {
+                staticLocations = Array.isArray(list) ? list : [];
             }
         };
         var ready = root.SEARCH_DATA_MANIFEST ? Promise.resolve()
-            : loadScript(dataPrefix + "manifest.js");
+            : loadScript(versioned(dataPrefix + "manifest.js", cfg.dataVersion));
         return ready.then(function () {
             var manifest = root.SEARCH_DATA_MANIFEST;
             if (!manifest || !Array.isArray(manifest.shards)) {
                 throw new Error("No manifest.js");
             }
+            staticManifest = manifest;
             return Promise.all(manifest.shards.map(function (name) {
-                return loadScript(dataPrefix + name);
+                return loadScript(dataUrl(name)).catch(function (error) {
+                    error.shard = true;     // the export is there, one file is not
+                    throw error;
+                });
             })).then(function () {
                 return {
                     version: manifest.version || 1,
@@ -488,10 +559,21 @@ var SITE = (function () {
         });
     }
 
+    // The static index, loaded once; after a failure the next call tries
+    // again. A package of an older version is only looked for when there
+    // is no manifest.js (not when one data file of an export is missing).
     function loadStaticIndex() {
         if (!staticData) {
-            staticData = loadScriptExport().catch(function () {
-                return loadOlderPackage();
+            staticData = loadScriptExport().catch(function (error) {
+                if (error && error.shard) {
+                    throw error;
+                }
+                return loadOlderPackage().catch(function () {
+                    throw error;
+                });
+            }).catch(function (error) {
+                staticData = null;
+                throw error;
             });
         }
         return staticData;
@@ -579,11 +661,16 @@ var SITE = (function () {
 
     function loadRecord(id, callback) {
         if (isStatic) {
-            loadStaticIndex().then(function () {
-                callback(staticDetails[String(id)] || null);
-            }).catch(function () {
-                callback(null);
-            });
+            settle(loadStaticIndex().then(function (data) {
+                var key = String(id);
+                var name = staticDetails[key] ? null : detailShard(data && data.manifest, key);
+                if (!name) {
+                    return staticDetails[key] || null;
+                }
+                return loadDataScript(name).then(function () {
+                    return staticDetails[key] || null;
+                });
+            }), callback);
             return;
         }
         getJson(cfg.api + "/image/" + encodeURIComponent(id)).then(callback, function () {
@@ -594,8 +681,19 @@ var SITE = (function () {
     function loadLocations(callback) {
         var promise;
         if (isStatic) {
-            promise = root.SEARCH_DATA_LOCATIONS ? Promise.resolve(root.SEARCH_DATA_LOCATIONS)
-                : getJson((cfg.data || "data/") + "locations.json");
+            promise = loadStaticIndex().then(function (data) {
+                var manifest = data && data.manifest;
+                if (!manifest) {
+                    // An older package.
+                    return getJson((cfg.data || "data/") + "locations.json");
+                }
+                if (typeof manifest.locations !== "string" || !manifest.locations) {
+                    return [];
+                }
+                return loadDataScript(manifest.locations).then(function () {
+                    return staticLocations || [];
+                });
+            });
         } else {
             promise = getJson(cfg.api + "/locations");
         }
@@ -615,6 +713,12 @@ var SITE = (function () {
         adminApi: cfg.adminApi || null,
         config: cfg,
         isStatic: isStatic,
+        // The name of the site: an export's title, else the program's.
+        title: typeof cfg.title === "string" && cfg.title ? cfg.title : "Image Search",
+        // The words of the link to imageUrl(): an export of web-size
+        // pictures has no originals.
+        originalLabel: isStatic && capabilities.images === true && capabilities.originals !== true
+            ? "Open the large picture" : "Open the original",
 
         searchState: {
             read: readSearchState,

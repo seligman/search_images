@@ -147,7 +147,13 @@
         if (mapLink && SITE.mapUrl) {
             mapLink.href = SITE.mapUrl(linkState()) || mapLink.href;
         }
-        document.title = state.q ? state.q + " - Image Search" : "Image Search";
+        updateTitle();
+    }
+
+    // "<query> - <site>" in the browser's tab and history.
+    function updateTitle() {
+        var site = SITE.title || "Image Search";
+        document.title = state.q ? state.q + " - " + site : site;
     }
 
     function rememberScroll() {
@@ -439,16 +445,65 @@
         });
         setupSyntaxHelp();
         setupSidebar();
+        if (SITE.isStatic && (SITE.capabilities || {}).file_names !== true) {
+            // No file names in this export ("File name" would sort by title).
+            var byName = byId("sort").querySelector("option[value='name']");
+            if (byName) {
+                byName.parentNode.removeChild(byName);
+            }
+            if (state.sort === "name") {
+                state.sort = "";
+            }
+        }
     }
 
     /* ---------- Search tips ------------------------------------------------------ */
+
+    // SearchCore.SYNTAX, in an export without what it cannot have: other
+    // libraries, hidden and undescribed pictures (never exported),
+    // screenshots (left out unless chosen), and folder and file names or
+    // GPS when they were not exported.
+    function syntaxRows() {
+        if (!SITE.isStatic) {
+            return SearchCore.SYNTAX;
+        }
+        var caps = SITE.capabilities || {};
+        var fields = ["tag", "subject", "title", "text (the text in the picture)", "description",
+                      "scene", "animal", "food", "vehicle", "color", "camera"];
+        if (caps.folders === true) {
+            fields.push("folder");
+        }
+        if (caps.file_names === true) {
+            fields.push("file");
+        }
+        var rows = [];
+        SearchCore.SYNTAX.forEach(function (row) {
+            var field = row.example.split(":")[0];
+            if (field === "lib") {
+                return;
+            }
+            if (field === "tag") {
+                row = {example: row.example, meaning: "a word in one field: " +
+                       fields.join(", ")};
+            } else if (field === "type") {
+                row = {example: "type:photo", meaning: "a kind of picture: photo, artwork, " +
+                       "diagram, receipt, menu, ..."};
+            } else if (field === "has" && caps.map !== true) {
+                row = {example: row.example, meaning: "with text, people, animals, ..."};
+            } else if (field === "is") {
+                row = {example: row.example, meaning: "360\u00b0 photos; also is:duplicate"};
+            }
+            rows.push(row);
+        });
+        return rows;
+    }
 
     function setupSyntaxHelp() {
         var button = byId("syntax-button");
         var box = byId("syntax-help");
         box.appendChild(el("h2", {text: "Search tips"}));
         var table = el("table", {className: "syntax-table"});
-        SearchCore.SYNTAX.forEach(function (row) {
+        syntaxRows().forEach(function (row) {
             var example = el("button", {type: "button", className: "syntax-example", text: row.example,
                                         title: "Search for " + row.example});
             example.addEventListener("click", function () {
@@ -1105,6 +1160,8 @@
                           actionButton("Search all libraries", function () {
                               SHELL.setLibrary("");
                           })]);
+            } else if (SITE.isStatic) {
+                emptyBox("This site has no pictures", [], []);
             } else {
                 emptyBox("No pictures indexed yet",
                          adminOn ? ["Scan your libraries on the Manage page; pictures show up " +
@@ -2325,6 +2382,7 @@
                 }
                 typing = false;
                 input.value = state.q;
+                updateTitle();
                 run();
                 // Back to an earlier search: where it was scrolled to.
                 var saved = window.history.state;

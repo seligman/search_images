@@ -9,9 +9,11 @@
    a click.
 
    ?dialog=add opens the Add dialog, ?dialog=browse the folder picker, and
-   ?dialog=edit|remove|failures&id=<library id> those dialogs, so they can
-   be linked to. Nothing in the address ever makes the server look at a
-   folder by itself: the folder picker always starts at the drives.
+   ?dialog=edit|remove|failures|export&id=<library id> those dialogs (with
+   &step=review the Export dialog's review step, with &step=done the result
+   of the library's last export), so they can be linked to. Nothing in the address ever makes the server look at a folder by
+   itself or start a job: the folder picker always starts at the drives,
+   and an export only starts with its button.
 */
 (function () {
     "use strict";
@@ -20,12 +22,15 @@
     var clear = SHELL.clear;
     var fmt = SHELL.format;
     var J = SHELL.jobs;
+    var R = EXPORT_REVIEW;
 
     var POLL_ACTIVE = 1000;
     var POLL_IDLE = 10000;
     var STATE_REFRESH = 10000;
     var STATE_RETRY = 10000;
     var LOG_LIMIT = 1000;
+    var REVIEW_PAGE = 60;       // pictures of a group the export review shows at first
+    var COUNT_DELAY = 400;      // ms after a change before the export count is asked again
     var CLOUD_OK_KEY = "searchImages.cloudOk.";
     var TEST_COST_KEY = "searchImages.testCost.";
     var PATH_PLACEHOLDER = "C:\\Photos\\Family  or  \\\\server\\share\\Photos";
@@ -45,6 +50,7 @@
     var deferred = {};          // renders waiting for the mouse button to be released
     var currentView = null;     // {key, update(job)} of the current-job box
     var listKeys = {};
+    var snapshotListeners = []; // functions called with every jobs snapshot
 
     function byId(id) {
         return document.getElementById(id);
@@ -509,6 +515,7 @@
         activityNodes[lib.id] = activity;
         card.appendChild(activity);
         SHELL.append(card, lastJobLine(lib));
+        SHELL.append(card, lastExportLine(lib));
         var endpointNote = el("p", {className: "card-note" + (info.ready ? "" : " card-problem"),
                                     text: endpointText(lib)},
                               info.ready ? null : [" ", el("a", {href: "/settings",
@@ -563,6 +570,13 @@
                 lib.id + ":previews", off,
                 "Make the screen-sized previews that are still missing"));
         }
+        var exporting = exportJobOf(lib);
+        actions.appendChild(button(exporting ? "Export... (" + (exporting.state === "queued" ?
+            "waiting" : "running") + ")" : "Export...", "", function () {
+            openDialog("export", lib.id);
+        }, {key: lib.id + ":export", disabled: off,
+            title: off ? "Turn the library on to export it" : "Make a copy of this library " +
+                "that works as a website on its own: the same search, on any web host"}));
         actions.appendChild(el("span", {className: "spacer"}));
         if (counts.failed) {
             actions.appendChild(button("Failures", "subtle", function () {
@@ -577,6 +591,37 @@
         }, {key: lib.id + ":remove", title: "Remove this library"}));
         card.appendChild(actions);
         return card;
+    }
+
+    // "Exported 2 days ago: 312 pictures, 162 MB" with a button to open the folder.
+    function lastExportLine(lib) {
+        var last = lib.export_info && lib.export_info.last;
+        if (!last) {
+            return null;
+        }
+        var text = "Last export: " + fmt.relative(last.updated) + ", " +
+            fmt.plural(last.pictures, "picture") + ", " + fmt.bytes(last.bytes) +
+            (last.finished ? "" : " (stopped before it finished)");
+        return el("div", {className: "last-job export-line"}, [
+            el("span", {text: text}),
+            button("Open folder", "subtle small", function () {
+                openExportFolder(lib);
+            }, {key: lib.id + ":export-folder", title: "Show " + last.output +
+                " in the file manager"}),
+            last.finished ? button("How to publish", "subtle small", function () {
+                openDialog("export", lib.id, "done");
+            }, {key: lib.id + ":export-done", title: "Where the site is and how to put it " +
+                "on the web"}) : null
+        ]);
+    }
+
+    function openExportFolder(lib) {
+        return SHELL.admin("/exports/" + encodeURIComponent(lib.id) + "/open-folder", {})
+            .then(function (reply) {
+                SHELL.toast("Opened " + reply.path + " in the file manager.", "ok", 4);
+            }, function () {
+                // The message is shown already.
+            });
     }
 
     // The "running now" / "waiting to run" box of each card, from the jobs.
@@ -636,6 +681,43 @@
             }
         });
         return found;
+    }
+
+    // The export job of a library that is running or waiting, or null.
+    function exportJobOf(lib) {
+        var jobs = snapshot ? (snapshot.current ? [snapshot.current] : []).concat(snapshot.queue)
+            : [];
+        var found = null;
+        jobs.forEach(function (job) {
+            if (!found && job.kind === "export" && job.library_id === lib.id &&
+                    job.state !== "cancelling") {
+                found = job;
+            }
+        });
+        return found;
+    }
+
+    // The last finished export job of a library (in the recent jobs), or null.
+    function lastExportJob(lib) {
+        var found = null;
+        (snapshot ? snapshot.recent : []).forEach(function (job) {
+            if (!found && job.kind === "export" && job.library_id === lib.id) {
+                found = job;
+            }
+        });
+        return found;
+    }
+
+    // The job with this id in a snapshot (current, waiting or finished), or null.
+    function jobById(data, id) {
+        var all = (data.current ? [data.current] : []).concat(data.queue || [],
+                                                               data.recent || []);
+        for (var k = 0; k < all.length; k++) {
+            if (all[k].id === id) {
+                return all[k];
+            }
+        }
+        return null;
     }
 
     function cloudKey(lib) {
@@ -822,6 +904,9 @@
         });
         logSeq = Math.max(logSeq, data.seq);
         snapshot = data;
+        snapshotListeners.slice().forEach(function (listener) {
+            listener(data);
+        });
         SHELL.showJobs(data);
         addLogLines(fresh);
         whenIdle("jobs", renderJobs);
@@ -1936,9 +2021,642 @@
         return box;
     }
 
+    /* ---------- Export dialog -------------------------------------------- */
+
+    function copyOptions(options) {
+        return JSON.parse(JSON.stringify(options || {}));
+    }
+
+    // Three views in one dialog: the options, "Review what will be
+    // published" (counts, size, and the flagged pictures to publish or
+    // leave out one by one), then the export's progress and result. The
+    // options are saved with the library when the export starts.
+    // options.step: "review" opens the review straight away.
+    function exportDialog(lib, options) {
+        options = options || {};
+        var info = lib.export_info || {};
+        var opts = copyOptions(info.options);
+        var last = info.last || null;
+        var defaultFolder = info.default_output || "";
+        var folderValue = last && last.output ? last.output : defaultFolder;
+        var closed = false;
+        var countTimer = null;
+        var countSeq = 0;
+        var viewSeq = 0;            // changes with the view: late answers are dropped
+        var jobId = null;
+        var listener = null;
+        var fields = {};
+        var refreshCount = function () {};
+        var box = SHELL.modal({
+            title: "Export \u201c" + lib.name + "\u201d as a website",
+            wide: true,
+            onClose: function () {
+                closed = true;
+                window.clearTimeout(countTimer);
+                stopListening();
+                SHELL.setState({dialog: null, id: null, step: null});
+            }
+        });
+        box.dialog.classList.add("export-dialog");
+        var footNote = el("span", {className: "foot-note", attrs: {"aria-live": "polite"}});
+        var general = el("span", {className: "foot-note field-error", hidden: true});
+        var previewPath = "/libraries/" + encodeURIComponent(lib.id) + "/export/preview";
+
+        function stopListening() {
+            if (listener) {
+                snapshotListeners = snapshotListeners.filter(function (item) {
+                    return item !== listener;
+                });
+                listener = null;
+            }
+        }
+
+        function newView(title) {
+            window.clearTimeout(countTimer);
+            countSeq += 1;
+            viewSeq += 1;
+            clear(box.body);
+            clear(box.footer);
+            fields = {};
+            footNote.textContent = "";
+            general.hidden = true;
+            box.footer.appendChild(footNote);
+            box.footer.appendChild(general);
+            box.setTitle(title);
+            box.body.scrollTop = 0;
+        }
+
+        function showGeneral(message) {
+            general.textContent = message;
+            general.hidden = !message;
+        }
+
+        // Ask for the counts again (debounced); then(reply) gets the answer.
+        function scheduleCount(then) {
+            window.clearTimeout(countTimer);
+            var seq = ++countSeq;
+            countTimer = window.setTimeout(function () {
+                SHELL.admin(previewPath, {options: opts, flagged: false}, {quiet: true})
+                    .then(function (reply) {
+                        if (!closed && seq === countSeq) {
+                            showGeneral("");
+                            then(reply);
+                        }
+                    }, function (error) {
+                        if (!closed && seq === countSeq && error.status !== 409) {
+                            showGeneral(error.message);
+                        }
+                    });
+            }, COUNT_DELAY);
+        }
+
+        function countLine(reply) {
+            footNote.textContent = R.headline(reply.counts) + " " + R.sizeText(reply);
+        }
+
+        /* -- the options -- */
+
+        function optionsView() {
+            SHELL.setState({step: null});
+            newView("Export \u201c" + lib.name + "\u201d as a website");
+            var body = box.body;
+            body.appendChild(el("p", {text: "This makes a copy of the library that works as " +
+                "a website on its own: the same search, viewer and picture pages, with no " +
+                "server and nothing to install. Put it on any web host, or open it from the " +
+                "folder. Nothing is uploaded; the files are written to a folder on this " +
+                "computer."}));
+
+            // Pictures
+            var modes = {};
+            var modeList = el("div", {className: "export-choices"});
+            ["web", "original", "none"].forEach(function (mode) {
+                var words = R.OPTIONS.images[mode];
+                var choice = radio("export-images-" + lib.id, words.label, opts.images === mode,
+                                   words.hint);
+                choice.input.value = mode;
+                choice.input.addEventListener("change", changed);
+                modes[mode] = choice.input;
+                modeList.appendChild(choice.node);
+            });
+            fields.images = {error: el("span", {className: "field-error", hidden: true}),
+                             control: modes.web};
+            body.appendChild(el("fieldset", {className: "group"}, [
+                el("legend", {text: "Pictures"}), modeList, fields.images.error
+            ]));
+
+            // What is left out
+            var leave = {};
+            var leaveList = el("div", {className: "export-choices two"});
+            [["exclude_private", R.OPTIONS.exclude_private],
+             ["exclude_sensitive", R.OPTIONS.exclude_sensitive],
+             ["document", R.TYPES.document], ["screenshot", R.TYPES.screenshot],
+             ["scan", R.TYPES.scan],
+             ["exclude_undescribed", R.OPTIONS.exclude_undescribed]].forEach(function (item) {
+                var key = item[0];
+                var on = R.TYPES[key] ? (opts.exclude_types || []).indexOf(key) >= 0 : opts[key];
+                leave[key] = check(item[1].label, on, item[1].hint);
+                leave[key].input.addEventListener("change", changed);
+                leaveList.appendChild(leave[key].node);
+            });
+            fields.exclude_types = {error: el("span", {className: "field-error", hidden: true}),
+                                    control: leave.document.input};
+            body.appendChild(el("fieldset", {className: "group"}, [
+                el("legend", {text: "Leave out"}),
+                leaveList,
+                el("p", {className: "field-hint", text: "These come from the AI model's " +
+                    "descriptions, which can be wrong. The next step shows the pictures they " +
+                    "catch, to publish or leave out one by one. Hidden pictures are never " +
+                    "published."}),
+                fields.exclude_types.error
+            ]));
+
+            // What each picture carries
+            var details = {};
+            var detailList = el("div", {className: "export-choices two"});
+            ["file_names", "folders", "location"].forEach(function (key) {
+                details[key] = check(R.OPTIONS[key].label, opts[key], R.OPTIONS[key].hint);
+                details[key].input.addEventListener("change", changed);
+                detailList.appendChild(details[key].node);
+            });
+            var detailsLine = el("p", {className: "field-hint"});
+            body.appendChild(el("fieldset", {className: "group"}, [
+                el("legend", {text: "Also publish"}),
+                detailList,
+                detailsLine,
+                el("p", {className: "field-hint", text: "Never published: where the pictures " +
+                    "are on this computer, file dates and times (a picture without a date " +
+                    "from the camera or its file name is published undated), the AI model " +
+                    "and what it cost, your other libraries and your settings."})
+            ]));
+
+            // The site
+            var title = el("input", {type: "text", className: "input", value: opts.title || "",
+                                     placeholder: lib.name, autocomplete: "off"});
+            fields.title = field(R.OPTIONS.title.label, title, {optional: true,
+                hint: R.OPTIONS.title.hint + " Blank: the library name."});
+            var credits = el("input", {type: "text", className: "input",
+                                       value: opts.credits || "", autocomplete: "off"});
+            fields.credits = field(R.OPTIONS.credits.label, credits, {optional: true,
+                hint: R.OPTIONS.credits.hint});
+            var folder = el("input", {type: "text", className: "input mono", spellcheck: false,
+                                      value: folderValue, placeholder: defaultFolder,
+                                      autocomplete: "off"});
+            var browse = button("Browse...", "", function () {
+                folderPicker(folder.value.trim(), function (chosen) {
+                    folder.value = chosen;
+                });
+            });
+            fields.out_dir = field("Folder", el("div", {className: "field-row"},
+                                                [folder, browse]), {
+                div: true,
+                control: folder,
+                hint: "A new or empty folder, or one an earlier export wrote: the files that " +
+                    "export made are updated or removed, and nothing else in it is touched." +
+                    (folderValue !== defaultFolder ? " The default folder is " + defaultFolder +
+                     "." : "")
+            });
+            var zip = check(R.OPTIONS.zip.label, opts.zip, R.OPTIONS.zip.hint);
+            var indexing = check(R.OPTIONS.allow_indexing.label, opts.allow_indexing,
+                                 R.OPTIONS.allow_indexing.hint);
+            zip.input.addEventListener("change", changed);
+            indexing.input.addEventListener("change", changed);
+            body.appendChild(el("fieldset", {className: "group"}, [
+                el("legend", {text: "The site"}),
+                el("div", {className: "field-grid"}, [fields.title.node, fields.credits.node]),
+                fields.out_dir.node,
+                el("div", {className: "export-choices two"}, [zip.node, indexing.node])
+            ]));
+
+            function collect() {
+                var result = copyOptions(opts);
+                Object.keys(modes).forEach(function (mode) {
+                    if (modes[mode].checked) {
+                        result.images = mode;
+                    }
+                });
+                var types = (opts.exclude_types || []).filter(function (type) {
+                    return !R.TYPES[type];
+                });
+                Object.keys(R.TYPES).forEach(function (type) {
+                    if (leave[type].input.checked) {
+                        types.push(type);
+                    }
+                });
+                result.exclude_types = types;
+                ["exclude_private", "exclude_sensitive", "exclude_undescribed"].forEach(
+                    function (key) {
+                        result[key] = leave[key].input.checked;
+                    });
+                Object.keys(details).forEach(function (key) {
+                    result[key] = details[key].input.checked;
+                });
+                result.title = title.value.trim();
+                result.credits = credits.value.trim();
+                result.zip = zip.input.checked;
+                result.allow_indexing = indexing.input.checked;
+                return result;
+            }
+
+            function changed() {
+                opts = collect();
+                detailsLine.textContent = R.detailsText(opts);
+                refreshCount();
+            }
+
+            refreshCount = function () {
+                scheduleCount(countLine);
+            };
+            detailsLine.textContent = R.detailsText(opts);
+            footNote.textContent = "Counting the pictures...";
+            refreshCount();
+            title.addEventListener("input", function () {
+                opts = collect();
+            });
+            credits.addEventListener("input", function () {
+                opts = collect();
+            });
+            box.button("Cancel", "", box.close);
+            box.button("Review what will be published", "primary", function () {
+                opts = collect();
+                folderValue = folder.value.trim();
+                reviewView();
+            });
+        }
+
+        function showOptionErrors(error) {
+            var shown = false;
+            Object.keys(error.fields || {}).forEach(function (key) {
+                var target = fields[key];
+                if (target && target.error) {
+                    target.error.textContent = error.fields[key];
+                    target.error.hidden = false;
+                    if (target.control) {
+                        target.control.setAttribute("aria-invalid", "true");
+                        if (!shown) {
+                            target.control.focus();
+                        }
+                    }
+                    shown = true;
+                }
+            });
+            if (!shown) {
+                showGeneral(error.message);
+            }
+        }
+
+        /* -- the review -- */
+
+        // The review: what the server counted once, then the choices made
+        // picture by picture are counted here (R.recount), with no new
+        // request per click.
+        function reviewView() {
+            SHELL.setState({step: "review"});
+            newView("Review what will be published: " + lib.name);
+            var summary = el("div", {className: "export-summary"}, [
+                el("p", {className: "muted", text: "Looking at the pictures..."})
+            ]);
+            var holder = el("div", {className: "export-review"});
+            box.body.appendChild(summary);
+            box.body.appendChild(holder);
+            box.button("Back", "", optionsView);
+            var go = box.button("Export", "primary", startExport);
+            go.disabled = true;
+            var base = null;
+
+            function update(reply) {
+                countLine(reply);
+                renderSummary(summary, reply);
+                go.disabled = !reply.counts.exported;
+                go.textContent = reply.counts.exported ? "Export " +
+                    fmt.plural(reply.counts.exported, "picture") : "Export";
+            }
+            refreshCount = function () {
+                if (base) {
+                    update(R.recount(base, opts));
+                }
+            };
+            var mine = viewSeq;
+            var ask = {options: opts, out_dir: folderValue || ""};
+            SHELL.admin(previewPath, ask, {quiet: true}).then(function (reply) {
+                if (closed || mine !== viewSeq) {
+                    return;
+                }
+                base = reply;
+                opts = copyOptions(reply.options);
+                update(reply);
+                renderGroups(holder, reply.flagged || []);
+            }, function (error) {
+                if (closed || mine !== viewSeq || error.status === 409) {
+                    return;
+                }
+                clear(summary);
+                summary.appendChild(notice("error", error.message));
+                if (Object.keys(error.fields || {}).length) {
+                    optionsView();
+                    showOptionErrors(error);
+                }
+            });
+        }
+
+        function renderSummary(holder, reply) {
+            clear(holder);
+            holder.appendChild(el("p", {className: "export-headline",
+                                        text: R.headline(reply.counts)}));
+            var size = R.sizeText(reply);
+            if (size) {
+                holder.appendChild(el("p", {className: "muted", text: size}));
+            }
+            var left = R.leftOut(reply.counts);
+            if (left.length) {
+                holder.appendChild(el("div", {className: "export-left"}, [
+                    el("span", {className: "export-left-label", text: "Left out:"}),
+                    el("ul", {className: "stats"}, left.map(function (text) {
+                        return el("li", {className: "stat", text: text});
+                    }))
+                ]));
+            }
+            holder.appendChild(el("p", {className: "export-details",
+                                        text: R.detailsText(opts)}));
+            var counts = reply.counts || {};
+            if (counts.unavailable) {
+                holder.appendChild(notice("error", "The folder of " + lib.name + " cannot be " +
+                    "read right now (offline?), and " + fmt.plural(counts.unavailable,
+                    "picture") + " to publish " + (counts.unavailable === 1 ? "needs" :
+                    "need") + " it (" + (opts.images === "original" ? "originals are read " +
+                    "from it" : "no web-size version is kept for them") + "). Connect it " +
+                    "first" + (opts.images === "original" ? ", or go back and choose Web " +
+                    "size" : "") + "; otherwise they are left out."));
+            }
+            if (typeof reply.free_bytes === "number" && typeof reply.size_estimate === "number" &&
+                    reply.free_bytes < reply.size_estimate) {
+                holder.appendChild(notice("warn", "The disk of the export folder has " +
+                    R.bytes(reply.free_bytes) + " free, and the export takes about " +
+                    R.bytes(reply.size_estimate) + " (less when it updates an earlier export " +
+                    "there). Free some space, or go back and choose another folder or " +
+                    "smaller pictures."));
+            }
+            holder.appendChild(notice("warn", "Descriptions, tags and the text read from " +
+                "pictures are published as the AI model wrote them, and may name people or " +
+                "places. Open a picture (it opens in a new tab) to read what it says about it."));
+        }
+
+        function renderGroups(holder, flagged) {
+            clear(holder);
+            var groups = R.groups(flagged);
+            if (!groups.length) {
+                holder.appendChild(el("p", {className: "muted", text: "No picture was " +
+                    "flagged: every picture the options allow is published as it is."}));
+                return;
+            }
+            holder.appendChild(el("p", {className: "field-hint", text: "The pictures the AI " +
+                "model flagged. Untick Publish to leave one out, or tick it to publish one " +
+                "the options leave out."}));
+            groups.forEach(function (group) {
+                var grid = el("ul", {className: "export-grid"});
+                var more = button("", "small", null);
+                var shown = 0;
+                function showMore() {
+                    group.items.slice(shown, shown + REVIEW_PAGE).forEach(function (item) {
+                        grid.appendChild(reviewTile(item));
+                    });
+                    shown = Math.min(group.items.length, shown + REVIEW_PAGE);
+                    var rest = group.items.length - shown;
+                    more.hidden = rest <= 0;
+                    more.textContent = "Show " + fmt.number(Math.min(rest, REVIEW_PAGE)) +
+                        " more of " + fmt.number(rest);
+                }
+                more.addEventListener("click", showMore);
+                holder.appendChild(el("section", {className: "export-group"}, [
+                    el("h3", {text: group.title + " (" + fmt.number(group.items.length) + ")"}),
+                    group.hint ? el("p", {className: "field-hint", text: group.hint}) : null,
+                    grid,
+                    more
+                ]));
+                showMore();
+            });
+        }
+
+        function reviewTile(item) {
+            var input = el("input", {type: "checkbox", checked: R.published(item, opts)});
+            var name = item.title || "Picture without a title";
+            var node = el("li", {className: "export-tile"}, [
+                el("a", {className: "export-thumb", href: SITE.detailUrl(item.id),
+                         target: "_blank", rel: "noopener",
+                         title: "Open \u201c" + name + "\u201d in a new tab"}, [
+                    el("img", {src: SITE.thumbUrl(item.id), alt: name, loading: "lazy"})
+                ]),
+                el("div", {className: "export-tile-title", text: name, title: name}),
+                el("div", {className: "export-tile-reasons", text: R.reasonWords(item.reasons)}),
+                el("label", {className: "check"}, [input, el("span", {text: "Publish"})])
+            ]);
+            // Chosen to be published before it got a flag that leaves it out.
+            var note = el("div", {className: "export-tile-note"});
+            node.insertBefore(note, node.lastChild);
+            function paint() {
+                node.classList.toggle("is-out", !input.checked);
+                var added = R.newFlags(item, opts);
+                note.textContent = added.length ? "New since you chose to publish it: " +
+                    R.reasonWords(added) : "";
+                note.hidden = !added.length;
+            }
+            input.addEventListener("change", function () {
+                opts = R.choose(opts, item, input.checked);
+                paint();
+                refreshCount();
+            });
+            paint();
+            return node;
+        }
+
+        /* -- the export -- */
+
+        function startExport() {
+            var go = this;
+            go.disabled = true;
+            showGeneral("");
+            var params = {options: opts, save_options: true};
+            if (folderValue && folderValue !== defaultFolder) {
+                params.out_dir = folderValue;
+            }
+            SHELL.admin("/jobs", {kind: "export", library_id: lib.id, params: params},
+                        {quiet: true}).then(function (reply) {
+                if (!reply.added) {
+                    SHELL.toast("An export of " + lib.name + " is already running; it " +
+                                "continues.", "info", 6);
+                }
+                jobId = reply.job.id;
+                applySnapshot(reply.jobs);
+                refreshState();
+                if (!closed) {
+                    progressView(reply.job);
+                }
+            }, function (error) {
+                go.disabled = false;
+                if (closed || error.status === 409) {
+                    return;
+                }
+                if (Object.keys(error.fields || {}).length) {
+                    optionsView();
+                    showOptionErrors(error);
+                } else {
+                    showGeneral(error.message);
+                }
+            });
+        }
+
+        /* -- progress and result -- */
+
+        function progressView(job) {
+            SHELL.setState({step: null});
+            newView("Exporting \u201c" + lib.name + "\u201d");
+            jobId = job.id;
+            var status = el("p", {className: "export-status"});
+            var bar = progressBar(null, {label: "Export progress"});
+            var numbers = el("p", {className: "muted"});
+            var current = job;
+            box.body.appendChild(status);
+            box.body.appendChild(bar);
+            box.body.appendChild(numbers);
+            box.body.appendChild(el("p", {className: "muted", text: "You can close this " +
+                "window: the export carries on, and the job panel shows it."}));
+            box.button("Stop export", "", function () {
+                cancelJob(current);
+            });
+            box.button("Close", "", box.close);
+            function update(now) {
+                current = now;
+                if (now.finished) {
+                    finishedView(now);
+                    return;
+                }
+                var other = snapshot && snapshot.current && snapshot.current.id !== now.id;
+                status.textContent = now.state === "queued" && !now.waiting ? (other ?
+                    "Waiting for the running job to finish..." : "Starting...") :
+                    J.stage(now.stage, now) + (now.state === "paused" ? " (paused)" :
+                                               now.waiting ? "" : "...");
+                var value = now.total ? fmt.percent(now.done, now.total) : null;
+                setProgress(bar, value, {still: now.state !== "running"});
+                numbers.textContent = J.progress(now);
+            }
+            stopListening();
+            listener = function (data) {
+                var now = jobById(data, jobId);
+                if (now && !closed) {
+                    update(now);
+                }
+            };
+            snapshotListeners.push(listener);
+            update(job);
+            if (snapshot) {
+                listener(snapshot);
+            }
+        }
+
+        function finishedView(job) {
+            stopListening();
+            refreshState();
+            SHELL.setState({step: "done"});
+            var summary = job.summary || {};
+            if (job.state !== "done") {
+                newView(job.state === "failed" ? "The export failed" : "The export stopped");
+                box.body.appendChild(notice(job.state === "failed" ? "error" : "warn",
+                    job.state === "failed" ? job.error || "The export could not be made." :
+                    "The export was stopped before it finished. What it wrote is kept; " +
+                    "export again to finish it."));
+                box.button("Close", "", box.close);
+                box.button("Back to the options", "primary", optionsView);
+                return;
+            }
+            newView("\u201c" + lib.name + "\u201d is exported");
+            var output = summary.output || "";
+            var lines = ["Exported " + fmt.plural(summary.count || 0, "picture") +
+                (summary.bytes ? " (" + fmt.bytes(summary.bytes) + " in all)" : "") + "."];
+            if (!summary.count) {
+                lines.push("The site has no pictures: every picture was left out. Go back to " +
+                           "the options to see why.");
+            }
+            if (summary.failed) {
+                lines.push(fmt.plural(summary.failed, "picture") + " could not be read and " +
+                           (summary.failed === 1 ? "was" : "were") + " left out; the log " +
+                           "names them.");
+            }
+            if (summary.kept) {
+                lines.push(fmt.plural(summary.kept, "picture") + " could not be read; the " +
+                           "files of the earlier export were kept.");
+            }
+            box.body.appendChild(notice(!summary.count || summary.failed || summary.kept
+                ? "warn" : "ok", lines.join(" ")));
+            box.body.appendChild(el("div", {className: "field"}, [
+                el("span", {className: "field-label", text: "Folder"}),
+                el("div", {className: "export-copy"}, [
+                    el("code", {className: "export-path", text: output}),
+                    button("Copy", "subtle small", function () {
+                        SHELL.copyText(output).then(function (ok) {
+                            SHELL.toast(ok ? "Folder path copied." : "The path could not be " +
+                                        "copied.", ok ? "ok" : "error", 3);
+                        });
+                    })
+                ]),
+                summary.zip ? el("span", {className: "field-hint", text: "Zip file: " +
+                                          summary.zip}) : null
+            ]));
+            var command = R.serveCommand(output);
+            box.body.appendChild(el("h3", {className: "export-h3", text: "Putting it on the web"}));
+            box.body.appendChild(el("ol", {className: "export-steps"}, [
+                el("li", {text: "Copy everything in the folder to a web host that serves " +
+                    "plain files, such as GitHub Pages, Netlify or your own web server. " +
+                    "Nothing needs to be installed or run there."}),
+                el("li", null, [
+                    "To try it on this computer first, run this command, then open " +
+                    "http://localhost:8000/ in a browser:",
+                    el("div", {className: "export-copy"}, [
+                        el("code", {className: "export-path", text: command}),
+                        button("Copy", "subtle small", function () {
+                            SHELL.copyText(command).then(function (ok) {
+                                SHELL.toast(ok ? "Command copied." : "The command could " +
+                                            "not be copied.", ok ? "ok" : "error", 3);
+                            });
+                        })
+                    ])
+                ]),
+                el("li", {text: "Or double-click index.html in the folder. Opened that way, " +
+                    "360-degree photos are shown flat."}),
+                el("li", {text: "After describing more pictures, export again: only what " +
+                    "changed is written, and pictures left out since are removed."})
+            ]));
+            if (!summary.count || summary.failed) {
+                box.button("Back to the options", "", optionsView);
+            }
+            box.button("Close", "", box.close);
+            box.button("Open folder", "primary", function () {
+                openExportFolder(lib);
+            });
+        }
+
+        var running = exportJobOf(lib);
+        var finished = options.step === "done" ? lastExportJob(lib) : null;
+        if (options.step === "done" && last && last.finished &&
+                (!finished || finished.state !== "done" ||
+                 (finished.summary || {}).output !== last.output)) {
+            // Made from the command line, or the job is no longer listed.
+            finished = {state: "done", summary: {output: last.output, count: last.pictures,
+                                                 bytes: last.bytes, zip: last.zip}};
+        }
+        if (running) {
+            progressView(running);
+        } else if (finished) {
+            finishedView(finished);
+        } else if (options.step === "review") {
+            reviewView();
+        } else {
+            optionsView();
+        }
+        return box;
+    }
+
     /* ---------- Dialogs from the URL ------------------------------------- */
 
-    function openDialog(kind, id) {
+    function openDialog(kind, id, step) {
         var lib = id ? findLibrary(id) : null;
         if (kind !== "add" && kind !== "browse" && !lib) {
             return null;
@@ -1961,6 +2679,11 @@
         if (kind === "failures") {
             return failuresDialog(lib);
         }
+        if (kind === "export") {
+            // A library that is turned off cannot be exported (its last export can be shown).
+            return lib.enabled === false && step !== "done" ? null :
+                exportDialog(lib, {step: step});
+        }
         return null;
     }
 
@@ -1979,7 +2702,7 @@
             loadState().then(function () {
                 var wanted = SHELL.getState();
                 if (wanted.dialog) {
-                    openDialog(wanted.dialog, wanted.id);
+                    openDialog(wanted.dialog, wanted.id, wanted.step);
                 }
             }, function () {
                 // Keep trying until the server answers.

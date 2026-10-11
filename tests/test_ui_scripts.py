@@ -259,8 +259,9 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
             self.assertIn('<link rel="icon" href="data:,">', self.page(url))
 
     def test_exported_pages_get_the_new_scripts(self):
-        for name in ("search-core.js", "viewer.js"):
-            self.assertIn(name, serve.ASSET_FILES)
+        import export
+        for name in ("search-core.js", "viewer.js", "shell.js", "site.js"):
+            self.assertIn(name, export.ASSETS)
 
 
 if __name__ == "__main__":

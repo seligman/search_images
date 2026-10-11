@@ -31,7 +31,9 @@ its value is empty, zero, or the "nothing" value noted below:
     q    aesthetic score 1-5              sh   sharpness score 1-5
     qf   quality flags []                 se   sensitive (not "none")
     pr   1 when the picture shows private information
-    dk   date taken "YYYY-MM-DD"          ts   date and time taken (server)
+    dk   date taken "YYYY-MM-DD" (an export: only from the camera or the
+         file name, never from the file's time)
+    ts   date and time taken (server)
     cm   camera                           gp   1 when the picture has a GPS
                                                position (never the position
                                                itself; an export only with
@@ -279,7 +281,10 @@ def record_for_row(row, for_export=False, export_options=None, info=None):
         if info.get("private_info") is True:
             record["pr"] = 1
     taken = row["taken_at"] or ""
-    if _DATE_RE.match(taken):
+    # An export only has dates from the camera or the file name: a date
+    # from the file's modification time is a file time, and says little.
+    if _DATE_RE.match(taken) and (not for_export
+                                  or row["taken_source"] in RELIABLE_DATE_SOURCES):
         record["dk"] = taken[:10]
         if not for_export:
             record["ts"] = taken

@@ -741,7 +741,7 @@ var VIEWER = (function () {
             self.img.src = loader.src;
             self.layout();
             if (wantPano) {
-                self.setNote("This browser cannot show the 360\u00b0 view here; this is the flat panorama.");
+                self.setNote(flatPanoramaNote());
             }
             self.state();
         };
@@ -847,6 +847,16 @@ var VIEWER = (function () {
     };
 
     // The preview could not be loaded but the large panorama (at url) could.
+    // Why a 360-degree photo is shown flat. Opened from disk (an export's
+    // index.html), browsers do not let the 360 view read the picture.
+    function flatPanoramaNote() {
+        if (window.location && window.location.protocol === "file:") {
+            return "The 360\u00b0 view needs the site to be opened from a web server; " +
+                "this is the flat panorama.";
+        }
+        return "This browser cannot show the 360\u00b0 view here; this is the flat panorama.";
+    }
+
     Stage.prototype.showSharpAlone = function (picture, url) {
         this.setNote("");
         this.natural = {w: picture.naturalWidth || picture.width,
@@ -854,7 +864,7 @@ var VIEWER = (function () {
         if (!this.startPano(picture, url)) {
             this.img.src = url;
             this.layout();
-            this.setNote("This browser cannot show the 360\u00b0 view here; this is the flat panorama.");
+            this.setNote(flatPanoramaNote());
             this.state();
         }
     };
@@ -1531,7 +1541,8 @@ var VIEWER = (function () {
         var original = window.SITE ? SITE.imageUrl(rec) : null;
         if (original) {
             actions.appendChild(el("a", {className: "button small", href: original, target: "_blank",
-                                         rel: "noopener", text: "Open the original"}));
+                                         rel: "noopener",
+                                         text: SITE.originalLabel || "Open the original"}));
         }
         if (context.inPage && context.detailUrl) {
             actions.appendChild(el("a", {className: "button small", href: context.detailUrl(rec.i),

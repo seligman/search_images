@@ -334,12 +334,14 @@ def clean_library_fields(config, fields, library=None, require_absolute=True):
         else:
             changes["context_notes"] = notes.strip()
     if "export" in fields:
-        # No export settings exist yet; until they do (and are checked like
-        # any other setting), only the empty object is stored.
-        if fields["export"] == {}:
-            changes["export"] = {}
-        else:
-            errors["export"] = "Export settings cannot be changed here yet."
+        # The saved export options, replaced as a whole (only the ones that
+        # differ from the defaults are stored).
+        import export       # imported here: a larger module most callers never need
+        wanted = fields["export"] if fields["export"] is not None else {}
+        try:
+            changes["export"] = export.options_to_save(export.validate_options(wanted))
+        except export.OptionsError as error:
+            errors["export"] = "Export options that cannot be used: %s" % error
     if errors:
         raise LibraryError("Some settings cannot be used.", errors)
     warnings = []
@@ -908,8 +910,29 @@ def reveal_file(path, timeout=REVEAL_TIMEOUT):
     """
     if not run_with_timeout(os.path.isfile, timeout, path):
         raise LibraryError("The file is not there any more: %s" % path, status=404)
+    return _start_file_manager(reveal_command(path))
+
+
+def open_folder_command(path, platform=None):
+    """The command that opens a folder in the system's file manager."""
+    platform = platform or sys.platform
+    if platform == "win32":
+        return ["explorer", path]
+    if platform == "darwin":
+        return ["open", path]
+    return ["xdg-open", path]
+
+
+def open_folder(path, timeout=REVEAL_TIMEOUT):
+    """Open a folder in the file manager (Explorer, Finder, xdg-open); like reveal_file."""
+    if not run_with_timeout(os.path.isdir, timeout, path):
+        raise LibraryError("The folder is not there any more: %s" % path, status=404)
+    return _start_file_manager(open_folder_command(path))
+
+
+def _start_file_manager(command):
     try:
-        process = subprocess.Popen(reveal_command(path), close_fds=True)
+        process = subprocess.Popen(command, close_fds=True)
     except OSError as error:
         raise LibraryError("The file manager could not be started: %s" % error, status=501)
     # Collect the exit status when it ends, so no zombie or warning is left.

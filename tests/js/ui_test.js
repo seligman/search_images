@@ -122,6 +122,24 @@ test("static export addresses are relative", function () {
     assert.strictEqual(noMap.previewUrl({i: "ab12"}), null);
 });
 
+test("an export names itself and its pictures' files", function () {
+    assert.strictEqual(SITE.title, "Image Search");
+    assert.strictEqual(SITE.originalLabel, "Open the original");
+    var web = loadSite({mode: "static", data: "data/", title: "Our Trips",
+                        capabilities: {static: true, images: true, originals: false}});
+    assert.strictEqual(web.title, "Our Trips");
+    assert.strictEqual(web.originalLabel, "Open the large picture");
+    // An original kept in its own format says so (rec.ix); nothing else
+    // can become part of the address.
+    assert.strictEqual(web.imageUrl({i: "ab12", ix: "png"}), "images/ab12.png");
+    assert.strictEqual(web.imageUrl({i: "ab12", ix: "../x"}), "images/ab12.jpg");
+    assert.strictEqual(web.imageUrl({i: "ab12", ix: 5}), "images/ab12.jpg");
+    var originals = loadSite({mode: "static", data: "data/",
+                              capabilities: {static: true, images: true, originals: true}});
+    assert.strictEqual(originals.originalLabel, "Open the original");
+    assert.strictEqual(originals.title, "Image Search");
+});
+
 /* ---------- Compact records from full ones ------------------------------------ */
 
 var DETAIL = {
@@ -271,12 +289,14 @@ test("the 360 view gets the large panorama of 360 photos only", function () {
     // A 360 photo no larger than its preview has none: the preview is all of it.
     assert.strictEqual(SITE.panoUrl({i: 4, p: "360", w: 2048, hgt: 1024}), null);
     assert.strictEqual(SITE.panoUrl({i: 5, p: "360", w: 2050, hgt: 1025}), "/pano/5");
-    // An export ships panoramas only when it says so.
+    // An export ships panoramas only when it says so, for the pictures
+    // that have one (pn).
     var bare = loadSite({mode: "static", data: "data/", capabilities: {static: true}});
-    assert.strictEqual(bare.panoUrl({i: "ab12", p: "360"}), null);
+    assert.strictEqual(bare.panoUrl({i: "ab12", p: "360", pn: 1}), null);
     var withPanos = loadSite({mode: "static", data: "data/",
                               capabilities: {static: true, panos: true}});
-    assert.strictEqual(withPanos.panoUrl({i: "ab12", p: "360"}), "panos/ab12.jpg");
+    assert.strictEqual(withPanos.panoUrl({i: "ab12", p: "360", pn: 1}), "panos/ab12.jpg");
+    assert.strictEqual(withPanos.panoUrl({i: "ab15", p: "360"}), null);
     assert.strictEqual(withPanos.panoUrl({i: "ab13"}), null);
     assert.strictEqual(withPanos.panoUrl({i: "ab14", p: "360", _pano: "x/p.jpg"}), "x/p.jpg");
     // The viewer no longer decides on its own which larger picture to load.

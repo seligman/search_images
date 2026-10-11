@@ -667,6 +667,27 @@ test("sort orders", function () {
     assert.deepStrictEqual(items(records, "", {sort: "nonsense"}), [2, 1, 4, 5, 3]);
 });
 
+test("an export's pictures of one day sort in the order they were taken (tn)", function () {
+    // Exports have no times: tn is the place in capture order within the day.
+    var records = [
+        {i: "aa", t: "dog", dk: "2020-07-01", tn: 2},
+        {i: "zz", t: "dog", dk: "2020-07-01", tn: 1},
+        {i: "mm", t: "dog", dk: "2020-07-01", tn: 3},
+        {i: "bb", t: "dog", dk: "2020-06-30"},
+        {i: "cc", t: "dog"}
+    ];
+    assert.deepStrictEqual(items(records, ""), ["mm", "aa", "zz", "bb", "cc"]);
+    assert.deepStrictEqual(items(records, "", {sort: "oldest"}), ["bb", "zz", "aa", "mm", "cc"]);
+    assert.deepStrictEqual(items(records, "dog"), ["mm", "aa", "zz", "bb", "cc"]);
+    // Taken one after the other that day: more alike.
+    var exported = [
+        {i: 1, g: ["a"], dk: "2020-01-01", tn: 1},
+        {i: 2, g: ["b"], dk: "2020-01-01", tn: 9},
+        {i: 3, g: ["c"], dk: "2020-01-01", tn: 2}
+    ];
+    assert.deepStrictEqual(SearchCore.similar(exported, 1), [3, 2]);
+});
+
 test("hidden, sensitive, private, junk and library options", function () {
     var records = [
         {i: 1, l: "lib_a", t: "beach", dk: "2020-01-01"},

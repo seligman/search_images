@@ -421,7 +421,7 @@ class WorkerLock:
 # ---------------------------------------------------------------------------
 # Jobs run by the web server
 
-JOB_KINDS = ("scan", "describe", "process", "previews", "delete_library")
+JOB_KINDS = ("scan", "describe", "process", "previews", "delete_library", "export")
 ACTIVE_STATES = ("running", "paused", "cancelling")
 FINISHED_STATES = ("done", "failed", "cancelled", "interrupted")
 JOB_STATES = ("queued",) + ACTIVE_STATES + FINISHED_STATES
@@ -444,6 +444,8 @@ STAGE_LABELS = {
     "previews": "Building previews",
     "describe": "Describing pictures",
     "delete": "Deleting indexed data",
+    "export": "Exporting pictures",
+    "zip": "Writing the zip file",
     WAITING_STAGE: "Waiting for another scan to finish",
 }
 # The job queue lives in data/jobs.db, a database of its own: a running scan
@@ -1536,10 +1538,37 @@ def run_delete_library(ctx, conn, config, params, helper=None):
     return library_ops.delete_library_job(ctx, conn, config, params)
 
 
+def run_export(ctx, conn, config, params, helper=None):
+    """Export one library as a static website (export.export_library).
+
+    params: "out_dir" (default: data/exports/<library name>/) and
+    "options" (they override the library's saved export options for this
+    export only). Raises JobError when the export cannot be made (an
+    unknown or disabled library, a folder it must not write to, bad
+    options); one picture that cannot be read is only counted.
+    """
+    import export
+    if not params.get("library_id"):
+        raise JobError("An export is made of one library; choose which.")
+    library = job_libraries(config, params)[0]
+    options = params.get("options")
+    try:
+        return export.export_library(ctx, conn, config, library["id"],
+                                     params.get("out_dir") or None,
+                                     options if isinstance(options, dict) else None,
+                                     helper=helper)
+    except export.ExportError as error:
+        raise JobError(str(error))
+    except OSError as error:
+        # (export.py words its own; this is for anything it did not expect.)
+        raise JobError(export.os_error_text(error))
+
+
 RUNNERS = {
     "scan": run_scan,
     "describe": run_describe,
     "process": run_process,
     "previews": run_previews,
     "delete_library": run_delete_library,
+    "export": run_export,
 }

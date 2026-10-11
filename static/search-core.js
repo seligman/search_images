@@ -1341,6 +1341,22 @@ var SearchCore = (function () {
         return a < b ? -1 : a > b ? 1 : 0;
     }
 
+    // What dates sort by: the date and time taken (ts), else the day
+    // (dk) and, in an export, the place in capture order within the day
+    // (tn), so the pictures of one day keep the order they were taken in.
+    function sortDate(rec) {
+        if (isText(rec.ts)) {
+            return rec.ts;
+        }
+        if (!isText(rec.dk)) {
+            return "";
+        }
+        if (typeof rec.tn === "number" && rec.tn > 0 && rec.tn < 1e9) {
+            return rec.dk + "#" + String(1e9 + Math.floor(rec.tn)).slice(1);
+        }
+        return rec.dk;
+    }
+
     // A growing list of 32-bit integers.
     function IntBuffer(size) {
         this.data = new Int32Array(size > 1024 ? size : 1024);
@@ -1404,7 +1420,7 @@ var SearchCore = (function () {
                 this.position[String(rec.i)] = r;
             }
             this.indexRecord(r, rec);
-            this.dates[r] = isText(rec.ts) ? rec.ts : isText(rec.dk) ? rec.dk : "";
+            this.dates[r] = sortDate(rec);
             this.flags[r] = (isText(rec.o) ? 1 : 0) | (rec.gp ? 2 : 0) | (rec.p === "360" ? 4 : 0);
         }
         this.build.pairStart[n] = this.build.pairs.length >> 1;
@@ -2406,7 +2422,8 @@ var SearchCore = (function () {
 
     // What similar() compares: the folded phrases of tags, subjects,
     // animals, food and vehicles (as sorted id lists, with postings), the
-    // scene, the capture minute and day.
+    // scene, the capture minute and day, and (an export, which has no
+    // times) the place in capture order within the day.
     Index.prototype.similarityData = function () {
         if (this.similarData) {
             return this.similarData;
@@ -2418,6 +2435,7 @@ var SearchCore = (function () {
         var scenes = new Array(this.n);
         var minutes = new Float64Array(this.n);
         var days = new Float64Array(this.n);
+        var places = new Float64Array(this.n);
         for (var r = 0; r < this.n; r++) {
             var rec = this.records[r];
             var set = [];
@@ -2425,6 +2443,7 @@ var SearchCore = (function () {
             scenes[r] = "";
             minutes[r] = -1;
             days[r] = -1;
+            places[r] = -1;
             if (!rec || typeof rec !== "object") {
                 continue;
             }
@@ -2450,9 +2469,10 @@ var SearchCore = (function () {
             scenes[r] = isText(rec.sc) ? tokens(rec.sc).map(foldWord).join(" ") : "";
             minutes[r] = parseMinutes(rec.ts);
             days[r] = parseDay(rec.dk);
+            places[r] = typeof rec.tn === "number" && rec.tn > 0 ? rec.tn : -1;
         }
         this.similarData = {sets: sets, postings: postings, scenes: scenes, minutes: minutes,
-                            days: days};
+                            days: days, places: places};
         return this.similarData;
     };
 
@@ -2481,6 +2501,11 @@ var SearchCore = (function () {
             }
         } else if (data.days[origin] >= 0 && data.days[origin] === data.days[r]) {
             score += 2;
+            // Taken one after the other that day (an export's tn).
+            if (data.places[origin] >= 0 && data.places[r] >= 0 &&
+                    Math.abs(data.places[origin] - data.places[r]) <= 2) {
+                score += 1;
+            }
         }
         if (isText(x.dt) && x.dt !== "none" && x.dt === y.dt) {
             score += 1;

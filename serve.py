@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
-"""Search the image database and package it as a static website.
+"""Search the image database, and export a library as a static website.
 
 Run with no arguments (or "serve") to start the interactive Flask server.
-Run with "package" to build a backend-free copy of the site that searches the
-data entirely in the browser.
+Run with "package" to export one library as a static website that searches
+in the browser with no server (see export.py, which does the work).
 """
 
 import argparse
-import base64
 import contextlib
-import fnmatch
 import hashlib
 import io
 import json
 import math
 import mimetypes
 import os
-import shutil
 import socket
 import sys
 import threading
-import time
 
 import admin
 import cache
@@ -35,23 +31,14 @@ import world_map
 TEMPLATE_DIR = os.path.join(common.BASE_DIR, "templates")
 STATIC_DIR = os.path.join(common.BASE_DIR, "static")
 FALLBACK_BASEMAP = os.path.join(STATIC_DIR, "worldmap.jpg")
-ASSET_FILES = ("style.css", "site.js", "shell.js", "search-core.js", "viewer.js", "app.js",
-               "detail.js", "map.js")
 TILE_SIZE = 256
 # Without a tile pyramid the bundled basemap is sliced into zoom 0..3.
 FALLBACK_MAX_ZOOM = 3
 # No tile request above this zoom is ever answered, whatever the manifest says.
 TILE_ZOOM_LIMIT = 20
-# The static site's data files are kept at or below this size.
-SHARD_LIMIT = 10 * 1024 * 1024
-# Marks a folder as built by "package". Only such a folder (or an empty one)
-# is written to, because packaging deletes stale files inside it.
-EXPORT_MARKER = ".search-images-export"
 # How long browsers may reuse thumbnails, previews and originals, and tiles.
 CACHE_SECONDS = 3600
 TILE_CACHE_SECONDS = 86400
-# JPEG data under another extension (Insta360 .insp): copied as .jpg files.
-JPEG_EXTENSIONS = (".insp",)
 # Originals with these extensions are converted to JPEG for browsers.
 CONVERTED_EXTENSIONS = common.HEIC_EXTENSIONS + (".tif", ".tiff")
 # Provenance fields the detail page may show (who described an image, when).
@@ -61,9 +48,6 @@ MAX_IMAGE_ID = 2 ** 63 - 1
 # Host names the server always answers to. Requests naming any other host are
 # refused, so a web page cannot reach the server through DNS rebinding.
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
-# Folders directly inside the program folder that git ignores, and that
-# "package" may therefore write to.
-IGNORED_SITE_FOLDERS = ("site", "site_*", "exports")
 # Sent with every page: scripts and styles only from this server (the page
 # settings are a JSON block, not a script), never shown inside a frame, no
 # <base> that could move the scripts' relative addresses, forms only sent
@@ -216,25 +200,6 @@ def disk_path(row, roots):
     return os.path.join(root, *row["path"].split("/"))
 
 
-def query_visible(conn, library_ids, columns, order_by="id"):
-    """Rows of present, non-hidden images in the given libraries."""
-    library_ids = list(library_ids)
-    if not library_ids:
-        return []
-    sql = ("SELECT %s FROM images WHERE missing_since IS NULL AND hidden = 0 "
-           "AND library_id IN (%s) ORDER BY %s"
-           % (columns, ",".join("?" * len(library_ids)), order_by))
-    return conn.execute(sql, library_ids).fetchall()
-
-
-def image_extension(name):
-    """Extension used for an original in the static site ("jpg" if converted)."""
-    lower = name.lower()
-    if lower.endswith(CONVERTED_EXTENSIONS + JPEG_EXTENSIONS):
-        return "jpg"
-    return os.path.splitext(lower)[1].lstrip(".") or "jpg"
-
-
 def projection_of(row):
     """The row's 360-degree projection, or "" (also while it is unchecked)."""
     projection = row["projection"]
@@ -349,7 +314,7 @@ def _fallback_tile_bytes(zoom, x, y):
 
 def render_template_file(name, mode, asset_prefix, data_prefix,
                          tiles_max=None, tile_prefix=None, libraries=None,
-                         capabilities=None):
+                         capabilities=None, extra=None):
     """Build a page from a template file, shared by server and static modes.
 
     The page settings go into the template's
@@ -360,7 +325,9 @@ def render_template_file(name, mode, asset_prefix, data_prefix,
     libraries are the libraries for the page's library picker: {id: name}
     (or a list of names); by default, the enabled libraries in config.json.
     capabilities are {"admin": the Manage and Settings pages may be used,
-    "static": a packaged site}; admin is off unless given.
+    "static": a static export, ...}; admin is off unless given (and always
+    off in static mode). extra holds more page settings (an export's
+    "title"); it cannot replace the ones made here.
     """
     with open(os.path.join(TEMPLATE_DIR, name), "r", encoding="utf-8") as handle:
         html = handle.read()
@@ -391,6 +358,8 @@ def render_template_file(name, mode, asset_prefix, data_prefix,
         app_config["tiles"] = tile_prefix
     app_config["tilesMax"] = tiles_max
     app_config["tileSize"] = TILE_SIZE
+    for key, value in (extra or {}).items():
+        app_config.setdefault(key, value)
     html = html.replace("__ASSET_PREFIX__", asset_prefix)
     html = html.replace("__APP_CONFIG__", script_json(app_config))
     return html
@@ -839,327 +808,50 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     return app
 
 
-# --- Static site packaging ---------------------------------------------------
+# --- Static export ("package") ------------------------------------------------
 
-class ExportError(Exception):
-    """The static site cannot be written to the chosen folder."""
+def package_library(config, wanted=None):
+    """The library "package" exports: wanted (a name or id), or the one enabled library.
 
-
-def default_export_dir():
-    """Where "package" writes when no folder is given: data/exports/site."""
-    return os.path.join(common.exports_dir(), "site")
-
-
-def _normalized(path):
-    return os.path.normcase(os.path.abspath(path))
-
-
-def _is_within(path, folder):
-    """True if path is folder or somewhere inside it (no file system access)."""
-    path, folder = _normalized(path), _normalized(folder)
-    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
-
-
-def _git_ignored_site_folder(output_dir):
-    """True if output_dir is in a folder directly inside the program folder that git ignores."""
-    rel = os.path.relpath(_normalized(output_dir), _normalized(common.BASE_DIR))
-    first = rel.split(os.sep)[0]
-    return any(fnmatch.fnmatchcase(first, os.path.normcase(pattern))
-               for pattern in IGNORED_SITE_FOLDERS)
-
-
-def check_export_dir(output_dir, config, force=False):
-    """Raise ExportError if package() must not write to output_dir.
-
-    Packaging deletes stale files inside the folder, so it refuses a folder
-    that overlaps a library, holds the data folder or the program, sits in
-    the data folder outside data/exports, or is not empty and lacks the
-    marker an earlier export left (force accepts such a folder, for example
-    a site built by an older version). Inside the program folder (a git
-    checkout) only folders git ignores are allowed: site/, site_*/,
-    exports/ and data/exports/, so private photos never end up in a commit.
+    Raises export.ExportError when wanted is unknown, or when it is not
+    given and there is not exactly one enabled library.
     """
-    for library in config.get("libraries", []):
-        root = common.library_root(library)
-        if root and (_is_within(output_dir, root) or _is_within(root, output_dir)):
-            raise ExportError(
-                "The output folder %s overlaps the folder of library %s. "
-                "Choose a folder outside your libraries."
-                % (output_dir, common.library_label(library)))
-    for folder, what in ((common.data_dir(), "the data folder"),
-                         (common.BASE_DIR, "the program folder")):
-        if _is_within(folder, output_dir):
-            raise ExportError("The output folder %s contains %s. Choose a "
-                              "different folder." % (output_dir, what))
-    if (_is_within(output_dir, common.data_dir())
-            and not _is_within(output_dir, common.exports_dir())):
-        raise ExportError("Inside the data folder, exports can only go to %s."
-                          % common.exports_dir())
-    if (_is_within(output_dir, common.BASE_DIR)
-            and not _is_within(output_dir, common.exports_dir())
-            and not _git_ignored_site_folder(output_dir)):
-        raise ExportError(
-            "The output folder %s is inside the program folder %s, where its private "
-            "photos could end up in a commit. Choose a folder outside it, or one named "
-            "site or site_<something> directly inside it." % (output_dir, common.BASE_DIR))
-    if os.path.exists(output_dir) and not os.path.isdir(output_dir):
-        raise ExportError("%s is a file, not a folder." % output_dir)
-    if (not force and os.path.isdir(output_dir) and os.listdir(output_dir)
-            and not os.path.isfile(os.path.join(output_dir, EXPORT_MARKER))):
-        raise ExportError(
-            "%s is not empty and was not created by 'serve.py package'. Choose "
-            "an empty or new folder. To update a site built by an older version, "
-            "add --force; files in its images, data and tiles folders may then "
-            "be replaced or deleted." % output_dir)
+    import export
+    if wanted:
+        library = common.get_library(config, wanted)
+        if library is None:
+            raise export.ExportError("There is no library %r in the settings." % (wanted,))
+        return library
+    enabled = [library for library in common.enabled_libraries(config) if library.get("id")]
+    if len(enabled) == 1:
+        return enabled[0]
+    if not enabled:
+        raise export.ExportError("There is no enabled library to export.")
+    raise export.ExportError(
+        "An export holds one library; choose one with --library (%s)."
+        % ", ".join(common.library_label(library) for library in enabled))
 
 
-def load_export_state(output_dir):
-    """The shard layout of the previous export into output_dir ([] if none)."""
-    path = os.path.join(output_dir, EXPORT_MARKER)
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            shards = json.load(handle).get("shards", [])
-    except (OSError, ValueError, AttributeError):
-        return []
-    return shards if isinstance(shards, list) else []
+def package(output_dir=None, library=None, log=print, options=None, ctx=None):
+    """Export one library as a static website (export.export_library); returns its summary.
 
-
-def save_export_state(output_dir, shards):
-    """Write the marker file, which also records the shard layout."""
-    write_json(os.path.join(output_dir, EXPORT_MARKER),
-               {"format": 1, "generated": int(time.time()), "shards": shards})
-
-
-def plan_shards(records, previous):
-    """Assign images to shard files, reusing previous shards where possible.
-
-    Returns (shards, dirty, by_id). Each shard is a list of [id, digest] pairs.
-    dirty is the set of shard indexes whose contents changed.
+    library is a name or id (needed when more than one library is
+    enabled); output_dir defaults to data/exports/<library name>/ in the
+    data root; options override the library's saved export options. The
+    log lines go to log, or to ctx (a jobs.JobContext) when given. The
+    database must already be prepared (db.init). Raises export.ExportError
+    when the export cannot be made.
     """
-    by_id = {}
-    order = []
-    for image_id, record, digest, size in records:
-        by_id[image_id] = (record, digest, size)
-        order.append(image_id)
-    shards = []
-    dirty = set()
-    placed = set()
-    for prev in previous:
-        rebuilt = []
-        is_dirty = False
-        for entry in prev:
-            image_id, old_digest = entry[0], entry[1]
-            if image_id not in by_id or image_id in placed:
-                is_dirty = True
-                continue
-            digest = by_id[image_id][1]
-            if digest != old_digest:
-                is_dirty = True
-            rebuilt.append([image_id, digest])
-            placed.add(image_id)
-        shards.append(rebuilt)
-        if is_dirty:
-            dirty.add(len(shards) - 1)
-    leftovers = [i for i in order if i not in placed]
-    if leftovers and not shards:
-        shards.append([])
-    for image_id in leftovers:
-        size = by_id[image_id][2]
-        index = len(shards) - 1
-        used = sum(by_id[e[0]][2] for e in shards[index])
-        if shards[index] and used + size > SHARD_LIMIT:
-            shards.append([])
-            index += 1
-        shards[index].append([image_id, by_id[image_id][1]])
-        dirty.add(index)
-    return shards, dirty, by_id
-
-
-def write_json(path, value):
-    """Write JSON atomically. NaN/Infinity are refused: browsers cannot parse them."""
-    common.write_file_atomic(path, json.dumps(value, allow_nan=False) + "\n")
-
-
-def copy_original(row, roots, dest, helper=None, log=print):
-    """Copy (or convert to JPEG) one original into the static site folder.
-
-    Returns "copied", "current" (dest is already up to date), "missing" (the
-    original cannot be reached) or "failed". The file is written under a
-    temporary name first, so a failure never leaves a partial image behind,
-    and one bad file does not stop the export.
-    """
-    source = disk_path(row, roots)
-    stat = common.stat_path(helper, source) if source else None
-    if stat is None:
-        return "missing"
-    try:
-        if os.path.isfile(dest) and os.path.getmtime(dest) >= stat.st_mtime:
-            return "current"
-        images = _images()
-        convert = row["name"].lower().endswith(CONVERTED_EXTENSIONS)
-        data = None
-        if not convert:
-            data = common.load_image_bytes(helper, source)
-            if images is not None:
-                mime = images.sniff_mime(data)
-                convert = mime is not None and not images.browser_can_display(mime)
-        if convert:
-            if images is None:
-                log("Warning: skipped %s: converting it needs Pillow." % row["path"])
-                return "failed"
-            data = images.to_browser_jpeg(source, helper)
-        common.write_file_atomic(dest, data)
-        return "copied"
-    except Exception as error:
-        log("Warning: could not copy %s: %s" % (row["path"], error))
-        return "failed"
-
-
-def package(output_dir=None, force=False, log=print):
-    """Build or update the static site in output_dir; return a summary dict.
-
-    Only present, non-hidden images of enabled libraries are included. The
-    database must already be prepared (db.init). Raises ExportError when the
-    folder is not safe to write to (see check_export_dir).
-    """
+    import export
     config = common.load_config()
-    output_dir = os.path.abspath(output_dir or default_export_dir())
-    check_export_dir(output_dir, config, force)
-    common.ensure_dir(output_dir)
-    previous = load_export_state(output_dir)
-    if not os.path.isfile(os.path.join(output_dir, EXPORT_MARKER)):
-        # Mark the folder before writing anything else, so an interrupted
-        # first export can simply be run again.
-        save_export_state(output_dir, [])
-
-    names = visible_libraries(config)
-    roots = library_roots(config)
-    helper = load_helper_for_config(config)
-    images_dir = common.ensure_dir(os.path.join(output_dir, "images"))
-    data_dir = common.ensure_dir(os.path.join(output_dir, "data"))
-
+    chosen = package_library(config, library)
     conn = db.connect()
-    thumbs = cache.ThumbStore()
     try:
-        rows = query_visible(conn, names, "*")
-        records = []
-        image_names = set()
-        copies = {"copied": 0, "current": 0, "missing": 0, "failed": 0}
-        for row in rows:
-            image_name = "%d.%s" % (row["id"], image_extension(row["name"]))
-            image_names.add(image_name)
-            status = copy_original(row, roots, os.path.join(images_dir, image_name),
-                                   helper, log)
-            copies[status] += 1
-            data = thumbs.get(row["id"])
-            thumb = ""
-            if data:
-                thumb = "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
-            info = load_json(row["info"], None)
-            exif = load_json(row["exif"], {})
-            record = {
-                "id": row["id"], "library": names[row["library_id"]],
-                "path": row["path"], "name": row["name"], "size": row["size"],
-                "mtime": finite(row["mtime"]), "ctime": finite(row["ctime"]),
-                "width": row["width"], "height": row["height"],
-                "projection": projection_of(row),
-                "taken_at": row["taken_at"], "taken_source": row["taken_source"],
-                "tz_offset": row["tz_offset"], "camera": row["camera"],
-                "info": info, "exif": exif if isinstance(exif, dict) else {},
-                "text": search_text(row["name"], row["path"], info, row["taken_at"],
-                                    projection_of(row)),
-                "dhash": row["dhash"], "thumb": thumb,
-                "image": "images/" + image_name,
-            }
-            text = json.dumps(record, sort_keys=True, allow_nan=False)
-            digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
-            records.append((row["id"], record, digest, len(text) + 2))
-
-        # Remove originals left over from images that are no longer exported.
-        for existing in os.listdir(images_dir):
-            target = os.path.join(images_dir, existing)
-            if existing not in image_names and os.path.isfile(target):
-                os.remove(target)
-
-        shards, dirty, by_id = plan_shards(records, previous)
-        shard_names = []
-        written = 0
-        for index, shard in enumerate(shards):
-            name = "data-%04d.json" % index
-            shard_names.append(name)
-            target = os.path.join(data_dir, name)
-            if index in dirty or not os.path.exists(target):
-                write_json(target, [by_id[entry[0]][0] for entry in shard])
-                written += 1
-        for existing in os.listdir(data_dir):
-            if (existing.startswith("data-") and existing.endswith(".json")
-                    and existing not in shard_names):
-                os.remove(os.path.join(data_dir, existing))
-
-        libraries = list(names.values())
-        write_json(os.path.join(data_dir, "manifest.json"), {
-            "libraries": libraries, "shards": shard_names,
-            "count": len(records), "generated": int(time.time()),
-        })
-
-        for asset in ASSET_FILES:
-            shutil.copyfile(os.path.join(STATIC_DIR, asset),
-                            os.path.join(output_dir, asset))
-
-        locations = world_map.collect_located_images(conn, list(names))
-        write_json(os.path.join(data_dir, "locations.json"),
-                   [{"id": i, "lat": lat, "lon": lon}
-                    for i, lat, lon in locations])
+        return export.export_library(ctx or export.LogContext(log), conn, config, chosen["id"],
+                                     output_dir, options,
+                                     helper=load_helper_for_config(config))
     finally:
-        thumbs.close()
         conn.close()
-
-    tiles_max = export_tiles(output_dir)
-    tile_prefix = "tiles/" if tiles_max is not None else None
-    for page in ("index.html", "detail.html", "map.html"):
-        template = "page.html" if page == "index.html" else page
-        common.write_file_atomic(os.path.join(output_dir, page), render_template_file(
-            template, "static", "", "data/", tiles_max=tiles_max,
-            tile_prefix=tile_prefix, libraries=names))
-
-    save_export_state(output_dir, shards)
-    log("Packaged %d image(s) into %s (%d data shard(s) written)."
-        % (len(records), output_dir, written))
-    if copies["missing"] or copies["failed"]:
-        log("Warning: %d original(s) could not be reached and %d could not be "
-            "copied; their full-size links will not work."
-            % (copies["missing"], copies["failed"]))
-    return {"count": len(records), "written": written, "output": output_dir,
-            "copies": copies}
-
-
-def export_tiles(output_dir):
-    """Copy data/tiles into the static site. Returns the max zoom, or None.
-
-    When no tile pyramid is present the fallback basemap is sliced into a
-    small zoom-0..3 pyramid so the static map page still works offline.
-    """
-    max_zoom = tiles_max_zoom()
-    dest_root = os.path.join(output_dir, "tiles")
-    if max_zoom is not None:
-        if os.path.isdir(dest_root):
-            shutil.rmtree(dest_root)
-        shutil.copytree(common.tiles_dir(), dest_root)
-        return max_zoom
-    if not os.path.isfile(FALLBACK_BASEMAP):
-        return None
-    for zoom in range(FALLBACK_MAX_ZOOM + 1):
-        cols = 2 ** (zoom + 1)
-        rows = 2 ** zoom
-        for x in range(cols):
-            for y in range(rows):
-                data = _fallback_tile_bytes(zoom, x, y)
-                if data is None:
-                    return None
-                tile_dir = common.ensure_dir(os.path.join(dest_root, str(zoom), str(x)))
-                with open(os.path.join(tile_dir, "%d.jpg" % y), "wb") as handle:
-                    handle.write(data)
-    return FALLBACK_MAX_ZOOM
 
 
 def main():
@@ -1174,15 +866,16 @@ def main():
     serve_parser.add_argument("--host", default="127.0.0.1", help="Set the IP to bind to (default: '127.0.0.1')")
     serve_parser.add_argument("--port", type=int, default=5000, help="Set the port to run on (default: 5000)")
 
-    package_parser = sub.add_parser("package", help="Build a backend-free static site.")
+    package_parser = sub.add_parser(
+        "package", help="Export one library as a static website (see export.py).")
     package_parser.add_argument(
         "output", nargs="?", default=None,
-        help="Output folder for the static site (default: data/exports/site "
-             "in the data folder). It must be empty or an earlier export.")
+        help="Output folder (default: data/exports/<library name> in the data "
+             "folder). It must be empty or an earlier export.")
     package_parser.add_argument(
-        "--force", action="store_true",
-        help="Also write to a non-empty folder that is not marked as an "
-             "export, such as a site built by an older version.")
+        "--library", default=None,
+        help="The library to export (name or id); needed when more than one "
+             "library is enabled.")
 
     args = parser.parse_args()
 
@@ -1192,10 +885,17 @@ def main():
         raise SystemExit("Error: %s" % error)
 
     if args.command == "package":
+        import export
         try:
-            package(args.output, force=args.force)
-        except (ExportError, common.ConfigError) as error:
+            summary = package(args.output, library=args.library,
+                              ctx=jobs.ConsoleContext("export"))
+        except (export.ExportError, common.ConfigError, db.DatabaseError) as error:
             raise SystemExit("Error: %s" % error)
+        except OSError as error:
+            raise SystemExit("Error: %s" % export.os_error_text(error))
+        status = export.report(summary)
+        if status:
+            raise SystemExit(status)
         return
 
     host = getattr(args, "host", "127.0.0.1")

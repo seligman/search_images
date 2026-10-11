@@ -300,13 +300,23 @@ class PageTest(AdminFixture, unittest.TestCase):
     def test_static_export_pages_have_the_block_and_no_admin(self):
         output = self.base.join("data", "exports", "site")
         serve.package(output, log=quiet)
-        for name in ("index.html", "detail.html", "map.html"):
+        for name in ("index.html", "detail.html"):
             with open(os.path.join(output, name), encoding="utf-8") as handle:
                 config = page_config(handle.read())
             self.assertEqual(config["mode"], "static")
             self.assertFalse(config["capabilities"]["admin"])
             self.assertTrue(config["capabilities"]["static"])
-        self.assertTrue(os.path.isfile(os.path.join(output, "shell.js")))
+            self.assertNotIn("adminApi", config)
+        self.assertTrue(os.path.isfile(os.path.join(output, "assets", "shell.js")))
+        # No key, key file, endpoint or model of the settings anywhere in it.
+        secrets = [LITERAL_KEY, FILE_KEY, ENV_KEY, self.key_file, "llm.example.com",
+                   "127.0.0.1:9", "gpt-test", "SEARCH_IMAGES_TEST_KEY"]
+        for folder, _dirs, names in os.walk(output):
+            for name in names:
+                with open(os.path.join(folder, name), "rb") as handle:
+                    data = handle.read()
+                for secret in secrets:
+                    self.assertNotIn(secret.encode("utf-8"), data, name)
 
 
 class StateTest(AdminFixture, unittest.TestCase):
@@ -608,11 +618,16 @@ class LibraryRoutesTest(AdminFixture, unittest.TestCase):
                           {"keep_data": True, "confirm_name": "Typo"}))
         self.assertEqual(self.ok(self.get("/state"))["orphans"], [])
 
-    def test_export_settings_cannot_be_set_yet(self):
+    def test_export_settings_are_checked(self):
         response = self.post("/libraries/lib_family1", {"export": {"output": self.family}})
         self.assertEqual(response.status_code, 400)
         self.assertIn("export", response.get_json()["fields"])
+        answer = self.ok(self.post("/libraries/lib_family1",
+                                   {"export": {"images": "none", "location": False}}))
+        self.assertEqual(self.library("lib_family1")["export"], {"images": "none"})
+        self.assertEqual(answer["library"]["export_info"]["options"]["images"], "none")
         self.ok(self.post("/libraries/lib_family1", {"export": {}}))
+        self.assertEqual(self.library("lib_family1")["export"], {})
 
     @unittest.skipUnless(os.name == "nt", "Windows paths")
     def test_device_paths_are_refused(self):
