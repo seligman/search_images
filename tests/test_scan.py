@@ -1,6 +1,7 @@
 """Tests for scan.py: walking, indexing, carry-over, missing files and the CLI."""
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -1226,6 +1227,160 @@ class WalkTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual([entry[0] for entry in entries], ["two.JPG", "A/one.jpg"])
         stat = os.stat(path)
         self.assertEqual(entries[1][1:3], (stat.st_size, stat.st_mtime))
+
+
+def insta360_exif(name="IMG_20190514_142301_00_001.insp"):
+    """EXIF as an Insta360 camera writes it: the original file name is the
+    ImageDescription (0x010E)."""
+    exif = imagegen.make_exif(make="Arashi Vision", model="Insta360 OneR",
+                              date="2019:05:14 14:23:01", offset=None)
+    exif[0x010E] = name
+    return exif
+
+
+def dual_fisheye_jpeg(exif=None):
+    frame = imagegen.dual_fisheye_image((1024, 512),
+                                        offsets=images.INSTA360_PARAMS["offsets"])
+    return imagegen.jpeg_bytes(frame, exif)
+
+
+class PanoramaScanTest(ScanTestCase):
+    """360-degree photos: stored projection, previews, thumbnails, re-checks."""
+
+    LIBRARY = "lib_pano0001"
+
+    def write(self, name, data):
+        return imagegen.write_bytes(self.folder, name, data)
+
+    def thumb_size(self, image_id):
+        with cache.ThumbStore() as thumbs:
+            data = thumbs.get(image_id)
+        with Image.open(io.BytesIO(data)) as image:
+            return image.size
+
+    def preview_size(self, image_id):
+        data = cache.PreviewStore().read(self.LIBRARY, image_id)
+        with Image.open(io.BytesIO(data)) as image:
+            return image.size
+
+    def test_scan_stores_the_projection(self):
+        self.write("IMG_20190514_142301_00_001.insp", dual_fisheye_jpeg(insta360_exif()))
+        self.write("pano.jpg", imagegen.jpeg_with_xmp(imagegen.equirect_image((800, 400)),
+                                                      imagegen.gpano_xmp()))
+        self.write("wide.jpg", imagegen.jpeg_bytes(imagegen.equirect_image((800, 400))))
+        # RAW files and 360 videos are not indexed.
+        self.write("IMG_20190514_142301_00_002.dng", b"II*\x00" + b"\x00" * 64)
+        self.write("VID_20190514_142301_00_003.insv", b"\x00" * 64)
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        summary = self.scan()
+        self.assertEqual(summary["added"], 3)
+        rows = self.rows()
+        self.assertEqual(sorted(rows), ["IMG_20190514_142301_00_001.insp", "pano.jpg",
+                                        "wide.jpg"])
+        insp = rows["IMG_20190514_142301_00_001.insp"]
+        self.assertEqual(insp["projection"], "dual_fisheye")
+        self.assertEqual((insp["width"], insp["height"]), (1024, 512))
+        self.assertEqual(insp["camera"], "Arashi Vision Insta360 OneR")
+        self.assertEqual(insp["taken_at"], "2019-05-14T14:23:01")
+        self.assertEqual(self.thumb_size(insp["id"]), (320, 240))
+        self.assertEqual(self.preview_size(insp["id"]), (1024, 512))
+        self.assertEqual(rows["pano.jpg"]["projection"], "equirectangular")
+        self.assertEqual(self.thumb_size(rows["pano.jpg"]["id"]), (320, 240))
+        self.assertEqual(self.preview_size(rows["pano.jpg"]["id"]), (800, 400))
+        self.assertEqual(rows["wide.jpg"]["projection"], "")
+        self.assertEqual(self.thumb_size(rows["wide.jpg"]["id"]), (320, 160))
+        self.scan()
+        self.assertEqual(self.reads, [])
+
+    def build_v1_database(self, files):
+        """index.db and thumbs.db as version 1 left them, one row per file."""
+        common.ensure_dir(common.data_dir())
+        conn = sqlite3.connect(common.db_path())
+        for statement in db.SCHEMA_V1:
+            conn.execute(statement)
+        conn.execute("PRAGMA user_version=1")
+        conn.execute("INSERT INTO libraries (id, name, created) VALUES (?, 'Family', 1)",
+                     (self.LIBRARY,))
+        thumbs = sqlite3.connect(common.thumbs_db_path())
+        db.create_thumbs_schema(thumbs)
+        for image_id, (name, described) in enumerate(files, 1):
+            path = os.path.join(self.folder, name)
+            stat = os.stat(path)
+            with Image.open(path) as image:
+                size = image.size
+            with open(path, "rb") as handle:
+                digest = hashlib.sha1(handle.read()).hexdigest()
+            conn.execute(
+                "INSERT INTO images (id, library_id, path, name, size, mtime, ctime, width, "
+                "height, content_hash, dhash, info, described, prompt_ver) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '00000000000000ff', ?, ?, ?)",
+                (image_id, self.LIBRARY, name, name, stat.st_size, stat.st_mtime,
+                 stat.st_ctime, size[0], size[1], digest,
+                 json.dumps(INFO) if described else "", described,
+                 describe.PROMPT_VER if described else 0))
+            thumbs.execute("INSERT INTO thumbs (image_id, jpeg) VALUES (?, ?)",
+                           (image_id, imagegen.jpeg_bytes(imagegen.marker_image())))
+        conn.commit()
+        conn.close()
+        thumbs.commit()
+        thumbs.close()
+
+    def test_rows_from_version_1_are_checked_again(self):
+        # A .insp copied under another name: its EXIF still says what it is.
+        self.write("unstitched.jpg",
+                   dual_fisheye_jpeg(insta360_exif("IMG_20190514_142301_00_004.insp")))
+        self.write("pano.jpg", imagegen.jpeg_with_xmp(imagegen.equirect_image((800, 400)),
+                                                      imagegen.gpano_xmp(form="attribute")))
+        self.write("wide.jpg", imagegen.jpeg_bytes(imagegen.equirect_image((800, 400))))
+        write_jpeg(os.path.join(self.folder, "photo.jpg"), seed=3)
+        files = [("unstitched.jpg", 1), ("pano.jpg", 0), ("wide.jpg", 0), ("photo.jpg", 1)]
+        self.build_v1_database(files)
+        # Previews off: only the projection check makes rows worth reading.
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY,
+                                        previews=False)])
+        self.assertEqual({row["path"]: row["projection"] for row in self.rows().values()},
+                         {"unstitched.jpg": "?", "pano.jpg": "?", "wide.jpg": "?",
+                          "photo.jpg": ""})
+        summary = self.scan()
+        self.assertEqual(summary["unchanged"], 4)
+        self.assertEqual(sorted(os.path.basename(path) for path in self.reads),
+                         ["pano.jpg", "unstitched.jpg", "wide.jpg"])
+        self.assertEqual(summary["backfill"]["filled"], 3)
+        self.assertEqual(summary["backfill"]["panoramas"], 2)
+        self.assertIn("2 360-degree photo(s) recognised in", self.log_text())
+        rows = self.rows()
+        self.assertEqual({path: row["projection"] for path, row in rows.items()},
+                         {"unstitched.jpg": "dual_fisheye", "pano.jpg": "equirectangular",
+                          "wide.jpg": "", "photo.jpg": ""})
+        for path in ("unstitched.jpg", "pano.jpg"):
+            self.assertEqual(self.thumb_size(rows[path]["id"]), (320, 240))
+            self.assertNotEqual(rows[path]["dhash"], "00000000000000ff")
+        self.assertEqual(rows["photo.jpg"]["dhash"], "00000000000000ff")    # not read
+        # Descriptions are kept; a hint says which ones were made from the
+        # unstitched picture.
+        self.assertEqual(rows["unstitched.jpg"]["described"], 1)
+        self.assertEqual(json.loads(rows["unstitched.jpg"]["info"]), INFO)
+        self.assertIn("unstitched 360-degree photos (unstitched.jpg)", self.log_text())
+        self.scan()
+        self.assertEqual(self.reads, [])
+
+    def test_unreadable_marked_row_is_not_read_every_time(self):
+        self.write("wide.jpg", imagegen.jpeg_bytes(imagegen.equirect_image((800, 400))))
+        self.build_v1_database([("wide.jpg", 0)])
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY,
+                                        previews=False)])
+        # The file is damaged after it was indexed (same size and time).
+        path = os.path.join(self.folder, "wide.jpg")
+        stat = os.stat(path)
+        with open(path, "r+b") as handle:
+            handle.seek(2)
+            handle.write(b"\x00" * 64)
+        os.utime(path, (stat.st_atime, stat.st_mtime))
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["failed"], 1)
+        self.scan()
+        self.assertEqual(self.reads, [])
+        self.assertEqual(self.rows()["wide.jpg"]["projection"], "?")
 
 
 if __name__ == "__main__":

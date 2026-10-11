@@ -10,6 +10,13 @@
 /*_helper.py
 !/example_helper.py
 
+# ---- API key files: keep them outside the program folder ----
+*.key
+/keys/
+*_key.txt
+*api-key*
+/.*_token
+
 # ---- Runtime droppings (some older versions wrote these to the CWD) ----
 abort
 abort.txt

@@ -35,6 +35,7 @@ import images                                           # noqa: E402
 RESULT_KEYS = {
     "width", "height", "thumb", "preview", "exif", "dhash", "content_hash",
     "mime", "taken_at", "taken_source", "tz_offset", "camera", "lat", "lon",
+    "projection",
 }
 
 _tmp = None

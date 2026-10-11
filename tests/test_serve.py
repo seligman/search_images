@@ -150,6 +150,43 @@ class ServerTest(ServerFixture, unittest.TestCase):
         xss = [r for r in records if r["id"] == self.xss][0]
         self.assertEqual(xss["library"], XSS_NAME)
 
+    def test_index_text_covers_version_5_descriptions(self):
+        info = {"title": "Toddler blowing out birthday candles", "description": "A party.",
+                "photo_type": "photo", "document_type": "none", "setting": "indoor",
+                "scene": "dining room", "time_of_day": "unknown", "event": "birthday",
+                "animals": ["beagle"], "food": ["chocolate cake"], "vehicles": [],
+                "people_descriptors": ["toddler in a party hat"], "tags": ["cake"],
+                "text": "HAPPY BIRTHDAY", "colors": ["yellow"], "_model_name": "test-model"}
+        image_id = insert_image(self.conn, "lib_family1", "2021/Party/cake.jpg", described=1,
+                                prompt_ver=5, info=json.dumps(info),
+                                taken_at="2021-03-07T18:00:00")
+        _response, records = self.get_json("/api/index")
+        text = [r["text"] for r in records if r["id"] == image_id][0]
+        for word in ("toddler blowing out birthday candles", "indoor", "dining room",
+                     "birthday", "beagle", "chocolate cake", "toddler in a party hat",
+                     "happy birthday", "photo", "2021", "march", "party", "cake.jpg"):
+            self.assertIn(word, text)
+        for word in ("unknown", "none", "test-model"):
+            self.assertNotIn(word, text)
+        # The older (version 4) row also gets its capture month.
+        older = [r["text"] for r in records if r["id"] == self.visible][0]
+        self.assertIn("2019 may", older)
+
+    def test_api_image_shows_public_provenance_only(self):
+        provenance = {"model": "model.gguf", "endpoint": "local", "seconds": 2.5,
+                      "tokens_in": 1000, "tokens_out": 300, "prompt_ver": 5,
+                      "prompt_hash": "0123456789ab", "profile": "core", "cost": 0.001,
+                      "at": "2026-01-02T03:04:05Z", "requests": 1}
+        image_id = insert_image(self.conn, "lib_family1", "described.jpg", described=1,
+                                prompt_ver=5, info=json.dumps({"description": "x"}),
+                                provenance=json.dumps(provenance))
+        _response, record = self.get_json("/api/image/%d" % image_id)
+        self.assertEqual(record["provenance"], {"model": "model.gguf", "endpoint": "local",
+                                                "prompt_ver": 5, "profile": "core",
+                                                "at": "2026-01-02T03:04:05Z"})
+        _response, record = self.get_json("/api/image/%d" % self.visible)
+        self.assertIsNone(record["provenance"])
+
     def test_index_follows_config_changes(self):
         config = common.load_config()
         common.get_library(config, "lib_family1")["enabled"] = False
@@ -492,6 +529,72 @@ class PackageTest(ServerFixture, unittest.TestCase):
         images_dir = self.base.join("site", "images")
         self.assertNotIn("%d.jpg" % image_id, os.listdir(images_dir))
         self.assertEqual([name for name in os.listdir(images_dir) if "tmp" in name], [])
+
+
+class PanoramaFixture(ServerFixture):
+    """Adds a stitched and an unstitched 360 photo, and a row not checked yet."""
+
+    def setUp(self):
+        super().setUp()
+        self.dual = insert_image(self.conn, "lib_family1", "360/IMG_20190514_142301_00_001.insp",
+                                 width=6080, height=3040, projection="dual_fisheye")
+        self.stitched = insert_image(self.conn, "lib_family1", "360/pano.jpg",
+                                     width=4000, height=2000, projection="equirectangular")
+        self.unchecked = insert_image(self.conn, "lib_family1", "old/wide.jpg",
+                                      width=4000, height=2000, projection="?")
+        for image_id in (self.dual, self.stitched, self.unchecked):
+            self.thumbs.put(image_id, b"\xff\xd8thumb-%d" % image_id)
+
+
+@unittest.skipIf(flask is None, "Flask is not installed")
+class PanoramaServerTest(PanoramaFixture, unittest.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.app = serve.build_app(init_db=False)
+        self.app.testing = True
+        self.addCleanup(self.app.extensions["search_images"].close)
+        self.client = self.app.test_client()
+
+    def get_json(self, url):
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        return strict_json(response.get_data(as_text=True))
+
+    def test_index_marks_360_photos(self):
+        records = {r["id"]: r for r in self.get_json("/api/index")}
+        self.assertEqual(records[self.dual]["p"], "360")
+        self.assertEqual(records[self.stitched]["p"], "360")
+        for image_id in (self.unchecked, self.visible):
+            self.assertNotIn("p", records[image_id])
+
+    def test_detail_record_has_the_projection(self):
+        self.assertEqual(self.get_json("/api/image/%d" % self.dual)["projection"],
+                         "dual_fisheye")
+        self.assertEqual(self.get_json("/api/image/%d" % self.stitched)["projection"],
+                         "equirectangular")
+        # "?" (not checked yet) is not shown as anything.
+        self.assertEqual(self.get_json("/api/image/%d" % self.unchecked)["projection"], "")
+        self.assertEqual(self.get_json("/api/image/%d" % self.visible)["projection"], "")
+
+
+class PanoramaPackageTest(PanoramaFixture, unittest.TestCase):
+
+    def test_insp_originals_become_jpg_files(self):
+        self.assertEqual(serve.image_extension("IMG_1.insp"), "jpg")
+        self.assertEqual(serve.image_extension("IMG_1.INSP"), "jpg")
+        self.assertEqual(serve.image_extension("photo.png"), "png")
+
+    def test_records_carry_the_projection(self):
+        self.write_original("360/IMG_20190514_142301_00_001.insp", b"\xff\xd8\xff\xe0 jpeg")
+        out = self.base.join("site")
+        serve.package(out, log=quiet)
+        with open(os.path.join(out, "data", "data-0000.json"), encoding="utf-8") as handle:
+            records = {r["id"]: r for r in strict_json(handle.read())}
+        self.assertEqual(records[self.dual]["projection"], "dual_fisheye")
+        self.assertEqual(records[self.dual]["image"], "images/%d.jpg" % self.dual)
+        self.assertTrue(os.path.isfile(os.path.join(out, "images", "%d.jpg" % self.dual)))
+        self.assertEqual(records[self.unchecked]["projection"], "")
 
 
 if __name__ == "__main__":

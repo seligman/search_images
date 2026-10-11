@@ -50,7 +50,8 @@ class Grid:
         print(self.render())
 
 
-COUNT_KEYS = ("total", "described", "stale", "failed", "missing", "hidden")
+COUNT_KEYS = ("total", "described", "stale", "failed", "gave_up", "missing", "hidden")
+MAX_FAILURES = common.MAX_DESCRIBE_FAILURES
 
 
 def percent(part, whole):
@@ -66,7 +67,7 @@ def library_rows(conn, config):
     counts is a db.library_counts() entry. Orphans (libraries in the database
     that are no longer in config.json) are listed only if they hold images.
     """
-    counts = db.library_counts(conn, PROMPT_VER)
+    counts = db.library_counts(conn, PROMPT_VER, MAX_FAILURES)
     names = db.library_names(conn)
     empty = dict.fromkeys(COUNT_KEYS, 0)
     rows = []
@@ -85,8 +86,31 @@ def library_rows(conn, config):
     return rows
 
 
+def count_cells(counts):
+    """The table cells for one library's counts (see show_counts)."""
+    current = counts["described"] - counts["stale"]
+    return [
+        counts["described"],
+        current,
+        counts["stale"],
+        counts["total"] - counts["described"] - counts["gave_up"],
+        counts["failed"],
+        counts["gave_up"],
+        counts["missing"],
+        counts["total"],
+        percent(current, counts["total"]),
+    ]
+
+
 def show_counts(conn=None, config=None):
-    """Print a table of described / pending images per library."""
+    """Print a table of described / pending images per library.
+
+    "older" are descriptions from an older prompt (described again only
+    with scan.py --redescribe-stale); "left" is what the next run describes
+    (images without a description, but not those it gave up on); "failed"
+    counts undescribed images with a failed attempt, and "gave up" those
+    that failed MAX_FAILURES times (retried with --retry-failed).
+    """
     if config is None:
         config = common.load_config()
     close_after = conn is None
@@ -98,53 +122,33 @@ def show_counts(conn=None, config=None):
         if close_after:
             conn.close()
 
-    grid = Grid(["library", "described", f"at v={PROMPT_VER}", "left", "failed",
-                 "missing", "total", "done"])
-    totals = dict.fromkeys(("described", "current", "failed", "missing", "total"), 0)
+    grid = Grid(["library", "described", f"at v={PROMPT_VER}", "older", "left", "failed",
+                 "gave up", "missing", "total", "done"])
+    totals = dict.fromkeys(COUNT_KEYS, 0)
     for label, counts in rows:
-        current = counts["described"] - counts["stale"]
-        grid.add_row(
-            label,
-            counts["described"],
-            current,
-            counts["total"] - current,
-            counts["failed"],
-            counts["missing"],
-            counts["total"],
-            percent(current, counts["total"]),
-        )
-        totals["described"] += counts["described"]
-        totals["current"] += current
-        for key in ("failed", "missing", "total"):
+        grid.add_row(label, *count_cells(counts))
+        for key in COUNT_KEYS:
             totals[key] += counts[key]
-
     grid.add_row("break")
-    grid.add_row(
-        "  (all)",
-        totals["described"],
-        totals["current"],
-        totals["total"] - totals["current"],
-        totals["failed"],
-        totals["missing"],
-        totals["total"],
-        percent(totals["current"], totals["total"]),
-    )
+    grid.add_row("  (all)", *count_cells(totals))
     grid.print()
 
 
 def pending_rows(conn, config):
-    """Present, non-hidden images of enabled libraries that still need a
-    (current) description, as (library label, row): new ones first."""
+    """Present images of enabled libraries that still need a (current)
+    description, as (library label, row): new ones first, then those
+    given up on, then those described with an older prompt. Hidden images
+    are included: they are described too."""
     labels = {library["id"]: common.library_label(library)
               for library in common.enabled_libraries(config) if library.get("id")}
     if not labels:
         return []
     rows = conn.execute(
         "SELECT library_id, path, described, describe_attempts, describe_error "
-        "FROM images WHERE missing_since IS NULL AND hidden = 0 "
+        "FROM images WHERE missing_since IS NULL "
         "AND (described = 0 OR prompt_ver < ?) AND library_id IN (%s) "
-        "ORDER BY described, id" % ",".join("?" * len(labels)),
-        [PROMPT_VER] + list(labels)).fetchall()
+        "ORDER BY described, describe_attempts >= ?, id" % ",".join("?" * len(labels)),
+        [PROMPT_VER] + list(labels) + [MAX_FAILURES]).fetchall()
     return [(labels[row["library_id"]], row) for row in rows]
 
 
@@ -162,7 +166,12 @@ def show_files(conn=None, config=None):
             conn.close()
     for i, (label, row) in enumerate(pending, 1):
         line = f"{i:7,}: {label}: {row['path']}"
-        if not row["described"] and row["describe_attempts"]:
+        if row["described"]:
+            line += "  (older prompt; run scan.py --redescribe-stale)"
+        elif row["describe_attempts"] >= MAX_FAILURES:
+            line += (f"  (skipped after {row['describe_attempts']} failures: "
+                     f"{row['describe_error']}; run scan.py --retry-failed)")
+        elif row["describe_attempts"]:
             line += f"  (failed {row['describe_attempts']}x: {row['describe_error']})"
         print(line)
 

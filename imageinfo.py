@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Facts about image files that need no image library.
 
-Format sniffing from a file's first bytes, EXIF cleaning, and the capture
-date, GPS position and camera name worked out from an EXIF dict. images.py
+Format sniffing from a file's first bytes, EXIF cleaning, the capture date,
+GPS position and camera name worked out from an EXIF dict, and the metadata
+clues for 360-degree photos (XMP GPano tags, 360 camera makers). images.py
 uses these on freshly read files; db.py uses the same functions on EXIF JSON
 stored by older versions, so both give the same answers.
 
@@ -454,3 +455,156 @@ def exif_metadata(exif_dict, filename="", mtime=None):
         "taken_at": taken_at, "taken_source": source, "tz_offset": offset,
         "camera": camera_name(exif), "lat": lat, "lon": lon,
     }
+
+
+# ---------------------------------------------------------------------------
+# 360-degree photos
+
+# Values of the images.projection column. "" is an ordinary photo and "?"
+# marks a row stored before projections were detected that may be a 360
+# photo (the scanner reads it again to find out).
+PROJECTION_EQUIRECT = "equirectangular"     # stitched 360 x 180 degree panorama
+PROJECTION_DUAL_FISHEYE = "dual_fisheye"    # two unstitched fisheye circles
+PROJECTIONS_360 = (PROJECTION_EQUIRECT, PROJECTION_DUAL_FISHEYE)
+PROJECTION_UNKNOWN = "?"
+
+# A full panorama is twice as wide as it is high, give or take this much.
+PANORAMA_ASPECT_TOLERANCE = 0.02
+
+_XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+_GPANO_PROJECTION_RE = re.compile(
+    rb"GPano:ProjectionType\s*(?:=\s*[\"']([^\"']*)[\"']|>\s*([^<\s]*)\s*<)")
+_GPANO_NUMBER_RE = rb"GPano:%s\s*(?:=\s*[\"']\s*(\d+)\s*[\"']|>\s*(\d+)\s*<)"
+
+
+def is_panorama_aspect(width, height):
+    """True for a 2:1 frame (within PANORAMA_ASPECT_TOLERANCE)."""
+    try:
+        width, height = float(width), float(height)
+    except (TypeError, ValueError):
+        return False
+    if width <= 0 or height <= 0:
+        return False
+    return abs(width / (2.0 * height) - 1.0) <= PANORAMA_ASPECT_TOLERANCE + 1e-9
+
+
+def jpeg_xmp(data):
+    """The XMP packet of JPEG bytes (from its APP1 segment), or b"".
+
+    Only the segments before the image data are looked at, so this is quick
+    even for large files. Anything that is not a JPEG gives b"".
+    """
+    if bytes(data[:3]) != b"\xff\xd8\xff":
+        return b""
+    pos = 2
+    while pos + 4 <= len(data):
+        if data[pos] != 0xFF:
+            return b""
+        marker = data[pos + 1]
+        if marker == 0xFF:              # fill byte
+            pos += 1
+            continue
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            pos += 2
+            continue
+        if marker in (0xDA, 0xD9):      # start of scan / end of image
+            return b""
+        length = int.from_bytes(bytes(data[pos + 2:pos + 4]), "big")
+        if length < 2:
+            return b""
+        segment = bytes(data[pos + 4:pos + 2 + length])
+        if marker == 0xE1 and segment.startswith(_XMP_HEADER):
+            return segment[len(_XMP_HEADER):]
+        pos += 2 + length
+    return b""
+
+
+def _xmp_text(xmp):
+    if isinstance(xmp, str):
+        return xmp.encode("utf-8", "replace")
+    return bytes(xmp or b"")
+
+
+def xmp_projection(xmp):
+    """The GPano:ProjectionType of an XMP packet, lowercased ("" if absent).
+
+    Both the attribute form (GPano:ProjectionType="equirectangular") and the
+    element form (<GPano:ProjectionType>equirectangular</...>) are found.
+    """
+    match = _GPANO_PROJECTION_RE.search(_xmp_text(xmp))
+    if not match:
+        return ""
+    value = match.group(1) if match.group(1) is not None else match.group(2)
+    return value.decode("latin-1").strip().lower()
+
+
+def _xmp_number(text, name):
+    match = re.search(_GPANO_NUMBER_RE % name.encode("ascii"), text)
+    if not match:
+        return None
+    return int(match.group(1) if match.group(1) is not None else match.group(2))
+
+
+def xmp_covers_sphere(xmp):
+    """False when GPano says the image is only part of a panorama.
+
+    Phones write GPano for wide but partial panoramas too: the cropped area
+    is then smaller than the full panorama. Without those fields the image
+    is taken to be complete.
+    """
+    text = _xmp_text(xmp)
+    for cropped, full in (("CroppedAreaImageWidthPixels", "FullPanoWidthPixels"),
+                          ("CroppedAreaImageHeightPixels", "FullPanoHeightPixels")):
+        part, whole = _xmp_number(text, cropped), _xmp_number(text, full)
+        if part and whole and part < whole * (1.0 - PANORAMA_ASPECT_TOLERANCE):
+            return False
+    return True
+
+
+def _exif_text(exif, key):
+    return " ".join((_as_text(exif.get(key)) or "").split()).lower()
+
+
+def is_insta360(exif_dict):
+    """True for photos from an Insta360 camera (maker Insta360 / Arashi Vision)."""
+    exif = exif_dict if isinstance(exif_dict, dict) else {}
+    make = _exif_text(exif, "Make")
+    return "insta360" in make or "arashi vision" in make
+
+
+# Insta360 cameras write the file's own name into EXIF ImageDescription,
+# cut short on some models ("DCIM\Camera01\IMG_..._00_005.jp"): .insp for an
+# unstitched dual-fisheye photo, .jpg for one the camera stitched itself.
+# Copies exported from the camera's app keep the name (and add GPano XMP).
+_INSTA360_FILE_TYPES = (
+    ("insp", (".insp", ".ins")),
+    ("jpg", (".jpg", ".jpeg", ".jp")),
+)
+
+
+def insta360_file_type(exif_dict):
+    """The type of file an Insta360 camera saved a photo as, from its EXIF.
+
+    "insp" for an unstitched original, "jpg" for a photo stitched in the
+    camera, "" when the EXIF does not say (or the photo is not from an
+    Insta360 camera). Unlike the file's extension, this survives renaming.
+    """
+    exif = exif_dict if isinstance(exif_dict, dict) else {}
+    if not is_insta360(exif):
+        return ""
+    name = _exif_text(exif, "ImageDescription")
+    for file_type, endings in _INSTA360_FILE_TYPES:
+        if name.endswith(endings):
+            return file_type
+    return ""
+
+
+def is_360_camera(exif_dict):
+    """True for photos from a known 360-degree camera (by EXIF Make and Model)."""
+    exif = exif_dict if isinstance(exif_dict, dict) else {}
+    if is_insta360(exif):
+        return True
+    make, model = _exif_text(exif, "Make"), _exif_text(exif, "Model")
+    return (("ricoh" in make and "theta" in model)
+            or ("gopro" in make and "max" in model)
+            or ("samsung" in make and "gear 360" in model))

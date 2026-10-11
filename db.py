@@ -31,7 +31,7 @@ import common
 import imageinfo
 import jobs
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # The schema for SCHEMA_VERSION 1. Later versions add migrations below rather
 # than editing this list.
@@ -250,6 +250,31 @@ def connect(path=None, check_same_thread=True):
     return conn
 
 
+def connect_readonly(path=None):
+    """Open index.db (or another database file) for reading only.
+
+    For tools that must never change the database (compare_models.py).
+    Rows come back as sqlite3.Row; any write raises sqlite3.Error. Raises
+    DatabaseError when the file does not exist or cannot be opened.
+    """
+    path = path or common.db_path()
+    if not os.path.isfile(path):
+        raise DatabaseError("%s does not exist; run scan.py first." % path)
+    try:
+        conn = sqlite3.connect(_readonly_uri(path), uri=True, timeout=30)
+    except sqlite3.Error as error:
+        raise DatabaseError("Could not open %s: %s" % (path, error))
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error as error:
+        conn.close()
+        raise DatabaseError("Could not open %s: %s" % (path, error))
+    return conn
+
+
 def user_version(conn):
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
@@ -262,10 +287,38 @@ def _migrate_to_1(conn):
         conn.execute(statement)
 
 
+# Rows that may be 360-degree photos: a 2:1 size (within the tolerance of
+# imageinfo.is_panorama_aspect) or a .insp file.
+_POSSIBLE_360_SQL = """
+    UPDATE images SET projection = ?
+    WHERE projection = '' AND ((height > 0 AND width >= height * ? AND width <= height * ?)
+        OR lower(name) LIKE '%.insp')"""
+
+
+def mark_possible_360(conn):
+    """Set projection '?' on rows that may be 360 photos; returns the count.
+
+    The scanner's back-fill stage reads those again and stores what they
+    really are (see scan.backfill). No commit.
+    """
+    tolerance = imageinfo.PANORAMA_ASPECT_TOLERANCE
+    return conn.execute(_POSSIBLE_360_SQL, (imageinfo.PROJECTION_UNKNOWN,
+                                            2.0 * (1.0 - tolerance),
+                                            2.0 * (1.0 + tolerance))).rowcount
+
+
+def _migrate_to_2(conn):
+    # 360-degree photos: "" (ordinary), "equirectangular", "dual_fisheye",
+    # or "?" (not checked yet).
+    conn.execute("ALTER TABLE images ADD COLUMN projection TEXT NOT NULL DEFAULT ''")
+    mark_possible_360(conn)
+
+
 # Ordered (version, function, rewrites_data). A migration that rewrites
 # existing data gets a backup copy (index.db.bak-v<old version>) first.
 MIGRATIONS = (
     (1, _migrate_to_1, False),
+    (2, _migrate_to_2, True),
 )
 
 
@@ -301,7 +354,8 @@ def migrate(conn, path=None, log=None):
         version = user_version(conn)
         if target <= version:
             continue
-        if rewrites_data and version > 0:
+        # A database created by this call has nothing worth a backup.
+        if rewrites_data and start > 0:
             log("Backed up the database to " + _backup(conn, path, version))
         conn.commit()
         conn.execute("BEGIN IMMEDIATE")
@@ -433,16 +487,18 @@ def init(config=None, log=None):
 # ---------------------------------------------------------------------------
 # Queries shared by the scanner, the server and the tools
 
-def library_counts(conn, prompt_ver=0):
-    """Per-library counts: {library_id: {total, described, stale, failed, missing, hidden}}.
+def library_counts(conn, prompt_ver=0, max_failures=common.MAX_DESCRIBE_FAILURES):
+    """Per-library counts: {library_id: {total, described, stale, failed, gave_up,
+    missing, hidden}}.
 
-    total, described, stale, failed and hidden count present files only
-    (missing_since IS NULL); missing counts files that have disappeared.
-    stale = described with a prompt_ver older than prompt_ver; failed = not
-    described after at least one failed attempt. Registered libraries with
-    no images are included with zeros.
+    total, described, stale, failed, gave_up and hidden count present files
+    only (missing_since IS NULL); missing counts files that have
+    disappeared. stale = described with a prompt_ver older than prompt_ver;
+    failed = not described after at least one failed attempt; gave_up = not
+    described after max_failures or more (skipped until a run retries
+    them). Registered libraries with no images are included with zeros.
     """
-    keys = ("total", "described", "stale", "failed", "missing", "hidden")
+    keys = ("total", "described", "stale", "failed", "gave_up", "missing", "hidden")
     result = {}
     for row in conn.execute("SELECT id FROM libraries"):
         result[row[0]] = dict.fromkeys(keys, 0)
@@ -452,10 +508,11 @@ def library_counts(conn, prompt_ver=0):
             SUM(missing_since IS NULL AND described = 1),
             SUM(missing_since IS NULL AND described = 1 AND prompt_ver < ?),
             SUM(missing_since IS NULL AND described = 0 AND describe_attempts > 0),
+            SUM(missing_since IS NULL AND described = 0 AND describe_attempts >= ?),
             SUM(missing_since IS NOT NULL),
             SUM(missing_since IS NULL AND hidden = 1)
         FROM images GROUP BY library_id"""
-    for row in conn.execute(sql, (prompt_ver,)):
+    for row in conn.execute(sql, (prompt_ver, max_failures)):
         result[row[0]] = {key: int(value or 0) for key, value in zip(keys, row[1:])}
     return result
 
@@ -766,7 +823,6 @@ def import_legacy(config, log=None):
             conn.execute("PRAGMA journal_mode=MEMORY")
             conn.execute("PRAGMA synchronous=OFF")
         _migrate_to_1(dest)
-        dest.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         create_thumbs_schema(thumbs)
         for library in config.get("libraries", []):
             if library.get("id"):
@@ -816,6 +872,11 @@ def import_legacy(config, log=None):
                     counts["thumbs_rejected"] += 1
             if counts["rows"] and counts["rows"] % 5000 < len(batch):
                 log("  %d images imported" % counts["rows"])
+        # The rows are in the version 1 layout; bring them up to date.
+        for version, func, _rewrites_data in MIGRATIONS:
+            if version > 1:
+                func(dest)
+        dest.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         dest.commit()
         thumbs.commit()
     except BaseException as error:

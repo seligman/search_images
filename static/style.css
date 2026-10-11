@@ -446,3 +446,14 @@ p {
     padding: 3px 10px;
     font-size: 13px;
 }
+
+.detail-title {
+    font-size: 18px;
+    font-weight: bold;
+    margin: 4px 0 8px;
+}
+
+.chip.badge-warn {
+    background: #5a3a12;
+    color: #ffd8a8;
+}

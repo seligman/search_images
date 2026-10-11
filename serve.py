@@ -25,6 +25,7 @@ import cache
 import common
 import db
 import imageinfo
+import prompts
 import world_map
 
 TEMPLATE_DIR = os.path.join(common.BASE_DIR, "templates")
@@ -44,13 +45,12 @@ EXPORT_MARKER = ".search-images-export"
 # How long browsers may reuse thumbnails, previews and originals, and tiles.
 CACHE_SECONDS = 3600
 TILE_CACHE_SECONDS = 86400
+# JPEG data under another extension (Insta360 .insp): copied as .jpg files.
+JPEG_EXTENSIONS = (".insp",)
 # Originals with these extensions are converted to JPEG for browsers.
 CONVERTED_EXTENSIONS = common.HEIC_EXTENSIONS + (".tif", ".tiff")
-# Description fields whose words are searchable, in this order.
-SEARCH_FIELDS = (
-    "title", "description", "text", "subjects", "tags", "colors", "scene",
-    "people_descriptors", "animals", "food", "vehicles",
-)
+# Provenance fields the detail page may show (who described an image, when).
+PROVENANCE_FIELDS = ("model", "endpoint", "prompt_ver", "profile", "at")
 # SQLite integers are 64-bit; larger ids in a URL simply do not exist.
 MAX_IMAGE_ID = 2 ** 63 - 1
 # Host names the server always answers to. Requests naming any other host are
@@ -108,25 +108,24 @@ def script_json(value):
     return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
-def _text_values(value):
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (list, tuple)):
-        return [item for item in value if isinstance(item, str)]
-    return []
-
-
-def search_text(name, path, info):
+def search_text(name, path, info, taken_at="", projection=""):
     """The lower-cased text the search page matches a query against.
 
-    It holds the file name, the relative path and the words of the
-    description (info, a dict or None).
+    See prompts.search_terms: the words of the description (info, a dict
+    or None; any prompt version), the file name and path, and the capture
+    year and month, and "360 panorama" for a 360-degree photo.
     """
-    parts = [name or "", path or ""]
-    if isinstance(info, dict):
-        for key in SEARCH_FIELDS:
-            parts.extend(_text_values(info.get(key)))
-    return " ".join(part for part in parts if part).lower()
+    return prompts.search_terms(info, name, path, taken_at, projection)
+
+
+def provenance_record(text):
+    """The public part of a row's provenance JSON: model, endpoint, prompt version, time."""
+    data = load_json(text, None)
+    if not isinstance(data, dict):
+        return None
+    record = {key: data[key] for key in PROVENANCE_FIELDS
+              if isinstance(data.get(key), (str, int)) and not isinstance(data.get(key), bool)}
+    return record or None
 
 
 def visible_libraries(config):
@@ -216,9 +215,20 @@ def query_visible(conn, library_ids, columns, order_by="id"):
 def image_extension(name):
     """Extension used for an original in the static site ("jpg" if converted)."""
     lower = name.lower()
-    if lower.endswith(CONVERTED_EXTENSIONS):
+    if lower.endswith(CONVERTED_EXTENSIONS + JPEG_EXTENSIONS):
         return "jpg"
     return os.path.splitext(lower)[1].lstrip(".") or "jpg"
+
+
+def projection_of(row):
+    """The row's 360-degree projection, or "" (also while it is unchecked)."""
+    projection = row["projection"]
+    return projection if projection in imageinfo.PROJECTIONS_360 else ""
+
+
+def index_flags(row):
+    """Extra keys of a row's /api/index record: {"p": "360"} for a 360 photo."""
+    return {"p": "360"} if projection_of(row) else {}
 
 
 def detail_record(row, library_name):
@@ -235,6 +245,7 @@ def detail_record(row, library_name):
         "ctime": finite(row["ctime"]),
         "width": row["width"],
         "height": row["height"],
+        "projection": projection_of(row),
         "taken_at": row["taken_at"],
         "taken_source": row["taken_source"],
         "tz_offset": row["tz_offset"],
@@ -243,6 +254,7 @@ def detail_record(row, library_name):
         "lon": finite(row["lon"]),
         "info": load_json(row["info"], None),
         "exif": exif if isinstance(exif, dict) else {},
+        "provenance": provenance_record(row["provenance"]),
     }
 
 
@@ -561,12 +573,14 @@ def build_app(init_db=True, bind_host="127.0.0.1"):
     def api_index():
         names = visible_libraries(state.config())
         rows = query_visible(get_conn(), names,
-                             "id, library_id, name, path, info, dhash",
+                             "id, library_id, name, path, info, dhash, taken_at, projection",
                              order_by="name")
         return jsonify([{"id": r["id"], "name": r["name"],
                          "library": names[r["library_id"]],
+                         **index_flags(r),
                          "text": search_text(r["name"], r["path"],
-                                             load_json(r["info"])),
+                                             load_json(r["info"]), r["taken_at"],
+                                             projection_of(r)),
                          "dhash": r["dhash"]}
                         for r in rows])
 
@@ -894,10 +908,12 @@ def package(output_dir=None, force=False, log=print):
                 "path": row["path"], "name": row["name"], "size": row["size"],
                 "mtime": finite(row["mtime"]), "ctime": finite(row["ctime"]),
                 "width": row["width"], "height": row["height"],
+                "projection": projection_of(row),
                 "taken_at": row["taken_at"], "taken_source": row["taken_source"],
                 "tz_offset": row["tz_offset"], "camera": row["camera"],
                 "info": info, "exif": exif if isinstance(exif, dict) else {},
-                "text": search_text(row["name"], row["path"], info),
+                "text": search_text(row["name"], row["path"], info, row["taken_at"],
+                                    projection_of(row)),
                 "dhash": row["dhash"], "thumb": thumb,
                 "image": "images/" + image_name,
             }

@@ -12,19 +12,24 @@ that was set when this module was first imported.
 import copy
 import fnmatch
 import importlib.util
+import ipaddress
 import json
 import locale
+import math
 import os
 import re
 import secrets
 import sys
 import threading
 import time
+import types
+import urllib.parse
 
 
 IMAGE_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".hif", ".webp",
     ".tif", ".tiff", ".avif", ".bmp",
+    ".insp",            # Insta360 360-degree photos (JPEG data)
 )
 # Formats Pillow can only read through an optional plugin (pillow-heif, or a
 # Pillow build with AVIF support), and that browsers may not display.
@@ -253,13 +258,19 @@ def load_config():
     if not isinstance(stored, dict):
         raise ConfigError("Could not read %s: the top level is not an object" % path)
     config.update(stored)
-    # Endpoint keys are merged separately so older config files keep working.
-    # A list of endpoints (round robin) merges the defaults into each item.
-    stored_endpoint = stored.get("endpoint", {})
-    if isinstance(stored_endpoint, list):
-        config["endpoint"] = [_merge_endpoint(item) for item in stored_endpoint]
+    if "endpoints" in stored and "endpoint" not in stored:
+        # Only the newer "endpoints" list: no placeholder for the older
+        # "endpoint" key, which would otherwise be saved back into the file.
+        config.pop("endpoint", None)
     else:
-        config["endpoint"] = _merge_endpoint(stored_endpoint)
+        # Endpoint keys are merged separately so older config files keep
+        # working. A list of endpoints (round robin) merges the defaults
+        # into each item.
+        stored_endpoint = stored.get("endpoint", {})
+        if isinstance(stored_endpoint, list):
+            config["endpoint"] = [_merge_endpoint(item) for item in stored_endpoint]
+        else:
+            config["endpoint"] = _merge_endpoint(stored_endpoint)
     libraries = config.get("libraries")
     if not isinstance(libraries, list):
         libraries = []
@@ -451,6 +462,587 @@ def library_label(library):
 
 
 # ---------------------------------------------------------------------------
+# LLM endpoints
+#
+# config.json lists the services that describe images under "endpoints", each
+# with a unique "name", and picks the one libraries use unless they name
+# another with "default_endpoint". A library (or default_endpoint) may also
+# name a "group": then every enabled endpoint in that group shares the work.
+#
+# Older files have a single "endpoint" object, or a list of them that share
+# the work (round robin). Those keep working without being rewritten:
+# endpoint_list() turns them into endpoints named "default", "default-2", ...
+# and a list's members all get "group": "default".
+
+ENDPOINT_KINDS = ("openai", "claude", "ollama")
+
+# What each preset fills in when an endpoint does not set it: the API it
+# speaks (kind), the base URL, the environment variable read for the API key
+# when no key is configured (key_env), and how many requests to keep in
+# flight at once (concurrency; None means the server's slot count, from
+# llm.probe(), or 1).
+ENDPOINT_PRESETS = {
+    "llamacpp": {
+        "label": "llama.cpp", "kind": "openai", "base_url": "http://127.0.0.1:8080/v1",
+        "key_env": "", "concurrency": None,
+        "notes": "llama.cpp's llama-server. Requests in flight follow its slot count "
+                 "(--parallel), and thinking is turned off for models that have it.",
+    },
+    "local": {
+        "label": "Local server", "kind": "openai", "base_url": "http://127.0.0.1:8080/v1",
+        "key_env": "", "concurrency": None,
+        "notes": "An OpenAI-compatible server on this computer or the local network, "
+                 "treated like llama.cpp. Chosen automatically for such addresses.",
+    },
+    "lmstudio": {
+        "label": "LM Studio", "kind": "openai", "base_url": "http://127.0.0.1:1234/v1",
+        "key_env": "", "concurrency": 1,
+        "notes": "LM Studio's local server.",
+    },
+    "vllm": {
+        "label": "vLLM", "kind": "openai", "base_url": "http://127.0.0.1:8000/v1",
+        "key_env": "", "concurrency": 1,
+        "notes": "vLLM or SGLang. They batch requests well: raise the concurrency.",
+    },
+    "ollama-openai": {
+        "label": "Ollama (OpenAI API)", "kind": "openai",
+        "base_url": "http://127.0.0.1:11434/v1", "key_env": "", "concurrency": 1,
+        "notes": "Ollama through its OpenAI-compatible API. The ollama preset (its own "
+                 "API) can also turn thinking off.",
+    },
+    "ollama": {
+        "label": "Ollama", "kind": "ollama", "base_url": "http://127.0.0.1:11434",
+        "key_env": "", "concurrency": 1,
+        "notes": "Ollama's own chat API.",
+    },
+    "openai": {
+        "label": "OpenAI", "kind": "openai", "base_url": "https://api.openai.com/v1",
+        "key_env": "OPENAI_API_KEY", "concurrency": 4,
+        "notes": "OpenAI. Images are sent to OpenAI and billed per token.",
+    },
+    "azure": {
+        "label": "Azure OpenAI", "kind": "openai", "base_url": "",
+        "key_env": "AZURE_OPENAI_API_KEY", "concurrency": 4,
+        "notes": "Azure OpenAI (v1 API). Base URL: https://RESOURCE.openai.azure.com/openai/v1; "
+                 "the model is the deployment name.",
+    },
+    "gemini": {
+        "label": "Gemini", "kind": "openai",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "key_env": "GEMINI_API_KEY", "concurrency": 4,
+        "notes": "Google Gemini through its OpenAI-compatible API. Images are sent to Google.",
+    },
+    "openrouter": {
+        "label": "OpenRouter", "kind": "openai", "base_url": "https://openrouter.ai/api/v1",
+        "key_env": "OPENROUTER_API_KEY", "concurrency": 4,
+        "notes": "OpenRouter. Images are sent to the provider it routes the model to.",
+    },
+    "anthropic": {
+        "label": "Claude", "kind": "claude", "base_url": "https://api.anthropic.com",
+        "key_env": "ANTHROPIC_API_KEY", "concurrency": 4,
+        "notes": "Anthropic's Claude models. Images are sent to Anthropic and billed per token.",
+    },
+    "custom": {
+        "label": "OpenAI-compatible", "kind": "openai", "base_url": "",
+        "key_env": "", "concurrency": 1,
+        "notes": "Any other service with an OpenAI-compatible chat completions API.",
+    },
+}
+
+# Presets for servers that normally run on this computer or the local
+# network, presets for cloud services, and those that behave like llama.cpp
+# (/props, /health, chat_template_kwargs).
+LOCAL_PRESETS = ("llamacpp", "local", "lmstudio", "vllm", "ollama-openai", "ollama")
+CLOUD_PRESETS = ("openai", "azure", "gemini", "openrouter", "anthropic")
+LLAMACPP_PRESETS = ("llamacpp", "local")
+
+# Hosts of the cloud services, used to pick a preset for endpoints without one.
+_PRESET_HOSTS = (
+    ("api.openai.com", "openai"),
+    (".openai.azure.com", "azure"),
+    (".cognitiveservices.azure.com", "azure"),
+    (".services.ai.azure.com", "azure"),
+    ("generativelanguage.googleapis.com", "gemini"),
+    ("openrouter.ai", "openrouter"),
+    ("api.anthropic.com", "anthropic"),
+)
+
+DEFAULT_MAX_IMAGE_EDGE = 1536
+DEFAULT_TIMEOUT = 180
+DEFAULT_MAX_OUTPUT_TOKENS = 4000
+# Thinking counts against the output tokens, so models that always think get more.
+THINKING_MAX_OUTPUT_TOKENS = 8000
+MAX_CONCURRENCY = 32
+# Images that failed to be described in this many runs are skipped until a
+# run asks to retry them (describe.py, progress.py).
+MAX_DESCRIBE_FAILURES = 3
+
+# How to keep thinking to a minimum on Claude models (matched by id prefix):
+# "disabled" sends thinking {"type": "disabled"}, "between_tools" sends
+# thinking {"type": "between_tools"}, and "effort" (models that always
+# think) sends no thinking settings but a low effort. Other models get
+# nothing; an endpoint's "extra" settings can add what they need.
+CLAUDE_THINKING = (
+    ("claude-haiku-5-5", "disabled"),
+    ("claude-sonnet-5-5", "between_tools"),
+    ("claude-opus-5-5", "effort"),
+    ("claude-fable-5-1", "effort"),
+)
+
+# Every endpoint setting and its default. None means "automatic".
+ENDPOINT_DEFAULTS = {
+    "name": "",
+    "label": "",
+    "kind": "",
+    "preset": "",
+    "base_url": "",
+    "model": "",
+    "api_key": "",              # the key itself; prefer api_key_env or api_key_file
+    "api_key_env": "",          # name of an environment variable holding the key
+    "api_key_file": "",         # file holding only the key (relative: next to config.json)
+    "concurrency": None,        # requests in flight at once
+    "max_image_edge": DEFAULT_MAX_IMAGE_EDGE,
+    "timeout": DEFAULT_TIMEOUT,  # seconds without an answer before a request fails
+    "max_output_tokens": None,
+    "extra": {},                # merged into every request body
+    "price_in": None,           # USD per million input tokens, for cost estimates
+    "price_out": None,          # USD per million output tokens
+    "enabled": True,
+    "group": "",
+}
+
+
+def claude_thinking(model):
+    """How thinking is kept down for a Claude model id: a CLAUDE_THINKING mode or ''."""
+    model = model.strip().lower() if isinstance(model, str) else ""
+    for prefix, mode in CLAUDE_THINKING:
+        if model == prefix or model.startswith(prefix + "-"):
+            return mode
+    return ""
+
+
+def url_host(url):
+    """The lower-case host name of a URL ('' if there is none)."""
+    url = url.strip() if isinstance(url, str) else ""
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "http://" + url
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def is_local_host(host):
+    """True for a host on this computer or the local network.
+
+    That is loopback, private, link-local and other non-public addresses,
+    "localhost", and names without a dot or ending in .local, .lan,
+    .home.arpa or .internal.
+    """
+    host = (host or "").strip().strip("[]").lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "." not in host or host.endswith((".local", ".lan", ".home.arpa", ".internal"))
+    return not address.is_global
+
+
+def infer_preset(endpoint):
+    """The preset of an endpoint: its "preset" setting, or one inferred.
+
+    Without a (known) preset: kind claude means "anthropic", kind ollama
+    "ollama"; an openai-kind endpoint without a base URL is "openai", one on
+    a cloud service's host gets that service's preset, one on this computer
+    or the local network is "local" (treated like llama.cpp), and anything
+    else is "custom".
+    """
+    endpoint = endpoint if isinstance(endpoint, dict) else {}
+    preset = endpoint.get("preset")
+    preset = preset.strip().lower() if isinstance(preset, str) else ""
+    if preset in ENDPOINT_PRESETS:
+        return preset
+    kind = endpoint.get("kind")
+    kind = kind.strip().lower() if isinstance(kind, str) else ""
+    if kind == "claude":
+        return "anthropic"
+    if kind == "ollama":
+        return "ollama"
+    base_url = endpoint.get("base_url")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return "openai"
+    host = url_host(base_url)
+    for _suffix, name in _PRESET_HOSTS:
+        if preset_host(name, host):
+            return name
+    if is_local_host(host):
+        return "local"
+    return "custom"
+
+
+def preset_host(preset, host):
+    """True when host is (a host of) the cloud service of this preset."""
+    for suffix, name in _PRESET_HOSTS:
+        if name != preset:
+            continue
+        if suffix.startswith("."):
+            if host.endswith(suffix):
+                return True
+        elif host == suffix or host.endswith("." + suffix):
+            return True
+    return False
+
+
+def _with_scheme(base_url):
+    """A base URL with its scheme settled.
+
+    A URL typed without one gets http:// for hosts on this computer or the
+    local network ("localhost:8080/v1") and https:// for everything else, so
+    an API key and the pictures never cross the internet unencrypted
+    because a scheme was left out. The cloud services' own hosts always get
+    https://, even when http:// was typed: they only serve https.
+    """
+    if not base_url:
+        return base_url
+    if "://" not in base_url:
+        scheme = "http" if is_local_host(url_host(base_url)) else "https"
+        base_url = "%s://%s" % (scheme, base_url)
+    scheme, rest = base_url.split("://", 1)
+    if scheme.lower() == "http" and any(preset_host(name, url_host(base_url))
+                                        for name in CLOUD_PRESETS):
+        return "https://" + rest
+    return base_url
+
+
+def insecure_endpoint(endpoint):
+    """True when an endpoint sends requests unencrypted (http://) beyond the local network."""
+    base_url = endpoint_settings(endpoint)["base_url"]
+    return (base_url.lower().startswith("http://")
+            and not is_local_host(url_host(base_url)))
+
+
+def _positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def endpoint_settings(endpoint):
+    """A copy of an endpoint with every setting filled in (see ENDPOINT_DEFAULTS).
+
+    The preset is resolved (infer_preset) and supplies the kind (an explicit
+    preset wins over the kind), the base URL when none is set, and the
+    concurrency when none is set (None for llama.cpp-like servers: see
+    endpoint_concurrency). A base URL without a scheme gets http:// on this
+    computer or the local network and https:// elsewhere (see _with_scheme).
+    max_output_tokens defaults to 4000, or 8000 for
+    Claude models that cannot turn thinking off. Invalid values fall back to
+    the defaults. The input is not changed, and calling this again on the
+    result changes nothing.
+    """
+    source = endpoint if isinstance(endpoint, dict) else {}
+    result = copy.deepcopy(ENDPOINT_DEFAULTS)
+    for key, value in source.items():
+        result[key] = copy.deepcopy(value)
+    for key in ("name", "label", "kind", "preset", "base_url", "model", "api_key",
+                "api_key_env", "api_key_file", "group"):
+        value = result.get(key)
+        result[key] = value.strip() if isinstance(value, str) else ""
+    preset = infer_preset(result)
+    info = ENDPOINT_PRESETS[preset]
+    explicit = result["preset"].lower() == preset
+    kind = result["kind"].lower()
+    if explicit or not kind:
+        kind = info["kind"]
+    elif kind not in ENDPOINT_KINDS:
+        kind = "openai"         # as older versions did with unknown kinds
+    result["kind"] = kind
+    result["preset"] = preset
+    result["base_url"] = _with_scheme((result["base_url"] or info["base_url"]).rstrip("/"))
+    if not _positive_int(result["concurrency"]):
+        result["concurrency"] = info["concurrency"]
+    edge = result["max_image_edge"]
+    result["max_image_edge"] = (int(edge) if _number(edge) and 64 <= edge <= 8000
+                                else DEFAULT_MAX_IMAGE_EDGE)
+    timeout = result["timeout"]
+    result["timeout"] = timeout if _number(timeout) and timeout > 0 else DEFAULT_TIMEOUT
+    if not _positive_int(result["max_output_tokens"]):
+        result["max_output_tokens"] = (
+            THINKING_MAX_OUTPUT_TOKENS
+            if kind == "claude" and claude_thinking(result["model"]) == "effort"
+            else DEFAULT_MAX_OUTPUT_TOKENS)
+    if not isinstance(result["extra"], dict):
+        result["extra"] = {}
+    for key in ("price_in", "price_out"):
+        value = result[key]
+        result[key] = float(value) if _number(value) and value >= 0 else None
+    enabled = result["enabled"]
+    result["enabled"] = enabled if isinstance(enabled, bool) else enabled not in (0, None, "")
+    result["label"] = result["label"] or result["name"]
+    return result
+
+
+def _unique_name(wanted, taken):
+    name = wanted
+    number = 2
+    while name.casefold() in taken:
+        name = "%s-%d" % (wanted, number)
+        number += 1
+    taken.add(name.casefold())
+    return name
+
+
+def endpoint_list(config):
+    """Every configured endpoint, as filled-in copies (endpoint_settings).
+
+    Uses config["endpoints"] when the config has that list; otherwise the
+    older config["endpoint"] (one object, or a round-robin list whose
+    members become the group "default"), named "default", "default-2", ...
+    Names are made unique (case-insensitively) by adding "-2", "-3", ...
+    Disabled endpoints are included. Change config["endpoints"] (or
+    config["endpoint"]) to change settings, not these copies.
+    """
+    endpoints = config.get("endpoints") if isinstance(config, dict) else None
+    if isinstance(endpoints, list):
+        items = [item for item in endpoints if isinstance(item, dict)]
+        legacy_group = None
+    else:
+        legacy = config.get("endpoint") if isinstance(config, dict) else None
+        if isinstance(legacy, list):
+            items = [item for item in legacy if isinstance(item, dict)]
+            legacy_group = "default"
+        else:
+            items = [legacy] if isinstance(legacy, dict) else []
+            legacy_group = ""
+    taken = set()
+    result = []
+    for position, item in enumerate(items, 1):
+        endpoint = endpoint_settings(item)
+        if legacy_group is None:
+            wanted = endpoint["name"] or "endpoint-%d" % position
+        else:
+            wanted = endpoint["name"] or "default"
+            if legacy_group and not endpoint["group"]:
+                endpoint["group"] = legacy_group
+        label_was_name = endpoint["label"] == endpoint["name"]
+        endpoint["name"] = _unique_name(wanted, taken)
+        if label_was_name:
+            endpoint["label"] = endpoint["name"]
+        result.append(endpoint)
+    return result
+
+
+def convert_legacy_endpoints(config):
+    """Rewrite an older "endpoint" setting as "endpoints" (in place). True if changed.
+
+    For tools that edit endpoints, which save the newer form. Each older
+    endpoint keeps its settings and gets the name endpoint_list() gives it
+    ("default", "default-2", ...); a round-robin list's members also get
+    "group": "default". default_endpoint becomes "default" (unless set), so
+    libraries keep using the same endpoints. An unused placeholder (no
+    model, base URL or key) is dropped. Configs that already have
+    "endpoints" are left alone.
+    """
+    if not isinstance(config, dict) or isinstance(config.get("endpoints"), list):
+        return False
+    legacy = config.pop("endpoint", None)
+    items = legacy if isinstance(legacy, list) else [legacy]
+    endpoints = []
+    taken = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        entry = copy.deepcopy(item)
+        name = entry.get("name") if isinstance(entry.get("name"), str) else ""
+        entry["name"] = _unique_name(name.strip() or "default", taken)
+        if isinstance(legacy, list) and not entry.get("group"):
+            entry["group"] = "default"
+        if not any(isinstance(entry.get(key), str) and entry[key].strip()
+                   for key in ("model", "base_url", "api_key", "api_key_env", "api_key_file")):
+            continue
+        endpoints.append(entry)
+    config["endpoints"] = endpoints
+    name = config.get("default_endpoint")
+    if not isinstance(name, str) or not name.strip():
+        config["default_endpoint"] = "default"
+    return True
+
+
+def get_endpoint(config, name):
+    """The endpoint with this name (exact, else case-insensitive), or None."""
+    if not isinstance(name, str) or not name.strip():
+        return None
+    endpoints = endpoint_list(config)
+    for endpoint in endpoints:
+        if endpoint["name"] == name:
+            return endpoint
+    wanted = name.strip().casefold()
+    for endpoint in endpoints:
+        if endpoint["name"].casefold() == wanted:
+            return endpoint
+    return None
+
+
+def default_endpoint_name(config):
+    """The endpoint (or group) name libraries use when they do not name one.
+
+    config["default_endpoint"] when set; otherwise "default" for the older
+    single-endpoint or round-robin forms. Without a default_endpoint, the
+    newer form falls back to the first enabled endpoint on this computer or
+    the local network, and to none ('') when there is no such endpoint:
+    pictures are never sent to a cloud service nobody chose for them.
+    """
+    name = config.get("default_endpoint") if isinstance(config, dict) else None
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    if isinstance(config, dict) and not isinstance(config.get("endpoints"), list):
+        return "default"
+    for endpoint in endpoint_list(config):
+        if endpoint["enabled"] and is_local_endpoint(endpoint):
+            return endpoint["name"]
+    return ""
+
+
+def resolve_endpoints(config, name):
+    """The enabled endpoints a name refers to: a group's members, else one endpoint.
+
+    A group wins over an endpoint of the same name (the older round-robin
+    form names its first endpoint and its group "default"). Unknown or
+    disabled names give an empty list: images are never sent somewhere
+    other than where the settings say.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return []
+    wanted = name.strip().casefold()
+    endpoints = endpoint_list(config)
+    members = [endpoint for endpoint in endpoints
+               if endpoint["group"] and endpoint["group"].casefold() == wanted]
+    if not members:
+        endpoint = get_endpoint(config, name)
+        members = [endpoint] if endpoint is not None else []
+    return [endpoint for endpoint in members if endpoint["enabled"]]
+
+
+def endpoints_for_library(config, library=None):
+    """The enabled endpoints that describe a library's images.
+
+    The library's "endpoint" setting (an endpoint or group name), or the
+    default endpoint when it is empty (or no library is given). An empty
+    list when the name matches nothing enabled.
+    """
+    wanted = library.get("endpoint") if isinstance(library, dict) else None
+    if not isinstance(wanted, str) or not wanted.strip():
+        wanted = default_endpoint_name(config)
+    return resolve_endpoints(config, wanted)
+
+
+def endpoint_concurrency(endpoint, slots=None):
+    """How many requests to keep in flight at once on an endpoint.
+
+    The endpoint's "concurrency" setting when it has one; otherwise its
+    preset's default, where llama.cpp-like servers use their slot count
+    (slots, from llm.probe()) and fall back to 1. At most MAX_CONCURRENCY.
+    """
+    settings = endpoint_settings(endpoint)
+    value = settings["concurrency"]
+    if not _positive_int(value):
+        value = slots if settings["preset"] in LLAMACPP_PRESETS and _positive_int(slots) else 1
+    return min(value, MAX_CONCURRENCY)
+
+
+def is_local_endpoint(endpoint):
+    """True when an endpoint's server is on this computer or the local network.
+
+    Cloud presets never are; otherwise the base URL's host decides, so a
+    llama.cpp server rented on the internet does not count as local.
+    """
+    settings = endpoint_settings(endpoint)
+    if settings["preset"] in CLOUD_PRESETS:
+        return False
+    return is_local_host(url_host(settings["base_url"]))
+
+
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def looks_like_key(text):
+    """True for text shaped like an API key rather than a variable or file name."""
+    text = (text or "").strip()
+    if text.startswith(("sk-", "sk_", "AIza")):
+        return True
+    return (len(text) >= 24 and any(char.islower() for char in text)
+            and any(char.isupper() for char in text) and any(char.isdigit() for char in text))
+
+
+def valid_env_name(name):
+    """True for a usable environment variable name (that does not look like a key)."""
+    return bool(ENV_NAME_RE.match(name or "")) and not looks_like_key(name)
+
+
+def resolve_api_key(endpoint):
+    """The API key for an endpoint and where it came from: (key, source).
+
+    Looked up in this order: the environment variable named by api_key_env,
+    the file named by api_key_file (its first line; a relative path is next
+    to config.json), the literal api_key, and finally the preset's usual
+    environment variable (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...) -- that
+    last one only when the endpoint configures no key at all and its base
+    URL is the preset's own service (a gateway or proxy at another address
+    never gets it). A missing or unreadable key file gives ("", "file
+    missing"): another key is never used in its place.
+
+    source describes where the key came from ("env NAME", "file", "config",
+    "none", "file missing", "file empty", "env NAME not set", "env (invalid
+    name) not set"); it never contains the key. An api_key_env that is not
+    a valid variable name (a key pasted there by mistake) is never echoed.
+    Keys must never be logged, printed or stored.
+    """
+    endpoint = endpoint if isinstance(endpoint, dict) else {}
+
+    def text(key):
+        value = endpoint.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    env_name = text("api_key_env")
+    env_valid = valid_env_name(env_name)
+    if env_name and env_valid:
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value, "env " + env_name
+    file_name = text("api_key_file")
+    if file_name:
+        try:
+            with open(resolve_config_relative(file_name), "r", encoding="utf-8-sig") as handle:
+                content = handle.read()
+        except (OSError, UnicodeDecodeError):
+            return "", "file missing"
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if lines:
+            return lines[0], "file"
+        return "", "file empty"
+    literal = text("api_key")
+    if literal:
+        return literal, "config"
+    if env_name:
+        return "", "env %s not set" % (env_name if env_valid else "(invalid name)")
+    settings = endpoint_settings(endpoint)
+    preset_env = ENDPOINT_PRESETS[settings["preset"]]["key_env"]
+    if preset_env and preset_host(settings["preset"], url_host(settings["base_url"])):
+        value = os.environ.get(preset_env, "").strip()
+        if value:
+            return value, "env " + preset_env
+    return "", "none"
+
+
+# ---------------------------------------------------------------------------
 # File types and ignore patterns
 
 def is_image_file(name):
@@ -605,6 +1197,33 @@ def load_image_bytes(helper, path):
                 return data
     with open(path, "rb") as handle:
         return handle.read()
+
+
+def thread_safe_helper(helper):
+    """A stand-in for the helper whose load_image and stat hooks run one at a time.
+
+    Files are read by several threads at once (scanning, describing), and
+    helpers written for the old one-at-a-time scanner may not expect that.
+    Decoding still runs in parallel. A helper module that sets THREAD_SAFE =
+    True is used as is. The stand-in only has load_image and stat; use the
+    helper itself for its other hooks.
+    """
+    if helper is None or getattr(helper, "THREAD_SAFE", False):
+        return helper
+    lock = threading.Lock()
+    proxy = types.SimpleNamespace()
+
+    def locked(func):
+        def call(*args, **kwargs):
+            with lock:
+                return func(*args, **kwargs)
+        return call
+
+    for name in ("load_image", "stat"):
+        func = getattr(helper, name, None)
+        if func is not None:
+            setattr(proxy, name, locked(func))
+    return proxy
 
 
 def stat_path(helper, path):

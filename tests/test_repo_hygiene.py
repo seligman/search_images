@@ -61,6 +61,11 @@ PROFILE_RE = re.compile(
 UNC_RE = re.compile(r"(?<![\\:\w])\\\\([A-Za-z0-9_.$-]+)\\")
 IP_RE = re.compile(r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3})(?![\d.])")
 GGUF_RE = re.compile(r"([A-Za-z0-9_.+-]+\.gguf)\b", re.IGNORECASE)
+# Strings shaped like real API keys (OpenAI, Anthropic, OpenRouter, Gemini).
+KEY_RE = re.compile(r"(?<![A-Za-z0-9])(sk-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{30,})")
+# Made-up keys in tests and docs carry one of these.
+ALLOWED_KEY_MARKERS = ("test", "fake", "example", "abcdef", "0123456789", "xxxx",
+                       "your", "pasted")
 
 
 def candidate_files():
@@ -120,6 +125,11 @@ def scan_line(line):
     for match in GGUF_RE.finditer(line):
         if match.group(1).lower() not in ALLOWED_GGUF:
             problems.append("model file name " + match.group(1))
+    for match in KEY_RE.finditer(line):
+        key = match.group(1)
+        if not any(marker in key.lower() for marker in ALLOWED_KEY_MARKERS):
+            # Never print the key itself.
+            problems.append("something shaped like an API key (%s...)" % key[:6])
     return sorted(set(problems))
 
 
@@ -172,7 +182,10 @@ class RepoHygieneTest(unittest.TestCase):
             "config.json", "data/images.db", "data/thumbs/thumb-0000.dat",
             "site/index.html", "exports/x/index.html", "abort", "abort.txt",
             "_error_0001.txt", "world_map.png", "__pycache__/x.cpython-314.pyc",
-            "my_helper.py", "local/config.json", "models/x.gguf"
+            "my_helper.py", "local/config.json", "models/x.gguf",
+            # Key files a user might create next to config.json.
+            "openai.key", "keys/openai.txt", "anthropic_key.txt", "api-key.txt",
+            ".service_token",
         ]
         must_keep = ["example_helper.py", "sample/images/01-cat.jpg",
                      "static/worldmap.jpg", "static/app.js"]
@@ -197,6 +210,8 @@ class ScannerSelfTest(unittest.TestCase):
             "server at 192.168.1.20",
             "load Llama-3-8B-Q4_K_M.gguf",
             "E:\\Media\\Pictures",
+            'api_key = "sk-proj-Q8v2LmN4rT6yW1zX3cV5bN7mK9pL0qR2"',
+            "GEMINI_API_KEY=AIzaSyQ8v2LmN4rT6yW1zX3cV5bN7mK9pL0qR2s",
         ]
         for line in leaky:
             self.assertTrue(scan_line(line), line)
@@ -208,6 +223,8 @@ class ScannerSelfTest(unittest.TestCase):
             "http://127.0.0.1:8080/",
             "/home/you/Pictures",
             "point it at model.gguf and model.mmproj.gguf",
+            'SECRET = "sk-test-0123456789abcdefSECRET"',
+            "export OPENAI_API_KEY=sk-your-key-here-xxxxxxxx",
         ]
         for line in clean:
             self.assertEqual(scan_line(line), [], line)

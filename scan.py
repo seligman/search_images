@@ -30,7 +30,10 @@ Then the describe step (describe.py) runs for images without a description.
 Usage:
     python scan.py [--library NAME_OR_ID ...] [--no-scan] [--no-describe]
                    [--newest-first | --oldest-first] [--retry-failed]
+                   [--redescribe-stale] [--limit N] [--endpoint NAME]
                    [--allow-mass-removal] [--verbose]
+    python scan.py --list-endpoints
+    python scan.py --test-endpoint NAME [--image PATH]
 
 To stop a long run early, create data/abort (or a file named "abort" or
 "abort.txt" in the current directory). Work done so far is kept; run again to
@@ -43,9 +46,7 @@ import concurrent.futures
 import json
 import os
 import sys
-import threading
 import time
-import types
 
 import cache
 import common
@@ -53,6 +54,7 @@ import db
 import describe
 import images
 import jobs
+import llm
 
 COMMIT_ROWS = 100           # commit after this many written rows...
 COMMIT_SECONDS = 3.0        # ...or this many seconds, whichever comes first
@@ -292,29 +294,8 @@ def _under_any(path, prefixes):
 # ---------------------------------------------------------------------------
 # Reading files in parallel
 
-def thread_safe_helper(helper):
-    """A stand-in for the helper whose load_image and stat hooks run one at a time.
-
-    Files are read by several threads at once, and helpers written for the
-    old one-at-a-time scanner may not expect that. Decoding still runs in
-    parallel. A helper module that sets THREAD_SAFE = True is used as is.
-    """
-    if helper is None or getattr(helper, "THREAD_SAFE", False):
-        return helper
-    lock = threading.Lock()
-    proxy = types.SimpleNamespace()
-
-    def locked(func):
-        def call(*args, **kwargs):
-            with lock:
-                return func(*args, **kwargs)
-        return call
-
-    for name in ("load_image", "stat"):
-        func = getattr(helper, name, None)
-        if func is not None:
-            setattr(proxy, name, locked(func))
-    return proxy
+# Older name; the helper wrapper now lives in common.
+thread_safe_helper = common.thread_safe_helper
 
 
 def reader_threads(config):
@@ -463,6 +444,7 @@ def _metadata(result):
         "taken_at": result["taken_at"], "taken_source": result["taken_source"],
         "tz_offset": result["tz_offset"], "camera": result["camera"],
         "lat": result["lat"], "lon": result["lon"], "exif": exif,
+        "projection": result.get("projection", ""),
     }
 
 
@@ -502,6 +484,7 @@ class LibraryScan:
         self.ctx = ctx
         self.helper = helper
         self.read_helper = thread_safe_helper(helper)
+        self.profile = describe.library_profile(library)
         self.thumbs = thumbs
         self.previews = previews
         self.threads = max(1, int(threads or 1))
@@ -737,12 +720,29 @@ class LibraryScan:
         moves = [row for row in rows if self._is_move_source(row)]
         if moves:
             return best(moves), True
-        described = [row for row in rows if row["described"]]
+        described = [row for row in rows if row["described"] and self._fits_profile(row)]
         if described:
             return best(described), False
         replaced = (self.replaced.get(metadata["content_hash"])
                     or self.replaced.get((size, metadata["dhash"])))
         return replaced, False
+
+    def _fits_profile(self, row):
+        """True when a described row's description suits this library.
+
+        A current description from another library is only reused when it
+        has the fields this library asks for: an "extended" library does
+        not take a "core" description (it would never be asked for the
+        rest). Descriptions from an older prompt stay stale wherever they go.
+        """
+        if row["library_id"] == self.library_id or row["prompt_ver"] < describe.PROMPT_VER:
+            return True
+        try:
+            provenance = json.loads(row["provenance"] or "{}")
+        except ValueError:
+            provenance = {}
+        profile = provenance.get("profile") if isinstance(provenance, dict) else None
+        return self.profile == "core" or profile == self.profile
 
     def _remember_description(self, row):
         """Keep the description of a row whose content is about to change."""
@@ -1075,7 +1075,8 @@ def preview_ids(previews, library_id):
 
 
 _BACKFILL_SQL = """
-    SELECT id, path, size, mtime, content_hash, dhash, width, height, has_preview
+    SELECT id, path, size, mtime, content_hash, dhash, width, height, has_preview,
+           projection, described
     FROM images WHERE library_id = ? AND missing_since IS NULL ORDER BY id"""
 
 
@@ -1084,10 +1085,13 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
 
     Rows imported from the old database have no content hash or preview;
     this reads each such original once and fills them in, with fresh EXIF
-    facts and thumbnail. Rows of files the ignore patterns now exclude are
-    left alone. It runs as stage "previews", can be stopped at any point and
-    continues where it left off. Returns a summary dict:
-    {needed, filled, failed, changed, unsupported, aborted}.
+    facts and thumbnail. Rows whose projection is "?" (stored before 360
+    photos were recognised) are read again the same way, which gives 360
+    photos their panorama preview, front-view thumbnail and dHash. Rows of
+    files the ignore patterns now exclude are left alone. It runs as stage
+    "previews", can be stopped at any point and continues where it left off.
+    Returns a summary dict:
+    {needed, filled, failed, changed, unsupported, aborted, panoramas}.
     """
     own_thumbs = thumbs is None
     thumbs = thumbs or cache.ThumbStore()
@@ -1105,7 +1109,8 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
     patterns = common.ignore_patterns(library)
     want_previews = bool(library.get("previews", True))
     summary = {"needed": 0, "filled": 0, "failed": 0, "changed": 0, "unsupported": 0,
-               "aborted": False}
+               "aborted": False, "panoramas": 0}
+    redescribe = []
     on_disk = preview_ids(previews, library_id)
     failures = _load_failures(conn, library_id)
     needed = []
@@ -1117,7 +1122,8 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
             conn.execute("UPDATE images SET has_preview = 0 WHERE id = ?", (row["id"],))
             has_preview = False
         if (row["content_hash"] and row["dhash"] and row["width"] > 0 and row["height"] > 0
-                and (has_preview or not want_previews)):
+                and (has_preview or not want_previews)
+                and row["projection"] != images.PROJECTION_UNKNOWN):
             continue
         if excluded_by_ignores(row["path"], patterns):
             continue
@@ -1170,6 +1176,11 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
             _update_row(conn, row["id"], values)
             thumbs.put(row["id"], result["thumb"], commit=False)
             summary["filled"] += 1
+            if values["projection"] in images.PROJECTIONS_360:
+                summary["panoramas"] += 1
+                if (values["projection"] == images.PROJECTION_DUAL_FISHEYE
+                        and row["described"] and row["projection"] != values["projection"]):
+                    redescribe.append(row["path"])
         timer.wrote()
         ctx.step(item=row["path"])
 
@@ -1178,6 +1189,16 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
                                              ctx, timer.flush)
     finally:
         timer.commit()
+    if summary["panoramas"]:
+        ctx.log("%d 360-degree photo(s) recognised in %s."
+                % (summary["panoramas"], common.library_label(library)))
+    if redescribe:
+        # Their descriptions were made from the two raw fisheye circles.
+        ctx.log("%d described image(s) turned out to be unstitched 360-degree photos (%s%s); "
+                "their descriptions were made from the unstitched picture, so describe them "
+                "again to get better ones."
+                % (len(redescribe), ", ".join(redescribe[:3]),
+                   ", ..." if len(redescribe) > 3 else ""), "warn")
     return summary
 
 
@@ -1186,13 +1207,14 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
 
 def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
         newest_first=None, retry_failed=False, allow_mass_removal=False, helper=None,
-        now=None, verbose=False):
+        now=None, verbose=False, redescribe_stale=False, limit=None, endpoint_name=None):
     """Scan (and back-fill) the selected libraries, then describe what needs it.
 
     library_ids limits the run to those library ids (default: every enabled
-    library). db.init() must have run in this process. Returns
-    {"libraries": [scan summaries], "describe": describe summary or None,
-    "stopped": bool}.
+    library). db.init() must have run in this process. redescribe_stale,
+    limit and endpoint_name are passed on to describe.describe_pending.
+    Returns {"libraries": [scan summaries], "describe": describe summary or
+    None, "stopped": bool}.
     """
     libraries = describe.selected_libraries(config, library_ids)
     summary = {"libraries": [], "describe": None, "stopped": False}
@@ -1224,7 +1246,9 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
             summary["describe"] = describe.describe_pending(
                 conn, config, ctx, helper=helper,
                 library_ids=[library["id"] for library in libraries],
-                newest_first=newest_first, retry_failed=retry_failed, previews=previews)
+                newest_first=newest_first, retry_failed=retry_failed,
+                redescribe_stale=redescribe_stale, limit=limit, endpoint_name=endpoint_name,
+                previews=previews)
             summary["stopped"] = summary["describe"]["stopped"]
         elif ctx.should_stop():
             summary["stopped"] = True
@@ -1242,6 +1266,83 @@ def _safe_output():
                 reconfigure(errors="backslashreplace")
             except (ValueError, OSError):
                 pass
+
+
+DEFAULT_TEST_IMAGE = os.path.join(common.BASE_DIR, "sample", "images", "18-chalkboard-menu.jpg")
+
+
+def endpoint_rows(config):
+    """[(name, kind, preset, model, key source, enabled, group)] for --list-endpoints.
+
+    The key source says where a key would come from ("env NAME", "file",
+    "config", "none", ...); keys themselves are never included.
+    """
+    rows = []
+    for endpoint in common.endpoint_list(config):
+        rows.append((endpoint["name"], endpoint["kind"], endpoint["preset"],
+                     endpoint["model"] or "(none)", common.resolve_api_key(endpoint)[1],
+                     "yes" if endpoint["enabled"] else "no", endpoint["group"] or "-"))
+    return rows
+
+
+def list_endpoints(config, out=None):
+    """Print the configured endpoints (never their keys). Returns the exit code."""
+    out = out or sys.stdout
+    rows = endpoint_rows(config)
+    if not rows:
+        print("No LLM endpoints are configured. Run settings.py.", file=out)
+        return 0
+    headers = ("name", "kind", "preset", "model", "key", "enabled", "group")
+    widths = [max(len(str(row[index])) for row in rows + [headers])
+              for index in range(len(headers))]
+    for row in [headers] + rows:
+        print("  ".join(str(value).ljust(width)
+                        for value, width in zip(row, widths)).rstrip(), file=out)
+    default = common.default_endpoint_name(config)
+    print("Default endpoint: %s" % (default or "(none)"), file=out)
+    for library in config.get("libraries", []):
+        if library.get("endpoint"):
+            print("Library %s uses %s." % (common.library_label(library), library["endpoint"]),
+                  file=out)
+    return 0
+
+
+def test_endpoint(config, name, image_path=None, out=None):
+    """Describe one image with an endpoint and print the result (never the key).
+
+    The image defaults to a sample picture. Returns the exit code: 0 when
+    the endpoint produced a usable description, 1 when it did not, 2 for an
+    unknown endpoint or an unreadable image.
+    """
+    out = out or sys.stdout
+    endpoint = common.get_endpoint(config, name)
+    if endpoint is None:
+        names = ", ".join(item["name"] for item in common.endpoint_list(config)) or "none"
+        print("Unknown endpoint: %s (configured: %s)" % (name, names), file=out)
+        return 2
+    path = image_path or DEFAULT_TEST_IMAGE
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        jpeg = images.prepare_for_llm(data, max_edge=endpoint["max_image_edge"])
+    except (OSError, images.ImageReadError) as error:
+        print("Cannot read the test image %s: %s" % (path, error), file=out)
+        return 2
+    print("Testing endpoint %s (%s, model %s) with %s..."
+          % (endpoint["name"], endpoint["preset"], endpoint["model"] or "(none)",
+             os.path.basename(path)), file=out)
+    if common.insecure_endpoint(endpoint):
+        print("Warning: %s is not encrypted (http://): %s the network unprotected. Use "
+              "https:// if the service has it."
+              % (common.redact(endpoint["base_url"]),
+                 "the picture and the API key cross" if common.resolve_api_key(endpoint)[0]
+                 else "the picture crosses"), file=out)
+    result = llm.test_endpoint(endpoint, jpeg,
+                               parse=lambda text: describe.parse_reply(text, "core"))
+    print(json.dumps(result, indent=2, ensure_ascii=False), file=out)
+    if not result["ok"]:
+        print("The test failed: %s" % (result["error"] or result["error_kind"]), file=out)
+    return 0 if result["ok"] else 1
 
 
 def main(argv=None):
@@ -1265,6 +1366,21 @@ def main(argv=None):
     parser.add_argument("--retry-failed", action="store_true",
                         help="Also retry images that failed to describe %d times."
                              % describe.MAX_FAILURES)
+    parser.add_argument("--redescribe-stale", action="store_true",
+                        help="Also describe again images described with an older prompt "
+                             "(after the new ones).")
+    parser.add_argument("--limit", type=int, metavar="N",
+                        help="Describe at most N images in this run.")
+    parser.add_argument("--endpoint", metavar="NAME",
+                        help="Describe with this endpoint (or group) instead of each "
+                             "library's own.")
+    parser.add_argument("--list-endpoints", action="store_true",
+                        help="List the configured LLM endpoints and exit.")
+    parser.add_argument("--test-endpoint", metavar="NAME",
+                        help="Describe one image with this endpoint, print the result "
+                             "and exit.")
+    parser.add_argument("--image", metavar="PATH",
+                        help="The image for --test-endpoint (default: a sample picture).")
     parser.add_argument("--allow-mass-removal", action="store_true",
                         help="Mark files missing even when most of a library seems to "
                              "have vanished.")
@@ -1273,6 +1389,16 @@ def main(argv=None):
                              "first %d of each kind per library)." % FILE_LOG_LIMIT)
     args = parser.parse_args(argv)
 
+    if args.list_endpoints or args.test_endpoint:
+        # These only read config.json (and talk to the endpoint).
+        try:
+            config = common.load_config()
+        except common.ConfigError as error:
+            print("Error: %s" % error)
+            return 2
+        if args.list_endpoints:
+            return list_endpoints(config)
+        return test_endpoint(config, args.test_endpoint, args.image)
     ctx = jobs.ConsoleContext("scan")
     found = ctx.abort_file_present()
     if found:
@@ -1282,6 +1408,15 @@ def main(argv=None):
         config = common.load_config()
     except common.ConfigError as error:
         print("Error: %s" % error)
+        return 2
+    if args.limit is not None and args.limit < 0:
+        print("--limit must be 0 or more.")
+        return 2
+    if args.endpoint and not args.no_describe and not common.resolve_endpoints(
+            config, args.endpoint):
+        names = ", ".join(item["name"] for item in common.endpoint_list(config)) or "none"
+        print("No enabled endpoint or group is named %s (configured: %s). See "
+              "--list-endpoints." % (args.endpoint, names))
         return 2
     if not config.get("libraries"):
         print("No libraries configured. Run settings.py first.")
@@ -1311,14 +1446,20 @@ def main(argv=None):
                       describe_images=not args.no_describe, newest_first=args.newest_first,
                       retry_failed=args.retry_failed,
                       allow_mass_removal=args.allow_mass_removal, helper=helper,
-                      verbose=args.verbose)
+                      verbose=args.verbose, redescribe_stale=args.redescribe_stale,
+                      limit=args.limit, endpoint_name=args.endpoint)
     except (db.DatabaseError, common.ConfigError) as error:
         print("Error: %s" % error)
         return 2
     finally:
         lock.release()
+    described = summary.get("describe") or {}
     if summary["stopped"]:
         ctx.log("Abort requested. Progress saved; run scan.py again to continue.")
+    elif described.get("fatal") or described.get("error"):
+        # Unattended runs (a scheduled task) can tell this from success.
+        ctx.log("Stopped early: %s" % described["error"], "error")
+        return 1
     else:
         ctx.log("Done.")
     return 0

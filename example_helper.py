@@ -4,8 +4,9 @@
 Point settings.py at this file (or your own copy) to wrap the LLM calls.
 Every function is optional; remove any you do not need.
 
-The scanner reads several images at once. Unless THREAD_SAFE is True, it
-makes sure load_image and stat are only ever called one at a time.
+The scanner and the describe step read several images at once. Unless
+THREAD_SAFE is True, they make sure load_image and stat are only ever called
+one at a time (call_api is always called one at a time).
 """
 
 # Set to True if load_image and stat may be called from several threads at
@@ -30,8 +31,11 @@ def after_launch():
 def call_api(prompt, image_path, source_path=None):
     """Adjust a request just before it is sent to the LLM.
 
-    image_path is a temporary JPEG holding the image as it will be sent
-    (upright and shrunk for the model); it is deleted afterwards.
+    prompt is the text sent after the image ("Describe this image." plus the
+    library's context notes); the instructions themselves go in the system
+    prompt, which is sent unchanged. image_path is a temporary JPEG holding
+    the image as it will be sent (upright and shrunk for the model); it is
+    deleted afterwards.
     source_path is the original file in the library, for hooks that pick
     what to do by folder or file name. (Older versions passed the original
     as image_path; a hook that only takes two arguments still works, it just

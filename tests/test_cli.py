@@ -73,7 +73,7 @@ class ProgressTest(support.TempBaseMixin, unittest.TestCase):
         conn = self.open_db()
         text = output_of(progress.show_counts, conn)
         cells = table_row(text, "(all)")
-        self.assertEqual(cells[1:], ["-"] * 7)
+        self.assertEqual(cells[1:], ["-"] * 9)
         self.assertEqual(output_of(progress.show_files, conn), "")
 
     def test_counts_per_library(self):
@@ -87,6 +87,9 @@ class ProgressTest(support.TempBaseMixin, unittest.TestCase):
         insert_image(conn, "lib_family1", "done.jpg", described=1, prompt_ver=current)
         insert_image(conn, "lib_family1", "stale.jpg", described=1, prompt_ver=current - 1)
         insert_image(conn, "lib_family1", "new.jpg")
+        insert_image(conn, "lib_family1", "hidden.jpg", hidden=1)
+        insert_image(conn, "lib_family1", "once.jpg", describe_attempts=1,
+                     describe_error="cut off")
         insert_image(conn, "lib_family1", "bad.jpg", describe_attempts=3,
                      describe_error="timed out")
         insert_image(conn, "lib_family1", "gone.jpg", missing_since=NOW)
@@ -94,21 +97,27 @@ class ProgressTest(support.TempBaseMixin, unittest.TestCase):
         insert_image(conn, "lib_orphan01", "lost.jpg")
 
         text = output_of(progress.show_counts, conn)
-        # described, at current version, left, failed, missing, total, done
+        # described, at current version, older prompt, left (what the next
+        # run describes: hidden images too, not those given up on), failed,
+        # gave up, missing, total, done
         self.assertEqual(table_row(text, "Family")[1:],
-                         ["2", "1", "3", "1", "1", "4", "25.00%"])
+                         ["2", "1", "1", "3", "2", "1", "1", "6", "16.67%"])
         self.assertEqual(table_row(text, "Garden (disabled)")[1:],
-                         ["1", "1", "-", "-", "-", "1", "100.00%"])
+                         ["1", "1", "-", "-", "-", "-", "-", "1", "100.00%"])
         self.assertEqual(table_row(text, "lib_orphan01 (orphan)")[1:],
-                         ["-", "-", "1", "-", "-", "1", "0.00%"])
+                         ["-", "-", "-", "1", "-", "-", "-", "1", "0.00%"])
         self.assertEqual(table_row(text, "(all)")[1:],
-                         ["3", "2", "4", "1", "1", "6", "33.33%"])
+                         ["3", "2", "1", "4", "2", "1", "1", "8", "25.00%"])
 
         lines = output_of(progress.show_files, conn).splitlines()
-        self.assertEqual(len(lines), 3, lines)
+        self.assertEqual(len(lines), 5, lines)
         self.assertTrue(lines[0].endswith("Family: new.jpg"), lines)
-        self.assertIn("Family: bad.jpg  (failed 3x: timed out)", lines[1])
-        self.assertTrue(lines[2].endswith("Family: stale.jpg"), lines)
+        self.assertTrue(lines[1].endswith("Family: hidden.jpg"), lines)
+        self.assertIn("Family: once.jpg  (failed 1x: cut off)", lines[2])
+        self.assertIn("Family: bad.jpg  (skipped after 3 failures: timed out; run scan.py "
+                      "--retry-failed)", lines[3])
+        self.assertIn("Family: stale.jpg  (older prompt; run scan.py --redescribe-stale)",
+                      lines[4])
 
     def test_command_line(self):
         for command in ("counts", "files"):
@@ -129,6 +138,14 @@ class ProgressTest(support.TempBaseMixin, unittest.TestCase):
 
 class SettingsTest(support.TempBaseMixin, unittest.TestCase):
 
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "TEST_SETTINGS_KEY"):
+            os.environ.pop(name, None)
+
     def config_with_two_endpoints(self):
         config = common.default_config()
         config["endpoint"] = [
@@ -138,57 +155,292 @@ class SettingsTest(support.TempBaseMixin, unittest.TestCase):
         ]
         return config
 
-    def test_list_endpoints_are_shown_without_keys(self):
+    def test_endpoints_are_shown_without_keys(self):
         config = self.config_with_two_endpoints()
-        lines = settings.settings_lines(config)
-        text = "\n".join(lines)
-        self.assertIn("1. kind=openai, model=first", text)
-        self.assertIn("2. kind=claude, model=second", text)
-        self.assertIn("API key set", text)
-        self.assertIn("API key (empty)", text)
+        text = "\n".join(settings.settings_lines(config))
+        self.assertIn("LLM endpoints (default: default):", text)
+        self.assertIn("1. default: Local server, model=first", text)
+        self.assertIn("2. default-2: Claude, model=second", text)
+        self.assertIn("API key: config", text)
+        self.assertIn("API key: none", text)
+        self.assertIn("group=default", text)
         self.assertNotIn(SECRET, text)
+        # Showing does not convert the older form.
+        self.assertIn("endpoint", config)
+        self.assertNotIn("endpoints", config)
         with mock.patch("builtins.input", return_value=""):
             shown = output_of(settings.show_settings, config)
         self.assertNotIn(SECRET, shown)
         self.assertNotIn("0123456789", shown)
 
     def test_base_url_secrets_are_masked(self):
-        endpoint = {"kind": "openai", "base_url": "https://example.com/v1?key=abcdef123456",
-                    "api_key": "", "model": "m"}
+        config = {"endpoints": [{"name": "web", "kind": "openai", "model": "m",
+                                 "base_url": "https://example.com/v1?key=abcdef123456"}]}
+        endpoint = config["endpoints"][0]
         self.assertNotIn("abcdef123456", settings.endpoint_summary(endpoint))
         # Nor in the prompt that edits it; Enter keeps the value.
         prompts = []
-        answers = iter(["3", "", "0"])
+        answers = iter(["4", "", "0"])
 
         def fake_input(prompt=""):
             prompts.append(prompt)
             return next(answers)
 
         with mock.patch("builtins.input", fake_input):
-            output = output_of(settings.edit_endpoint, endpoint)
+            output = output_of(settings.edit_endpoint, config, endpoint)
         self.assertNotIn("abcdef123456", "".join(prompts) + output)
         self.assertTrue(any("Base URL" in prompt for prompt in prompts))
         self.assertEqual(endpoint["base_url"], "https://example.com/v1?key=abcdef123456")
 
-    def test_add_and_remove_endpoints(self):
+    def test_add_remove_rename_and_default(self):
         config = common.default_config()
-        self.assertIsInstance(config["endpoint"], dict)
-        first = settings.endpoint_list(config)[0]
-        added = settings.add_endpoint(config)
-        self.assertEqual(config["endpoint"], [first, added])
-        self.assertIs(settings.endpoint_list(config)[1], added)
-        settings.remove_endpoint(config, 0)
-        self.assertEqual(config["endpoint"], [added])
+        self.assertEqual(settings.endpoint_entries(config), [])     # the placeholder is dropped
+        self.assertNotIn("endpoint", config)
+        local = settings.add_endpoint(config, "llamacpp")
+        self.assertEqual(local, {"name": "llamacpp", "preset": "llamacpp", "model": ""})
+        self.assertEqual(config["default_endpoint"], "llamacpp")
+        cloud = settings.add_endpoint(config, "openai")
+        again = settings.add_endpoint(config, "openai")
+        self.assertEqual((cloud["name"], again["name"]), ("openai", "openai-2"))
+        self.assertEqual(config["default_endpoint"], "llamacpp")
+        for bad in ("OPENAI", "a,b", "a=b", " "):
+            with self.assertRaises(ValueError):
+                settings.add_endpoint(config, "openai", name=bad)
         with self.assertRaises(ValueError):
-            settings.remove_endpoint(config, 0)
+            settings.add_endpoint(config, "no-such-preset")
+        config["libraries"] = [{"name": "Family", "path": "C:\\Photos\\Family",
+                                "endpoint": "OpenAI"}]
+        settings.rename_endpoint(config, "openai", "cloud")
+        self.assertEqual(config["libraries"][0]["endpoint"], "cloud")
+        settings.set_default_endpoint(config, "CLOUD")
+        self.assertEqual(config["default_endpoint"], "cloud")
+        with self.assertRaises(ValueError):
+            settings.set_default_endpoint(config, "nothing")
+        self.assertEqual([library["name"] for library in
+                          settings.libraries_using(config, "cloud")], ["Family"])
+        settings.remove_endpoint(config, "cloud")
+        self.assertEqual(config["default_endpoint"], "llamacpp")
+        # The library keeps naming it: its images are never sent elsewhere.
+        self.assertEqual(config["libraries"][0]["endpoint"], "cloud")
+        self.assertEqual(common.endpoints_for_library(config, config["libraries"][0]), [])
+        with self.assertRaises(ValueError):
+            settings.remove_endpoint(config, "cloud")
 
-    def test_edit_endpoint_by_index(self):
+    def test_older_forms_are_converted_when_endpoints_are_edited(self):
         config = self.config_with_two_endpoints()
-        answers = iter(["2", "2", "new-model", "0", "0"])
+        entries = settings.endpoint_entries(config)
+        self.assertNotIn("endpoint", config)
+        self.assertEqual([entry["name"] for entry in entries], ["default", "default-2"])
+        self.assertEqual({entry["group"] for entry in entries}, {"default"})
+        self.assertEqual(config["default_endpoint"], "default")
+        self.assertEqual(len(common.endpoints_for_library(config, None)), 2)
+        self.base.write_config([])
+        settings.save(config)
+        saved = common.load_config()
+        self.assertNotIn("endpoint", saved)
+        self.assertEqual([entry["model"] for entry in saved["endpoints"]], ["first", "second"])
+        # A single older endpoint keeps working the same way.
+        single = common.default_config()
+        single["endpoint"] = {"kind": "openai", "base_url": "http://127.0.0.1:8080/",
+                              "model": "only"}
+        self.assertEqual([entry["name"] for entry in settings.endpoint_entries(single)],
+                         ["default"])
+        self.assertEqual(common.endpoints_for_library(single, None)[0]["model"], "only")
+
+    def test_base_url_change_removes_a_typed_key(self):
+        endpoint = {"name": "x", "preset": "openai", "model": "m", "api_key": SECRET}
+        self.assertFalse(settings.set_base_url(endpoint, "https://api.openai.com/v1/"))
+        self.assertEqual(endpoint["api_key"], SECRET)
+        self.assertTrue(settings.set_base_url(endpoint, "https://elsewhere.example/v1"))
+        self.assertNotIn("api_key", endpoint)
+        endpoint.update(api_key_env="TEST_SETTINGS_KEY")
+        self.assertFalse(settings.set_base_url(endpoint, ""))
+        self.assertNotIn("base_url", endpoint)
+        self.assertEqual(endpoint["api_key_env"], "TEST_SETTINGS_KEY")
+
+    def test_preset_change_removes_a_typed_key(self):
+        # A key typed for one service is never sent to another one.
+        config = {"endpoints": [{"name": "cloud", "preset": "openai", "model": "m",
+                                 "api_key": SECRET}]}
+        endpoint = config["endpoints"][0]
+        gemini = str(list(common.ENDPOINT_PRESETS).index("gemini") + 1)
+        answers = iter(["2", gemini, "0"])
         with mock.patch("builtins.input", lambda _prompt="": next(answers)):
+            output = output_of(settings.edit_endpoint, config, endpoint)
+        self.assertEqual(endpoint["preset"], "gemini")
+        self.assertNotIn("api_key", endpoint)
+        self.assertIn("stored API key was removed", output)
+        self.assertNotIn(SECRET, output)
+        # The same address keeps it (a base URL of its own stays put).
+        endpoint.update(api_key=SECRET, base_url="https://llm.example.com/v1")
+        self.assertFalse(settings.set_preset(endpoint, "custom"))
+        self.assertEqual(endpoint["api_key"], SECRET)
+        with self.assertRaises(ValueError):
+            settings.set_preset(endpoint, "no-such-preset")
+
+    def test_removing_the_default_never_moves_libraries_to_the_cloud(self):
+        config = {"endpoints": [{"name": "local", "preset": "llamacpp", "model": "m"},
+                                {"name": "cloud", "preset": "anthropic", "model": "m"}],
+                  "default_endpoint": "local",
+                  "libraries": [{"name": "Family", "path": "C:\\Photos\\Family"}]}
+        family = config["libraries"][0]
+        self.assertEqual([e["name"] for e in common.endpoints_for_library(config, family)],
+                         ["local"])
+        # Endpoints menu: Remove, the first one, yes, Back.
+        answers = iter(["4", "1", "y", "0"])
+        prompts = []
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            return next(answers)
+
+        with mock.patch("builtins.input", fake_input):
             output_of(settings.configure_endpoints, config)
-        self.assertEqual(config["endpoint"][1]["model"], "new-model")
-        self.assertEqual(config["endpoint"][0]["model"], "first")
+        question = [prompt for prompt in prompts if "Remove endpoint local?" in prompt][0]
+        self.assertIn("It is the default endpoint (used by Family); no endpoint will be the "
+                      "default", question)
+        self.assertEqual(config["default_endpoint"], "")
+        self.assertEqual(common.endpoints_for_library(config, family), [])
+        # A cloud endpoint added now does not become the default by itself...
+        settings.add_endpoint(config, "openai", name="cloud-2")
+        self.assertEqual(config["default_endpoint"], "")
+        # ...a local one does, and a local one takes over from a removed default.
+        settings.add_endpoint(config, "llamacpp", name="gpu-a")
+        settings.add_endpoint(config, "vllm", name="gpu-b")
+        self.assertEqual(config["default_endpoint"], "gpu-a")
+        settings.remove_endpoint(config, "gpu-a")
+        self.assertEqual(config["default_endpoint"], "gpu-b")
+
+    def test_a_key_typed_as_a_variable_name_is_not_saved(self):
+        pasted = "AIzaSyFAKE-pasted-key-0123456789abcdefg"
+        config = {"endpoints": [{"name": "g", "preset": "gemini", "model": "m"}]}
+        endpoint = config["endpoints"][0]
+        answers = iter(["5", "1", pasted, "0"])
+        with mock.patch("builtins.input", lambda _prompt="": next(answers)):
+            output = output_of(settings.edit_endpoint, config, endpoint)
+        self.assertIn("looks like a key", output)
+        self.assertNotIn("api_key_env", endpoint)
+        # One saved by an older version is never shown.
+        endpoint["api_key_env"] = pasted
+        prompts = []
+        answers = iter(["5", "1", "", "0"])
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            return next(answers)
+
+        with mock.patch("builtins.input", fake_input):
+            output = output_of(settings.edit_endpoint, config, endpoint)
+        self.assertNotIn(pasted, output + "".join(prompts))
+        self.assertIn("(not a valid name)", "".join(prompts))
+
+    def test_key_file_in_the_program_folder_and_plain_http_are_warned_about(self):
+        config = {"endpoints": [{"name": "c", "preset": "custom", "model": "m"}]}
+        endpoint = config["endpoints"][0]
+        inside = os.path.join(common.BASE_DIR, "my-test-key.txt")
+        self.assertFalse(os.path.exists(inside))
+        answers = iter(["5", "2", inside, "4", "http://llm.example.com/v1", "0"])
+        with mock.patch("builtins.input", lambda _prompt="": next(answers)):
+            output = output_of(settings.edit_endpoint, config, endpoint)
+        self.assertIn("inside the program folder", output)
+        self.assertIn("is not encrypted", output)
+        self.assertFalse(os.path.exists(inside))
+
+    def test_key_options_never_echo_the_key(self):
+        config = {"endpoints": [{"name": "cloud", "preset": "openai", "model": "m"}]}
+        endpoint = config["endpoints"][0]
+        printed = []
+        getpass_prompts = []
+
+        def run(answers, secret=None):
+            answers = iter(answers)
+
+            def fake_getpass(prompt=""):
+                getpass_prompts.append(prompt)
+                return secret
+
+            with mock.patch("builtins.input", lambda _prompt="": next(answers)), \
+                    mock.patch("getpass.getpass", fake_getpass):
+                printed.append(output_of(settings.edit_endpoint, config, endpoint))
+
+        # API key, type it in, back.
+        run(["5", "3", "0"], secret=SECRET)
+        self.assertEqual(endpoint["api_key"], SECRET)
+        self.assertEqual(settings.key_status(endpoint), "config")
+        # API key, environment variable (the preset's is suggested), back.
+        run(["5", "1", "", "0"])
+        self.assertEqual(endpoint["api_key_env"], "OPENAI_API_KEY")
+        self.assertNotIn("api_key", endpoint)
+        self.assertEqual(settings.key_status(endpoint), "env OPENAI_API_KEY not set")
+        os.environ["OPENAI_API_KEY"] = SECRET
+        self.assertEqual(settings.key_status(endpoint), "env OPENAI_API_KEY")
+        # API key, key file, back.
+        key_file = self.base.write_file("cloud.key", SECRET)
+        run(["5", "2", key_file, "0"])
+        self.assertEqual((endpoint["api_key_file"], settings.key_status(endpoint)),
+                         (key_file, "file"))
+        self.assertNotIn("api_key_env", endpoint)
+        run(["5", "4", "0"])
+        self.assertEqual(settings.key_status(endpoint), "env OPENAI_API_KEY")
+        for text in printed + getpass_prompts:
+            self.assertNotIn(SECRET, text)
+
+    def test_edit_endpoint_settings(self):
+        config = {"endpoints": [{"name": "local", "preset": "llamacpp", "model": "m"}]}
+        endpoint = config["endpoints"][0]
+        # Concurrency 3, image edge 1024, timeout 60, tokens 1500, prices,
+        # group, disable, then clear the concurrency again.
+        answers = iter(["6", "3", "7", "1024", "8", "60", "9", "1500", "10", "0.1", "0.5",
+                        "11", "pool", "12", "6", "-", "0"])
+        with mock.patch("builtins.input", lambda _prompt="": next(answers)):
+            output_of(settings.edit_endpoint, config, endpoint)
+        self.assertEqual(endpoint, {"name": "local", "preset": "llamacpp", "model": "m",
+                                    "max_image_edge": 1024, "timeout": 60.0,
+                                    "max_output_tokens": 1500, "price_in": 0.1,
+                                    "price_out": 0.5, "group": "pool", "enabled": False})
+        self.assertEqual(settings.parse_number(" 7 "), 7)
+        self.assertIsNone(settings.parse_number(""))
+        with self.assertRaises(ValueError):
+            settings.parse_number("x")
+        with self.assertRaises(ValueError):
+            settings.parse_number("0", minimum=1)
+
+    def test_edit_endpoint_from_the_main_menu(self):
+        self.base.write_config([], endpoint=self.config_with_two_endpoints()["endpoint"])
+        # Endpoints, edit the second, Model, new name, Back, Back, Save.
+        answers = iter(["1", "2", "3", "new-model", "0", "0", "5"])
+        with mock.patch("builtins.input", lambda _prompt="": next(answers)):
+            output_of(settings.main)
+        with open(common.config_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertNotIn("endpoint", saved)
+        self.assertEqual([entry["model"] for entry in saved["endpoints"]],
+                         ["first", "new-model"])
+        self.assertEqual(saved["default_endpoint"], "default")
+        # Endpoints, Add, preset 1 (llama.cpp), Model, name, Back, Back, Save.
+        answers = iter(["1", "3", "1", "3", "added-model", "0", "0", "5"])
+        with mock.patch("builtins.input", lambda _prompt="": next(answers)):
+            output_of(settings.main)
+        added = common.get_endpoint(common.load_config(), "llamacpp")
+        self.assertEqual((added["preset"], added["model"]), ("llamacpp", "added-model"))
+
+    def test_library_endpoint_metadata_and_notes(self):
+        config = common.default_config()
+        settings.add_endpoint(config, "llamacpp", name="local")
+        settings.add_library(config, "C:\\Photos\\Family")
+        settings.set_library_endpoint(config, 0, "LOCAL")
+        self.assertEqual(config["libraries"][0]["endpoint"], "local")
+        with self.assertRaises(ValueError):
+            settings.set_library_endpoint(config, 0, "elsewhere")
+        settings.set_library_endpoint(config, 0, "")
+        self.assertEqual(config["libraries"][0]["endpoint"], "")
+        # Metadata: extended; notes; back.
+        answers = iter(["5", "2", "6", "Photos from a sailing club.", "0"])
+        with mock.patch("builtins.input", lambda _prompt="": next(answers)):
+            output = output_of(settings.edit_library, config, 0)
+        self.assertEqual(config["libraries"][0]["metadata"], "extended")
+        self.assertEqual(config["libraries"][0]["context_notes"], "Photos from a sailing club.")
+        self.assertIn("sent to the LLM service", output)
 
     def test_answers_keep_or_clear(self):
         self.assertEqual(settings.apply_answer("", "old"), "old")

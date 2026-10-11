@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import sys
 import unittest
 from unittest import mock
@@ -21,6 +22,7 @@ IMAGE_COLUMNS = [
     "content_hash", "dhash", "taken_at", "taken_source", "tz_offset", "camera", "lat",
     "lon", "exif", "info", "described", "prompt_ver", "provenance", "describe_attempts",
     "describe_error", "hidden", "has_preview", "missing_since", "added", "updated",
+    "projection",
 ]
 
 
@@ -187,6 +189,7 @@ class SchemaTest(support.TempBaseMixin, unittest.TestCase):
             ("a", 1, 4, 0, 0, None),
             ("b", 1, 3, 0, 0, None),
             ("c", 0, 0, 2, 0, None),
+            ("c3", 0, 0, 3, 0, None),
             ("d", 0, 0, 0, 1, None),
             ("e", 1, 4, 0, 0, 12345.0),
         ]
@@ -200,10 +203,11 @@ class SchemaTest(support.TempBaseMixin, unittest.TestCase):
                      "VALUES ('lib_gone0003', 'x', 'x', 1, 1)")
         conn.commit()
         counts = db.library_counts(conn, 4)
-        self.assertEqual(counts["lib_aaaa0001"], {"total": 4, "described": 2, "stale": 1,
-                                                  "failed": 1, "missing": 1, "hidden": 1})
+        self.assertEqual(counts["lib_aaaa0001"], {"total": 5, "described": 2, "stale": 1,
+                                                  "failed": 2, "gave_up": 1, "missing": 1,
+                                                  "hidden": 1})
         self.assertEqual(counts["lib_bbbb0002"], dict.fromkeys(
-            ("total", "described", "stale", "failed", "missing", "hidden"), 0))
+            ("total", "described", "stale", "failed", "gave_up", "missing", "hidden"), 0))
         self.assertEqual(counts["lib_gone0003"]["total"], 1)
         self.assertEqual(db.orphan_library_ids(conn, common.load_config()), ["lib_gone0003"])
 
@@ -506,6 +510,92 @@ class LegacyHelpersTest(unittest.TestCase):
         self.assertEqual(db.orphan_library_id("Old Stuff"), db.orphan_library_id("Old Stuff"))
         self.assertRegex(db.orphan_library_id("Old Stuff"), r"^lib_[0-9a-f]{8}$")
         self.assertNotEqual(db.orphan_library_id("A"), db.orphan_library_id("B"))
+
+
+class MigrationToV2Test(support.TempBaseMixin, unittest.TestCase):
+    """Schema 2 adds images.projection; rows that may be 360 photos get '?'."""
+
+    FAMILY = "lib_aaaa0001"
+
+    def setUp(self):
+        super().setUp()
+        self.base.write_config([support.library("Family", "C:\\Photos\\Family",
+                                                id=self.FAMILY)])
+        self.log = []
+
+    def build_v1(self, rows):
+        """index.db as version 1 of the schema wrote it, with the given rows."""
+        common.ensure_dir(common.data_dir())
+        conn = sqlite3.connect(common.db_path())
+        for statement in db.SCHEMA_V1:
+            conn.execute(statement)
+        conn.execute("PRAGMA user_version=1")
+        conn.execute("INSERT INTO libraries (id, name, created) VALUES (?, 'Family', 1)",
+                     (self.FAMILY,))
+        for image_id, name, width, height, described in rows:
+            conn.execute(
+                "INSERT INTO images (id, library_id, path, name, size, mtime, width, height, "
+                "content_hash, dhash, info, described) VALUES (?, ?, ?, ?, 10, 1, ?, ?, "
+                "'abc', '0123456789abcdef', ?, ?)",
+                (image_id, self.FAMILY, "a/" + name, name, width, height,
+                 '{"description": "x"}' if described else "", described))
+        conn.commit()
+        conn.close()
+
+    def test_version_1_database_is_migrated(self):
+        self.build_v1([
+            (3, "pano.jpg", 2000, 1000, 1), (4, "near.jpg", 1970, 1000, 0),
+            (5, "photo.jpg", 4000, 3000, 1), (6, "tall.jpg", 1000, 2000, 0),
+            (7, "IMG_1.INSP", 300, 300, 0), (8, "unknown.jpg", 0, 0, 0),
+            (9, "wide.jpg", 2100, 1000, 0)])
+        report = db.init(common.load_config(), log=self.log.append)
+        self.assertEqual((report["from_version"], report["version"]), (1, 2))
+        self.assertFalse(report["created"])
+        self.assertTrue(any("from version 1 to 2" in line for line in self.log))
+        conn = db.connect()
+        self.addCleanup(conn.close)
+        self.assertEqual(db.user_version(conn), 2)
+        rows = {row["name"]: row for row in conn.execute("SELECT * FROM images")}
+        self.assertEqual({name: row["projection"] for name, row in rows.items()}, {
+            "pano.jpg": "?", "near.jpg": "?", "photo.jpg": "", "tall.jpg": "",
+            "IMG_1.INSP": "?", "unknown.jpg": "", "wide.jpg": ""})
+        # Everything else is kept as it was.
+        self.assertEqual(rows["pano.jpg"]["id"], 3)
+        self.assertEqual(rows["pano.jpg"]["info"], '{"description": "x"}')
+        self.assertEqual(rows["pano.jpg"]["described"], 1)
+        self.assertEqual(rows["photo.jpg"]["dhash"], "0123456789abcdef")
+        # The old version is backed up first.
+        backup = common.db_path() + ".bak-v1"
+        self.assertTrue(os.path.isfile(backup))
+        old = sqlite3.connect(backup)
+        try:
+            self.assertEqual(old.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertNotIn("projection", columns(old, "images"))
+            self.assertEqual(old.execute("SELECT COUNT(*) FROM images").fetchone()[0], 7)
+        finally:
+            old.close()
+        # Running again changes nothing.
+        report = db.init(common.load_config(), log=self.log.append)
+        self.assertEqual(report["from_version"], 2)
+
+    def test_new_database_needs_no_backup(self):
+        db.init(common.load_config(), log=self.log.append)
+        self.assertFalse([name for name in os.listdir(common.data_dir()) if ".bak-" in name])
+
+    @unittest.skipUnless(support.pillow_available(), "needs Pillow to build JPEG fixtures")
+    def test_imported_rows_are_marked_too(self):
+        builder = support.LegacyBuilder(common.data_dir())
+        builder.add(1, "Family", "trip/pano.jpg", width=4000, height=2000)
+        builder.add(2, "Family", "trip/photo.jpg", width=4000, height=3000)
+        builder.add(3, "Family", "trip/IMG_2.insp", width=10, height=10)
+        builder.close()
+        report = db.init(common.load_config(), log=self.log.append)
+        self.assertEqual(report["legacy"]["rows"], 3)
+        conn = db.connect()
+        self.addCleanup(conn.close)
+        self.assertEqual(db.user_version(conn), db.SCHEMA_VERSION)
+        self.assertEqual(dict(conn.execute("SELECT id, projection FROM images")),
+                         {1: "?", 2: "", 3: "?"})
 
 
 if __name__ == "__main__":

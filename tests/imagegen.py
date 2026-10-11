@@ -286,3 +286,130 @@ def truncated_jpeg(directory, name="truncated.jpg"):
 
 def empty_file(directory, name="empty.jpg"):
     return _write(directory, name, b"")
+
+
+# ---------------------------------------------------------------------------
+# 360-degree photos
+
+XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+
+
+def dual_fisheye_image(size=(1024, 512), radius=None, offsets=((0.0, 0.0), (0.0, 0.0)),
+                       markers=(), background=(0, 0, 0)):
+    """An unstitched dual-fisheye frame: two bright, differently striped
+    circles on black, one per half.
+
+    radius defaults to half the height (circles as tall as the frame);
+    offsets move the centres from the quarter points, in units of radius.
+    markers are (x, y, r) red discs drawn on top.
+    """
+    width, height = size
+    radius = float(radius or height / 2.0)
+    frame = Image.new("RGB", size, background)
+    for half, (dx, dy) in enumerate(offsets):
+        cx = (2 * half + 1) * width / 4.0 + dx * radius
+        cy = height / 2.0 + dy * radius
+        pattern = Image.new("RGB", size, (90, 160, 90) if half == 0 else (90, 120, 200))
+        draw = ImageDraw.Draw(pattern)
+        step = max(4, height // 16)
+        for start in range(-height, width + height, step * 2):
+            if half == 0:
+                draw.line([(start, 0), (start + height, height)], fill=(200, 220, 120),
+                          width=max(1, step // 2))
+            else:
+                draw.line([(start, height), (start + height // 2, 0)], fill=(230, 230, 250),
+                          width=max(1, step // 3))
+        mask = Image.new("L", size, 0)
+        ImageDraw.Draw(mask).ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
+                                     fill=255)
+        frame.paste(pattern, (0, 0), mask)
+    draw = ImageDraw.Draw(frame)
+    for x, y, r in markers:
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=RED)
+    return frame
+
+
+def equirect_image(size=(512, 256), marker=False):
+    """A stitched-panorama-like 2:1 picture: sky above, ground below, posts.
+
+    With marker=True a red disc sits in the middle (the forward direction).
+    """
+    width, height = size
+    image = Image.new("RGB", size)
+    draw = ImageDraw.Draw(image)
+    for y in range(height):
+        if y < height // 2:
+            shade = 150 + 90 * y // max(1, height // 2)
+            draw.line([(0, y), (width, y)], fill=(shade - 40, shade - 10, 255))
+        else:
+            shade = 120 - 60 * (y - height // 2) // max(1, height // 2)
+            draw.line([(0, y), (width, y)], fill=(shade, shade + 30, 40))
+    for index in range(12):
+        left = (index * 37 * width) // 400 % width
+        draw.rectangle([left, height * 3 // 8 - (index % 3) * height // 16,
+                        left + max(2, width // 60), height * 5 // 8], fill=(70, 50, 30))
+    if marker:
+        r = max(3, width // 64)
+        draw.ellipse([width / 2.0 - r, height / 2.0 - r, width / 2.0 + r, height / 2.0 + r],
+                     fill=RED)
+    return image
+
+
+def night_panorama(size=(1024, 512), marker=False):
+    """A stitched 2:1 night panorama: near-black sky and ground, a lit band
+    of buildings along the horizon. Its corners are as dark as a
+    dual-fisheye frame's. With marker=True a red disc sits in the middle.
+    """
+    width, height = size
+    image = Image.new("RGB", size, (12, 12, 18))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([0, height * 5 // 16, width, height * 11 // 16], fill=(150, 130, 90))
+    for index in range(24):
+        left = index * width // 24
+        draw.rectangle([left, height * 6 // 16, left + width // 60, height * 10 // 16],
+                       fill=(230, 210, 120) if index % 2 else (60, 50, 40))
+    if marker:
+        r = max(3, width // 64)
+        draw.ellipse([width / 2.0 - r, height / 2.0 - r, width / 2.0 + r, height / 2.0 + r],
+                     fill=RED)
+    return image
+
+
+def gpano_xmp(projection="equirectangular", form="element", cropped=None, full=None):
+    """An XMP packet with GPano tags, in element or attribute form.
+
+    cropped and full are (width, height) for the CroppedAreaImage*/FullPano*
+    pixel counts (left out when None).
+    """
+    values = [("ProjectionType", projection), ("UsePanoramaViewer", "True")]
+    if cropped:
+        values += [("CroppedAreaImageWidthPixels", cropped[0]),
+                   ("CroppedAreaImageHeightPixels", cropped[1])]
+    if full:
+        values += [("FullPanoWidthPixels", full[0]), ("FullPanoHeightPixels", full[1])]
+    if form == "attribute":
+        body = ("<rdf:Description rdf:about='' "
+                "xmlns:GPano='http://ns.google.com/photos/1.0/panorama/' %s/>"
+                % " ".join("GPano:%s=\"%s\"" % pair for pair in values))
+    else:
+        body = ("<rdf:Description rdf:about='' "
+                "xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'>%s</rdf:Description>"
+                % "".join("<GPano:%s>%s</GPano:%s>" % (name, value, name)
+                          for name, value in values))
+    return ("<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>"
+            "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF "
+            "xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>%s</rdf:RDF>"
+            "</x:xmpmeta><?xpacket end='w'?>" % body).encode("utf-8")
+
+
+def jpeg_with_xmp(image, xmp, exif=None, quality=90):
+    """JPEG bytes with an XMP packet in its own APP1 segment (and optional EXIF)."""
+    data = jpeg_bytes(image, exif, quality)
+    payload = XMP_HEADER + xmp
+    segment = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+    return data[:2] + segment + data[2:]
+
+
+def write_bytes(directory, name, data):
+    """Write bytes to directory/name; returns the path."""
+    return _write(directory, name, data)
