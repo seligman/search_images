@@ -7,45 +7,68 @@ with its base URL for llama.cpp.
 """
 
 import base64
+import itertools
 import json
+import mimetypes
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 import common
+import imageinfo
 
 MAX_TOKENS = 5000 # Max size to allow the response
 PROPS_MAX_ATTEMPTS = 3
 PROPS_RETRY_DELAY = 1.0
 
-def _mime_for(path):
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".png":
-        return "image/png"
-    if ext == ".gif":
-        return "image/gif"
+def image_mime(data, path=""):
+    """The MIME type to send for image bytes, judged from their content.
+
+    The file extension (and then JPEG) is only a fallback for bytes that
+    imageinfo.sniff_mime() does not recognize, so a ".png" file holding
+    JPEG data is sent as image/jpeg.
+    """
+    mime = imageinfo.sniff_mime(data)
+    if mime:
+        return mime
+    guessed = mimetypes.guess_type(path or "")[0]
+    if guessed and guessed.startswith("image/"):
+        return guessed
     return "image/jpeg"
 
 
-def log_error(partial_response, error):
-    """Write a numbered _error_NNNN.txt snapshot if LOG_ERRORS is set.
+_log_counter = itertools.count(1)
+_log_lock = threading.Lock()
 
-    Always records the error message; the partial response section is included
-    even when empty so the file format stays predictable.
+
+def log_error(partial_response, error):
+    """Write an error snapshot to data/logs if LOG_ERRORS is set.
+
+    Each snapshot gets its own file, llm-error-<time>-<pid>-<n>.txt, holding
+    the error message, a separator line and whatever part of the response
+    arrived (the section is there even when empty, so the format stays
+    predictable). Credentials are masked. Nothing is written to the current
+    directory: replies can contain text read from private photos.
     """
     if "LOG_ERRORS" not in os.environ:
         return
-    error_num = 0
-    while True:
-        fn = "_error_%04d.txt" % (error_num,)
-        if not os.path.isfile(fn):
-            break
-        error_num += 1
-    with open(fn, "wt", encoding="utf-8", newline="") as handle:
-        handle.write(str(error) + "\n")
-        handle.write("-" * 100 + "\n")
-        handle.write(str(partial_response))
+    try:
+        folder = common.ensure_dir(common.logs_dir())
+        with _log_lock:
+            number = next(_log_counter)
+        name = "llm-error-%s-%d-%04d.txt" % (
+            datetime.now().strftime("%Y%m%d-%H%M%S"), os.getpid(), number)
+        with open(os.path.join(folder, name), "x", encoding="utf-8",
+                  newline="") as handle:
+            handle.write(common.redact(error) + "\n")
+            handle.write("-" * 100 + "\n")
+            handle.write(common.redact(partial_response))
+    except OSError:
+        # Debug logging must never break a describe run.
+        pass
 
 
 def _post(url, headers, payload):
@@ -69,19 +92,28 @@ def _post(url, headers, payload):
         raise
 
 
-def describe_image(endpoint, prompt, image_path, schema=None, helper=None):
+def describe_image(endpoint, prompt, image, schema=None, helper=None, mime=None):
     """Send one image to the configured endpoint and return the text reply.
+
+    image is the image bytes to send (normally a JPEG made by
+    images.prepare_for_llm), or a file path, which is read through the
+    helper's load_image when it has one. mime defaults to the type sniffed
+    from the bytes.
 
     When schema (a JSON Schema dict) is given it is used to constrain the
     reply where the endpoint supports it. Only the openai-kind path honors
     this today; claude and ollama rely on the prompt instead.
     """
-    encoded = base64.b64encode(common.load_image_bytes(helper, image_path)).decode("ascii")
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        data, path = bytes(image), ""
+    else:
+        data, path = common.load_image_bytes(helper, image), image
+    encoded = base64.b64encode(data).decode("ascii")
     kind = endpoint.get("kind", "openai")
     model = endpoint.get("model", "")
     base_url = endpoint.get("base_url", "").rstrip("/")
     api_key = endpoint.get("api_key", "")
-    mime = _mime_for(image_path)
+    mime = mime or image_mime(data, path)
     if kind == "claude":
         return _call_claude(base_url, api_key, model, prompt, encoded, mime)
     if kind == "ollama":

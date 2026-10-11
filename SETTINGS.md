@@ -26,13 +26,21 @@ The same variable is honored by every script.
 {
     "endpoint": { ... },
     "helper":   "path/to/helper.py",
+    "reader_threads": 6,
+    "purge_after_days": 30,
     "libraries": [ { ... }, { ... } ]
 }
 ```
 
-The three top-level keys are described below. Anything else in the file is
-ignored, so it is safe to keep your own notes or extra fields alongside the
-real settings.
+The keys are described below. Anything else in the file is ignored, so it is
+safe to keep your own notes or extra fields alongside the real settings. The
+tools fill in defaults for keys that are missing and may write them into the
+file (for example when a new library gets its `id`).
+
+The file is read as UTF-8 (a file saved in the system's encoding by an older
+editor still loads, with a warning). The tools write it with non-ASCII
+characters escaped, such as `"Z\u00fcrich"`, which every version reads
+correctly; you can type such names directly when editing by hand.
 
 ## endpoint
 
@@ -86,17 +94,59 @@ one.  Can be useful, for instance, to start and stop the endpoint automatically.
 "helper": "my_helper.py"
 ```
 
+A relative path is relative to the folder holding `config.json`. (Older
+versions used the current directory; a helper found only there, or next to
+the scripts, is still loaded, with a warning.)
+
+The `call_api(prompt, image_path)` hook gets a temporary JPEG holding the
+image as it will be sent. Declare a third parameter,
+`call_api(prompt, image_path, source_path=None)`, to also get the path of the
+original file. The `stat(path)` hook, when present, supplies the size and
+time of every image the scanner lists.
+
+## reader_threads
+
+How many images the scanner reads and decodes at the same time (1 to 32,
+default 6). More threads help with slow network shares; fewer use less
+memory.
+
+## purge_after_days
+
+A file that disappears from a library is marked missing rather than removed,
+so its description comes back if the file returns. After this many days
+(default 30) missing files are removed from the database. Use a negative
+number to never remove them.
+
 ## libraries
 
 A list of folders to scan. Each library is one object:
 
-- `name` - a short label shown in the search UI. Must be unique.
-- `path` - the absolute folder to scan. All image files found anywhere under
-  this folder are added to the library, with the folder structure preserved
-  as part of the search text.
+- `id` - assigned automatically the first time the tools see the library
+  (for example `lib_1a2b3c4d`) and never changed afterwards. The indexed
+  images belong to the id, so a library can be renamed freely. Do not edit
+  or copy it.
+- `name` - a short label shown in the search UI. Must be unique (ignoring
+  case).
+- `path` - the absolute folder to scan (`~` is expanded). All image files
+  found anywhere under this folder are added to the library, with the folder
+  structure preserved as part of the search text. Symbolic links and
+  directory junctions inside it are not followed.
 - `ignore` - optional list of wildcard patterns. Any file whose path,
   relative to the library root, matches one of these patterns is skipped.
   See "Ignore patterns" below.
+- `default_ignores` - `true` (the default) also skips the junk that NAS boxes
+  and operating systems leave in photo folders: `@eaDir`, `.@__thumb`,
+  `#recycle`, `$RECYCLE.BIN`, `.Trashes`, `.thumbnails`, `._*` files and
+  `Thumbs.db`, at any depth.
+- `enabled` - `false` stops scanning the library and hides it from search;
+  its indexed images are kept.
+- `previews` - `true` (the default) keeps a 2048 px preview of every image
+  in the data folder, used by the detail page and for describing.
+- `newest_first` - describe the most recently taken images first (default
+  `true`).
+
+A library removed from the file is not deleted from the database: its images
+stay there, unused, until you delete them or attach them to a library again.
 
 Minimal example:
 
@@ -149,8 +199,9 @@ A few more examples:
   the root. Use `Originals/*` if you want to skip its contents.
 
 A file that was scanned previously and is now covered by an `ignore` pattern
-is removed from the database on the next full scan, the same as if it had
-been deleted from disk.
+is marked missing on the next full scan (and removed after
+`purge_after_days`), the same as a file deleted from disk. Such files do not
+count towards the "most of the library vanished" safety check.
 
 ## Full example
 

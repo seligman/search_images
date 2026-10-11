@@ -58,6 +58,12 @@ var SITE = (function () {
             return cfg.mode === "static" ? rec.image : "/image/" + rec.id;
         },
 
+        // A screen-sized (2048 px) version of the image, or null when there
+        // is none (the static site), in which case the thumbnail is used.
+        previewUrl: function (rec) {
+            return cfg.mode === "static" ? null : "/preview/" + rec.id;
+        },
+
         tileUrl: function (zoom, x, y) {
             var prefix = cfg.tiles;
             if (!prefix) {

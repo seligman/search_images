@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Show current progress of described images in local database."""
-import common
-from scan import PROMPT_VER
-from collections import defaultdict
+"""Show how far describing has got in the local database, per library."""
 import argparse
+import sys
+
+import common
+import db
+from prompts import PROMPT_VER
+
 
 class Grid:
     def __init__(self, headers):
@@ -20,7 +23,7 @@ class Grid:
 
     def render(self):
         # chars = "-|+"
-        chars = "\u2500\u2502\u253C"
+        chars = "─│┼"
         widths = [len(h) for h in self.headers]
         for row in self.rows:
             for i, val in enumerate(row):
@@ -47,53 +50,126 @@ class Grid:
         print(self.render())
 
 
-def show_counts():
-    conn = common.open_db()
-    totals = defaultdict(int)
+COUNT_KEYS = ("total", "described", "stale", "failed", "missing", "hidden")
 
-    sql = ("SELECT library, COUNT(*) AS count, "
-           "SUM(described) AS described, "
-           "SUM(CASE WHEN described = 1 AND prompt_ver = ? THEN 1 ELSE 0 END) AS current "
-           "FROM images GROUP BY library;")
 
-    grid = Grid(["library", "done", f"at v={PROMPT_VER}", "left", "total", "done"])
+def percent(part, whole):
+    """part/whole as "12.34%", or "-" when whole is 0."""
+    if not whole:
+        return "-"
+    return f"{part / whole * 100:.2f}%"
 
-    for row in conn.execute(sql, (PROMPT_VER,)).fetchall():
+
+def library_rows(conn, config):
+    """[(label, counts)] for each configured library, then each orphan.
+
+    counts is a db.library_counts() entry. Orphans (libraries in the database
+    that are no longer in config.json) are listed only if they hold images.
+    """
+    counts = db.library_counts(conn, PROMPT_VER)
+    names = db.library_names(conn)
+    empty = dict.fromkeys(COUNT_KEYS, 0)
+    rows = []
+    configured = set()
+    for library in config.get("libraries", []):
+        library_id = library.get("id")
+        configured.add(library_id)
+        label = common.library_label(library)
+        if not library.get("enabled", True):
+            label += " (disabled)"
+        rows.append((label, counts.get(library_id, empty)))
+    for library_id in sorted(set(counts) - configured):
+        entry = counts[library_id]
+        if entry["total"] or entry["missing"]:
+            rows.append(("%s (orphan)" % names.get(library_id, library_id), entry))
+    return rows
+
+
+def show_counts(conn=None, config=None):
+    """Print a table of described / pending images per library."""
+    if config is None:
+        config = common.load_config()
+    close_after = conn is None
+    if close_after:
+        conn = db.connect()
+    try:
+        rows = library_rows(conn, config)
+    finally:
+        if close_after:
+            conn.close()
+
+    grid = Grid(["library", "described", f"at v={PROMPT_VER}", "left", "failed",
+                 "missing", "total", "done"])
+    totals = dict.fromkeys(("described", "current", "failed", "missing", "total"), 0)
+    for label, counts in rows:
+        current = counts["described"] - counts["stale"]
         grid.add_row(
-            row['library'],
-            row['described'],
-            row['current'],
-            row['count'] - row['current'],
-            row['count'],
-            "-" if row['current'] == 0 else f"{row['current'] / row['count'] * 100:.2f}%", 
+            label,
+            counts["described"],
+            current,
+            counts["total"] - current,
+            counts["failed"],
+            counts["missing"],
+            counts["total"],
+            percent(current, counts["total"]),
         )
-        for key in ['current', 'count', 'described']:
-            totals[key] += row[key]
+        totals["described"] += counts["described"]
+        totals["current"] += current
+        for key in ("failed", "missing", "total"):
+            totals[key] += counts[key]
 
     grid.add_row("break")
     grid.add_row(
         "  (all)",
-        totals['described'],
-        totals['current'],
-        totals['count'] - totals['current'],
-        totals['count'],
-        f"{totals['current'] / totals['count'] * 100:.2f}%",
+        totals["described"],
+        totals["current"],
+        totals["total"] - totals["current"],
+        totals["failed"],
+        totals["missing"],
+        totals["total"],
+        percent(totals["current"], totals["total"]),
     )
     grid.print()
 
 
-def show_files():
-    conn = common.open_db()
-    fresh = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
-    stale = conn.execute(
-        "SELECT * FROM images WHERE described = 1 AND prompt_ver < ?",
-        (PROMPT_VER,)).fetchall()
+def pending_rows(conn, config):
+    """Present, non-hidden images of enabled libraries that still need a
+    (current) description, as (library label, row): new ones first."""
+    labels = {library["id"]: common.library_label(library)
+              for library in common.enabled_libraries(config) if library.get("id")}
+    if not labels:
+        return []
+    rows = conn.execute(
+        "SELECT library_id, path, described, describe_attempts, describe_error "
+        "FROM images WHERE missing_since IS NULL AND hidden = 0 "
+        "AND (described = 0 OR prompt_ver < ?) AND library_id IN (%s) "
+        "ORDER BY described, id" % ",".join("?" * len(labels)),
+        [PROMPT_VER] + list(labels)).fetchall()
+    return [(labels[row["library_id"]], row) for row in rows]
 
-    for i, cur in enumerate(fresh + stale, 1):
-        print(f"{i:7,}: {cur['library']}: {cur['path']}")
+
+def show_files(conn=None, config=None):
+    """Print every image that still needs describing."""
+    if config is None:
+        config = common.load_config()
+    close_after = conn is None
+    if close_after:
+        conn = db.connect()
+    try:
+        pending = pending_rows(conn, config)
+    finally:
+        if close_after:
+            conn.close()
+    for i, (label, row) in enumerate(pending, 1):
+        line = f"{i:7,}: {label}: {row['path']}"
+        if not row["described"] and row["describe_attempts"]:
+            line += f"  (failed {row['describe_attempts']}x: {row['describe_error']})"
+        print(line)
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(
         description="Show progress on the current work.",
         # epilog="Run '%(prog)s <command> --help' for options on a specific command.",
@@ -105,13 +181,19 @@ def main():
     sub.add_parser("files", help="Show a list of images that need processing.")
 
     args = parser.parse_args()
-
-    if args.command == "counts":
-        show_counts()
-    elif args.command == "files":
-        show_files()
-    else:
+    if args.command not in ("counts", "files"):
         parser.print_help()
+        return
+
+    try:
+        db.init()
+        if args.command == "counts":
+            show_counts()
+        else:
+            show_files()
+    except (db.DatabaseError, common.ConfigError) as error:
+        raise SystemExit("Error: %s" % error)
+
 
 if __name__ == "__main__":
     main()

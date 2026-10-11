@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Generate a world map PNG with one pin per area where images were taken.
 
-GPS coordinates are read from the EXIF data stored in the SQLite database.
-Images whose pins would land near each other on the output map are merged
-into a single pin labelled with the number of photos in that cluster.
+GPS positions come from the lat/lon columns of the database, which the
+scanner fills from each image's EXIF data. Images whose pins would land near
+each other on the output map are merged into a single pin labelled with the
+number of photos in that cluster.
 
-Run with no arguments to write `world_map.png` in the current directory, or
-pass a path. The `generate_map_bytes` and `render_map` functions are intended
-for the server, which can call them to build the image in memory.
+Run with no arguments to write `world_map.png` in the data folder, or pass a
+path. The `generate_map_bytes` and `render_map` functions are intended for
+the server, which can call them to build the image in memory.
 """
 
 import argparse
 import io
-import json
+import math
 import os
 
 import common
+import db
 
 
 def _pillow():
@@ -45,50 +47,14 @@ PIN_TEXT = (255, 255, 255)
 DEFAULT_BASEMAP = os.path.join(common.BASE_DIR, "static", "worldmap.jpg")
 
 
-def _to_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def gps_to_decimal(dms, ref):
-    """Convert an EXIF GPS triple to a signed decimal degree."""
-    if dms is None or not ref:
-        return None
-    if isinstance(dms, (int, float)):
-        value = float(dms)
-    else:
-        try:
-            parts = [_to_float(item) for item in dms]
-        except TypeError:
-            return None
-        if not parts or any(p is None for p in parts):
-            return None
-        # Pad with zeros so [deg], [deg, min], [deg, min, sec] all work.
-        while len(parts) < 3:
-            parts.append(0.0)
-        value = parts[0] + parts[1] / 60.0 + parts[2] / 3600.0
-    if ref in ("S", "W"):
-        value = -value
-    return value
-
-
-def extract_lat_lon(gps):
-    """Return (lat, lon) from an EXIF GPS sub-dict, or None if unusable."""
-    if not isinstance(gps, dict):
-        return None
-    lat = gps_to_decimal(gps.get("GPSLatitude"), gps.get("GPSLatitudeRef"))
-    lon = gps_to_decimal(gps.get("GPSLongitude"), gps.get("GPSLongitudeRef"))
-    if lat is None or lon is None:
-        return None
+def valid_position(lat, lon):
+    """True for a usable GPS position (finite, in range, not exactly 0,0)."""
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (lat, lon)):
+        return False
     if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
-        return None
-    # Treat the exact null island reading as missing; cameras often report it
-    # when no GPS fix is actually available.
-    if lat == 0.0 and lon == 0.0:
-        return None
-    return lat, lon
+        return False
+    # Cameras often write 0,0 when they have no GPS fix.
+    return not (lat == 0.0 and lon == 0.0)
 
 
 def latlon_to_pixel(lat, lon, width, height):
@@ -106,36 +72,40 @@ def latlon_to_pixel(lat, lon, width, height):
     return int(round(x)), int(round(y))
 
 
-def collect_locations(conn=None):
-    """Return a list of (lat, lon) for every DB image with usable GPS data."""
-    return [(lat, lon) for _id, lat, lon in collect_located_images(conn)]
+def collect_locations(conn=None, library_ids=None):
+    """Return a list of (lat, lon) for every shown image with a GPS position."""
+    return [(lat, lon) for _id, lat, lon in collect_located_images(conn, library_ids)]
 
 
-def collect_located_images(conn=None):
-    """Return a list of (id, lat, lon) for every DB image with usable GPS."""
+def collect_located_images(conn=None, library_ids=None):
+    """Return a list of (id, lat, lon) for every shown image with a GPS position.
+
+    Only present (not missing), non-hidden images count. library_ids limits
+    the result to those libraries; None means the enabled libraries in
+    config.json. conn is a db.connect() connection (one is opened if None).
+    """
+    if library_ids is None:
+        library_ids = [library["id"] for library
+                       in common.enabled_libraries(common.load_config())
+                       if library.get("id")]
+    library_ids = list(library_ids)
+    if not library_ids:
+        return []
     close_after = False
     if conn is None:
-        conn = common.open_db()
+        conn = db.connect()
         close_after = True
     try:
         rows = conn.execute(
-            "SELECT id, exif FROM images WHERE exif LIKE '%GPS%'").fetchall()
+            "SELECT id, lat, lon FROM images WHERE lat IS NOT NULL "
+            "AND lon IS NOT NULL AND missing_since IS NULL AND hidden = 0 "
+            "AND library_id IN (%s) ORDER BY id" % ",".join("?" * len(library_ids)),
+            library_ids).fetchall()
     finally:
         if close_after:
             conn.close()
-    points = []
-    for row in rows:
-        raw = row["exif"]
-        if not raw:
-            continue
-        try:
-            exif = json.loads(raw)
-        except (TypeError, ValueError):
-            continue
-        latlon = extract_lat_lon(exif.get("GPS"))
-        if latlon:
-            points.append((row["id"], latlon[0], latlon[1]))
-    return points
+    return [(row[0], float(row[1]), float(row[2])) for row in rows
+            if valid_position(row[1], row[2])]
 
 
 def cluster_points(points, width, height, radius):
@@ -246,8 +216,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate a world map PNG with one pin per area where "
                     "images were taken.")
-    parser.add_argument("output", nargs="?", default="world_map.png",
-                        help="Output PNG path (default: world_map.png).")
+    parser.add_argument("output", nargs="?", default=None,
+                        help="Output PNG path (default: world_map.png in the "
+                             "data folder).")
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH,
                         help="Output width in pixels.")
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT,
@@ -259,10 +230,16 @@ def main():
                         default=DEFAULT_CLUSTER_RADIUS,
                         help="Pixels within which pins are merged.")
     args = parser.parse_args()
-    img = render_map(args.width, args.height, args.basemap,
-                     args.cluster_radius)
-    img.save(args.output, format="PNG")
-    print("Wrote " + args.output)
+    output = args.output or os.path.join(common.ensure_dir(common.data_dir()),
+                                         "world_map.png")
+    try:
+        db.init()
+        img = render_map(args.width, args.height, args.basemap,
+                         args.cluster_radius)
+    except (db.DatabaseError, common.ConfigError) as error:
+        raise SystemExit("Error: %s" % error)
+    img.save(output, format="PNG")
+    print("Wrote " + output)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,25 @@
         return new Date(seconds * 1000).toLocaleString();
     }
 
+    // The capture time ("YYYY-MM-DDTHH:MM:SS", local to where the photo was
+    // taken). Empty when it only repeats the file's modified time.
+    function takenText(rec) {
+        var match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(rec.taken_at || "");
+        if (!match || rec.taken_source === "mtime") {
+            return "";
+        }
+        var when = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]),
+            Number(match[4]), Number(match[5]), Number(match[6]));
+        var text = when.toLocaleString();
+        if (rec.tz_offset) {
+            text += " (UTC" + rec.tz_offset + ")";
+        }
+        if (rec.taken_source === "filename") {
+            text += " (from the file name)";
+        }
+        return text;
+    }
+
     function factsTable(pairs) {
         var table = document.createElement("table");
         table.className = "facts";
@@ -79,7 +98,17 @@
         var link = document.createElement("a");
         link.href = SITE.imageUrl(rec);
         var img = document.createElement("img");
-        img.src = SITE.thumbUrl(rec);
+        var thumb = SITE.thumbUrl(rec);
+        var preview = SITE.previewUrl(rec);
+        if (preview) {
+            // No preview can be made when the original is offline or
+            // unreadable; show the thumbnail instead.
+            img.addEventListener("error", function onError() {
+                img.removeEventListener("error", onError);
+                img.src = thumb;
+            });
+        }
+        img.src = preview || thumb;
         img.alt = rec.name;
         link.appendChild(img);
         frame.appendChild(link);
@@ -184,6 +213,8 @@
             ["Path", rec.path],
             ["Dimensions", rec.width + " x " + rec.height + " pixels"],
             ["Size", humanSize(rec.size)],
+            ["Taken", takenText(rec)],
+            ["Camera", rec.camera],
             ["Modified", whenText(rec.mtime)]
         ])));
         renderDescription(body, rec.info);

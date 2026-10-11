@@ -5,11 +5,14 @@ The world-map page falls back to the small `static/worldmap.jpg` if no tiles
 are present, so this script is optional. Run it once to get high-resolution
 tiles for the live server and the static-site export.
 
-Output layout (equirectangular projection, world is 2:1 at zoom 0):
+Output layout (equirectangular projection, world is 2:1 at zoom 0), in the
+data folder (SETTINGS_BASE/data):
     data/tiles/<z>/<x>/<y>.jpg     256x256 JPEG tiles
     data/tiles/manifest.json       max zoom level
 
-Existing tiles are skipped, so reruns only fill in missing pieces.
+Existing tiles are skipped, so reruns only fill in missing pieces. Each tile
+is written under a temporary name and then renamed, so an interrupted run
+never leaves a half-written tile behind.
 """
 
 import argparse
@@ -41,10 +44,13 @@ DEFAULT_URL = (
     "https://assets.science.nasa.gov/content/dam/science/esd/eo/"
     "images/bmng/bmng-topography-bathymetry/july/"
     "world.topo.bathy.200407.3x21600x10800.jpg")
-DEFAULT_SOURCE = os.path.join(common.DATA_DIR, "blue_marble.jpg")
-TILES_DIR = os.path.join(common.DATA_DIR, "tiles")
 TILE_SIZE = 256
 DEFAULT_MAX_ZOOM = 6
+
+
+def default_source():
+    """Where the downloaded source image is kept: data/blue_marble.jpg."""
+    return os.path.join(common.data_dir(), "blue_marble.jpg")
 
 
 def download(url, dest):
@@ -64,7 +70,7 @@ def download(url, dest):
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         print("Source already present: " + dest)
         return
-    common.ensure_data_dirs()
+    common.ensure_dir(os.path.dirname(os.path.abspath(dest)))
     temp = dest + ".part"
     print("Downloading " + url)
     with urllib.request.urlopen(url, timeout=60) as response:
@@ -89,17 +95,12 @@ def download(url, dest):
                     sys.stdout.flush()
                     last_report = done
     sys.stdout.write("\n")
-    os.rename(temp, dest)
+    os.replace(temp, dest)
     print("Saved " + dest)
 
 
 def tile_path(zoom, x, y):
-    return os.path.join(TILES_DIR, str(zoom), str(x), "%d.jpg" % y)
-
-
-def ensure_dir(path):
-    if not os.path.isdir(path):
-        os.makedirs(path)
+    return os.path.join(common.tiles_dir(), str(zoom), str(x), "%d.jpg" % y)
 
 
 def slice_zoom(source, zoom, quality, force):
@@ -111,7 +112,7 @@ def slice_zoom(source, zoom, quality, force):
     written = 0
     skipped = 0
     for x in range(cols):
-        ensure_dir(os.path.join(TILES_DIR, str(zoom), str(x)))
+        common.ensure_dir(os.path.join(common.tiles_dir(), str(zoom), str(x)))
         # Map the tile's column to a source x-range. Use float math so the
         # rounding does not accumulate; the last tile in a row still reaches
         # the source's right edge.
@@ -127,28 +128,28 @@ def slice_zoom(source, zoom, quality, force):
             crop = source.crop((sx0, sy0, sx1, sy1))
             if crop.size != (TILE_SIZE, TILE_SIZE):
                 crop = crop.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
-            crop.save(out, format="JPEG", quality=quality, optimize=True)
+            temp = out + ".part"
+            crop.save(temp, format="JPEG", quality=quality, optimize=True)
+            os.replace(temp, out)
             written += 1
     print("  zoom %d: %d tiles (%d written, %d already there)"
           % (zoom, total, written, skipped))
 
 
 def write_manifest(max_zoom):
-    common.ensure_data_dirs()
-    ensure_dir(TILES_DIR)
-    path = os.path.join(TILES_DIR, "manifest.json")
-    with open(path, "w") as handle:
-        json.dump({"max_zoom": max_zoom, "tile_size": TILE_SIZE}, handle)
-        handle.write("\n")
+    path = os.path.join(common.ensure_dir(common.tiles_dir()), "manifest.json")
+    common.write_file_atomic(
+        path, json.dumps({"max_zoom": max_zoom, "tile_size": TILE_SIZE}) + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Build a world-map tile pyramid from a NASA Blue Marble "
                     "JPEG. Existing tiles are kept, so reruns only fill gaps.")
-    parser.add_argument("--source", default=DEFAULT_SOURCE,
-                        help="Path to the source equirectangular JPEG. "
-                             "Downloaded from NASA if missing.")
+    parser.add_argument("--source", default=None,
+                        help="Path to the source equirectangular JPEG "
+                             "(default: data/blue_marble.jpg). Downloaded "
+                             "from NASA if missing.")
     parser.add_argument("--url", default=DEFAULT_URL,
                         help="Where to download the source from when --source "
                              "is missing.")
@@ -161,17 +162,18 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="Rewrite tiles even if they already exist.")
     args = parser.parse_args()
+    source_path = args.source or default_source()
 
-    if not os.path.exists(args.source):
-        download(args.url, args.source)
+    if not os.path.exists(source_path):
+        download(args.url, source_path)
 
-    print("Slicing " + args.source)
-    with Image.open(args.source) as source:
+    print("Slicing " + source_path)
+    with Image.open(source_path) as source:
         source = source.convert("RGB")
         for zoom in range(args.max_zoom + 1):
             slice_zoom(source, zoom, args.quality, args.force)
     write_manifest(args.max_zoom)
-    print("Done. Wrote tiles to " + TILES_DIR)
+    print("Done. Wrote tiles to " + common.tiles_dir())
 
 
 if __name__ == "__main__":

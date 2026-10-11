@@ -1,581 +1,1328 @@
 #!/usr/bin/env python3
-"""Scan image libraries, build thumbnails, and request descriptions.
+"""Scan image libraries, then ask the LLM to describe new images.
 
-For each configured library this script finds new or changed images, stores
-their metadata and EXIF data in the SQLite database, builds a thumbnail in the
-shard files, and removes images that no longer exist on disk. It then asks the
-LLM to describe each image, expecting a JSON reply that is parsed and stored so
-the images can be searched.
+For each enabled library this lists the image files and reads every new or
+changed one exactly once. That single read gives the thumbnail (stored in
+data/thumbs.db), a 2048 px preview (data/previews/), the cleaned EXIF data,
+dHash, content hash, capture date, camera and GPS position, all stored in
+data/index.db. Unchanged files are not read again.
+
+Descriptions are never thrown away by accident:
+- a file that is touched, moved or renamed keeps its description, and an
+  exact copy of a described image gets the same description (matched by
+  content hash), also when files swap names or an edited file's original is
+  kept under another name;
+- a file that disappears is only marked missing (missing_since). It is
+  removed after purge_after_days (30 by default) and comes back as it was if
+  the file returns first;
+- nothing is marked missing when the library folder is offline, when the
+  walk stopped early, under a folder that could not be listed or a linked
+  folder that is not followed, or when most of a library would vanish at
+  once (unless --allow-mass-removal is given). Files that merely moved
+  within the library, and files now excluded by ignore patterns, do not
+  count towards that limit.
+- Libraries that are no longer in config.json are never touched.
+- A hidden image stays hidden when it is moved, renamed or copied within its
+  library.
+
+Then the describe step (describe.py) runs for images without a description.
+
+Usage:
+    python scan.py [--library NAME_OR_ID ...] [--no-scan] [--no-describe]
+                   [--newest-first | --oldest-first] [--retry-failed]
+                   [--allow-mass-removal] [--verbose]
+
+To stop a long run early, create data/abort (or a file named "abort" or
+"abort.txt" in the current directory). Work done so far is kept; run again to
+continue. Only one scan (or server job) runs at a time.
 """
 
 import argparse
+import collections
 import concurrent.futures
-import fnmatch
 import json
 import os
-import queue
 import sys
 import threading
-from datetime import datetime
-if sys.version_info >= (3, 11): from datetime import UTC
-else: import datetime as datetime_fix; UTC=datetime_fix.timezone.utc
+import time
+import types
 
+import cache
 import common
+import db
+import describe
 import images
-import llm
+import jobs
+
+COMMIT_ROWS = 100           # commit after this many written rows...
+COMMIT_SECONDS = 3.0        # ...or this many seconds, whichever comes first
+# While waiting this long for a read with writes pending, they are committed,
+# so a slow share (or a pause) never keeps other writers out of the database.
+FLUSH_WAIT = 0.5
+MTIME_TOLERANCE = 1.0       # seconds; some file systems round modification times
+# Refuse to mark more than this share of a library missing in one scan, once
+# more than MASS_REMOVAL_MIN files would be affected.
+MASS_REMOVAL_FRACTION = 0.5
+MASS_REMOVAL_MIN = 20
+DAY = 86400.0
+MISSING_LOG_LIMIT = 20      # log at most this many missing paths one by one
+FILE_LOG_LIMIT = 20         # per library, "Added ..." (etc.) lines beyond this are only counted
+LIST_LOG_SECONDS = 10.0     # progress line while listing a large library
+# Windows reparse tag of a directory junction (stat.IO_REPARSE_TAG_MOUNT_POINT).
+_JUNCTION_TAG = 0xA0000003
 
 
-PROMPT_VER = 4
-
-DESCRIBE_PROMPT = """\
-Look at this image and reply with a single JSON object and nothing else. Use exactly these keys:
-  "description": two or three sentences describing the image.
-  "subjects": a list of the main subjects or objects shown.
-  "text": every piece of text visible in the image, transcribed exactly, or an empty string if there is no text.
-  "tags": a list of short keywords useful for searching.
-  "colors": a list of the most prominent colors.
-  "aesthetic_score": a float from 0 to 1 rating overall aesthetic appeal (1 = very appealing).
-  "sharpness": a float from 0 to 1 rating focus and sharpness (1 = razor sharp).
-  "exposure_score": a float from 0 to 1 rating exposure quality (1 = ideal exposure).
-  "watermark_score": a float from 0 to 1 rating freedom from watermarks or text overlays (1 = clean, 0 = heavily watermarked).
-For every score above, higher is better. Reply with only the JSON object. Do not wrap it in Markdown code fences."""
-
-SCORE_FIELDS = ("aesthetic_score", "sharpness", "exposure_score",
-                "watermark_score")
-
-# JSON schema matching parse_description's expected shape. Used to constrain
-# llama.cpp sampling to a valid reply.
-DESCRIBE_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "description": {"type": "string", "minLength": 1},
-        "subjects": {"type": "array", "items": {"type": "string"}},
-        "text": {"type": "string"},
-        "tags": {"type": "array", "items": {"type": "string"}},
-        "colors": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["description", "subjects", "text", "tags", "colors"],
-}
-for _field in SCORE_FIELDS:
-    DESCRIBE_SCHEMA["properties"][_field] = {
-        "type": "number", "minimum": 0, "maximum": 1,
-    }
-    DESCRIBE_SCHEMA["required"].append(_field)
-
-MAX_DESCRIBE_ATTEMPTS = 4
-
-# Scanning stops gracefully when a file with one of these names exists in the
-# working directory. Progress is committed, so a later run resumes.
-ABORT_FILES = ("abort", "abort.txt")
+def library_root(library):
+    """The folder of a library, with ~ expanded (see common.library_root)."""
+    return common.library_root(library)
 
 
-def abort_requested():
-    return any(os.path.exists(name) for name in ABORT_FILES)
+# ---------------------------------------------------------------------------
+# Listing files
 
-
-def normalize_ignore(patterns):
-    """Return a clean list of ignore patterns with forward-slash separators.
-
-    Either separator (/ or backslash) is accepted in the config so the same
-    library entry works on every platform.
-    """
-    result = []
-    for pattern in patterns or []:
-        if isinstance(pattern, str) and pattern.strip():
-            result.append(pattern.strip().replace("\\", "/"))
-    return result
-
-
-def matches_ignore(rel_path, patterns):
-    for pattern in patterns:
-        if fnmatch.fnmatch(rel_path, pattern):
+def _is_link(entry):
+    """True for a symlink, or a Windows directory junction (never followed)."""
+    try:
+        if entry.is_symlink():
             return True
-    return False
-
-
-def as_string_list(value):
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str) and value.strip():
-        return [value.strip()]
-    return []
-
-
-def as_unit_float(value, name):
-    """Validate a 0..1 subjective score. Clamps slightly out-of-range values."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("response field " + name + " is not a number")
-    return max(0.0, min(1.0, float(value)))
-
-
-def parse_description(reply):
-    """Turn an LLM reply into a validated description dict."""
-    data = llm.extract_json(reply)
-    if not isinstance(data, dict):
-        raise ValueError("response was not a JSON object")
-    description = data.get("description")
-    if not isinstance(description, str) or not description.strip():
-        raise ValueError("response is missing a text description")
-    text = data.get("text")
-    result = {
-        "description": description.strip(),
-        "subjects": as_string_list(data.get("subjects")),
-        "text": text.strip() if isinstance(text, str) else "",
-        "tags": as_string_list(data.get("tags")),
-        "colors": as_string_list(data.get("colors")),
-    }
-    for field in SCORE_FIELDS:
-        result[field] = as_unit_float(data.get(field), field)
-    return result
-
-
-def build_search_text(name, path, info):
-    parts = [name, path, info["description"], info["text"]]
-    parts.extend(info["subjects"])
-    parts.extend(info["tags"])
-    parts.extend(info["colors"])
-    return " ".join(parts).lower()
-
-
-def request_description(endpoint, helper, image_path, helper_lock=None):
-    """Ask the LLM for a description, retrying until the reply parses.
-
-    Raises an exception if no valid JSON reply arrives within a few attempts.
-    helper_lock, when given, serializes helper calls across worker threads.
-    """
-    last_error = None
-    for _attempt in range(MAX_DESCRIBE_ATTEMPTS):
-        response = ""
-        prompt = DESCRIBE_PROMPT
-        path = image_path
-        if helper and hasattr(helper, "call_api"):
-            if helper_lock is not None:
-                with helper_lock:
-                    changed = helper.call_api(prompt, path)
-            else:
-                changed = helper.call_api(prompt, path)
-            if changed is not None:
-                prompt, path = changed
-        try:
-            response = llm.describe_image(endpoint, prompt, path, DESCRIBE_SCHEMA, helper)
-            return parse_description(response)
-        except Exception as error:
-            llm.log_error(response, error)
-            last_error = error
-    raise Exception("no valid description after %d attempts: %s"
-                    % (MAX_DESCRIBE_ATTEMPTS, last_error))
-
-
-def process_file(conn, store, dirty, library, root, rel, full, filename, helper=None):
-    if common.is_heic_file(filename) and not images.ensure_heif():
-        return
-    stat = common.stat_path(helper, full)
-    if stat is None:
-        return
-    row = conn.execute("SELECT * FROM images WHERE library = ? AND path = ?",
-                        (library, rel)).fetchone()
-    if row and row["size"] == stat.st_size and abs(row["mtime"] - stat.st_mtime) < 1.0:
-        return
-    try:
-        width, height, thumb, exif, dhash = images.read_image(full, helper)
-    except Exception as error:
-        print("  Could not read " + rel + ": " + str(error))
-        return
-    shard, offset, length = store.append(thumb)
-    search_text = (filename + " " + rel).lower()
-    exif_json = json.dumps(exif)
-    if row:
-        if row["thumb_shard"] is not None:
-            dirty.add(row["thumb_shard"])
-        conn.execute(
-            "UPDATE images SET size=?, mtime=?, ctime=?, width=?, height=?, "
-            "thumb_shard=?, thumb_offset=?, thumb_length=?, exif=?, info='', "
-            "search_text=?, described=0, dhash=? WHERE id=?",
-            (stat.st_size, stat.st_mtime, stat.st_ctime, width, height,
-             shard, offset, length, exif_json, search_text, dhash, row["id"]))
-        print("  Updated " + rel)
-    else:
-        conn.execute(
-            "INSERT INTO images (library, path, name, size, mtime, ctime, "
-            "width, height, thumb_shard, thumb_offset, thumb_length, exif, "
-            "search_text, dhash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (library, rel, filename, stat.st_size, stat.st_mtime, stat.st_ctime,
-             width, height, shard, offset, length, exif_json, search_text, dhash))
-        print("  Added " + rel)
-
-
-def scan_library(conn, store, dirty, name, root, ignore=None, helper=None):
-    """Scan one library. Returns False if an abort file interrupted it."""
-    patterns = normalize_ignore(ignore)
-    seen = set()
-    aborted = False
-    for current, dirs, files in common.walk_library(helper, root):
-        if aborted:
-            break
-        rel_dir = os.path.relpath(current, root).replace(os.sep, "/")
-        prefix = "" if rel_dir == "." else rel_dir + "/"
-        if patterns:
-            # Prune subdirectories whose contents are fully ignored. A made-up
-            # placeholder name probes whether anything inside the dir could
-            # match an ignore pattern.
-            kept = []
-            for d in dirs:
-                sub = prefix + d
-                if (matches_ignore(sub, patterns)
-                        or matches_ignore(sub + "/_", patterns)):
-                    continue
-                kept.append(d)
-            dirs[:] = kept
-        for filename in files:
-            if not common.is_image_file(filename):
-                continue
-            if abort_requested():
-                aborted = True
-                break
-            full = os.path.join(current, filename)
-            rel = os.path.relpath(full, root).replace(os.sep, "/")
-            if matches_ignore(rel, patterns):
-                continue
-            seen.add(rel)
-            process_file(conn, store, dirty, name, root, rel, full, filename, helper)
-    conn.commit()
-    if aborted:
-        return False
-    # Missing files are removed only after a complete walk, so a partial scan
-    # never deletes images it simply has not reached yet.
-    rows = conn.execute("SELECT id, path, thumb_shard FROM images WHERE library = ?",
-                        (name,)).fetchall()
-    for row in rows:
-        if row["path"] not in seen:
-            if row["thumb_shard"] is not None:
-                dirty.add(row["thumb_shard"])
-            conn.execute("DELETE FROM images WHERE id = ?", (row["id"],))
-            print("  Removed " + row["path"])
-    conn.commit()
-    return True
-
-
-def backfill_dhashes(conn, libraries, helper=None):
-    """Compute the dHash for any rows that lack one.
-
-    Runs once per scan invocation. Existing rows from before the dhash column
-    existed (or rows whose hashing failed previously) are picked up here so the
-    similarity grouping in the search UI works across the whole library.
-    """
-    roots = {}
-    for library in libraries:
-        roots[library.get("name", "")] = library.get("path", "")
-    rows = conn.execute(
-        "SELECT id, library, path FROM images WHERE dhash = ''").fetchall()
-    if not rows:
-        return False
-    print("Computing perceptual hashes for %d image(s)..." % len(rows))
-    done = 0
-    aborted = False
-    for row in rows:
-        if abort_requested():
-            aborted = True
-            break
-        root = roots.get(row["library"])
-        if not root:
-            continue
-        full = os.path.join(root, *row["path"].split("/"))
-        if common.stat_path(helper, full) is None:
-            continue
-        if common.is_heic_file(full) and not images.ensure_heif():
-            continue
-        try:
-            dhash = images.read_dhash(full, helper)
-        except Exception as error:
-            print("  Could not hash " + row["path"] + ": " + str(error))
-            continue
-        conn.execute("UPDATE images SET dhash = ? WHERE id = ?",
-                     (dhash, row["id"]))
-        done += 1
-    conn.commit()
-    if done:
-        print("  Hashed %d image(s)." % done)
-    return aborted
-
-
-def rebuild_dirty(conn, store, dirty):
-    """Compact the shard files that lost or replaced thumbnails."""
-    for index in sorted(dirty):
-        rows = conn.execute(
-            "SELECT id, thumb_offset, thumb_length FROM images "
-            "WHERE thumb_shard = ? ORDER BY thumb_offset", (index,)).fetchall()
-        entries = [(r["thumb_offset"], r["thumb_length"]) for r in rows]
-        if not entries:
-            open(store.shard_path(index), "wb").close()
-            continue
-        rebuilt = store.rebuild_shard(index, entries)
-        for row, (offset, length) in zip(rows, rebuilt):
-            conn.execute(
-                "UPDATE images SET thumb_offset=?, thumb_length=? WHERE id=?",
-                (offset, length, row["id"]))
-    conn.commit()
-
-
-def compute_description(endpoint, helper, helper_lock, row, full):
-    """Run the LLM for one image. Returns the info dict, or None on failure.
-
-    This does no database work, so it is safe to call from worker threads.
-    """
-    temp = None
-    image_path = full
-    if common.is_heic_file(full):
-        if not images.ensure_heif():
-            print("  Skipping " + row["path"] + " (pillow-heif not installed)")
-            return None
-        try:
-            temp = images.heic_to_temp_jpeg(full, helper)
-            image_path = temp
-        except Exception as error:
-            print("  Could not convert " + row["path"] + ": " + str(error))
-            return None
-    try:
-        info = request_description(endpoint, helper, image_path, helper_lock)
-        info["_model_name"] = llm.probe_model_name(endpoint)
-        return info
-    except Exception as error:
-        print("  Failed to describe " + row["path"] + ": " + str(error))
-        return None
-    finally:
-        if temp and os.path.exists(temp):
-            os.remove(temp)
-
-
-def store_description(conn, row, info, remaining):
-    """Save a computed description. Called only from the main thread."""
-    search_text = build_search_text(row["name"], row["path"], info)
-    conn.execute(
-        "UPDATE images SET info=?, search_text=?, described=1, prompt_ver=? "
-        "WHERE id=?",
-        (json.dumps(info), search_text, PROMPT_VER, row["id"]))
-    conn.commit()
-    print("%s: %5d left | Described %s"
-          % (datetime.now(UTC).strftime("%d %H:%M:%S"), remaining, row["path"]))
-
-
-def describe_one(conn, endpoint, helper, row, full, remaining):
-    info = compute_description(endpoint, helper, None, row, full)
-    if info is not None:
-        store_description(conn, row, info, remaining)
-
-
-def description_date(row):
-    """Return a timestamp for ordering pending descriptions.
-
-    Uses an EXIF capture date when present and parseable; otherwise falls
-    back to the file's modified time.
-    """
-    try:
-        exif = json.loads(row["exif"] or "{}")
-    except (TypeError, ValueError):
-        exif = {}
-    for field in ("DateTimeOriginal", "DateTime"):
-        value = exif.get(field)
-        if isinstance(value, str):
-            try:
-                return datetime.strptime(value, "%Y:%m:%d %H:%M:%S").timestamp()
-            except ValueError:
-                pass
-    return row["mtime"]
-
-
-def endpoint_list(config):
-    """Return the configured endpoints as a list.
-
-    A single endpoint dict becomes a one item list; a list (round robin) is
-    kept as is. Only endpoints that name a model are returned.
-    """
-    endpoint = config.get("endpoint", {})
-    items = endpoint if isinstance(endpoint, list) else [endpoint]
-    return [item for item in items
-            if isinstance(item, dict) and item.get("model")]
-
-
-def describe_in_series(conn, endpoint, helper, roots, rows):
-    """Describe images one at a time. Returns True if an abort file stopped it."""
-    aborted = False
-    remaining = len(rows)
-    for row in rows:
-        if abort_requested():
-            aborted = True
-            break
-        root = roots.get(row["library"])
-        if not root:
-            continue
-        full = os.path.join(root, *row["path"].split("/"))
-        remaining -= 1
-        describe_one(conn, endpoint, helper, row, full, remaining)
-    return aborted
-
-
-def describe_in_parallel(conn, endpoints, helper, roots, rows):
-    """Describe images using several endpoints at once (round robin).
-
-    Each endpoint handles one request at a time, so images spread across the
-    endpoints and the slow LLM calls overlap. New work stops as soon as an
-    abort file appears; requests already in flight are allowed to finish and
-    their results are saved. Returns True if an abort file stopped it.
-    """
-    tasks = []
-    for row in rows:
-        root = roots.get(row["library"])
-        if root:
-            full = os.path.join(root, *row["path"].split("/"))
-            tasks.append((row, full))
-    helper_lock = threading.Lock()
-    free_endpoints = queue.Queue()
-    for endpoint in endpoints:
-        free_endpoints.put(endpoint)
-
-    def work(row, full):
-        endpoint = free_endpoints.get()
-        try:
-            return compute_description(endpoint, helper, helper_lock, row, full)
-        finally:
-            free_endpoints.put(endpoint)
-
-    aborted = False
-    remaining = len(tasks)
-    task_iter = iter(tasks)
-    in_flight = {}
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(endpoints)) as pool:
-        def submit_next():
-            for row, full in task_iter:
-                in_flight[pool.submit(work, row, full)] = row
-                return True
+        check = getattr(entry, "is_junction", None)       # Python 3.12+
+        if check is not None:
+            return bool(check())
+        if os.name != "nt":
             return False
-        for _ in endpoints:
-            if abort_requested():
-                aborted = True
-                break
-            if not submit_next():
-                break
-        while in_flight:
+        # Older Pythons: junctions are reparse points with this tag.
+        tag = getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0)
+        return tag == _JUNCTION_TAG
+    except OSError:
+        return False
+
+
+def _error_text(error):
+    text = str(error) or type(error).__name__
+    return text[:300]
+
+
+class LibraryWalk:
+    """The image files below a library root.
+
+    Iterate to get (rel_path, size, mtime, ctime) for each image file that no
+    ignore pattern excludes; rel_path is relative to the root and uses "/".
+    Ignored folders are not entered at all (see common.should_prune_dir).
+    Symlinks and junctions -- to folders or files -- are not followed; they
+    are listed in links instead.
+
+    When the helper module has walk_library(root) and it returns an iterator
+    (the os.walk contract), that is used together with common.stat_path.
+    Otherwise the folder is listed with os.scandir, which needs the root to
+    be an existing folder; a helper stat(path) hook, if there is one, still
+    supplies sizes and times. After iterating:
+
+        reachable   False if the root could not be listed at all (offline)
+        errors      [(rel_path, message)] for folders (or files) that could not
+                    be read; rel_path '' means the root itself
+        links       [rel_path] of linked folders and files that were skipped
+        stopped     True if ctx asked to stop part-way through
+        complete    True when every folder was listed
+    """
+
+    def __init__(self, root, patterns, helper=None, ctx=None, label=""):
+        self.root = root
+        self.patterns = list(patterns or [])
+        self.helper = helper
+        self.ctx = ctx
+        self.label = label or root
+        self.reachable = True
+        self.stopped = False
+        self.errors = []
+        self.links = []
+        self.helper_walk = False
+        self.folders = 0
+        self.files = 0
+        self._last_report = time.monotonic()
+
+    @property
+    def complete(self):
+        return (self.reachable and not self.stopped
+                and not any(rel == "" for rel, _ in self.errors))
+
+    def _error(self, rel, error):
+        self.errors.append((rel, _error_text(error)))
+
+    def _stop_requested(self):
+        if self.ctx is not None and self.ctx.should_stop():
+            self.stopped = True
+        return self.stopped
+
+    def _folder_done(self):
+        """Count a listed folder; now and then say how far the listing has got."""
+        self.folders += 1
+        now = time.monotonic()
+        if self.ctx is not None and now - self._last_report >= LIST_LOG_SECONDS:
+            self._last_report = now
+            self.ctx.log("Listing %s: %d folders, %d image files so far"
+                         % (self.label, self.folders, self.files))
+
+    def __iter__(self):
+        walker = getattr(self.helper, "walk_library", None) if self.helper is not None else None
+        try:
+            iterator = walker(self.root) if walker is not None else None
+        except Exception as error:
+            self.helper_walk = True
+            self._error("", error)
+            return iter(())
+        if iterator is None:
+            # Also when a helper's walk_library returns None: the normal
+            # walk, which checks that the root folder is there.
+            return self._scandir_walk()
+        self.helper_walk = True
+        return self._helper_walk(iterator)
+
+    def _scandir_walk(self):
+        if not self.root or not os.path.isdir(self.root):
+            self.reachable = False
+            return
+        helper_stat = getattr(self.helper, "stat", None) if self.helper is not None else None
+        stack = [""]
+        while stack:
+            if self._stop_requested():
+                return
+            rel_dir = stack.pop()
+            folder = os.path.join(self.root, *rel_dir.split("/")) if rel_dir else self.root
+            try:
+                with os.scandir(folder) as listing:
+                    entries = sorted(listing, key=lambda item: item.name)
+            except OSError as error:
+                self._error(rel_dir, error)
+                continue
+            subdirs = []
+            for entry in entries:
+                rel = rel_dir + "/" + entry.name if rel_dir else entry.name
+                try:
+                    link = _is_link(entry)
+                    # For a link, what it points to decides which patterns apply.
+                    is_dir = entry.is_dir(follow_symlinks=not link)
+                    if is_dir and common.should_prune_dir(rel, self.patterns):
+                        continue
+                    if not is_dir and (not common.is_image_file(entry.name)
+                                       or common.matches_ignore(rel, self.patterns)):
+                        continue
+                    if link:
+                        self.links.append(rel)
+                        continue
+                    if is_dir:
+                        subdirs.append(rel)
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    stat = helper_stat(entry.path) if helper_stat is not None else None
+                    if stat is None:
+                        stat = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    self._error(rel, error)
+                    continue
+                self.files += 1
+                yield rel, stat.st_size, stat.st_mtime, getattr(stat, "st_ctime", 0.0)
+            self._folder_done()
+            # Depth first, in name order.
+            stack.extend(reversed(subdirs))
+
+    def _relative(self, dirpath):
+        try:
+            rel = os.path.relpath(dirpath, self.root)
+        except ValueError:
+            return None
+        rel = rel.replace(os.sep, "/").replace("\\", "/")
+        if rel == ".":
+            return ""
+        if rel == ".." or rel.startswith("../"):
+            return None
+        return rel
+
+    def _helper_walk(self, iterator):
+        try:
+            for dirpath, dirnames, filenames in iterator:
+                if self._stop_requested():
+                    return
+                rel_dir = self._relative(dirpath)
+                if rel_dir is None:
+                    continue
+                prefix = rel_dir + "/" if rel_dir else ""
+                dirnames[:] = [name for name in dirnames
+                               if not common.should_prune_dir(prefix + name, self.patterns)]
+                for filename in sorted(filenames):
+                    rel = prefix + filename
+                    if not common.is_image_file(filename) or common.matches_ignore(
+                            rel, self.patterns):
+                        continue
+                    stat = common.stat_path(self.helper, os.path.join(dirpath, filename))
+                    if stat is None:
+                        self._error(rel, "cannot read the file's size and time")
+                        continue
+                    self.files += 1
+                    yield rel, stat.st_size, stat.st_mtime, getattr(stat, "st_ctime", 0.0)
+                self._folder_done()
+        except Exception as error:
+            # The helper's walk broke off: whatever it did not list must not
+            # look deleted.
+            self._error("", error)
+
+
+def walk_library(root, patterns, helper=None, ctx=None, label=""):
+    """Return a LibraryWalk over a library root (see LibraryWalk)."""
+    return LibraryWalk(root, patterns, helper, ctx, label)
+
+
+def excluded_by_ignores(path, patterns):
+    """True if a relative path is skipped by the ignore patterns (itself or a folder above it)."""
+    if common.matches_ignore(path, patterns):
+        return True
+    parts = path.split("/")
+    return any(common.should_prune_dir("/".join(parts[:depth]), patterns)
+               for depth in range(1, len(parts)))
+
+
+def _under_any(path, prefixes):
+    """True if path is one of prefixes, or inside one of them ('' covers everything)."""
+    if "" in prefixes or path in prefixes:
+        return True
+    parts = path.split("/")
+    return any("/".join(parts[:depth]) in prefixes for depth in range(1, len(parts)))
+
+
+# ---------------------------------------------------------------------------
+# Reading files in parallel
+
+def thread_safe_helper(helper):
+    """A stand-in for the helper whose load_image and stat hooks run one at a time.
+
+    Files are read by several threads at once, and helpers written for the
+    old one-at-a-time scanner may not expect that. Decoding still runs in
+    parallel. A helper module that sets THREAD_SAFE = True is used as is.
+    """
+    if helper is None or getattr(helper, "THREAD_SAFE", False):
+        return helper
+    lock = threading.Lock()
+    proxy = types.SimpleNamespace()
+
+    def locked(func):
+        def call(*args, **kwargs):
+            with lock:
+                return func(*args, **kwargs)
+        return call
+
+    for name in ("load_image", "stat"):
+        func = getattr(helper, name, None)
+        if func is not None:
+            setattr(proxy, name, locked(func))
+    return proxy
+
+
+def reader_threads(config):
+    """The number of reader threads to use (config "reader_threads", 1..32)."""
+    try:
+        count = int(config.get("reader_threads") or 6)
+    except (TypeError, ValueError):
+        count = 6
+    return max(1, min(32, count))
+
+
+def _parallel_reads(threads, items, read, handle, should_stop, ctx, flush=None):
+    """read(item) on a thread pool for each item; handle(item, result) on this thread.
+
+    At most 2 x threads reads are in flight, so memory stays bounded and the
+    results are written as they arrive. When should_stop() turns true no
+    new reads start; those already running finish and are handled. flush(),
+    when given, is called before this thread waits for a while (a slow read,
+    a pause), so pending writes are committed rather than holding the
+    database's write lock. Returns True if it stopped early.
+    """
+    in_flight = {}
+
+    def drain():
+        done, _ = concurrent.futures.wait(
+            in_flight, timeout=FLUSH_WAIT, return_when=concurrent.futures.FIRST_COMPLETED)
+        if not done:
+            if flush is not None:
+                flush()
             done, _ = concurrent.futures.wait(
                 in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
-            for future in done:
-                row = in_flight.pop(future)
-                info = future.result()
-                remaining -= 1
-                if info is not None:
-                    store_description(conn, row, info, remaining)
-                if not aborted and abort_requested():
-                    aborted = True
-                if not aborted:
-                    submit_next()
-    return aborted
+        for future in done:
+            handle(in_flight.pop(future), future.result())
 
-
-def describe_pending(conn, config, helper, newest_first=False):
-    """Describe images that need it. Returns True if an abort file stopped it."""
-    fresh = conn.execute("SELECT * FROM images WHERE described = 0").fetchall()
-    stale = conn.execute(
-        "SELECT * FROM images WHERE described = 1 AND prompt_ver < ?",
-        (PROMPT_VER,)).fetchall()
-    if not fresh and not stale:
-        print("All images already have descriptions.")
-        return False
-    if newest_first:
-        fresh = sorted(fresh, key=description_date, reverse=True)
-        stale = sorted(stale, key=description_date, reverse=True)
-    # Undescribed images always come before stale-prompt re-describes.
-    rows = list(fresh) + list(stale)
-    endpoints = endpoint_list(config)
-    if not endpoints:
-        print("No LLM model configured; skipping descriptions. Run settings.py.")
-        return False
-    roots = {}
-    for library in config.get("libraries", []):
-        roots[library.get("name", "")] = library.get("path", "")
-    print("Describing %d image(s)..." % len(rows))
-    if helper and hasattr(helper, "before_launch"):
-        helper.before_launch()
-    for endpoint in endpoints:
-        print("  Using model: " + llm.probe_model_name(endpoint))
-    if len(endpoints) > 1:
-        aborted = describe_in_parallel(conn, endpoints, helper, roots, rows)
-    else:
-        aborted = describe_in_series(conn, endpoints[0], helper, roots, rows)
-    if helper and hasattr(helper, "after_launch"):
-        helper.after_launch()
-    if aborted:
-        print("Abort requested. Descriptions saved; "
-              "run scan.py again to continue.")
-    return aborted
-
-
-def run_scan(scan_images, describe, newest_first=False):
-    config = common.load_config()
-    libraries = config.get("libraries", [])
-    if not libraries:
-        print("No libraries configured. Run settings.py first.")
-        return
-    if abort_requested():
-        print("Abort file present; remove 'abort' or 'abort.txt' first.")
-        return
-    helper = common.load_helper(config.get("helper", ""))
-    conn = common.open_db()
-    if scan_images:
-        store = common.ThumbStore(common.THUMB_DIR)
-        dirty = set()
-        configured = set()
-        aborted = False
-        for library in libraries:
-            name = library.get("name", "")
-            root = library.get("path", "")
-            ignore = library.get("ignore", [])
-            configured.add(name)
-            helper_walks = helper is not None and hasattr(helper, "walk_library")
-            if not name or (not helper_walks and not os.path.isdir(root)):
-                print("Skipping library (missing folder): " + str(name))
-                continue
-            print("Scanning library: " + name)
-            if not scan_library(conn, store, dirty, name, root, ignore, helper):
-                aborted = True
+    stopped = False
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+    try:
+        for item in items:
+            if should_stop():
+                stopped = True
                 break
-        if aborted:
-            rebuild_dirty(conn, store, dirty)
-            conn.close()
-            print("Abort requested. Progress saved; run scan.py again to continue.")
+            if ctx.paused and flush is not None:
+                flush()
+            ctx.wait_if_paused()
+            while len(in_flight) >= 2 * threads:
+                drain()
+            in_flight[pool.submit(read, item)] = item
+        while in_flight:
+            drain()
+    finally:
+        pool.shutdown(wait=True)
+    return stopped or should_stop()
+
+
+def _missing_decoder(error):
+    """True when a read failed only because an optional decoder is not installed."""
+    text = str(error)
+    return images.HEIF_MISSING in text or images.AVIF_MISSING in text
+
+
+def _read_original(root, rel, helper, want_previews, mtime):
+    """Worker thread: images.read_image() for one file. Returns (result, error); never raises."""
+    full = os.path.join(root, *rel.split("/"))
+    try:
+        return images.read_image(full, helper, want_preview=want_previews, mtime=mtime), None
+    except Exception as error:
+        return None, error
+
+
+def _failed_before(failures, rel, size, mtime):
+    """True if the file could not be read last time and has not changed since."""
+    failure = failures.get(rel)
+    return (failure is not None and failure["size"] == size
+            and abs((failure["mtime"] or 0) - mtime) < MTIME_TOLERANCE)
+
+
+def _load_failures(conn, library_id):
+    return {row["path"]: row for row in conn.execute(
+        "SELECT path, size, mtime FROM read_failures WHERE library_id = ?", (library_id,))}
+
+
+def _record_read_failure(conn, library_id, rel, size, mtime, error):
+    """Remember a file that could not be read, so it is skipped until it changes."""
+    conn.execute(
+        "INSERT OR REPLACE INTO read_failures (library_id, path, size, mtime, error, seen) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (library_id, rel, size, mtime, _error_text(error), time.time()))
+
+
+def _update_row(conn, image_id, values, extra=""):
+    """UPDATE one images row with a dict of column values (extra: more SQL assignments)."""
+    columns = sorted(values)
+    assignments = ", ".join("%s = ?" % column for column in columns)
+    if extra:
+        assignments += ", " + extra
+    conn.execute("UPDATE images SET %s WHERE id = ?" % assignments,
+                 [values[column] for column in columns] + [image_id])
+
+
+def _delete_preview(previews, library_id, image_id, ctx):
+    """Remove a preview file (best effort; a failure is only logged)."""
+    try:
+        previews.delete(library_id, image_id)
+    except OSError as error:
+        ctx.log("Could not delete the preview of image %d: %s"
+                % (image_id, _error_text(error)), "warn")
+
+
+class _CommitTimer:
+    """Commits thumbs.db and index.db every COMMIT_ROWS writes or COMMIT_SECONDS."""
+
+    def __init__(self, conn, thumbs):
+        self.conn = conn
+        self.thumbs = thumbs
+        self.pending = 0
+        self.last = time.monotonic()
+
+    def wrote(self, count=1):
+        self.pending += count
+        if self.pending >= COMMIT_ROWS or time.monotonic() - self.last >= COMMIT_SECONDS:
+            self.commit()
+
+    def commit(self):
+        # Thumbnails first: a committed row then always has its thumbnail, or
+        # is read again on the next scan.
+        self.thumbs.commit()
+        self.conn.commit()
+        self.pending = 0
+        self.last = time.monotonic()
+
+    def flush(self):
+        """Commit now if anything is waiting (before this thread blocks)."""
+        if self.pending:
+            self.commit()
+
+
+def _metadata(result):
+    """Column values for the image facts returned by images.read_image()."""
+    try:
+        exif = json.dumps(result["exif"], ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        exif = "{}"
+    return {
+        "width": int(result["width"]), "height": int(result["height"]),
+        "content_hash": result["content_hash"], "dhash": result["dhash"],
+        "taken_at": result["taken_at"], "taken_source": result["taken_source"],
+        "tz_offset": result["tz_offset"], "camera": result["camera"],
+        "lat": result["lat"], "lon": result["lon"], "exif": exif,
+    }
+
+
+_DESCRIPTION_COLUMNS = ("info", "described", "prompt_ver", "provenance", "hidden",
+                        "describe_attempts", "describe_error")
+_EMPTY_DESCRIPTION = {"info": "", "described": 0, "prompt_ver": 0, "provenance": "",
+                      "describe_attempts": 0, "describe_error": ""}
+
+_ROW_SQL = """
+    SELECT id, path, size, mtime, content_hash, dhash, width, height, described,
+           hidden, has_preview, missing_since
+    FROM images WHERE library_id = ?"""
+
+_SOURCE_COLUMNS = "id, library_id, path, " + ", ".join(_DESCRIPTION_COLUMNS) + ", missing_since"
+# Rows with the same content: the images_hash index makes this one lookup.
+_SOURCE_BY_HASH_SQL = ("SELECT " + _SOURCE_COLUMNS
+                       + " FROM images WHERE content_hash = ? AND id <> ?")
+_HIDDEN_TWIN_SQL = ("SELECT 1 FROM images WHERE content_hash = ? AND library_id = ? "
+                    "AND hidden = 1 LIMIT 1")
+
+
+# ---------------------------------------------------------------------------
+# Scanning one library
+
+class LibraryScan:
+    """The state of one library scan. Use scan_library() rather than this directly."""
+
+    def __init__(self, conn, library, ctx, helper=None, thumbs=None, previews=None,
+                 threads=6, allow_mass_removal=False, purge_after_days=30, now=None,
+                 verbose=False):
+        self.conn = conn
+        self.library = library
+        self.library_id = library["id"]
+        self.label = common.library_label(library)
+        self.root = library_root(library)
+        self.patterns = common.ignore_patterns(library)
+        self.ctx = ctx
+        self.helper = helper
+        self.read_helper = thread_safe_helper(helper)
+        self.thumbs = thumbs
+        self.previews = previews
+        self.threads = max(1, int(threads or 1))
+        self.want_previews = bool(library.get("previews", True))
+        self.allow_mass_removal = allow_mass_removal
+        self.purge_after_days = purge_after_days
+        self.now = time.time() if now is None else now
+        self.verbose = verbose
+        self.rows = {}
+        self.failures = {}
+        self.thumb_ids = set()
+        self.walked = set()
+        self.cleared = set()        # ids whose missing_since this scan already cleared
+        self.read_errors = []
+        self.went_offline = False
+        self.helper_walk = False
+        # (size, dhash) -> ids of rows imported from the old database, which
+        # have no content hash yet.
+        self.legacy_index = collections.defaultdict(list)
+        # Descriptions of rows whose content changed in this scan, by the old
+        # content (hash, or (size, dhash) for imported rows), so a file that
+        # still holds the old content elsewhere can keep them.
+        self.replaced = {}
+        self.unsupported_logged = set()
+        self.logged = collections.Counter()
+        self.timer = None
+        self.summary = {
+            "library_id": self.library_id, "name": self.label, "offline": False,
+            "aborted": False, "complete": False, "files": 0, "added": 0, "updated": 0,
+            "changed": 0, "moved": 0, "copied": 0, "unchanged": 0, "restored": 0,
+            "failed": 0, "skipped_failed": 0, "unsupported": 0, "read_errors": 0,
+            "missing": 0, "protected": 0, "links": 0, "excluded": 0, "guarded": 0,
+            "removed_moved": 0, "purged": 0, "errors": [],
+        }
+
+    # -- bookkeeping --------------------------------------------------------
+
+    def _wrote(self, count=1):
+        self.timer.wrote(count)
+
+    def commit(self):
+        self.timer.commit()
+
+    def flush(self):
+        self.timer.flush()
+
+    def _note(self, kind, message):
+        """Log a per-file line; past FILE_LOG_LIMIT of a kind they are only counted."""
+        self.logged[kind] += 1
+        count = self.logged[kind]
+        if self.verbose or count <= FILE_LOG_LIMIT:
+            self.ctx.log(message)
+        elif count == FILE_LOG_LIMIT + 1:
+            self.ctx.log("(More %s files are counted but not listed; use --verbose to list "
+                         "every file.)" % kind)
+
+    def _load(self):
+        for row in self.conn.execute(_ROW_SQL, (self.library_id,)):
+            self.rows[row["path"]] = row
+            if not row["content_hash"] and row["dhash"]:
+                self.legacy_index[(row["size"], row["dhash"])].append(row["id"])
+        self.failures = _load_failures(self.conn, self.library_id)
+        self.thumb_ids = self.thumbs.ids()
+
+    def delete_rows(self, ids):
+        """Delete image rows with their thumbnails and previews (no commit)."""
+        ids = list(ids)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            self.conn.execute("DELETE FROM images WHERE id IN (%s)"
+                              % ",".join("?" * len(chunk)), chunk)
+        self.thumbs.delete(ids, commit=False)
+        for image_id in ids:
+            _delete_preview(self.previews, self.library_id, image_id, self.ctx)
+
+    def _set_missing(self, ids, value):
+        ids = list(ids)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            self.conn.execute(
+                "UPDATE images SET missing_since = ? WHERE id IN (%s)"
+                % ",".join("?" * len(chunk)), [value] + chunk)
+
+    # -- the scan -----------------------------------------------------------
+
+    def run(self):
+        ctx = self.ctx
+        ctx.log("Scanning library %s (%s)" % (self.label, self.root or "no folder set"))
+        self.timer = _CommitTimer(self.conn, self.thumbs)
+        self._load()
+        walk = walk_library(self.root, self.patterns, self.helper, ctx, self.label)
+        ctx.stage("scan")
+        entries = list(walk)
+        self.walked = {entry[0] for entry in entries}
+        self.helper_walk = walk.helper_walk
+        self.summary["files"] = len(entries)
+        self.summary["links"] = len(walk.links)
+        if not walk.reachable:
+            self.summary["offline"] = True
+            ctx.log("Skipping library %s: the folder %s is not available (offline?). "
+                    "Nothing was changed." % (self.label, self.root or "(none)"), "warn")
+            return self.summary
+        for rel, message in walk.errors:
+            ctx.log("Could not read %s: %s" % (rel or self.root, message), "warn")
+        if walk.links:
+            ctx.log("%d linked folder(s) or file(s) were not followed: %s%s. Files indexed "
+                    "under them earlier are kept as they are; add a link's target as a "
+                    "library of its own to index it."
+                    % (len(walk.links), ", ".join(walk.links[:5]),
+                       ", ..." if len(walk.links) > 5 else ""), "warn")
+        ctx.set_total(len(entries))
+        try:
+            stopped = walk.stopped or _parallel_reads(
+                self.threads, self._to_read(entries), self._read, self._handle,
+                self._should_stop, ctx, self.flush)
+            self.commit()
+            if stopped or self.went_offline:
+                self.summary["aborted"] = not self.went_offline
+                self.summary["offline"] = self.went_offline
+                ctx.log("The scan of %s did not finish, so no files were marked missing."
+                        % self.label, "warn" if self.went_offline else "info")
+            elif not walk.complete:
+                ctx.log("The folder %s could not be listed, so no files were marked "
+                        "missing." % (self.root or self.label), "warn")
+            else:
+                self._finish(walk)
+            self.commit()
+        finally:
+            self.summary["errors"] = walk.errors + self.read_errors
+        ctx.log(self._summary_line())
+        return self.summary
+
+    def _summary_line(self):
+        summary = self.summary
+        parts = ["%d files" % summary["files"]]
+        for key in ("added", "changed", "updated", "moved", "copied", "restored", "failed",
+                    "unsupported", "missing", "excluded", "guarded", "removed_moved",
+                    "purged"):
+            if summary[key]:
+                parts.append("%d %s" % (summary[key], key.replace("_", " ")))
+        return "Library %s: %s." % (self.label, ", ".join(parts))
+
+    def _should_stop(self):
+        return self.went_offline or self.ctx.should_stop()
+
+    def _to_read(self, entries):
+        """Yield the entries that need reading; deal with the rest on the way."""
+        for entry in entries:
+            rel, size, mtime, _ctime = entry
+            row = self.rows.get(rel)
+            if (row is not None and row["size"] == size
+                    and abs(row["mtime"] - mtime) < MTIME_TOLERANCE
+                    and row["id"] in self.thumb_ids):
+                self.summary["unchanged"] += 1
+                if row["missing_since"] is not None:
+                    self.conn.execute("UPDATE images SET missing_since = NULL WHERE id = ?",
+                                      (row["id"],))
+                    self.cleared.add(row["id"])
+                    self.summary["restored"] += 1
+                    self._note("found again", "Found again: " + rel)
+                    self._wrote()
+                self.ctx.step(item=rel)
+                continue
+            if _failed_before(self.failures, rel, size, mtime):
+                self.summary["skipped_failed"] += 1
+                self.ctx.step(item=rel)
+                continue
+            yield entry
+
+    def _read(self, entry):
+        """Worker thread: read one file. Returns (result, error); never raises."""
+        rel, _size, mtime, _ctime = entry
+        return _read_original(self.root, rel, self.read_helper, self.want_previews, mtime)
+
+    def _handle(self, entry, outcome):
+        rel, size, mtime, ctime = entry
+        result, error = outcome
+        if error is None:
+            self._store(rel, size, mtime, ctime, result)
+        elif isinstance(error, images.SourceReadError):
+            # Possibly temporary (a share that went away): not recorded as a
+            # bad file, and never a reason to mark anything missing.
+            self.read_errors.append((rel, _error_text(error)))
+            self.summary["read_errors"] += 1
+            self.ctx.log("Could not read %s: %s" % (rel, _error_text(error)), "warn")
+            if not self.helper_walk and not os.path.isdir(self.root):
+                self.went_offline = True
+                self.ctx.log("The folder %s is no longer available; stopping this "
+                             "library." % self.root, "warn")
+        elif _missing_decoder(error):
+            # Not a bad file: it is read once the decoder is installed.
+            self.summary["unsupported"] += 1
+            if str(error) not in self.unsupported_logged:
+                self.unsupported_logged.add(str(error))
+                self.ctx.log("Skipping %s: %s" % (rel, error), "warn")
+        else:
+            _record_read_failure(self.conn, self.library_id, rel, size, mtime, error)
+            self.summary["failed"] += 1
+            self.ctx.log("Could not read %s: %s" % (rel, _error_text(error)), "warn")
+            self._wrote()
+        self.ctx.step(item=rel)
+
+    def _is_move_source(self, row):
+        """True for a missing row of this library whose file is not back at its path."""
+        return (row["library_id"] == self.library_id and row["missing_since"] is not None
+                and row["path"] not in self.walked)
+
+    def _find_source(self, metadata, size, exclude_id):
+        """(row, moved): a row whose description this content can reuse, or (None, False).
+
+        Prefers a missing row of this library with the same content (the
+        file was moved or renamed: moved is True), then any described row
+        with the same content hash. Rows imported from the old database have
+        no content hash yet; for those, the same size and dHash in this
+        library count. Last come descriptions this scan took off files whose
+        content changed (the old content may live on under another name).
+        """
+        rows = self.conn.execute(_SOURCE_BY_HASH_SQL,
+                                 (metadata["content_hash"], exclude_id)).fetchall()
+        if not rows and metadata["dhash"]:
+            ids = [image_id for image_id in self.legacy_index.get((size, metadata["dhash"]), ())
+                   if image_id != exclude_id]
+            if ids:
+                rows = self.conn.execute(
+                    "SELECT " + _SOURCE_COLUMNS + " FROM images WHERE id IN (%s) "
+                    "AND content_hash = ''" % ",".join("?" * len(ids)), ids).fetchall()
+
+        def best(candidates):
+            return min(candidates, key=lambda row: (-row["described"], -row["prompt_ver"],
+                                                    row["library_id"] != self.library_id,
+                                                    row["id"]))
+
+        moves = [row for row in rows if self._is_move_source(row)]
+        if moves:
+            return best(moves), True
+        described = [row for row in rows if row["described"]]
+        if described:
+            return best(described), False
+        replaced = (self.replaced.get(metadata["content_hash"])
+                    or self.replaced.get((size, metadata["dhash"])))
+        return replaced, False
+
+    def _remember_description(self, row):
+        """Keep the description of a row whose content is about to change."""
+        if not row["described"]:
             return
-        # Drop images that belong to libraries no longer in the config.
-        for row in conn.execute("SELECT id, library, thumb_shard FROM images").fetchall():
-            if row["library"] not in configured:
-                if row["thumb_shard"] is not None:
-                    dirty.add(row["thumb_shard"])
-                conn.execute("DELETE FROM images WHERE id = ?", (row["id"],))
-        conn.commit()
-        rebuild_dirty(conn, store, dirty)
-    if backfill_dhashes(conn, libraries, helper):
-        conn.close()
-        print("Abort requested. Progress saved; run scan.py again to continue.")
-        return
-    if describe and describe_pending(conn, config, helper, newest_first):
-        conn.close()
-        return
-    conn.close()
-    print("Done.")
+        source = self.conn.execute("SELECT " + _SOURCE_COLUMNS + " FROM images WHERE id = ?",
+                                   (row["id"],)).fetchone()
+        if source is None:
+            return
+        source = dict(source)
+        source["missing_since"] = None
+        key = row["content_hash"] or ((row["size"], row["dhash"]) if row["dhash"] else None)
+        if key and key not in self.replaced:
+            self.replaced[key] = source
+
+    @staticmethod
+    def _same_content(row, metadata, size, mtime):
+        if row["content_hash"]:
+            return row["content_hash"] == metadata["content_hash"]
+        # Imported from the old database, so no content hash yet.
+        if row["size"] == size and abs(row["mtime"] - mtime) < MTIME_TOLERANCE:
+            return True
+        return bool(row["dhash"]) and row["dhash"] == metadata["dhash"] and row["size"] == size
+
+    def _store(self, rel, size, mtime, ctime, result):
+        metadata = _metadata(result)
+        now = time.time()
+        row = self.rows.get(rel)
+        preview = result["preview"] if self.want_previews else None
+        if row is None:
+            image_id = self._insert(rel, size, mtime, ctime, metadata, preview is not None, now)
+        else:
+            image_id = row["id"]
+            values = dict(metadata, size=size, mtime=mtime, ctime=ctime, updated=now)
+            if self._same_content(row, metadata, size, mtime):
+                self.summary["updated"] += 1
+                self._note("updated", "Updated " + rel
+                           + (" (description kept)" if row["described"] else ""))
+            else:
+                self._remember_description(row)
+                source, _moved = self._find_source(metadata, size, image_id)
+                if source is not None:
+                    values.update({key: source[key] for key in _DESCRIPTION_COLUMNS
+                                   if key != "hidden"})
+                    self.summary["copied"] += 1
+                    self._note("changed", "Changed %s (description copied from %s)"
+                               % (rel, source["path"]))
+                else:
+                    values.update(_EMPTY_DESCRIPTION)
+                    self._note("changed", "Changed " + rel)
+                self.summary["changed"] += 1
+                if preview is None and row["has_preview"]:
+                    _delete_preview(self.previews, self.library_id, image_id, self.ctx)
+                    values["has_preview"] = 0
+            if preview is not None:
+                values["has_preview"] = 1
+            _update_row(self.conn, image_id, values, "missing_since = NULL")
+            self.cleared.add(image_id)
+        if rel in self.failures:
+            self.conn.execute("DELETE FROM read_failures WHERE library_id = ? AND path = ?",
+                              (self.library_id, rel))
+        self.thumbs.put(image_id, result["thumb"], commit=False)
+        self.thumb_ids.add(image_id)
+        if preview is not None:
+            try:
+                self.previews.write(self.library_id, image_id, preview)
+            except OSError as error:
+                # Never leave the previous picture's preview behind: it would
+                # be shown, and sent to the LLM, for the new content.
+                _delete_preview(self.previews, self.library_id, image_id, self.ctx)
+                self.conn.execute("UPDATE images SET has_preview = 0 WHERE id = ?", (image_id,))
+                self.ctx.log("Could not save the preview of %s: %s"
+                             % (rel, _error_text(error)), "warn")
+        self._wrote()
+
+    def _insert(self, rel, size, mtime, ctime, metadata, has_preview, now):
+        values = dict(metadata)
+        values.update(library_id=self.library_id, path=rel, name=rel.rsplit("/", 1)[-1],
+                      size=size, mtime=mtime, ctime=ctime, has_preview=1 if has_preview else 0,
+                      added=now, updated=now)
+        values.update(_EMPTY_DESCRIPTION)
+        values["hidden"] = 0
+        source, moved = self._find_source(metadata, size, -1)
+        if source is not None:
+            values.update({key: source[key] for key in _DESCRIPTION_COLUMNS})
+        if not values["hidden"] and self.conn.execute(
+                _HIDDEN_TWIN_SQL, (metadata["content_hash"], self.library_id)).fetchone():
+            # A hidden picture stays hidden under a new name or as a copy.
+            values["hidden"] = 1
+        columns = sorted(values)
+        image_id = self.conn.execute(
+            "INSERT INTO images (%s) VALUES (%s)" % (", ".join(columns),
+                                                     ", ".join("?" * len(columns))),
+            [values[column] for column in columns]).lastrowid
+        self.summary["added"] += 1
+        if moved:
+            # The old row was the same file at its previous path.
+            self.delete_rows([source["id"]])
+            self.summary["moved"] += 1
+            self._note("moved", "Moved %s -> %s" % (source["path"], rel))
+        elif source is not None:
+            self.summary["copied"] += 1
+            self._note("added", "Added %s (description copied from %s)" % (rel, source["path"]))
+        else:
+            self._note("added", "Added " + rel)
+        return image_id
+
+    # -- after a complete walk ----------------------------------------------
+
+    def _present_walked(self):
+        """Present rows of this library whose files were listed in this walk.
+
+        Returns (by_hash, by_size_dhash): {content_hash: [row]} and
+        {(size, dhash): [row]}.
+        """
+        by_hash = collections.defaultdict(list)
+        by_size_dhash = collections.defaultdict(list)
+        for row in self.conn.execute(
+                "SELECT id, path, content_hash, size, dhash, described FROM images "
+                "WHERE library_id = ? AND missing_since IS NULL", (self.library_id,)):
+            if row["path"] not in self.walked:
+                continue
+            if row["content_hash"]:
+                by_hash[row["content_hash"]].append(row)
+            if row["dhash"]:
+                by_size_dhash[(row["size"], row["dhash"])].append(row)
+        return by_hash, by_size_dhash
+
+    @staticmethod
+    def _twins(row, present):
+        """Rows listed in this walk that hold the same content as row."""
+        by_hash, by_size_dhash = present
+        if row["content_hash"]:
+            twins = by_hash.get(row["content_hash"], [])
+        elif row["dhash"]:
+            twins = by_size_dhash.get((row["size"], row["dhash"]), [])
+        else:
+            twins = []
+        return [twin for twin in twins if twin["id"] != row["id"]]
+
+    def _finish(self, walk):
+        ctx = self.ctx
+        error_paths = {rel for rel, _ in walk.errors + self.read_errors}
+        links = set(walk.links)
+
+        # Every file listed in this walk exists, even if it could not be read.
+        back = [row["id"] for path, row in self.rows.items()
+                if path in self.walked and row["missing_since"] is not None
+                and row["id"] not in self.cleared]
+        if back:
+            self._set_missing(back, None)
+            self.summary["restored"] += len(back)
+
+        present = sum(1 for row in self.rows.values() if row["missing_since"] is None)
+        candidates = [row for path, row in self.rows.items()
+                      if path not in self.walked and row["missing_since"] is None]
+        to_mark = [row for row in candidates
+                   if not _under_any(row["path"], error_paths)
+                   and not _under_any(row["path"], links)]
+        self.summary["protected"] = len(candidates) - len(to_mark)
+        if self.summary["protected"]:
+            ctx.log("%d file(s) in folders that could not be read (or linked folders) were "
+                    "left as they are." % self.summary["protected"], "warn")
+        if not self.walked:
+            # Nothing at all was listed: an emptied or unmounted folder is more
+            # likely than a deliberate deletion of everything.
+            if to_mark:
+                self._guard(to_mark, present)
+            self.summary["complete"] = True
+            return
+        present_walked = self._present_walked() if (to_mark or self._has_missing()) else None
+
+        # Files now excluded by ignore patterns were not deleted, but they
+        # are no longer part of the library.
+        excluded = [row for row in to_mark if excluded_by_ignores(row["path"], self.patterns)]
+        # Files whose content was listed at another path in this walk moved.
+        excluded_ids = {row["id"] for row in excluded}
+        moved = [row for row in to_mark if row["id"] not in excluded_ids
+                 and self._twins(row, present_walked)]
+        moved_ids = {row["id"] for row in moved}
+        rest = [row for row in to_mark if row["id"] not in excluded_ids
+                and row["id"] not in moved_ids]
+        if excluded:
+            self._set_missing([row["id"] for row in excluded], self.now)
+            self.summary["excluded"] = len(excluded)
+            ctx.log("%d file(s) in %s are now excluded by ignore patterns; they were marked "
+                    "missing." % (len(excluded), self.label))
+        if moved:
+            self._set_missing([row["id"] for row in moved], self.now)
+        trusted = True
+        if rest:
+            if self._is_mass_removal(rest, present) and not self.allow_mass_removal:
+                self._guard(rest, present)
+                trusted = False
+            else:
+                self._set_missing([row["id"] for row in rest], self.now)
+                self.summary["missing"] = len(rest)
+                for row in rest[:MISSING_LOG_LIMIT]:
+                    ctx.log("Missing: " + row["path"])
+                if len(rest) > MISSING_LOG_LIMIT:
+                    ctx.log("... and %d more missing file(s)" % (len(rest) - MISSING_LOG_LIMIT))
+        self.summary["complete"] = True
+        if present_walked is not None:
+            self._remove_moved(present_walked)
+        if not trusted:
+            # The walk did not look trustworthy: keep everything else as it is.
+            return
+        self._purge(error_paths | links)
+        stale = [path for path in self.failures
+                 if path not in self.walked and not _under_any(path, error_paths)]
+        for path in stale:
+            self.conn.execute("DELETE FROM read_failures WHERE library_id = ? AND path = ?",
+                              (self.library_id, path))
+
+    @staticmethod
+    def _is_mass_removal(rows, present):
+        return len(rows) > MASS_REMOVAL_MIN and len(rows) > present * MASS_REMOVAL_FRACTION
+
+    def _guard(self, rows, present):
+        self.summary["guarded"] = len(rows)
+        self.ctx.log("%d of the %d files in %s seem to be gone. That is too many to be "
+                     "likely, so none were marked missing. If they really were deleted or "
+                     "moved, scan again with --allow-mass-removal."
+                     % (len(rows), present, self.label), "warn")
+
+    def _has_missing(self):
+        return any(row["missing_since"] is not None for row in self.rows.values())
+
+    def _remove_moved(self, present_walked):
+        """Delete missing rows whose content was listed at another path in this walk.
+
+        The new row gets the old one's description when it has none yet, and
+        stays hidden if the old one was hidden.
+        """
+        missing = [row for row in self.conn.execute(
+            "SELECT " + _SOURCE_COLUMNS + ", content_hash, size, dhash FROM images "
+            "WHERE library_id = ? AND missing_since IS NOT NULL", (self.library_id,))
+                   if row["path"] not in self.walked]
+        gone = []
+        for row in missing:
+            twins = self._twins(row, present_walked)
+            if not twins:
+                continue
+            ids = [twin["id"] for twin in twins]
+            marks = ",".join("?" * len(ids))
+            if row["described"]:
+                self.conn.execute(
+                    "UPDATE images SET info = ?, described = 1, prompt_ver = ?, "
+                    "provenance = ?, describe_attempts = 0, describe_error = '' "
+                    "WHERE described = 0 AND id IN (%s)" % marks,
+                    [row["info"], row["prompt_ver"], row["provenance"]] + ids)
+            if row["hidden"]:
+                self.conn.execute("UPDATE images SET hidden = 1 WHERE id IN (%s)" % marks, ids)
+            gone.append(row)
+        if gone:
+            self.delete_rows([row["id"] for row in gone])
+            self.summary["removed_moved"] = len(gone)
+            for row in gone[:MISSING_LOG_LIMIT]:
+                self.ctx.log("Moved away: %s (its file is at another path now)" % row["path"])
+
+    def _purge(self, protected_paths):
+        days = self.purge_after_days
+        if days is None:
+            return
+        try:
+            days = float(days)
+        except (TypeError, ValueError):
+            return
+        if days < 0:
+            return
+        cutoff = self.now - days * DAY
+        rows = [row for row in self.conn.execute(
+            "SELECT id, path FROM images WHERE library_id = ? AND missing_since IS NOT NULL "
+            "AND missing_since < ?", (self.library_id, cutoff))
+                if row["path"] not in self.walked
+                and not _under_any(row["path"], protected_paths)]
+        if rows:
+            self.delete_rows([row["id"] for row in rows])
+            self.summary["purged"] = len(rows)
+            self.ctx.log("Removed %d file(s) that have been missing for more than %g days."
+                         % (len(rows), days))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Scan the image libraries.")
+def scan_library(conn, library, ctx, helper=None, thumbs=None, previews=None,
+                 threads=6, allow_mass_removal=False, purge_after_days=30, now=None,
+                 verbose=False):
+    """Bring the index of one library up to date with its folder.
+
+    conn is an index.db connection, ctx a jobs.JobContext; thumbs and
+    previews default to cache.ThumbStore() and cache.PreviewStore(). now
+    (seconds) is the time used for missing_since and purging. verbose logs
+    every added or changed file instead of the first FILE_LOG_LIMIT. Returns
+    a summary dict with counts (files, added, updated, changed, moved,
+    copied, unchanged, restored, failed, skipped_failed, unsupported,
+    read_errors, missing, protected, links, excluded, guarded,
+    removed_moved, purged), flags (offline, aborted, complete) and errors
+    [(rel_path, message)].
+    """
+    own_thumbs = thumbs is None
+    thumbs = thumbs or cache.ThumbStore()
+    try:
+        scan = LibraryScan(conn, library, ctx, helper, thumbs, previews or cache.PreviewStore(),
+                           threads, allow_mass_removal, purge_after_days, now, verbose)
+        return scan.run()
+    finally:
+        if own_thumbs:
+            thumbs.close()
+
+
+# ---------------------------------------------------------------------------
+# Filling in what older rows lack
+
+def preview_ids(previews, library_id):
+    """The ids of images that have a preview file in a library (one listing per bucket)."""
+    found = set()
+    try:
+        buckets = [entry.path for entry in os.scandir(previews.library_dir(library_id))
+                   if entry.is_dir()]
+    except OSError:
+        return found
+    for bucket in buckets:
+        try:
+            for entry in os.scandir(bucket):
+                stem, ext = os.path.splitext(entry.name)
+                if ext == ".jpg" and stem.isdigit():
+                    found.add(int(stem))
+        except OSError:
+            pass
+    return found
+
+
+_BACKFILL_SQL = """
+    SELECT id, path, size, mtime, content_hash, dhash, width, height, has_preview
+    FROM images WHERE library_id = ? AND missing_since IS NULL ORDER BY id"""
+
+
+def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, threads=6):
+    """Read rows that lack a content hash, dHash, size or (wanted) preview.
+
+    Rows imported from the old database have no content hash or preview;
+    this reads each such original once and fills them in, with fresh EXIF
+    facts and thumbnail. Rows of files the ignore patterns now exclude are
+    left alone. It runs as stage "previews", can be stopped at any point and
+    continues where it left off. Returns a summary dict:
+    {needed, filled, failed, changed, unsupported, aborted}.
+    """
+    own_thumbs = thumbs is None
+    thumbs = thumbs or cache.ThumbStore()
+    previews = previews or cache.PreviewStore()
+    try:
+        return _backfill(conn, library, ctx, helper, thumbs, previews, threads)
+    finally:
+        if own_thumbs:
+            thumbs.close()
+
+
+def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
+    library_id = library["id"]
+    root = library_root(library)
+    patterns = common.ignore_patterns(library)
+    want_previews = bool(library.get("previews", True))
+    summary = {"needed": 0, "filled": 0, "failed": 0, "changed": 0, "unsupported": 0,
+               "aborted": False}
+    on_disk = preview_ids(previews, library_id)
+    failures = _load_failures(conn, library_id)
+    needed = []
+    for row in conn.execute(_BACKFILL_SQL, (library_id,)).fetchall():
+        has_preview = bool(row["has_preview"])
+        if has_preview and row["id"] not in on_disk:
+            # The file was deleted: build it again. (A file without the flag
+            # is never trusted; it may hold an older picture.)
+            conn.execute("UPDATE images SET has_preview = 0 WHERE id = ?", (row["id"],))
+            has_preview = False
+        if (row["content_hash"] and row["dhash"] and row["width"] > 0 and row["height"] > 0
+                and (has_preview or not want_previews)):
+            continue
+        if excluded_by_ignores(row["path"], patterns):
+            continue
+        if _failed_before(failures, row["path"], row["size"], row["mtime"]):
+            continue
+        needed.append(row)
+    conn.commit()
+    summary["needed"] = len(needed)
+    if not needed:
+        return summary
+    ctx.stage("previews", total=len(needed))
+    ctx.log("Filling in previews and details for %d image(s) in %s"
+            % (len(needed), common.library_label(library)))
+    read_helper = thread_safe_helper(helper)
+    timer = _CommitTimer(conn, thumbs)
+    unsupported_logged = set()
+
+    def read(row):
+        return _read_original(root, row["path"], read_helper, want_previews, row["mtime"])
+
+    def handle(row, outcome):
+        result, error = outcome
+        if error is not None and _missing_decoder(error):
+            summary["unsupported"] += 1
+            if str(error) not in unsupported_logged:
+                unsupported_logged.add(str(error))
+                ctx.log("Skipping %s: %s" % (row["path"], error), "warn")
+        elif error is not None:
+            if not isinstance(error, images.SourceReadError):
+                _record_read_failure(conn, library_id, row["path"], row["size"],
+                                     row["mtime"], error)
+            summary["failed"] += 1
+            ctx.log("Could not read %s: %s" % (row["path"], _error_text(error)), "warn")
+        elif row["content_hash"] and row["content_hash"] != result["content_hash"]:
+            # Changed since it was scanned; the next scan picks it up.
+            summary["changed"] += 1
+        else:
+            values = _metadata(result)
+            values["updated"] = time.time()
+            preview = result["preview"] if want_previews else None
+            if preview is not None:
+                try:
+                    previews.write(library_id, row["id"], preview)
+                    values["has_preview"] = 1
+                except OSError as error:
+                    _delete_preview(previews, library_id, row["id"], ctx)
+                    values["has_preview"] = 0
+                    ctx.log("Could not save the preview of %s: %s"
+                            % (row["path"], _error_text(error)), "warn")
+            _update_row(conn, row["id"], values)
+            thumbs.put(row["id"], result["thumb"], commit=False)
+            summary["filled"] += 1
+        timer.wrote()
+        ctx.step(item=row["path"])
+
+    try:
+        summary["aborted"] = _parallel_reads(threads, needed, read, handle, ctx.should_stop,
+                                             ctx, timer.flush)
+    finally:
+        timer.commit()
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Whole runs and the command line
+
+def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
+        newest_first=None, retry_failed=False, allow_mass_removal=False, helper=None,
+        now=None, verbose=False):
+    """Scan (and back-fill) the selected libraries, then describe what needs it.
+
+    library_ids limits the run to those library ids (default: every enabled
+    library). db.init() must have run in this process. Returns
+    {"libraries": [scan summaries], "describe": describe summary or None,
+    "stopped": bool}.
+    """
+    libraries = describe.selected_libraries(config, library_ids)
+    summary = {"libraries": [], "describe": None, "stopped": False}
+    threads = reader_threads(config)
+    conn = db.connect()
+    try:
+        previews = cache.PreviewStore()
+        if scan_images:
+            with cache.ThumbStore() as thumbs:
+                for library in libraries:
+                    if ctx.should_stop():
+                        summary["stopped"] = True
+                        break
+                    result = scan_library(conn, library, ctx, helper, thumbs, previews, threads,
+                                          allow_mass_removal,
+                                          config.get("purge_after_days", 30), now, verbose)
+                    summary["libraries"].append(result)
+                    if result["aborted"]:
+                        summary["stopped"] = True
+                        break
+                    if result["offline"]:
+                        continue
+                    result["backfill"] = backfill(conn, library, ctx, helper, thumbs,
+                                                  previews, threads)
+                    if result["backfill"]["aborted"]:
+                        summary["stopped"] = True
+                        break
+        if describe_images and not summary["stopped"] and not ctx.should_stop():
+            summary["describe"] = describe.describe_pending(
+                conn, config, ctx, helper=helper,
+                library_ids=[library["id"] for library in libraries],
+                newest_first=newest_first, retry_failed=retry_failed, previews=previews)
+            summary["stopped"] = summary["describe"]["stopped"]
+        elif ctx.should_stop():
+            summary["stopped"] = True
+    finally:
+        conn.close()
+    return summary
+
+
+def _safe_output():
+    """Never crash on file names the console cannot show."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="backslashreplace")
+            except (ValueError, OSError):
+                pass
+
+
+def main(argv=None):
+    """Command line entry point. Returns the process exit code."""
+    _safe_output()
+    parser = argparse.ArgumentParser(description="Scan the image libraries and describe "
+                                                 "new images.")
+    parser.add_argument("--library", action="append", metavar="NAME_OR_ID",
+                        help="Only this library (by name or id). Can be repeated.")
     parser.add_argument("--no-scan", action="store_true",
                         help="Skip the index image step, and only run LLM descriptions.")
     parser.add_argument("--no-describe", action="store_true",
                         help="Index images without requesting LLM descriptions.")
-    parser.add_argument("--newest-first", action="store_true",
-                        help="Describe images most-recent first, using EXIF date "
-                             "and falling back to the file's modified time.")
-    args = parser.parse_args()
-    run_scan(scan_images=not args.no_scan, describe=not args.no_describe,
-             newest_first=args.newest_first)
+    order = parser.add_mutually_exclusive_group()
+    order.add_argument("--newest-first", dest="newest_first", action="store_const",
+                       const=True, default=None,
+                       help="Describe the most recently taken images first (default: "
+                            "each library's newest_first setting).")
+    order.add_argument("--oldest-first", dest="newest_first", action="store_const",
+                       const=False, help="Describe the oldest images first.")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="Also retry images that failed to describe %d times."
+                             % describe.MAX_FAILURES)
+    parser.add_argument("--allow-mass-removal", action="store_true",
+                        help="Mark files missing even when most of a library seems to "
+                             "have vanished.")
+    parser.add_argument("--verbose", action="store_true",
+                        help="List every added or changed file (by default only the "
+                             "first %d of each kind per library)." % FILE_LOG_LIMIT)
+    args = parser.parse_args(argv)
+
+    ctx = jobs.ConsoleContext("scan")
+    found = ctx.abort_file_present()
+    if found:
+        print("Abort file present (%s); delete it first." % found)
+        return 1
+    try:
+        config = common.load_config()
+    except common.ConfigError as error:
+        print("Error: %s" % error)
+        return 2
+    if not config.get("libraries"):
+        print("No libraries configured. Run settings.py first.")
+        return 0
+    lock = jobs.WorkerLock()
+    if not lock.acquire("scan.py"):
+        print("Another job is running: %s. Try again when it has finished."
+              % (lock.holder() or "another process"))
+        return 1
+    try:
+        db.init(config, log=ctx.log)
+        library_ids = None
+        if args.library:
+            library_ids = []
+            for wanted in args.library:
+                library = common.get_library(config, wanted)
+                if library is None:
+                    print("Unknown library: %s" % wanted)
+                    return 2
+                if not library.get("enabled", True):
+                    ctx.log("Library %s is disabled; skipping it."
+                            % common.library_label(library), "warn")
+                    continue
+                library_ids.append(library["id"])
+        helper = common.load_helper(config.get("helper", ""))
+        summary = run(config, ctx, library_ids=library_ids, scan_images=not args.no_scan,
+                      describe_images=not args.no_describe, newest_first=args.newest_first,
+                      retry_failed=args.retry_failed,
+                      allow_mass_removal=args.allow_mass_removal, helper=helper,
+                      verbose=args.verbose)
+    except (db.DatabaseError, common.ConfigError) as error:
+        print("Error: %s" % error)
+        return 2
+    finally:
+        lock.release()
+    if summary["stopped"]:
+        ctx.log("Abort requested. Progress saved; run scan.py again to continue.")
+    else:
+        ctx.log("Done.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
