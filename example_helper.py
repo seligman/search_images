@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
 """Example helper module for the image database.
 
-Point settings.py at this file (or your own copy) to wrap the LLM calls.
-Every function is optional; remove any you do not need.
+Point settings.py (or "helper" in config.json) at your own copy of this
+file to wrap the LLM calls and the file access. Every function is optional;
+remove any you do not need.
 
-The scanner and the describe step read several images at once. Unless
-THREAD_SAFE is True, they make sure load_image and stat are only ever called
-one at a time (call_api is always called one at a time).
+Which tools call which hooks:
+
+- before_launch, after_launch and call_api: describe runs only, that is
+  the describe step of scan.py and the Manage page's describe jobs
+  (Describe, Scan + describe, Process all, Re-describe, and "Describe
+  again" in the viewer). Manage jobs run inside the web server's process.
+  The endpoint tests (Test on the Settings page, settings.py's test,
+  scan.py --test-endpoint) and compare_models.py never call them, so start
+  the model server yourself before using those.
+- walk_library: scans (and the Build previews job), to list a library.
+- load_image and stat: everything that reads originals: scans, describing,
+  the search server and exports.
+
+The scanner, the describe step, the export and the web server read several
+images at once. Unless THREAD_SAFE is True, they make sure load_image and
+stat are only ever called one at a time within a program (the web server's
+requests and the jobs it runs take turns too); call_api is always called one
+at a time. A scan run from the command line while the web server is running
+is another program, and may call them at the same time as the server.
 """
 
 # Set to True if load_image and stat may be called from several threads at
@@ -15,27 +32,31 @@ THREAD_SAFE = False
 
 
 def before_launch():
-    """Run once before the first LLM call of a scan pass.
+    """Run once before the first LLM call of a describe run.
 
     Only called when there is at least one image to describe. Use it to start
-    a local model server, open a connection, and so on.
+    a local model server, open a connection, and so on. It may return as soon
+    as the server process is started: a local server that is still loading
+    its model is waited for (up to three minutes) before the first request.
     """
     pass
 
 
 def after_launch():
-    """Run once after the last LLM call of a scan pass."""
+    """Run once after the last LLM call of a describe run, even one that failed."""
     pass
 
 
 def call_api(prompt, image_path, source_path=None):
     """Adjust a request just before it is sent to the LLM.
 
-    prompt is the text sent after the image ("Describe this image." plus the
-    library's context notes); the instructions themselves go in the system
-    prompt, which is sent unchanged. image_path is a temporary JPEG holding
-    the image as it will be sent (upright and shrunk for the model); it is
-    deleted afterwards.
+    Called before each image is sent in a describe run (and again when an
+    unusable reply makes it ask again). prompt is the text sent after the
+    image ("Describe this image.", for 360-degree photos a note that the
+    image is an equirectangular panorama, and the library's context notes);
+    the instructions themselves go in the system prompt, which is sent
+    unchanged. image_path is a temporary JPEG holding the image as it will
+    be sent (upright and shrunk for the model); it is deleted afterwards.
     source_path is the original file in the library, for hooks that pick
     what to do by folder or file name. (Older versions passed the original
     as image_path; a hook that only takes two arguments still works, it just

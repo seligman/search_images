@@ -30,11 +30,7 @@ def columns(conn, table):
     return [row[1] for row in conn.execute("PRAGMA table_info(%s)" % table)]
 
 
-def strict_json(text):
-    """json.loads that rejects NaN/Infinity, like a browser does."""
-    def reject(token):
-        raise ValueError("non-finite number " + token)
-    return json.loads(text, parse_constant=reject)
+strict_json = support.strict_json
 
 
 class SchemaTest(support.TempBaseMixin, unittest.TestCase):

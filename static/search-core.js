@@ -2904,7 +2904,6 @@ var SearchCore = (function () {
     ];
 
     return {
-        VERSION: 1,
         FACETS: FACETS,
         SORTS: SORTS,
         SYNTAX: SYNTAX,

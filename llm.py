@@ -68,10 +68,6 @@ MAX_BACKOFF = 60
 MAX_RETRY_AFTER = 600
 # Characters of a provider's error message kept in a ProviderError.
 ERROR_TEXT_LIMIT = 300
-# probe_model_name() asks an unreachable server this many times in all,
-# this many seconds apart.
-PROPS_MAX_ATTEMPTS = 3
-PROPS_RETRY_DELAY = 1.0
 
 # Name given to the reply schema in OpenAI requests.
 SCHEMA_NAME = "reply"
@@ -1173,23 +1169,6 @@ def probe(endpoint):
     except Exception:
         pass        # a probe must never stop anything
     return result
-
-
-def probe_model_name(endpoint):
-    """Older entry point: the name of the model an endpoint serves.
-
-    What probe() reports, else the configured model name. An unreachable
-    server is asked PROPS_MAX_ATTEMPTS times in all, PROPS_RETRY_DELAY
-    seconds apart. Never raises.
-    """
-    configured = common.endpoint_settings(endpoint)["model"]
-    info = probe(endpoint)
-    for _attempt in range(1, PROPS_MAX_ATTEMPTS):
-        if info["reachable"] is not False:
-            break
-        time.sleep(PROPS_RETRY_DELAY)
-        info = probe(endpoint)
-    return info["model"] or configured
 
 
 def wait_until_ready(endpoint, timeout, should_stop=None, interval=1.0, sleep=time.sleep):

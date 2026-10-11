@@ -6,14 +6,16 @@ extended profile), the user text from user_text(library) and the JSON
 schema from schema(profile), which the LLM's reply must follow. The fields
 are listed once (see fields()); describe.parse_reply() uses the same list
 to check and tidy replies. search_terms() turns a stored description (this
-version's or an older one) into the text the search page matches.
+version's or an older one) into one plain lower-case text (the pages search
+the compact records of search_index.py instead).
 
 Two profiles exist: "core" (every library) and "extended" (opt-in per
 library: counted objects, landmarks, a location guess, mood, activities),
 which costs more output tokens.
 
 Kept apart from describe.py so tools that only count or search
-descriptions (progress.py, serve.py) can use it without importing Pillow.
+descriptions (progress.py, search_index.py) can use it without importing
+Pillow.
 This module uses only the standard library.
 """
 
@@ -373,7 +375,7 @@ def _enum_words(value):
 
 
 def search_terms(info, name="", path="", taken_at="", projection=""):
-    """The lower-cased text a search is matched against, for one image.
+    """All the words of one image as one lower-cased text.
 
     It holds the description's words (title, description, subjects, tags,
     visible text, animals, food, vehicles, people descriptors, scene,

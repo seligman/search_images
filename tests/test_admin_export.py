@@ -22,7 +22,6 @@ import support
 
 import admin
 import common
-import db
 import export
 import jobs
 import library_ops
@@ -539,6 +538,22 @@ class DialogTest(ExportFixture, unittest.TestCase):
         output = (result.stdout + result.stderr).decode("utf-8", "replace")
         self.assertEqual(result.returncode, 0, "\n" + output)
         self.assertRegex(output, r"(\d+) of \1 passed")
+
+
+class ForeignZipTest(ExportFixture, unittest.TestCase):
+
+    def test_a_zip_someone_else_made_is_refused_before_the_job_is_queued(self):
+        folder = tempfile.mkdtemp(prefix="search-images-zip-")
+        self.addCleanup(support.remove_tree, folder)
+        out = os.path.join(folder, "Vacation")
+        with open(out + ".zip", "wb") as handle:
+            handle.write(b"my own archive")
+        response = self.export_job({"out_dir": out, "options": {"zip": True}})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("was not made by an export", response.get_json()["fields"]["out_dir"])
+        self.assertEqual(self.ok(self.get("/jobs"))["queue"], [])
+        with open(out + ".zip", "rb") as handle:
+            self.assertEqual(handle.read(), b"my own archive")
 
 
 if __name__ == "__main__":

@@ -71,34 +71,10 @@ DAY = 86400.0
 MISSING_LOG_LIMIT = 20      # log at most this many missing paths one by one
 FILE_LOG_LIMIT = 20         # per library, "Added ..." (etc.) lines beyond this are only counted
 LIST_LOG_SECONDS = 10.0     # progress line while listing a large library
-# Windows reparse tag of a directory junction (stat.IO_REPARSE_TAG_MOUNT_POINT).
-_JUNCTION_TAG = 0xA0000003
-
-
-def library_root(library):
-    """The folder of a library, with ~ expanded (see common.library_root)."""
-    return common.library_root(library)
 
 
 # ---------------------------------------------------------------------------
 # Listing files
-
-def _is_link(entry):
-    """True for a symlink, or a Windows directory junction (never followed)."""
-    try:
-        if entry.is_symlink():
-            return True
-        check = getattr(entry, "is_junction", None)       # Python 3.12+
-        if check is not None:
-            return bool(check())
-        if os.name != "nt":
-            return False
-        # Older Pythons: junctions are reparse points with this tag.
-        tag = getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0)
-        return tag == _JUNCTION_TAG
-    except OSError:
-        return False
-
 
 def _error_text(error):
     text = str(error) or type(error).__name__
@@ -205,7 +181,7 @@ class LibraryWalk:
             for entry in entries:
                 rel = rel_dir + "/" + entry.name if rel_dir else entry.name
                 try:
-                    link = _is_link(entry)
+                    link = common.is_link(entry)
                     # For a link, what it points to decides which patterns apply.
                     is_dir = entry.is_dir(follow_symlinks=not link)
                     if is_dir and common.should_prune_dir(rel, self.patterns):
@@ -511,7 +487,7 @@ class LibraryScan:
         self.library = library
         self.library_id = library["id"]
         self.label = common.library_label(library)
-        self.root = library_root(library)
+        self.root = common.library_root(library)
         self.patterns = common.ignore_patterns(library)
         self.ctx = ctx
         self.helper = helper
@@ -1090,11 +1066,6 @@ def scan_library(conn, library, ctx, helper=None, thumbs=None, previews=None,
 # ---------------------------------------------------------------------------
 # Filling in what older rows lack
 
-def preview_ids(previews, library_id):
-    """The ids of images that have a preview file in a library (one listing per bucket)."""
-    return previews.stored_ids(library_id)[0]
-
-
 _BACKFILL_SQL = """
     SELECT id, path, size, mtime, content_hash, dhash, width, height, has_preview,
            projection, described
@@ -1128,7 +1099,7 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
 
 def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
     library_id = library["id"]
-    root = library_root(library)
+    root = common.library_root(library)
     patterns = common.ignore_patterns(library)
     want_previews = bool(library.get("previews", True))
     summary = {"needed": 0, "filled": 0, "failed": 0, "changed": 0, "unsupported": 0,
@@ -1265,6 +1236,9 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
                     if ctx.should_stop():
                         summary["stopped"] = True
                         break
+                    if jobs.library_removed(ctx, library["id"]):
+                        # Removed from the settings while this job runs.
+                        continue
                     result = scan_library(conn, library, ctx, helper, thumbs, previews, threads,
                                           allow_mass_removal,
                                           config.get("purge_after_days", 30), now, verbose)
@@ -1282,7 +1256,8 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
         if describe_images and not summary["stopped"] and not ctx.should_stop():
             summary["describe"] = describe.describe_pending(
                 conn, config, ctx, helper=helper,
-                library_ids=[library["id"] for library in libraries],
+                library_ids=[library["id"] for library in libraries
+                             if not jobs.library_removed(ctx, library["id"])],
                 newest_first=newest_first, retry_failed=retry_failed,
                 redescribe_stale=redescribe_stale, limit=limit, endpoint_name=endpoint_name,
                 previews=previews)
@@ -1480,20 +1455,25 @@ def main(argv=None):
                     continue
                 library_ids.append(library["id"])
         helper = common.load_helper(config.get("helper", ""))
-        summary = run(config, ctx, library_ids=library_ids, scan_images=not args.no_scan,
-                      describe_images=not args.no_describe, newest_first=args.newest_first,
-                      retry_failed=args.retry_failed,
-                      allow_mass_removal=args.allow_mass_removal, helper=helper,
-                      verbose=args.verbose, redescribe_stale=args.redescribe_stale,
-                      limit=args.limit, endpoint_name=args.endpoint)
+        with ctx.stop_on_ctrl_c():
+            summary = run(config, ctx, library_ids=library_ids, scan_images=not args.no_scan,
+                          describe_images=not args.no_describe,
+                          newest_first=args.newest_first, retry_failed=args.retry_failed,
+                          allow_mass_removal=args.allow_mass_removal, helper=helper,
+                          verbose=args.verbose, redescribe_stale=args.redescribe_stale,
+                          limit=args.limit, endpoint_name=args.endpoint)
     except (db.DatabaseError, common.ConfigError) as error:
         print("Error: %s" % error)
         return 2
+    except KeyboardInterrupt:
+        # A second Ctrl+C: what was committed is kept.
+        print("\nStopped (Ctrl+C). Most progress is saved; run scan.py again to continue.")
+        return 130
     finally:
         lock.release()
     described = summary.get("describe") or {}
     if summary["stopped"]:
-        ctx.log("Abort requested. Progress saved; run scan.py again to continue.")
+        ctx.log("Stopped as asked. Progress saved; run scan.py again to continue.")
     elif described.get("fatal") or described.get("error"):
         # Unattended runs (a scheduled task) can tell this from success.
         ctx.log("Stopped early: %s" % described["error"], "error")

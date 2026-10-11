@@ -6,6 +6,7 @@ import json
 import locale
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -65,7 +66,7 @@ class ConfigTest(support.TempBaseMixin, unittest.TestCase):
         config = common.load_config()
         self.assertEqual(config["libraries"], [])
         self.assertEqual(config["reader_threads"], 6)
-        self.assertEqual(config["endpoint"]["kind"], "openai")
+        self.assertEqual(config["endpoints"], [])
         self.assertFalse(os.path.exists(common.config_path()))
 
     def test_round_trip_keeps_unicode(self):
@@ -625,9 +626,6 @@ class FileTypeTest(unittest.TestCase):
             self.assertTrue(common.is_image_file(name), name)
         for name in ("a.mov", "b.mp4", "c.txt", "Thumbs.db", "jpg"):
             self.assertFalse(common.is_image_file(name), name)
-        for name in ("a.heic", "b.HEIF", "c.hif", "d.avif"):
-            self.assertTrue(common.is_heic_like(name), name)
-        self.assertFalse(common.is_heic_like("a.jpg"))
 
 
 class IgnoreTest(unittest.TestCase):
@@ -836,6 +834,120 @@ class RedactTest(unittest.TestCase):
             self.assertEqual(common.redact(text), text)
         self.assertEqual(common.redact(None), "")
         self.assertEqual(common.redact(ValueError("boom")), "boom")
+
+
+class FinalReviewConfigTest(support.TempBaseMixin, unittest.TestCase):
+    """A new config has no endpoint at all; quoted paths; an empty file."""
+
+    def test_a_new_config_names_no_endpoint(self):
+        config = common.load_config()
+        self.assertEqual(config["endpoints"], [])
+        self.assertNotIn("endpoint", config)
+        self.assertEqual(common.endpoint_list(config), [])
+        self.assertEqual(common.default_endpoint_name(config), "")
+        config["libraries"].append(support.library("Family", "C:\\Photos\\Family"))
+        common.save_config(config)
+        with open(common.config_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+        # No placeholder with an api_key field that invites pasting a key.
+        self.assertNotIn("endpoint", saved)
+        self.assertEqual(saved["endpoints"], [])
+
+    def test_the_placeholder_older_versions_wrote_is_no_endpoint(self):
+        placeholder = {"kind": "openai", "base_url": "", "api_key": "", "model": ""}
+        self.base.write_config([], endpoint=placeholder)
+        config = common.load_config()
+        self.assertEqual(common.endpoint_list(config), [])
+        self.assertEqual(common.default_endpoint_name(config), "")
+        self.assertEqual(common.endpoints_for_library(config, {}), [])
+        common.save_config(config)
+        with open(common.config_path(), encoding="utf-8") as handle:
+            self.assertNotIn("endpoint", json.load(handle))
+        # The same in a config made by hand (never loaded from a file).
+        raw = {"endpoint": dict(placeholder), "libraries": []}
+        self.assertEqual(common.endpoint_list(raw), [])
+        self.assertEqual(common.default_endpoint_name(raw), "")
+        # One with anything set is still an endpoint.
+        self.base.write_config([], endpoint={"kind": "openai", "model": "m"})
+        config = common.load_config()
+        self.assertEqual([e["name"] for e in common.endpoint_list(config)], ["default"])
+        self.assertEqual(common.default_endpoint_name(config), "default")
+
+    def test_an_empty_config_file_is_an_empty_config(self):
+        for text in ("", "  \n"):
+            self.base.write_file("config.json", text)
+            config = common.load_config()
+            self.assertEqual(config["libraries"], [])
+            self.assertEqual(config["endpoints"], [])
+
+    def test_quotes_around_a_path_are_not_part_of_it(self):
+        folder = self.base.library_folder("lib2")
+        for typed in ('"%s"' % folder, "'%s'" % folder, '  "%s" ' % folder, folder):
+            self.assertEqual(common.unquote_path(typed), folder, typed)
+            self.assertEqual(common.library_root({"path": typed}), os.path.normpath(folder))
+        self.assertEqual(common.unquote_path('"'), '"')
+        self.assertEqual(common.unquote_path('"a\''), '"a\'')
+        self.assertEqual(common.unquote_path(None), "")
+
+
+class FinalReviewHelperTest(unittest.TestCase):
+    """A helper module's load_image and stat take turns across every stand-in."""
+
+    def test_stand_ins_for_one_helper_file_share_one_lock(self):
+        folder = tempfile.mkdtemp(prefix="search-images-helper-")
+        self.addCleanup(support.remove_tree, folder)
+        path = os.path.join(folder, "helper.py")
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("import threading, time\n"
+                         "state = {'now': 0, 'most': 0}\n"
+                         "lock = threading.Lock()\n"
+                         "def load_image(path):\n"
+                         "    with lock:\n"
+                         "        state['now'] += 1\n"
+                         "        state['most'] = max(state['most'], state['now'])\n"
+                         "    time.sleep(0.02)\n"
+                         "    with lock:\n"
+                         "        state['now'] -= 1\n"
+                         "    return b'x'\n")
+        # Loaded twice (as the server and a job each load it): two modules.
+        first, second = common.load_helper(path), common.load_helper(path)
+        self.assertIsNot(first, second)
+        shared = {"now": 0, "most": 0}
+        first.state = second.state = shared
+        second.lock = first.lock
+        stand_ins = [common.thread_safe_helper(first), common.thread_safe_helper(second)]
+        threads = [threading.Thread(target=stand_ins[number % 2].load_image, args=("a",))
+                   for number in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(shared["most"], 1)
+        # A helper that says it is thread safe is used as it is.
+        first.THREAD_SAFE = True
+        self.assertIs(common.thread_safe_helper(first), first)
+
+
+class FinalReviewLinkTest(unittest.TestCase):
+
+    class Entry:
+        """A scandir entry as older Pythons give it (no is_junction)."""
+
+        def __init__(self, symlink=False, tag=0):
+            self.symlink, self.tag = symlink, tag
+
+        def is_symlink(self):
+            return self.symlink
+
+        def stat(self, follow_symlinks=True):
+            return mock.Mock(st_reparse_tag=self.tag)
+
+    def test_links_and_junctions(self):
+        self.assertTrue(common.is_link(self.Entry(symlink=True)))
+        self.assertFalse(common.is_link(self.Entry()))
+        junction = self.Entry(tag=common.JUNCTION_TAG)
+        # Before Python 3.12, a junction is told by its reparse tag (Windows only).
+        self.assertEqual(common.is_link(junction), os.name == "nt")
 
 
 if __name__ == "__main__":

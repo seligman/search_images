@@ -14,6 +14,7 @@ import datetime
 import math
 import os
 import re
+import struct
 
 MAX_TEXT = 2000           # longest EXIF string kept
 YEAR_MIN, YEAR_MAX = 1900, 2100
@@ -635,3 +636,75 @@ def is_360_camera(exif_dict):
     return (("ricoh" in make and "theta" in model)
             or ("gopro" in make and "max" in model)
             or ("samsung" in make and "gear 360" in model))
+
+
+# ---------------------------------------------------------------------------
+# Colour profiles
+
+# ICC tag types that hold free text (a description, a copyright, a device
+# name): text, desc (version 2) and mluc (version 4).
+_ICC_NEUTRAL = b"Profile"
+
+
+def scrub_icc(profile):
+    """An ICC colour profile with its free text replaced, the same length; the colours stay.
+
+    A profile's description, copyright and device names can name a person
+    or a computer (a calibrated monitor's profile, say). Every text, desc
+    and mluc tag gets a neutral word instead, and the profile id (an MD5
+    of the profile) is zeroed, as it no longer matches. Returns None for
+    bytes that are not a profile this can read: the caller drops them.
+    """
+    data = bytearray(profile)
+    size = len(data)
+    if size < 132 or bytes(data[36:40]) != b"acsp":
+        return None
+
+    def u32(pos):
+        return struct.unpack(">I", bytes(data[pos:pos + 4]))[0] if pos + 4 <= size else 0
+
+    def blank(start, end, wide=False):
+        if start >= end:
+            return
+        word = _ICC_NEUTRAL.decode("ascii").encode("utf-16-be") if wide else _ICC_NEUTRAL
+        filler = b"\x00 " if wide else b"\x00"
+        length = end - start
+        text = (word + filler * length)[:length]
+        if wide and length % 2:
+            text = text[:-1] + b"\x00"
+        data[start:end] = text
+
+    count = u32(128)
+    if count > 1000 or 132 + 12 * count > size:
+        return None
+    for index in range(count):
+        offset, length = u32(136 + 12 * index), u32(140 + 12 * index)
+        end = min(size, offset + length)
+        if offset < 132 or end - offset < 8:
+            continue
+        kind = bytes(data[offset:offset + 4])
+        if kind == b"text":
+            blank(offset + 8, end)
+        elif kind == b"desc":
+            ascii_count = u32(offset + 8)
+            start = offset + 12
+            blank(start, min(end, start + ascii_count))
+            pos = start + ascii_count
+            if pos + 8 <= end:
+                wide_count = u32(pos + 4)
+                blank(pos + 8, min(end, pos + 8 + 2 * wide_count), wide=True)
+                pos += 8 + 2 * wide_count
+                if pos + 3 <= end:
+                    blank(pos + 3, min(end, pos + 3 + 67))
+        elif kind == b"mluc":
+            records, record_size = u32(offset + 8), u32(offset + 12)
+            if record_size < 12:
+                continue
+            for number in range(min(records, 1000)):
+                record = offset + 16 + number * record_size
+                if record + 12 > end:
+                    break
+                start = offset + u32(record + 8)
+                blank(start, min(end, start + u32(record + 4)), wide=True)
+    data[84:100] = bytes(16)
+    return bytes(data)

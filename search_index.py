@@ -274,10 +274,13 @@ def record_for_row(row, for_export=False, export_options=None, info=None):
         words = _extended_words(info, not for_export or options["location"])
         if words:
             record["ex"] = words
-        for key, field in _SCORE_FIELDS:
-            value = _score(info.get(field))
-            if value is not None:
-                record[key] = value
+        if row["prompt_ver"] > 4:
+            # Version 4 rated sharpness from 0 to 1 (and had no aesthetic
+            # score): read as a 1-5 score it would be the worst there is.
+            for key, field in _SCORE_FIELDS:
+                value = _score(info.get(field))
+                if value is not None:
+                    record[key] = value
         if info.get("private_info") is True:
             record["pr"] = 1
     taken = row["taken_at"] or ""
@@ -898,16 +901,11 @@ def _fingerprint_line(item):
     return ("%d %s %s %s\n" % (image_id, dhash, content_hash, taken)).encode("utf-8", "replace")
 
 
-def groups_fingerprint(items):
-    """A digest of what duplicate_groups() depends on (items sorted by id)."""
-    digest = _fingerprint_start()
-    for item in items:
-        digest.update(_fingerprint_line(_item(item)))
-    return digest.hexdigest()
-
-
 def _fingerprints(items, upto):
-    """(groups_fingerprint(items), the same of the items with ids up to upto)."""
+    """(a digest of what duplicate_groups() depends on, the same of the items with ids up to upto).
+
+    items are sorted by id, each as _item() gives it.
+    """
     digest = _fingerprint_start()
     prefix = digest.hexdigest() if upto is None else None
     for item in items:
@@ -964,7 +962,7 @@ def library_groups(library_id, items, use_cache=True):
     items are (image id, dhash, content hash, trusted date) of the
     library's present, visible pictures (see duplicate_groups). The groups
     are remembered in memory and in data/cache/groups-<library id>.json,
-    keyed by a digest of exactly those inputs (groups_fingerprint): a new
+    keyed by a digest of exactly those inputs (_fingerprints): a new
     description, a rename or a new quality score never makes them be
     worked out again; a new, changed, hidden or removed picture does.
     When the only change is new pictures (a scan found more), only those
@@ -1048,15 +1046,6 @@ def index_etag(conn, libraries, include_hidden, state=None):
            prompts.PROMPT_VER, bool(include_hidden),
            [[library_id, name] for library_id, name in libraries.items()], state]
     return hashlib.sha1(json.dumps(key, separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
-
-
-def index_payload(conn, config, libraries, include_hidden=False):
-    """The /api/index answer: {"version", "generated", "libraries": [{id, name}], "records"}."""
-    records = build_records(conn, config, list(libraries), include_hidden=include_hidden)
-    return {"version": INDEX_VERSION, "generated": int(time.time()),
-            "libraries": [{"id": library_id, "name": name}
-                          for library_id, name in libraries.items()],
-            "records": records}
 
 
 def _json(value):

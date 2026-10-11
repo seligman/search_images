@@ -10,19 +10,33 @@ Two images contain text for testing the LLM's OCR ability:
 
 ## Running the demo
 
-1. Configure an LLM endpoint and add a library:
+A library cannot be inside the program folder, so first copy the pictures
+to a folder of their own (any folder outside the program folder works).
+From the program folder, on Linux or macOS:
 
-       python settings.py
+    cp -r sample/images ~/Pictures/search-demo
 
-   Add a library named "Demo" pointing at this folder's `images/` path.
+or on Windows:
 
-2. Scan and describe the images:
+    xcopy /e /i sample\images C:\Photos\Demo
 
-       python scan.py
-
-3. Search them:
+1. Start the server and open the address it prints:
 
        python serve.py
 
+2. On the **Settings** page, add an endpoint and press **Test** (see
+   "Describing pictures" in the main [README](../README.md)).
+3. On the **Manage** page, press **Add library**, enter the folder you
+   copied the pictures to and the name "Demo", and leave **Scan and
+   describe it right away** ticked.
+4. When the job panel shows the job is done, open **Search**.
+
+Or from the command line: run `python settings.py` (add the endpoint under
+"Configure LLM endpoints" and the library under "Manage image libraries",
+then "Save and exit"), then `python scan.py`, then `python serve.py`.
+
 Try searches like "cat", "snow", "yellow flower", "stop", or words from the
 deli menu once the images have been described.
+
+When you are done, remove the library on the Manage page (deleting its
+indexed data) and delete the copied folder.

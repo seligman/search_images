@@ -4,6 +4,10 @@ A searchable database of your images. It scans folders of pictures, asks an
 LLM to describe each one (including any text in the image), and lets you search
 those descriptions from a web page.  You can see a [demo of the site this produces here](https://seligman.github.io/search_image_sample/index.html).
 
+The LLM can be a model on your own computer (llama.cpp, LM Studio, vLLM,
+Ollama) or a cloud service (OpenAI, Azure OpenAI, Gemini, OpenRouter,
+Anthropic's Claude). A library can also be published as a static website.
+
 Supported image types are JPG/JPEG, PNG, GIF, WebP, TIFF, BMP, HEIC/HEIF,
 AVIF (HEIC needs `pillow-heif`; AVIF needs a Pillow built with AVIF support)
 and Insta360 `.insp` photos. RAW files (`.dng`, `.arw`, ...) are not indexed.
@@ -16,16 +20,12 @@ front of the scene. Each 360-degree photo larger than its 2048 px preview
 also gets a panorama up to 4096 px wide (made from the full-size original)
 so the 360 view stays sharp.
 
-## Where files are stored
+Coming from an older version? Read [Upgrading from an older
+version](#upgrading-from-an-older-version) first.
 
-By default `config.json` and the `data/` folder live next to the scripts. Set
-the `SETTINGS_BASE` environment variable to keep them somewhere else:
+## Install
 
-    SETTINGS_BASE=/path/to/store python scan.py
-
-## Requirements
-
-Python 3, plus a few third party packages:
+You need Python 3.9 or newer and a few packages:
 
     python -m pip install -r requirements.txt
 
@@ -33,48 +33,113 @@ Python 3, plus a few third party packages:
 Without it the scanner still runs and skips HEIC files with a warning. Each
 script also prints an install command if a package is missing.
 
-## Setup
+Run the commands in this README from the program folder (the folder that
+holds `serve.py` and the other scripts).
 
-The easiest way is the browser: run `python serve.py`, open the printed
-address, and use the **Settings** page to add an endpoint and the **Manage**
-page to add your libraries (see [Managing libraries in the
-browser](#managing-libraries-in-the-browser)). The console settings tool does
-the same from a numbered menu:
+### Where your settings and data are kept
 
-    python settings.py
+By default `config.json` (the settings) and the `data/` folder (the
+database, thumbnails, previews, logs and exports; see [The data
+folder](#the-data-folder)) are kept in the program folder, where git
+ignores them. They describe your pictures in detail, so keep them private.
+To keep them somewhere else, set the `SETTINGS_BASE` environment variable
+before running any tool:
 
-From there you can:
+    SETTINGS_BASE=/path/to/store python serve.py
 
-- Add the LLM endpoints that describe your images: a local server
-  (llama.cpp, LM Studio, vLLM, Ollama) or a cloud service (OpenAI, Azure
-  OpenAI, Gemini, OpenRouter, Anthropic's Claude), each from a preset. Pick
-  where its API key comes from (an environment variable, a key file, or
-  typed in), and test it on a sample picture.
-- Set an optional helper module that wraps the LLM calls. See
-  `example_helper.py`.
-- Add the image libraries to monitor. Each library has a name and a folder,
-  and can use its own endpoint, ask for extended metadata, and carry short
-  context notes for the LLM.
+or, on Windows (in PowerShell, `$env:SETTINGS_BASE = "c:\path\to\data"`):
 
-Settings are stored in `config.json`. See [SETTINGS.md](SETTINGS.md) for the
-full format, including options the menu does not edit (such as per-library
-ignore patterns and extra request fields).
+    set SETTINGS_BASE=c:\path\to\data
+    python serve.py
 
-With a cloud endpoint, your pictures (shrunk, without file names or EXIF
-data) are sent to that service. A local server keeps everything on your own
-machines. For a local model, any vision model your server can run works;
-models with good text reading (OCR) give the best results on screenshots
-and documents.
+## Quick start
 
-## Scanning
+1. Start the server and open the address it prints
+   (`http://127.0.0.1:5000`):
 
-    python scan.py
+       python serve.py
 
-This finds new and changed images and reads each of them once: it stores
-their metadata, EXIF data, capture date, camera and GPS position in a SQLite
-database (`data/index.db`), builds a thumbnail and a 2048 px preview, and then
-asks the LLM to describe anything without a description. Run it again
-whenever your folders change; unchanged files are not read again.
+2. On the **Settings** page (linked in the page header), press **Add
+   endpoint**, pick the service and the model and, for a cloud service,
+   where its API key comes from (see [Describing
+   pictures](#describing-pictures)). Press **Test**: it describes a bundled
+   sample picture and shows the answer.
+3. On the **Manage** page, press **Add library** and choose the folder that
+   holds your pictures (type it, or use **Browse...**). The folder must be
+   outside the program folder and the data folder. Leave **Scan and
+   describe it right away** ticked.
+4. Watch the job panel. Pictures can be found by file name, date and
+   camera as soon as they are scanned, and by what they show once they are
+   described. The job keeps running when you close the page (but not when
+   you stop the server); **Process all libraries** scans and describes
+   every library again after you add pictures.
+5. Open **Search** in the page header and type what you are looking for.
+
+To try it on the 18 bundled sample pictures first, see
+[sample/README.md](sample/README.md).
+
+The same from the command line: `python settings.py` adds endpoints and
+libraries from a numbered menu (it takes no options), `python scan.py`
+scans and describes (see [Scanning](#scanning)), and `python serve.py`
+serves the search page.
+
+## Describing pictures
+
+A library is described by the endpoint it names, or else by the default
+endpoint (the first one you add, until you press **Make default** on
+another). You can set up several and compare them on your own pictures
+(see [Comparing models](#comparing-models)).
+
+### On your own computer (llama.cpp)
+
+Nothing leaves your computer. Any vision model your server can run works;
+models that read text well (OCR) give the best results on screenshots and
+documents. Start llama.cpp's `llama-server` with the model and its vision
+projector (the `mmproj` file published with a vision model):
+
+    llama-server -m model.gguf --mmproj mmproj.gguf --parallel 4 -c 32768
+
+Then add an endpoint with the **llama.cpp** service; its default address,
+`http://127.0.0.1:8080/v1`, is where `llama-server` listens. Each slot
+(`--parallel`) describes one picture at a time, and the slots share the
+context (`-c`): give each about 8192 tokens. The Settings page shows
+whether the server is running and which model it loaded. To run the model
+on another computer, start `llama-server` there with `--host 0.0.0.0` and
+use that computer's address in the endpoint.
+
+As a rough guide at 4-bit quantization: a model of about 4B parameters
+suits a GPU with 8 GB of memory, 8B to 12B suits 12 to 16 GB, and larger
+models need 24 GB or more. Without a GPU it works, slowly. LM Studio, vLLM
+and Ollama work too: pick their service when you add the endpoint, and load
+a vision model.
+
+The helper module can start the server before each describe run and stop
+it afterwards (see [helper](SETTINGS.md#helper) in SETTINGS.md).
+
+### With a cloud service
+
+Pick the service (OpenAI, Azure OpenAI, Gemini, OpenRouter or Anthropic's
+Claude), the model, and where the API key comes from: an environment
+variable (recommended, for example `OPENAI_API_KEY`; set it before you
+start `serve.py` or `scan.py`), a file that holds only the key (keep it
+outside the program folder), or typed in (stored in `config.json`). Keys
+are never shown, logged or stored with the descriptions.
+
+Your pictures are then sent to that company: shrunk (1536 px on the long
+edge by default), without file names, folders or EXIF data. Each one costs
+tokens; add the endpoint's prices and **Test** shows the cost per picture.
+Before the first describe of a library that uses a cloud service, the
+Manage page says how many pictures will be sent and where. A cloud service
+whose API key is not set up is never sent a picture. To try a few pictures
+first, run `python scan.py --limit 20`.
+
+Hidden pictures (see [Searching](#searching)) are described too, so they
+are sent to the cloud service like the others: hiding only keeps them out
+of searches and exports. To keep pictures away from a cloud service, give
+their library a local endpoint, or skip them with `ignore` patterns (see
+SETTINGS.md).
+
+### What a description holds
 
 The LLM replies with a JSON structure that is checked and stored: a title,
 a description, the visible text (transcribed), the kind of picture (photo,
@@ -84,8 +149,9 @@ who they are), animals, food, vehicles, colors, search tags, quality flags
 (blurry, dark, ...), whether the picture is sensitive or shows private
 information, and scores from 1 to 5. Libraries set to extended metadata also
 get counted objects, activities, landmarks, a location guess and the mood.
-Each description records which model and endpoint made it, how long it took
-and how many tokens it used.
+A library's context notes (such as "Photos from a sailing club") are sent
+with each of its pictures. Each description records which model and
+endpoint made it, how long it took and how many tokens it used.
 
 Several images are described at once: as many as the endpoint's concurrency
 allows (for llama.cpp, its slot count). Rate limits and busy servers are
@@ -93,13 +159,28 @@ waited out, an unusable reply is asked for again, and an image that still
 fails is marked and retried on later runs (up to three times). A rejected
 API key or an empty account stops the run with a message.
 
+## Scanning
+
+The Manage page's buttons and `python scan.py` do the same work. A scan
+finds new and changed images and reads each of them once: it stores their
+metadata, EXIF data, capture date, camera and GPS position in a SQLite
+database (`data/index.db`), builds a thumbnail and a 2048 px preview (about
+0.5 MB per picture in `data/previews/`; see `previews` in SETTINGS.md), and
+then the LLM describes anything without a description. Run it again
+whenever your folders change; unchanged files are not read again.
+
 Descriptions follow the pictures: a file that is touched, renamed or moved
 keeps its description, and an exact copy of a described picture gets the same
 description. A file that disappears is first marked missing and only removed
 after `purge_after_days` (30 by default), so it comes back as it was if the
 file returns (a library on a share that is offline is skipped altogether). If
-most of a library seems to have vanished at once, nothing is marked; run with
-`--allow-mass-removal` if that really was intended.
+most of a library seems to have vanished at once, nothing is marked; run
+`python scan.py --library NAME --allow-mass-removal` if that really was
+intended.
+
+### From the command line
+
+    python scan.py
 
 Options:
 
@@ -119,80 +200,22 @@ Options:
   sample by default) and prints the result. Neither ever shows a key.
 - `--verbose` lists every added or changed file (by default only the first
   20 of each kind per library, then a count).
+- `--allow-mass-removal` marks files missing even when most of a library
+  seems to have vanished.
 
-`scan.py` exits with 0 when it finished, 1 when the describe step stopped
-early (a rejected key, or no usable endpoint left) and 2 for a settings
-problem (an unknown `--endpoint`, say), so scheduled runs can tell them
-apart.
+`scan.py` exits with 0 when it finished or was stopped as asked (see
+below; 130 after a second Ctrl+C), 1 when it could not start (another job
+is running, or an `abort` file is already there) or the describe step
+stopped early (a rejected key, or no usable endpoint left), and 2 for a
+settings problem (an unknown `--endpoint`, say), so scheduled runs can
+tell them apart.
 
-To stop a long scan early, create a file named `data/abort` in the data
-folder (or `abort` or `abort.txt` in the directory you ran `scan.py` from). It
-finishes the images in progress, saves its progress, and exits. Delete that
-file and run `scan.py` again to pick up where it stopped.
-
-### Upgrading from an older version
-
-The first run of any tool (`scan.py`, `serve.py`, `settings.py`,
-`progress.py`) copies the old `data/images.db` and `data/thumbs/` into the new
-`data/index.db` and `data/thumbs.db`. The old files are never changed, so an
-older checkout can still use them. Libraries are matched by name, so do not
-rename a library in `config.json` by hand before that first run (renaming it
-with `settings.py` is fine). Each library then gets a permanent `id` in
-`config.json`; renaming a library later only changes its name.
-
-Other changes to be aware of:
-
-- The prompt is now version 5, with many more fields (see above). Images
-  described by an older version keep their descriptions, which still show
-  and search as before; run `scan.py --redescribe-stale` when you want them
-  redone.
-- The older `endpoint` setting (one endpoint, or a round-robin list) still
-  works. Editing endpoints in `settings.py` saves them in the newer
-  `endpoints` form.
-
-- `config.json` is now written with non-ASCII characters escaped (`\u00fc`),
-  and read as UTF-8. A file saved in the system's encoding still loads, with a
-  warning.
-- A relative `helper` path is looked up next to `config.json` first; the old
-  location (the current directory) still works, with a warning.
-- The helper's `call_api(prompt, image_path)` now gets a temporary JPEG of the
-  image as it will be sent. Add a third parameter, `source_path`, to also get
-  the original file's path (see `example_helper.py`).
-- NAS and system junk folders (`@eaDir`, `#recycle`, `.thumbnails`, ...) are
-  skipped by default (`default_ignores`); images indexed there before are
-  marked missing.
-- Symbolic links and directory junctions inside a library are not followed.
-  Images indexed through them before are kept as they are; add the link's
-  target as a library of its own to index it.
-
-## Comparing models
-
-    python compare_models.py --endpoints local,cloud --sample 100 --endpoint-limit cloud=20
-
-Sends the same sample of your indexed images to several endpoints, one
-endpoint at a time, and writes a side-by-side HTML report (titles,
-descriptions, tags, text, types, flags, scores, time and tokens per image,
-plus a summary per endpoint with images per minute and an estimated cost
-per 10,000 images) and a JSON file with the raw results to `data/reports/`.
-The database is only read; nothing is stored.
-
-- The sample is seeded (`--seed`), so a run can be repeated, and mixes the
-  libraries and likely screenshots or documents with photos so that every
-  first part of it is a fair mix too. `--endpoint-limit NAME=N` gives an
-  endpoint only the first N images, to keep cloud costs down. `--ids 1,2,3`
-  picks the images, `--library NAME` the libraries, `--profile extended` the
-  extended metadata.
-- Libraries whose own `endpoint` setting keeps them on local endpoints are
-  not sent to a cloud endpoint unless you name them with `--library`. An
-  endpoint whose first few images all fail (or that keeps failing) is not
-  sent the rest of the sample.
-- Local servers that cannot run at the same time can be compared one by
-  one: run the script once per endpoint with the same `--seed` and
-  `--sample`, then combine the results with
-  `python compare_models.py --merge first.json second.json --out report.html`.
-
-The reports contain thumbnails and text from your pictures; keep them
-private.
+To stop a long scan early, press Ctrl+C, or create a file named `abort` in
+the data folder (`data/abort`), or one named `abort` or `abort.txt` in the
+directory you ran `scan.py` from. It finishes the images in progress, saves
+its progress, and exits (a second Ctrl+C stops it at once; what was saved
+so far is kept). Delete the `abort` file and run `scan.py` again to pick up
+where it stopped.
 
 ## Searching
 
@@ -214,8 +237,9 @@ the page header or the filters.
   the chosen ones show above the results with a button to remove each.
   "Hide blurry and accidental shots" and "Hide sensitive pictures" (on by
   default: explicit and graphic pictures) are there too.
-- **Group similar** shows near-duplicates (and exact copies) as one stack
-  with a "x3" badge; click the badge to see them all. The stack shows its
+- **Group similar** shows near-duplicates (and exact copies) within each
+  library as one stack with a "x3" badge; click the badge to see them all
+  (copies in two different libraries show separately). The stack shows its
   best picture: the best looking and sharpest, then the largest, then an
   original (with a camera name and the earliest date) rather than a copy.
   Pictures whose camera (or file name) dates them are only stacked when
@@ -237,12 +261,14 @@ the page header or the filters.
   picture, so links, reloads and the Back button bring the same view back.
 - **Keyboard**: `/` jumps to the search box, `Esc` clears it or closes the
   viewer, arrow keys move between thumbnails and `Enter` opens one.
-- **On this computer** (the Manage capability) the viewer can also copy the
-  picture's file path, show it in the file manager, describe it again, and
-  hide it. Hidden pictures no longer show in searches and are never
-  exported; "Show hidden pictures" in the sidebar brings them back to unhide
-  them. **Select** chooses many pictures at once (Shift-click for a range,
-  or "Select all") to hide, unhide or copy their file paths.
+- **On this computer** (where the Manage page works: a server started
+  without `--host`) the viewer can also copy the picture's file path, show
+  it in the file manager, describe it again, and hide it. Hidden pictures
+  no longer show in searches and are never exported, but they are still
+  described (and sent to a cloud service if their library uses one);
+  "Show hidden pictures" in the sidebar brings them back to unhide them.
+  **Select** chooses many pictures at once (Shift-click for a range, or
+  "Select all") to hide, unhide or copy their file paths.
 - The **Map** shows the located pictures of the current search as pins; a
   pin with a number holds pictures taken close together, which come apart
   as you zoom in. Click a pin for a list of its pictures: click one to view
@@ -253,7 +279,9 @@ the page header or the filters.
   (ringed while the map has the keyboard focus), and `Esc` closes the list.
   The address keeps the search, the map's place and the open list, so links
   and reloads show the same view (after a new search the map fits its
-  pictures); a static export with the map works the same way.
+  pictures); a static export with the map works the same way. The map uses
+  a small bundled world image; run `python make_tiles.py` once for a
+  detailed one (see [Other tools](#other-tools)).
 - While some pictures are not described yet, a note above the results says
   how many: they can only be found by file name, date and camera until then.
 - When nothing matches, the page says what left the pictures out (a filter,
@@ -291,14 +319,39 @@ come first.
 - `has:text`, `has:gps` - with text in the picture, with a GPS position
   (also `has:people`, `has:animals`)
 - `is:360`, `is:duplicate`, `is:undescribed` - 360-degree photos, pictures
-  with near-duplicates, pictures not described yet
+  with near-duplicates in the same library, pictures not described yet
 - `lib:name` - only the pictures of one library
+
+### Searching from other computers
+
+By default the server only answers this computer. To let the other
+computers on your network search too, start it with `--host` (add
+`--port N` for another port than 5000, which also helps when 5000 is
+taken):
+
+    python serve.py serve --host 0.0.0.0
+
+The others then open `http://NAME:5000/`, where NAME is this computer's
+name or one of its addresses (the server prints them when it starts). Any
+other name, such as an alias your router hands out, is refused with
+"Unknown host name.".
+
+There is no login. Anyone who can reach the computer can search every
+library that is turned on, see file and folder names, dates, GPS positions
+and the map, camera EXIF data and the model that described each picture,
+download the original files with all their metadata, and turn off "Hide
+sensitive pictures". Hidden pictures and turned-off libraries stay out. In
+this mode Manage, Settings and jobs are off, on this computer too; to manage
+the libraries at the same time, run a second server without `--host` on
+another port (`python serve.py serve --port 5001`). To share pictures
+beyond your household, publish a library instead (see [Publishing a
+library](#publishing-a-library)): it leaves out what you choose.
 
 ## Managing libraries in the browser
 
 The header of every page links to **Manage** and **Settings** when the
-server runs on this computer (the default address, `127.0.0.1`). Everything
-the command line does for libraries can be done there:
+server runs on this computer (the default address, `127.0.0.1`). Most of
+what the command line does can be done there:
 
 - **Manage** lists each library with its folder, whether the folder can be
   reached, how many pictures are described, waiting, out of date or failed,
@@ -312,8 +365,11 @@ the command line does for libraries can be done there:
   many pictures it found, and previews which files the ignore patterns skip.
   Editing a library can rename it or point it at a moved folder; its
   descriptions are kept. **Remove** asks you to type the name and whether to
-  keep the indexed data (it can be attached to a library again later) or
-  delete it.
+  keep the indexed data or delete it.
+- Indexed data that belongs to no library (a library removed with its data
+  kept, or taken out of `config.json` by hand) is shown in a notice at the
+  top of Manage, with **Re-attach to...** (give it to a library, say one
+  you added again for the same folder) and **Delete...**.
 - The job panel shows the running job with its progress, speed and time
   left, with **Pause**, **Resume** and **Cancel**; the queue; recent jobs;
   and the log. Jobs keep running when you close the page, one at a time, and
@@ -324,17 +380,33 @@ the command line does for libraries can be done there:
 - **Settings** lists the endpoints with their status (a local server shows
   whether it is running and which model it loaded), where each API key comes
   from (never the key itself), and buttons to add, edit, test, remove and
-  make one the default. **Test** describes the bundled sample picture and
-  shows the answer, the time it took and, with prices set, the cost per
-  picture. Before the first describe of a library that uses a cloud service,
-  the page says how many pictures will be sent and where. A cloud service
-  whose API key is not set up is never sent a picture: Manage says what is
-  missing and keeps the describe buttons off.
+  make one the default. **List models** in the endpoint dialog asks the
+  server for its models; before the endpoint is saved, it only uses a key
+  from a file or an environment variable when a saved endpoint already
+  sends that key to the same address (or the address is the cloud
+  service's own), so save the endpoint first otherwise. **Test** describes
+  the bundled sample picture and shows the answer, the time it took and,
+  with prices set, the cost per picture. Before the first describe of a
+  library that uses a cloud service, the page says how many pictures will
+  be sent and where. A cloud service whose API key is not set up is never
+  sent a picture: Manage says what is missing and keeps the describe
+  buttons off.
 
-These pages only answer requests from this computer. When the server is
-started with `--host` so that other computers can search, Manage and
-Settings are turned off. Do not put the server behind a reverse proxy on
-the same computer: every visitor would then look local.
+Only the command line can let a scan mark most of a library missing
+(`scan.py --allow-mass-removal`; a scan from Manage that stops for this
+says so in its log), describe at most N pictures (`--limit`), describe with
+another endpoint for one run (`--endpoint`), list every changed file
+(`--verbose`), and set the helper module (`settings.py`, or `helper` in
+`config.json`).
+
+These pages only answer requests from this computer, and are turned off
+when the server is started with `--host` (see [Searching from other
+computers](#searching-from-other-computers)). They have no login and are
+not a protected admin area for several users: any program running on this
+computer, under any account, can use them (web pages on other sites
+cannot; the browser marks their requests, which are refused). Only run the
+server on a computer you trust. Do not put the server behind a reverse
+proxy on the same computer: every visitor would then look local.
 
 ## Publishing a library
 
@@ -376,29 +448,42 @@ The same from the command line:
 One export runs at a time (`data/export.lock`), whether started on the
 Manage page or from the command line. Both print what was left out and
 why, and exit with status 1 when pictures could not be exported (2 when
-the export was stopped).
+the export was stopped). Ctrl+C stops `export.py` at the next safe point,
+keeping what is done (a second Ctrl+C stops it at once); run the same
+command again to finish the export.
 
-The site goes to `data/exports/<library name>/` in the data folder, or to
-the folder given (the dialog's Folder, `--out` for `export.py` or the
-folder after `package`), which must be new, empty, or an
-earlier export of the same library: an export marks the folder it writes
-(a `.search-images-export` file holding only a random id) and later
-removes only files it made itself (the list is kept in
-`data/exports/state/`, never in the site). Each library needs a folder of
-its own. Inside the program folder only `site/`, `site_<name>/` and
-`exports/` are accepted (git ignores those), so your photos never end up in
-a commit. Re-running an export only rewrites what changed. An export that
+The site goes to the folder given (the dialog's Folder, `--out` for
+`export.py` or the folder after `package`). Without one, the command line
+writes to `data/exports/<library name>/` in the data folder, even when the
+dialog last used another folder. That folder's name is the library name in
+lower case, with dashes for spaces and other signs ("Summer Trip" goes to
+`summer-trip`); when two libraries' names give the same folder, the
+library's id is added to it, and a library keeps the folder it was last
+exported to, so adding such a library later does not move it. The folder
+must be new, empty, or an earlier export of the same library: an export
+marks the folder it writes (a `.search-images-export` file holding only a
+random id) and later removes only files it made itself (the list is kept
+in `data/exports/state/`, never in the site). Each library needs a folder
+of its own. Inside the program folder only `site/`, `site_<name>/` and
+`exports/` are accepted (git ignores those), so your photos never end up
+in a commit. Re-running an export only rewrites what changed. An export that
 cannot read any picture (say the library's drive is not connected, and
 originals were asked for) stops before it changes the folder, and one that
 cannot write (a full disk, no access) stops at once; both say so in plain
 words.
 
 What is published follows the library's `export` options (see SETTINGS.md),
-changed for one run by these switches:
+which the Export dialog saves. `export.py` can change them for one run:
+`--images` picks the kind of pictures, and the other switches can only
+publish more. To publish less, change the options in the Export dialog (or
+`export` in `config.json`). `serve.py package` always uses the saved
+options.
 
 - `--images web` (the default) publishes 2048 px pictures, `original` the
-  originals with their metadata removed (HEIC and TIFF become JPEG, BMP
-  becomes PNG), and `none` thumbnails only.
+  originals with their metadata removed (HEIC, HEIF, AVIF and TIFF become
+  JPEG, BMP becomes PNG; an unstitched 360-degree photo, with its two
+  fisheye circles, is published as the stitched panorama), and `none`
+  thumbnails only.
 - Left out unless asked for: pictures not checked yet
   (`--include-undescribed`: not described yet, or described by an older
   version that did not look for private or sensitive content), screenshots
@@ -421,31 +506,140 @@ changed for one run by these switches:
   its colours but loses its texts), and their ids do not reveal the
   database's. Each picture shows its title, description, tags, the text
   read in it, the day it was taken and the camera model and settings.
-- `--zip` also writes `<folder>.zip` next to the folder. The pages ask
-  search engines not to list them or their pictures (and a `robots.txt`
-  says the same), but anyone who has the address can open the site.
+- `--zip` also writes `<folder>.zip` next to the folder. A file of that
+  name is only replaced when an earlier export made it and it was not
+  changed since; otherwise the export stops before writing anything. The
+  pages ask search engines not to list them or their pictures (and a
+  `robots.txt` says the same) unless `allow_indexing` is set, but anyone
+  who has the address can open the site.
 
-Try the site with any static web server, for example:
+Try the site with any static web server (the export prints the command for
+its folder), for example:
 
     python -m http.server --bind 127.0.0.1 --directory data/exports/family
 
 and open http://localhost:8000/ (with `--bind 127.0.0.1` only this computer
-can open it). To publish it, copy everything in the
-folder to any host that serves plain files (GitHub Pages, Netlify, your own
-web server); nothing needs to be installed there. Export again after
+can open it). To publish it, copy everything in the folder to any host
+that serves plain files (GitHub Pages, Netlify, your own web server);
+nothing needs to be installed there. Export again after
 describing more pictures: only what changed is written.
 
 Opened from disk, the 360-degree view shows the flat panorama (browsers do
 not allow it for files); over http it can be turned around.
 
-## Files
+## Comparing models
 
-- `settings.py` - manage settings
+    python compare_models.py --endpoints local,cloud --sample 100 --endpoint-limit cloud=20
+
+Sends the same sample of your indexed images to several endpoints, one
+endpoint at a time, and writes a side-by-side HTML report (titles,
+descriptions, tags, text, types, flags, scores, time and tokens per image,
+plus a summary per endpoint with images per minute and an estimated cost
+per 10,000 images) and a JSON file with the raw results to `data/reports/`.
+The database is only read; nothing is stored. With a cloud endpoint, the
+sample is sent to that service and paid for.
+
+- The sample is seeded (`--seed`), so a run can be repeated, and mixes the
+  libraries and likely screenshots or documents with photos so that every
+  first part of it is a fair mix too. `--endpoint-limit NAME=N` gives an
+  endpoint only the first N images, to keep cloud costs down. `--ids 1,2,3`
+  picks the images, `--library NAME` the libraries, `--profile extended` the
+  extended metadata.
+- Libraries whose own `endpoint` setting keeps them on local endpoints are
+  not sent to a cloud endpoint unless you name them with `--library`. An
+  endpoint whose first few images all fail (or that keeps failing) is not
+  sent the rest of the sample.
+- Local servers that cannot run at the same time can be compared one by
+  one: run the script once per endpoint with the same `--seed` and
+  `--sample`, then combine the JSON files each run names on its `Results:`
+  line:
+
+      python compare_models.py --merge data/reports/compare-<first>.json data/reports/compare-<second>.json
+
+  The combined report goes to `data/reports/` too. `--out PATH` chooses
+  another file (relative to the current folder); keep it out of the
+  program folder, or in `data/reports/`.
+- The helper module is not used: start the servers yourself.
+
+The reports contain thumbnails and text from your pictures; keep them
+private.
+
+## Settings, tools and files
+
+### Settings
+
+Everything is kept in `config.json`: the endpoints, the libraries and a few
+general settings. The Settings and Manage pages edit most of it, and so
+does `python settings.py`; [SETTINGS.md](SETTINGS.md) describes every field,
+including the two only a text editor changes (`reader_threads` and
+`purge_after_days`).
+
+`settings.py` writes nothing until you choose **Save and exit**. If
+`config.json` was changed in the meantime (on the Manage or Settings page,
+or by hand), it says so and asks whether to save over those changes,
+reload the file (dropping the changes made in `settings.py`) or exit
+without saving; when nothing was changed in `settings.py`, the file is
+left as it is.
+
+### The data folder
+
+`data/`, next to `config.json`, holds what the tools make. Most of it is
+private:
+
+- `index.db` - the database: file names, folders, dates, camera, EXIF and
+  GPS data, and the descriptions.
+- `thumbs.db` and `previews/` - thumbnails, and 2048 px previews and 360
+  panoramas (about 0.5 MB per picture).
+- `jobs.db` and `logs/` - the Manage page's jobs and their logs, which name
+  files. With the `LOG_ERRORS` environment variable set, the LLM's replies
+  to failed requests are saved in `logs/` too.
+- `exports/` - static sites (`exports/<library name>/`) and the list of
+  files each export wrote (`exports/state/`).
+- `reports/` - model comparison reports.
+- `cache/` (near-duplicate groups, rebuilt when missing) and `tmp/`.
+- `tiles/` and `blue_marble.jpg` (from `make_tiles.py`), `world_map.png`
+  (from `world_map.py`).
+- `images.db` and `thumbs/` - the database of older versions (see
+  [Upgrading](#upgrading-from-an-older-version)).
+- `*.lock` files and `abort` - used while tools run.
+
+To keep the descriptions, back up `config.json` and `data/index.db` while
+no tool is running.
+
+### Other tools
+
+    python progress.py counts
+    python progress.py files
+
+`counts` shows per library how many pictures are described, out of date,
+waiting, failed or missing; `files` lists the pictures that still need a
+description (new, failed or out of date), with the reason for each
+failure.
+
+    python world_map.py [out.png]
+
+draws a world map with a pin for each place pictures were taken (by default
+`data/world_map.png`).
+
+    python make_tiles.py
+
+downloads a detailed world image (about 27 MB, to `data/blue_marble.jpg`)
+and cuts it into map tiles in `data/tiles/`, for the Map page and for
+exports with locations. Without it the map shows a small bundled image. Run
+it again after an interruption: it keeps the tiles that are whole and
+writes the missing or damaged ones.
+
+### Program files
+
+- `serve.py` - search server (and `package`, a shortcut to `export.py`)
+- `settings.py` - manage settings from a menu
 - `scan.py` - scan libraries, then request descriptions
 - `describe.py`, `prompts.py` - the describe step and the prompt it sends
-- `compare_models.py` - compare how endpoints describe the same images
-- `serve.py` - search server (and `package`, a shortcut to `export.py`)
 - `export.py` - publish one library as a static website
+- `compare_models.py` - compare how endpoints describe the same images
+- `progress.py`, `world_map.py`, `make_tiles.py` - see [Other
+  tools](#other-tools)
+- `example_helper.py` - the hooks a helper module can have
 - `search_index.py` - the compact search records the search page downloads
   and searches in the browser, and the groups of near-duplicate pictures
 - `admin.py`, `library_ops.py` - the Manage and Settings pages' server side
@@ -457,20 +651,73 @@ not allow it for files); over http it can be turned around.
   `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
   `manage.js` and `settings.js` run Manage and Settings, and
   `export-review.js` holds the rules and words of the Export dialog)
-- `progress.py` - show how many images are described per library, how many
-  have descriptions from an older prompt, and which failed
-- `world_map.py` - render a world map with a pin for each GPS-tagged area
-- `make_tiles.py` - download a detailed world image and slice it into map
-  tiles (optional; run it again after an interruption: it keeps the tiles
-  that are whole and writes the missing or damaged ones)
 - `common.py`, `db.py`, `cache.py`, `jobs.py`, `images.py`, `imageinfo.py`,
   `llm.py` - shared helpers (settings, database, thumbnails and previews,
   job control, image reading, EXIF facts, LLM calls)
+- `sample/` - pictures to try the project on
 - `SETTINGS.md` - reference for every field in `config.json`
-- `data/` - database, thumbnails, previews, static exports
-  (`data/exports/<library name>/`, and what each export wrote in
-  `data/exports/state/`) and cached near-duplicate groups
-  (`data/cache/`, rebuilt when missing)
+
+## Upgrading from an older version
+
+The first run of any tool (`serve.py`, `scan.py`, `settings.py`,
+`export.py`, ...) copies the old `data/images.db` and `data/thumbs/` into
+the new `data/index.db` and `data/thumbs.db`. The old files are never
+changed, so an older checkout can still use them; delete them once you no
+longer need one. Libraries are matched by name, so do not rename a library
+in `config.json` by hand before that first run (renaming it with
+`settings.py` is fine). Each library then gets a permanent `id` in
+`config.json`; renaming a library later only changes its name.
+
+Other changes to be aware of:
+
+- The first scan after upgrading reads every picture once more, to fill in
+  details the old database did not keep and to build the previews (about
+  0.5 MB per picture, so about 50 GB per 100,000 pictures, in
+  `data/previews/`; with `"previews": false` on a library the pictures are
+  still read, but no previews are kept). On a large library on a network
+  share this can take hours. It can be stopped at any time (**Cancel** on
+  Manage, or Ctrl+C or `data/abort` for `scan.py`) and picks up where it
+  stopped.
+- The prompt is now version 5, with many more fields (see [What a
+  description holds](#what-a-description-holds)). Images described by an
+  older version keep their descriptions, which still show and search as
+  before; run **Re-describe out of date** on Manage (or
+  `scan.py --redescribe-stale`) when you want them redone. Until then an
+  export leaves them out, as they were not checked for private or
+  sensitive content (include them with "pictures not checked yet" in the
+  Export dialog, or `export.py --include-undescribed`).
+- `serve.py package` used to put every library in one site (`site/`, or
+  `data/exports/site/` in later versions) and took `--force`. It now
+  exports one library (`--library NAME` when more than one is turned on)
+  to `data/exports/<library name>/`, and `--force` is gone. To update the
+  old site in place, name its folder: a site made by the older command
+  (`data/exports/site/`, or a `site/` from the first versions) is
+  recognised and its files are replaced; other files in the folder are
+  kept. Screenshots, documents, file names, folders and GPS positions are
+  now left out unless you include them, and the pages ask search engines
+  not to list them unless `allow_indexing` is set. See
+  [Publishing a library](#publishing-a-library).
+- The older `endpoint` setting (one endpoint, or a round-robin list) still
+  works. Editing endpoints in `settings.py` saves them in the newer
+  `endpoints` form.
+- `config.json` is now written with non-ASCII characters escaped (`\u00fc`),
+  and read as UTF-8. A file saved in the system's encoding still loads, with a
+  warning.
+- A relative `helper` path is looked up next to `config.json` first; the old
+  location (the current directory) still works, with a warning.
+- The helper's `call_api(prompt, image_path)` now gets a temporary JPEG of the
+  image as it will be sent. Add a third parameter, `source_path`, to also get
+  the original file's path (see `example_helper.py`).
+- NAS and system junk folders (`@eaDir`, `#recycle`, `.thumbnails`, ...) are
+  skipped by default (`default_ignores`); images indexed there before are
+  marked missing.
+- Symbolic links and directory junctions inside a library are not followed.
+  Images indexed through them before are kept as they are; add the link's
+  target as a library of its own to index it.
+- A library can no longer be added (or moved) to a folder inside the
+  program folder or the data folder; one that is already there keeps
+  working. To try the bundled sample pictures, copy them elsewhere first
+  (see [sample/README.md](sample/README.md)).
 
 ## Tests
 
@@ -479,10 +726,12 @@ not allow it for files); over http it can be turned around.
 The page scripts' own tests (`tests/js/`) run as part of this when Node.js
 is installed, and are skipped when it is not.
 
-`tests/test_repo_hygiene.py` checks that nothing personal (absolute paths,
-host names, model files) is about to be committed. To add your own private
-words to that check, list them one per line in `private-terms.txt` inside
-your `SETTINGS_BASE` folder; that file is never committed.
+`tests/test_repo_hygiene.py` checks every file git would commit for
+personal details (absolute paths, host names, model files). To add your own
+private words to that check (a NAS or share name, library names), list them
+one per line in `private-terms.txt` next to `config.json` (in the
+`SETTINGS_BASE` folder, or the program folder by default) or in
+`.git/info/private-terms`. Git never commits either file.
 
 ## License
 

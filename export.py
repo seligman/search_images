@@ -90,6 +90,7 @@ import jobs
 import library_ops
 import prompts
 import search_index
+import world_map
 
 # The marker file of an export folder, and its format.
 MARKER = ".search-images-export"
@@ -432,13 +433,9 @@ def _normalized(path):
     return os.path.normcase(os.path.abspath(path))
 
 
-def _is_within(path, folder):
-    """True if path is folder or somewhere inside it (no file system access).
-
-    Compared like the library folders are (library_ops.is_within), so a
-    drive named through its admin share (\\\\localhost\\C$\\...) is the drive.
-    """
-    return library_ops.is_within(path, folder)
+# Folders are compared like the library folders are (no file system access),
+# so a drive named through its admin share (\\localhost\C$\...) is the drive.
+_is_within = library_ops.is_within
 
 
 def _first_part(path):
@@ -474,14 +471,29 @@ def _library_slug(library):
 
 
 def default_output_dir(config, library):
-    """data/exports/<slug of the library name>/ (with the library id when two names agree)."""
+    """data/exports/<slug of the library name>/ (with the library id when two names agree).
+
+    A library keeps the one of those two folders it was last exported to:
+    adding (or removing) another library whose name gives the same slug
+    never moves the default folder of one that was exported already, so
+    exporting it again updates its site in place (same picture ids, same
+    links).
+    """
     slug = _library_slug(library)
+    plain = os.path.join(common.exports_dir(), slug)
+    with_id = os.path.join(common.exports_dir(), "%s-%s" % (
+        slug, library_slug(library.get("id") or "") or "library"))
+    if library.get("id"):
+        used = _exported_folders(library["id"])
+        known = [(used[_normalized(folder)], folder) for folder in (plain, with_id)
+                 if _normalized(folder) in used]
+        if known:
+            return max(known)[1]
     for other in config.get("libraries", []):
         if other is not library and other.get("id") != library.get("id") \
                 and _library_slug(other) == slug:
-            slug = "%s-%s" % (slug, library_slug(library.get("id") or "") or "library")
-            break
-    return os.path.join(common.exports_dir(), slug)
+            return with_id
+    return plain
 
 
 def check_output_dir(out_dir, config, library_id=None):
@@ -533,6 +545,9 @@ def check_output_dir(out_dir, config, library_id=None):
     except OSError as error:
         raise ExportError(os_error_text(error, out_dir))
     if names and MARKER not in names:
+        if _old_package_site(out_dir):
+            # Its files are replaced, as with a site an older version marked.
+            return
         raise ExportError(
             "%s is not empty and does not hold an export made by this program. Choose an "
             "empty or new folder (an export removes files from the folder it writes to)."
@@ -547,6 +562,25 @@ def check_output_dir(out_dir, config, library_id=None):
                 "%s holds the export of library %s. Choose another folder: each library "
                 "needs a folder of its own (an export replaces what the folder holds)."
                 % (out_dir, common.library_label(other)))
+
+
+def _old_package_site(out_dir):
+    """True for a site made by the "package" command of the first versions (no marker).
+
+    Its index.html, site.js and app.js are at the top, and its
+    data/manifest.json lists its data shards (as a marker of a later older
+    version does).
+    """
+    for name in ("index.html", "site.js", "app.js"):
+        if not os.path.isfile(os.path.join(out_dir, name)):
+            return False
+    try:
+        with open(os.path.join(out_dir, "data", "manifest.json"), "r",
+                  encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and "shards" in data and "generated" in data
 
 
 def check_writable(out_dir):
@@ -585,7 +619,12 @@ def zip_path_for(out_dir):
 
 
 def check_zip_path(path, config):
-    """Raise ExportError if the zip of an export must not be written to path."""
+    """Raise ExportError if the zip of an export must not be written to path.
+
+    A file already there is only replaced when an export made it (its
+    state records it, and it was not changed since): a zip of the same
+    name made by someone else is never overwritten.
+    """
     for library in config.get("libraries", []):
         root = common.library_root(library)
         if root and _is_within(path, root):
@@ -601,6 +640,9 @@ def check_zip_path(path, config):
             "a commit. Export to a folder outside it (or to site/ and without a zip)." % path)
     if os.path.isdir(path):
         raise ExportError("%s is a folder; the zip file cannot be written." % path)
+    if os.path.exists(path) and not _zip_made_here(path):
+        raise ExportError("%s already exists and was not made by an export of this program "
+                          "(or was changed since). Move it, or choose another folder." % path)
 
 
 def read_marker(out_dir):
@@ -739,6 +781,10 @@ def _state_summary(path):
                  if isinstance(entry, list) and len(entry) == 3
                  and isinstance(entry[1], int) and entry[1] > 0]
         zip_info = state.get("zip")
+        zip_file = None
+        if isinstance(zip_info, dict) and isinstance(zip_info.get("path"), str):
+            zip_file = (_normalized(zip_info["path"]), zip_info.get("size"),
+                        zip_info.get("mtime"))
         summary = {"library_id": state.get("library_id"), "output": state["out_dir"],
                    "updated": state.get("updated") or 0,
                    "finished": state.get("finished") is not False,
@@ -746,10 +792,46 @@ def _state_summary(path):
                                 and not isinstance(state.get("count"), bool) else
                                 sum(1 for rel in state["files"] if rel.startswith("thumbs/"))),
                    "bytes": sum(sizes),
-                   "zip": zip_info.get("path") if isinstance(zip_info, dict) else None}
+                   "zip": zip_info.get("path") if isinstance(zip_info, dict) else None,
+                   "zip_file": zip_file}
     with _summaries_lock:
         _summaries[path] = (key, summary)
     return summary
+
+
+def _state_summaries():
+    """The summary (_state_summary) of every readable export state in the data root."""
+    try:
+        names = os.listdir(state_dir())
+    except OSError:
+        return []
+    found = []
+    for name in sorted(names):
+        if name.endswith(".json") and EXPORT_ID_RE.match(name[:-len(".json")]):
+            summary = _state_summary(os.path.join(state_dir(), name))
+            if summary is not None:
+                found.append(summary)
+    return found
+
+
+def _exported_folders(library_id):
+    """{normalized output folder: time of the newest export into it} of a library."""
+    folders = {}
+    for summary in _state_summaries():
+        if summary["library_id"] == library_id:
+            key = _normalized(summary["output"])
+            folders[key] = max(folders.get(key, 0), summary["updated"])
+    return folders
+
+
+def _zip_made_here(path):
+    """True when the file at path is a zip an export wrote (and nobody changed since)."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return False
+    wanted = (_normalized(path), stat.st_size, stat.st_mtime_ns)
+    return any(summary["zip_file"] == wanted for summary in _state_summaries())
 
 
 def last_export(library_id):
@@ -760,21 +842,14 @@ def last_export(library_id):
     (its zip file or None)}. The output folder itself is not looked at (it
     may be on a share that does not answer).
     """
-    try:
-        names = os.listdir(state_dir())
-    except OSError:
-        return None
     best = None
-    for name in names:
-        if not (name.endswith(".json") and EXPORT_ID_RE.match(name[:-len(".json")])):
-            continue
-        summary = _state_summary(os.path.join(state_dir(), name))
-        if (summary is not None and summary["library_id"] == library_id
+    for summary in _state_summaries():
+        if (summary["library_id"] == library_id
                 and (best is None or summary["updated"] > best["updated"])):
             best = summary
     if best is None:
         return None
-    return {key: value for key, value in best.items() if key != "library_id"}
+    return {key: value for key, value in best.items() if key not in ("library_id", "zip_file")}
 
 
 # ---------------------------------------------------------------------------
@@ -836,73 +911,8 @@ def _tiff_orientation(tiff):
     return None
 
 
-# ICC tag types that hold free text (a description, a copyright, a device
-# name): text, desc (version 2) and mluc (version 4).
-_ICC_NEUTRAL = b"Profile"
-
-
-def scrub_icc(profile):
-    """An ICC colour profile with its free text replaced, the same length; the colours stay.
-
-    A profile's description, copyright and device names can name a person
-    or a computer (a calibrated monitor's profile, say). Every text, desc
-    and mluc tag gets a neutral word instead, and the profile id (an MD5
-    of the profile) is zeroed, as it no longer matches. Returns None for
-    bytes that are not a profile this can read: the caller drops them.
-    """
-    data = bytearray(profile)
-    size = len(data)
-    if size < 132 or bytes(data[36:40]) != b"acsp":
-        return None
-
-    def u32(pos):
-        return struct.unpack(">I", bytes(data[pos:pos + 4]))[0] if pos + 4 <= size else 0
-
-    def blank(start, end, wide=False):
-        if start >= end:
-            return
-        word = _ICC_NEUTRAL.decode("ascii").encode("utf-16-be") if wide else _ICC_NEUTRAL
-        filler = b"\x00 " if wide else b"\x00"
-        length = end - start
-        text = (word + filler * length)[:length]
-        if wide and length % 2:
-            text = text[:-1] + b"\x00"
-        data[start:end] = text
-
-    count = u32(128)
-    if count > 1000 or 132 + 12 * count > size:
-        return None
-    for index in range(count):
-        offset, length = u32(136 + 12 * index), u32(140 + 12 * index)
-        end = min(size, offset + length)
-        if offset < 132 or end - offset < 8:
-            continue
-        kind = bytes(data[offset:offset + 4])
-        if kind == b"text":
-            blank(offset + 8, end)
-        elif kind == b"desc":
-            ascii_count = u32(offset + 8)
-            start = offset + 12
-            blank(start, min(end, start + ascii_count))
-            pos = start + ascii_count
-            if pos + 8 <= end:
-                wide_count = u32(pos + 4)
-                blank(pos + 8, min(end, pos + 8 + 2 * wide_count), wide=True)
-                pos += 8 + 2 * wide_count
-                if pos + 3 <= end:
-                    blank(pos + 3, min(end, pos + 3 + 67))
-        elif kind == b"mluc":
-            records, record_size = u32(offset + 8), u32(offset + 12)
-            if record_size < 12:
-                continue
-            for number in range(min(records, 1000)):
-                record = offset + 16 + number * record_size
-                if record + 12 > end:
-                    break
-                start = offset + u32(record + 8)
-                blank(start, min(end, start + u32(record + 4)), wide=True)
-    data[84:100] = bytes(16)
-    return bytes(data)
+# (Moved to imageinfo, which every picture encoder uses; kept here by name.)
+scrub_icc = imageinfo.scrub_icc
 
 
 def _scrub_icc_segments(body):
@@ -1429,9 +1439,11 @@ class _Sizes:
     def needs_original(self, row):
         """True when the picture's files cannot be made without reading its original."""
         mode = self.options["images"]
-        if mode == "original" or row["id"] not in self.thumbs:
+        if row["id"] not in self.thumbs:
             return True
-        return mode == "web" and self.stored_preview(row) is None
+        if mode == "original" and row["projection"] != imageinfo.PROJECTION_DUAL_FISHEYE:
+            return True
+        return mode != "none" and self.stored_preview(row) is None
 
     def parts(self, record, row):
         """{thumbs, images, panos, data} bytes of one picture."""
@@ -1440,7 +1452,7 @@ class _Sizes:
         mode = self.options["images"]
         if mode == "none":
             return parts
-        if mode == "original":
+        if mode == "original" and row["projection"] != imageinfo.PROJECTION_DUAL_FISHEYE:
             parts["images"] = row["size"] or 0
         else:
             size = self.stored_preview(row)
@@ -1584,10 +1596,9 @@ def detail_entry(row, record):
 
 
 def _location(row):
+    """(lat, lon) of a row, rounded, or None: the same rule as the server's map."""
     lat, lon = row["lat"], row["lon"]
-    if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in (lat, lon)):
-        return None
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0 and lon == 0):
+    if not world_map.valid_position(lat, lon):
         return None
     return round(lat, LOCATION_DECIMALS), round(lon, LOCATION_DECIMALS)
 
@@ -1601,25 +1612,11 @@ def _js_json(value):
 
 
 def _write_replacing(path, data):
-    """Write bytes so readers see the old file or the new one, never a partial file."""
-    temp = "%s.tmp-%d-%d" % (path, os.getpid(), threading.get_ident())
-    try:
-        with open(temp, "wb") as handle:
-            handle.write(data)
-        for attempt in range(10):
-            try:
-                os.replace(temp, path)
-                return
-            except PermissionError:
-                if attempt == 9:
-                    raise
-                time.sleep(0.05 * (attempt + 1))
-    finally:
-        if os.path.exists(temp):
-            try:
-                os.remove(temp)
-            except OSError:
-                pass
+    """Write bytes so readers see the old file or the new one, never a partial file.
+
+    Not flushed to the disk first: the next export checks what it wrote.
+    """
+    common.write_file_atomic(path, data, fsync=False)
 
 
 class Writer:
@@ -1941,7 +1938,9 @@ class _Export:
                 guessed = _guess_own_files(self.out_dir)
                 self.ctx.log("No record of the earlier export into %s was found; the files "
                              "it made are recognised by their names." % self.out_dir, "warn")
-        elif marker and marker.get("legacy"):
+        elif (marker and marker.get("legacy")) or (
+                marker is None and os.path.isdir(self.out_dir)
+                and _old_package_site(self.out_dir)):
             guessed = _guess_own_files(self.out_dir)
             self.ctx.log("%s holds a site made by an older version; its files are replaced."
                          % self.out_dir)
@@ -2075,6 +2074,13 @@ class _Export:
 
     def _original(self, picture):
         row = picture.row
+        if row["projection"] == imageinfo.PROJECTION_DUAL_FISHEYE:
+            # The original is two unstitched fisheye circles, which no page
+            # can show as the 360-degree picture: the site gets the
+            # stitched panorama (its web-size picture) instead.
+            self._web_image(picture)
+            picture.ext = "jpg"
+            return
         sig = self._source_sig("original", row)
         for ext in ORIGINAL_EXTENSIONS:
             if self.writer.current("images/%s.%s" % (picture.xid, ext), sig):
@@ -2827,10 +2833,14 @@ def main(argv=None):
         ctx = jobs.ConsoleContext("export")
         conn = db.connect()
         try:
-            summary = export_library(ctx, conn, config, library["id"], args.out, options,
-                                     helper=common.load_helper(config.get("helper", "")))
+            with ctx.stop_on_ctrl_c():
+                summary = export_library(ctx, conn, config, library["id"], args.out, options,
+                                         helper=common.load_helper(config.get("helper", "")))
         finally:
             conn.close()
+    except KeyboardInterrupt:
+        # A second Ctrl+C: the next run finishes the export.
+        raise SystemExit("\nStopped (Ctrl+C). Run the same command again to finish the export.")
     except (ExportError, common.ConfigError, db.DatabaseError) as error:
         raise SystemExit("Error: %s" % error)
     except OSError as error:

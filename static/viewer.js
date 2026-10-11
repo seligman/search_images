@@ -2011,10 +2011,8 @@ var VIEWER = (function () {
     return {
         format: format,
         Stage: Stage,
-        Panorama: Panorama,
         renderInfo: renderInfo,
         altText: altText,
-        highlighted: highlighted,
         open: open,
         close: closeLightbox,
         update: update,

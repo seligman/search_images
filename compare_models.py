@@ -723,6 +723,9 @@ def main(argv=None):
     except (common.ConfigError, db.DatabaseError) as error:
         print("Error: %s" % error)
         return 2
+    except KeyboardInterrupt:
+        print("\nStopped (Ctrl+C); no report was written.")
+        return 130
     except SystemExit as error:
         if isinstance(error.code, str):
             print("Error: %s" % error.code)

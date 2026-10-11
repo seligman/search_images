@@ -23,8 +23,7 @@ SECRET = "sk-test-0123456789abcdefSECRET"
 NOW = 1700000000.0
 
 
-def quiet(*_args, **_kwargs):
-    pass
+quiet = support.quiet
 
 
 def insert_image(conn, library_id, path, **fields):
@@ -125,6 +124,8 @@ class ProgressTest(support.TempBaseMixin, unittest.TestCase):
             result = run_script("progress.py", command)
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(b"(all)", run_script("progress.py", "counts").stdout)
+        # With no command: the counts too.
+        self.assertIn(b"(all)", run_script("progress.py").stdout)
         self.assertTrue(os.path.isfile(common.db_path()))
 
     def test_broken_config_is_reported_without_a_traceback(self):
@@ -148,7 +149,9 @@ class SettingsTest(support.TempBaseMixin, unittest.TestCase):
             os.environ.pop(name, None)
 
     def config_with_two_endpoints(self):
+        """A config with the older round-robin "endpoint" list (and no "endpoints")."""
         config = common.default_config()
+        del config["endpoints"]
         config["endpoint"] = [
             {"kind": "openai", "base_url": "http://127.0.0.1:8080/v1", "api_key": SECRET,
              "model": "first"},
@@ -242,6 +245,7 @@ class SettingsTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual([entry["model"] for entry in saved["endpoints"]], ["first", "second"])
         # A single older endpoint keeps working the same way.
         single = common.default_config()
+        del single["endpoints"]
         single["endpoint"] = {"kind": "openai", "base_url": "http://127.0.0.1:8080/",
                               "model": "only"}
         self.assertEqual([entry["name"] for entry in settings.endpoint_entries(single)],
@@ -669,14 +673,18 @@ class MakeTilesTest(support.TempBaseMixin, unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     make_tiles.slice_zoom(source, 1, 80, False)
         # The tile being written when it stopped is not there under its name
-        # (only its temporary file); the ones before it are whole.
+        # (its temporary file was removed on the way out); the ones before it
+        # are whole.
         stopped = calls[2]
         self.assertFalse(os.path.exists(stopped))
-        self.assertTrue(os.path.exists(stopped + ".part"))
+        self.assertFalse(os.path.exists(stopped + ".part"))
         import imageinfo
         for done in calls[:2]:
             self.assertTrue(imageinfo.jpeg_file_complete(done), done)
-        # The next run removes the temporary file and fills the gaps.
+        # A process that was killed outright leaves the temporary file: the
+        # next run removes it and fills the gaps.
+        with open(stopped + ".part", "wb") as handle:
+            handle.write(b"\xff\xd8 cut short")
         self.assertEqual(make_tiles.remove_partial_files(), 1)
         with contextlib.redirect_stdout(io.StringIO()):
             counts = make_tiles.slice_zoom(source, 1, 80, False)
@@ -728,6 +736,179 @@ class MakeTilesTest(support.TempBaseMixin, unittest.TestCase):
                 handle.write(b"x")
         self.assertEqual(make_tiles.remove_partial_files(), 1)
         self.assertEqual(sorted(os.listdir(tiles)), ["3.jpg", "notes.part"])
+
+
+class HelpTest(support.TempBaseMixin, unittest.TestCase):
+    """--help says what a tool takes, and never starts the work."""
+
+    def run_closed(self, name, *args):
+        """Run a script with no input at all (stdin closed); help lines are not wrapped."""
+        return subprocess.run([sys.executable, name] + list(args), cwd=support.REPO,
+                              env=support.child_env(COLUMNS="200"), capture_output=True,
+                              stdin=subprocess.DEVNULL, timeout=120)
+
+    def test_settings_help_prints_usage_without_the_menu(self):
+        result = self.run_closed("settings.py", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"usage: settings.py", result.stdout)
+        self.assertNotIn(b"Image database settings", result.stdout)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assertFalse(os.path.exists(common.config_path()))
+        # An option it does not know is an error, not a menu.
+        result = self.run_closed("settings.py", "--library", "x")
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(b"Image database settings", result.stdout)
+
+    def test_settings_menu_without_input_stops_cleanly(self):
+        result = self.run_closed("settings.py")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"nothing was saved", result.stdout)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assertFalse(os.path.exists(common.config_path()))
+
+    def test_map_tools_name_their_formats_and_defaults(self):
+        result = self.run_closed("world_map.py", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"JPEG, PNG", result.stdout)
+        if support.pillow_available():
+            result = self.run_closed("make_tiles.py", "--help")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b"(default: 82)", result.stdout)
+
+
+class SettingsSaveCheckTest(support.TempBaseMixin, unittest.TestCase):
+    """settings.py never silently undoes a change made elsewhere while it was open."""
+
+    def setUp(self):
+        super().setUp()
+        self.family = self.base.library_folder("Family")
+        self.base.write_config([support.library("Family", self.family, id="lib_family1")])
+
+    def change_elsewhere(self):
+        """What the Manage page does while settings.py waits at a prompt."""
+        config = common.load_config()
+        config["libraries"].append(support.library("AddedOnManagePage",
+                                                   self.base.library_folder("Other"),
+                                                   id="lib_other001"))
+        config["libraries"][0]["export"] = {"location": True}
+        common.save_config(config)
+
+    def run_settings(self, answers):
+        """settings.main with these answers; a callable answer runs, then answers its value."""
+        answers = iter(answers)
+        prompts = []
+
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            answer = next(answers)
+            return answer() if callable(answer) else answer
+
+        with mock.patch("builtins.input", fake_input):
+            return output_of(settings.main), prompts
+
+    def saved_names(self):
+        return [library["name"] for library in common.load_config()["libraries"]]
+
+    def elsewhere_then(self, answer):
+        def step():
+            self.change_elsewhere()
+            return answer
+        return step
+
+    def test_nothing_changed_here_keeps_the_other_change(self):
+        output, _prompts = self.run_settings([self.elsewhere_then("5")])
+        self.assertIn("changed by something else", output)
+        self.assertIn("left as it is", output)
+        self.assertEqual(self.saved_names(), ["Family", "AddedOnManagePage"])
+        self.assertEqual(common.load_config()["libraries"][0]["export"], {"location": True})
+
+    def test_a_change_here_asks_first(self):
+        new = self.base.library_folder("New")
+        # Add a library here; meanwhile one is added elsewhere; Save and exit,
+        # then "Exit without saving".
+        output, _prompts = self.run_settings(["3", "1", new, "", "0",
+                                              self.elsewhere_then("5"), "3"])
+        self.assertIn("Nothing was saved", output)
+        self.assertEqual(self.saved_names(), ["Family", "AddedOnManagePage"])
+        # Back (0) returns to the menu; Reload (2) drops the change made
+        # here, which is then made again and saved over the new file.
+        self.base.write_config([support.library("Family", self.family, id="lib_family1")])
+        output, _prompts = self.run_settings(["3", "1", new, "", "0",
+                                              self.elsewhere_then("5"), "0",
+                                              "5", "2", "3", "1", new, "", "0", "5"])
+        self.assertIn("Reloaded", output)
+        self.assertEqual(self.saved_names(), ["Family", "AddedOnManagePage", "New"])
+        self.assertEqual(common.load_config()["libraries"][0]["export"], {"location": True})
+        # Saving anyway (1) is a choice, never a surprise.
+        self.base.write_config([support.library("Family", self.family, id="lib_family1")])
+        self.run_settings(["3", "1", new, "", "0", self.elsewhere_then("5"), "1"])
+        self.assertEqual(self.saved_names(), ["Family", "New"])
+
+    def test_unchanged_file_saves_as_before(self):
+        new = self.base.library_folder("New")
+        output, _prompts = self.run_settings(["3", "1", new, "", "0", "5"])
+        self.assertIn("Saved to", output)
+        self.assertEqual(self.saved_names(), ["Family", "New"])
+
+    def test_ctrl_c_at_a_prompt_saves_nothing_and_shows_no_traceback(self):
+        with mock.patch("builtins.input", side_effect=KeyboardInterrupt):
+            with self.assertRaises(SystemExit) as caught:
+                output_of(settings.main)
+        self.assertEqual(caught.exception.code, 130)
+
+
+class SettingsInputTest(support.TempBaseMixin, unittest.TestCase):
+
+    def test_quoted_folders_and_files(self):
+        folder = self.base.library_folder("lib2")
+        config = common.default_config()
+        # Windows Explorer's "Copy as path" puts quotes around the path.
+        library = settings.add_library(config, '"%s"' % folder)
+        self.assertEqual(library["path"], folder)
+        self.assertEqual(library["name"], "lib2")
+        self.assertIsNone(settings.library_folder_error('"%s"' % folder))
+        settings.set_library_folder(config, 0, "'%s'" % folder)
+        self.assertEqual(config["libraries"][0]["path"], folder)
+        # The same for the key file and the helper module.
+        endpoint = {"name": "x", "preset": "custom", "model": "m"}
+        key_file = self.base.write_file("cloud.key", SECRET)
+        with mock.patch("builtins.input", side_effect=["2", '"%s"' % key_file]):
+            output_of(settings.configure_key, endpoint)
+        self.assertEqual(endpoint["api_key_file"], key_file)
+        helper = self.base.write_file("helper.py", "")
+        with mock.patch("builtins.input", return_value='"%s"' % helper):
+            output_of(settings.configure_helper, config)
+        self.assertEqual(config["helper"], helper)
+
+    def test_testing_without_pillow_keeps_the_session(self):
+        with mock.patch.dict(sys.modules, {"scan": None}):
+            output = output_of(settings.test_endpoint_now, {"name": "x", "model": "m"})
+        self.assertIn("Pillow", output)
+
+
+class TileWriteTest(support.TempBaseMixin, unittest.TestCase):
+
+    def test_a_tile_the_server_is_sending_is_replaced_after_a_moment(self):
+        import make_tiles
+        path = os.path.join(self.base.path, "0.jpg")
+        with open(path, "wb") as handle:
+            handle.write(b"old")
+        real_replace = os.replace
+        calls = []
+
+        def busy_twice(src, dst):
+            # Windows refuses to replace a file another process has open.
+            calls.append(dst)
+            if len(calls) <= 2:
+                raise PermissionError(13, "Access is denied", dst)
+            real_replace(src, dst)
+
+        with mock.patch.object(make_tiles.os, "replace", side_effect=busy_twice):
+            make_tiles.write_tile(path, b"new")
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"new")
+        self.assertEqual(len(calls), 3)
+        self.assertFalse(os.path.exists(path + ".part"))
 
 
 if __name__ == "__main__":

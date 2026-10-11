@@ -7,12 +7,12 @@ each other on the output map are merged into a single pin labelled with the
 number of photos in that cluster.
 
 Run with no arguments to write `world_map.png` in the data folder, or pass a
-path. The `generate_map_bytes` and `render_map` functions are intended for
-the server, which can call them to build the image in memory.
+path. The web server's map page draws its own pins in the browser; it only
+uses this module's collect_located_images() (and valid_position(), as the
+static export does), not the PNG drawing.
 """
 
 import argparse
-import io
 import math
 import os
 
@@ -202,16 +202,6 @@ def render_map(width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT,
     return img
 
 
-def generate_map_bytes(width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT,
-                       basemap_path=DEFAULT_BASEMAP,
-                       cluster_radius=DEFAULT_CLUSTER_RADIUS, points=None):
-    """Return PNG bytes for the world map. Convenient for HTTP responses."""
-    img = render_map(width, height, basemap_path, cluster_radius, points)
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Generate a world map PNG with one pin per area where "
@@ -224,8 +214,10 @@ def main():
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT,
                         help="Output height in pixels.")
     parser.add_argument("--basemap", default=DEFAULT_BASEMAP,
-                        help="Equirectangular base map PNG; a plain "
-                             "graticule is used if missing.")
+                        help="Equirectangular base map image, in any format "
+                             "Pillow opens (JPEG, PNG, ...); default: the "
+                             "bundled static/worldmap.jpg. A plain graticule "
+                             "is drawn if the file is missing.")
     parser.add_argument("--cluster-radius", type=int,
                         default=DEFAULT_CLUSTER_RADIUS,
                         help="Pixels within which pins are merged.")

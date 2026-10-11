@@ -8,6 +8,9 @@
 /site.zip
 /site_*.zip
 /exports/
+# The repo-hygiene test's list of private words (see README, "Tests")
+/private-terms.txt
+/private-terms*.txt
 # User helper modules contain machine-specific paths/commands
 /*_helper.py
 !/example_helper.py

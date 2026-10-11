@@ -1179,10 +1179,15 @@
         }
         var chosen = picked();
         if (chosen && !chosen.stale) {
-            // (The pictures that are still there: one hidden or removed
-            // since the link was made is not counted.)
+            // (The pictures that are still there and shown, as the grid
+            // shows them: one removed since the link was made, hidden
+            // while hidden pictures are not shown, or in another library
+            // than the one picked is not counted.)
+            var shown = visibility();
             var pickedCount = chosen.ids.filter(function (id) {
-                return record(id) !== null;
+                var rec = record(id);
+                return rec !== null && !(rec.h && !shown.hidden) &&
+                    !(shown.library && rec.l !== shown.library);
             }).length;
             chips.push(chipButton("Picked on the map: " + fmt.plural(pickedCount, "picture"),
                                   function () {

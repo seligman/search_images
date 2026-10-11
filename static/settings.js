@@ -17,7 +17,11 @@
     var clear = SHELL.clear;
     var fmt = SHELL.format;
 
-    var TEST_COST_KEY = "searchImages.testCost.";
+    var TEST_COST_KEY = SHELL.TEST_COST_KEY;
+    var field = SHELL.field;
+    var notice = SHELL.notice;
+    var warningList = SHELL.warningList;
+    var money = fmt.money;
     var STATUS_REFRESH = 30000;     // how often the model servers' status is checked
     var LOCAL_ORDER = ["llamacpp", "lmstudio", "ollama", "ollama-openai", "vllm", "local"];
     var CLOUD_ORDER = ["openai", "anthropic", "gemini", "openrouter", "azure"];
@@ -61,42 +65,6 @@
         return node;
     }
 
-    var fieldCount = 0;
-
-    // A labelled field. The label (and the hint) are tied to the control
-    // by id, also when the field holds more than the control (options.div).
-    function field(label, control, options) {
-        options = options || {};
-        fieldCount += 1;
-        var labelId = "settings-field-" + fieldCount;
-        var error = el("span", {className: "field-error", hidden: true,
-                                attrs: {"aria-live": "polite"}});
-        var labelNode = el("span", {className: "field-label", id: labelId}, [label]);
-        if (options.optional) {
-            labelNode.appendChild(el("span", {className: "optional", text: " (optional)"}));
-        }
-        var hint = options.hint ? el("span", {className: "field-hint", id: labelId + "-hint"},
-                                     options.hint) : null;
-        var node = el(options.div ? "div" : "label", {className: "field"}, [
-            labelNode, control, hint, options.after || null, error
-        ]);
-        var target = options.control || control;
-        target.setAttribute("aria-labelledby", labelId);
-        if (hint) {
-            target.setAttribute("aria-describedby", labelId + "-hint");
-        }
-        return {node: node, error: error, control: target};
-    }
-
-    function notice(kind, content, actions) {
-        var box = el("div", {className: "notice " + (kind || "")});
-        box.appendChild(SHELL.append(el("div", {className: "notice-text"}), content));
-        (actions || []).forEach(function (action) {
-            box.appendChild(action);
-        });
-        return box;
-    }
-
     function showNotice(kind, content) {
         var holder = byId("settings-notices");
         var close = button("Dismiss", "small");
@@ -105,15 +73,6 @@
             holder.removeChild(box);
         });
         holder.appendChild(box);
-    }
-
-    function warningList(warnings) {
-        if (warnings.length === 1) {
-            return warnings[0];
-        }
-        return el("ul", {className: "warning-list"}, warnings.map(function (text) {
-            return el("li", {text: text});
-        }));
     }
 
     /* ---------- Loading -------------------------------------------------- */
@@ -408,13 +367,6 @@
     }
 
     /* ---------- Test ----------------------------------------------------- */
-
-    function money(value) {
-        if (value === 0) {
-            return "$0";
-        }
-        return "$" + value.toFixed(value < 0.01 ? 5 : value < 1 ? 3 : 2);
-    }
 
     function parsedValue(value) {
         if (Array.isArray(value)) {

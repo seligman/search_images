@@ -30,18 +30,10 @@ else:
 SECRET = "sk-sentinel-job-secret-0123456789"
 
 
-def quiet(*_args, **_kwargs):
-    pass
+quiet = support.quiet
 
 
-def wait_for(condition, timeout=10.0, interval=0.01):
-    """Poll condition() until it is true; returns its last value."""
-    deadline = time.monotonic() + timeout
-    while True:
-        value = condition()
-        if value or time.monotonic() > deadline:
-            return value
-        time.sleep(interval)
+wait_for = support.wait_for
 
 
 class Gate:
@@ -586,6 +578,37 @@ class RealRunnerTest(support.TempBaseMixin, unittest.TestCase):
         self.assertTrue(self.manager.wait_idle(60))
         self.assertIn("disabled", self.manager.get(disabled["id"])["error"])
         self.assertIn("no longer in the settings", self.manager.get(gone["id"])["error"])
+
+
+class RemovedLibraryTest(ManagerFixture, unittest.TestCase):
+    """Removing a library stops the work on it, also the job that is running."""
+
+    def test_the_running_job_of_a_removed_library_is_cancelled(self):
+        manager = self.manager()
+        running, _added = manager.enqueue("slow", "lib_a", {})
+        self.assertTrue(self.gate.started.wait(10))
+        queued, _added = manager.enqueue("scan", "lib_a", {})
+        self.assertEqual(manager.cancel_library_jobs("lib_a"), 1)
+        self.wait_state(manager, running["id"], "cancelled")
+        self.assertEqual(self.state_of(manager, queued["id"]), "cancelled")
+        self.assertLess(manager.get(running["id"])["done"], self.gate.steps)
+
+    def test_a_job_of_every_library_skips_a_removed_one(self):
+        manager = self.manager()
+        running, _added = manager.enqueue("slow", None, {})
+        self.assertTrue(self.gate.started.wait(10))
+        other, _added = manager.enqueue("scan", "lib_b", {})
+        self.assertEqual(manager.cancel_library_jobs("lib_a"), 0)
+        ctx = manager._current["ctx"]
+        self.assertTrue(ctx.library_removed("lib_a"))
+        self.assertFalse(ctx.library_removed("lib_b"))
+        self.assertTrue(jobs.library_removed(ctx, "lib_a"))
+        # The job itself goes on, and so do the other libraries' jobs.
+        self.assertEqual(self.state_of(manager, running["id"]), "running")
+        self.gate.release.set()
+        self.assertTrue(manager.wait_idle(10))
+        self.assertEqual(self.state_of(manager, running["id"]), "done")
+        self.assertEqual(self.state_of(manager, other["id"]), "done")
 
 
 if __name__ == "__main__":

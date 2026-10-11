@@ -11,6 +11,12 @@
    opens the search page for it. The choice is kept in ?lib= and in
    localStorage.
 
+   SHELL.field(label, control, options), SHELL.notice(kind, content,
+   actions) and SHELL.warningList(warnings) build the forms and notices of
+   the Manage and Settings pages; SHELL.format.money(dollars) writes a
+   cost, and SHELL.TEST_COST_KEY + endpoint name is where the Settings
+   page's last Test keeps its cost per picture (the Manage page reads it).
+
    SHELL.admin(path, body, options) calls /api/admin<path> with the
    X-Search-Images header: GET without a body, POST with a JSON body (and
    the last config token seen, so a change made elsewhere is noticed). It
@@ -41,6 +47,8 @@ var SHELL = (function () {
     var jobTimer = null;
     var jobIndicator = null;
     var reloadShown = false;
+
+    var TEST_COST_KEY = "searchImages.testCost.";
 
     /* ---------- DOM helpers ---------------------------------------------- */
 
@@ -102,6 +110,58 @@ var SHELL = (function () {
             node.removeChild(node.firstChild);
         }
         return node;
+    }
+
+    /* ---------- Forms and notices (Manage and Settings) ------------------ */
+
+    var fieldCount = 0;
+
+    // A labelled field. The label (and the hint) are tied to the control
+    // by id, also when the field holds more than the control (options.div).
+    function field(label, control, options) {
+        options = options || {};
+        fieldCount += 1;
+        var labelId = "shell-field-" + fieldCount;
+        var error = el("span", {className: "field-error", hidden: true,
+                                attrs: {"aria-live": "polite"}});
+        var labelNode = el("span", {className: "field-label", id: labelId}, [label]);
+        if (options.optional) {
+            labelNode.appendChild(el("span", {className: "optional", text: " (optional)"}));
+        }
+        var hint = options.hint ? el("span", {className: "field-hint", id: labelId + "-hint"},
+                                     options.hint) : null;
+        var node = el(options.div ? "div" : "label", {className: "field"}, [
+            labelNode, control, hint, options.after || null, error
+        ]);
+        var target = options.control || control;
+        target.setAttribute("aria-labelledby", labelId);
+        if (hint) {
+            target.setAttribute("aria-describedby", labelId + "-hint");
+        }
+        return {node: node, error: error, control: target};
+    }
+
+    // A notice box ("ok", "warn", "error" or "") holding text or nodes, and
+    // action buttons (empty ones are left out).
+    function notice(kind, content, actions) {
+        var box = el("div", {className: "notice " + (kind || "")});
+        box.appendChild(append(el("div", {className: "notice-text"}), content));
+        (actions || []).forEach(function (action) {
+            if (action) {
+                box.appendChild(action);
+            }
+        });
+        return box;
+    }
+
+    // One warning as text, several as a list.
+    function warningList(warnings) {
+        if (warnings.length === 1) {
+            return warnings[0];
+        }
+        return el("ul", {className: "warning-list"}, warnings.map(function (text) {
+            return el("li", {text: text});
+        }));
     }
 
     /* ---------- Storage (may be unavailable, e.g. some file:// pages) ---- */
@@ -222,6 +282,15 @@ var SHELL = (function () {
     }
 
     // "512 bytes", "4.2 KB", "162 MB", "1.3 GB".
+    // A cost in dollars. Small ones keep their first digits ("$0.00040"),
+    // so the cost per picture of a cheap cloud model never reads as nothing.
+    function money(value) {
+        if (value === 0) {
+            return "$0";
+        }
+        return "$" + value.toFixed(value < 0.01 ? 5 : value < 1 ? 3 : 2);
+    }
+
     function bytes(value) {
         var n = Number(value);
         if (!isFinite(n) || n < 0) {
@@ -955,7 +1024,6 @@ var SHELL = (function () {
         showJobs: showJobs,
         storageGet: storageGet,
         storageSet: storageSet,
-        capabilities: capabilities,
         library: function () {
             return currentLibrary;
         },
@@ -975,9 +1043,10 @@ var SHELL = (function () {
             setLibrary(key, false);
         },
         navLink: navLink,
-        configToken: function () {
-            return configToken;
-        },
+        field: field,
+        notice: notice,
+        warningList: warningList,
+        TEST_COST_KEY: TEST_COST_KEY,
         format: {
             number: number,
             plural: plural,
@@ -985,6 +1054,7 @@ var SHELL = (function () {
             relative: relative,
             clock: clock,
             percent: percent,
+            money: money,
             bytes: bytes
         },
         jobs: {

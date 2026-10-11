@@ -844,13 +844,11 @@ class ProbeTest(LlmTestCase):
         self.assertEqual(request["path"], "/props")
         self.assertEqual(request["headers"]["authorization"], "Bearer test-key-0003")
         self.assertEqual(common.endpoint_concurrency(endpoint, info["slots"]), 4)
-        self.assertEqual(llm.probe_model_name(endpoint), "model.gguf")
 
     def test_server_without_props_or_still_loading(self):
         self.server.props = False
         info = llm.probe(self.endpoint())
         self.assertEqual((info["model"], info["reachable"], info["loading"]), (None, True, False))
-        self.assertEqual(llm.probe_model_name(self.endpoint()), "fake-model")
         self.server.props = True
         self.server.props_status = 503
         info = llm.probe(self.endpoint())
@@ -865,8 +863,6 @@ class ProbeTest(LlmTestCase):
                 self.assertIsNone(info["model"])
             info = llm.probe(self.endpoint(preset="lmstudio"))
             self.assertIs(info["reachable"], False)
-            with mock.patch.object(llm, "PROPS_RETRY_DELAY", 0):
-                self.assertEqual(llm.probe_model_name(self.endpoint()), "fake-model")
             self.assertEqual(llm.list_models(self.endpoint()), [])
         self.assertIsNone(llm.probe("not an endpoint")["reachable"])
 

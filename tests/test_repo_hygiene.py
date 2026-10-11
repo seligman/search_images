@@ -9,9 +9,11 @@ names. Text files must also use LF line endings only.
 
 You can also keep a private list of words that must never appear in the repo
 (a NAS name, a share, library names, ...). Put one term per line in either of
-these files, which are never committed:
+these files, which git never commits:
 
-    <SETTINGS_BASE>/private-terms.txt
+    <SETTINGS_BASE>/private-terms.txt   (next to config.json: the program
+                                         folder when SETTINGS_BASE is not set,
+                                         where .gitignore covers it)
     .git/info/private-terms
 
 Run with:  python -m unittest discover -s tests
@@ -69,22 +71,28 @@ ALLOWED_KEY_MARKERS = ("test", "fake", "example", "abcdef", "0123456789", "xxxx"
 
 
 def candidate_files():
-    """Files git would commit: tracked plus untracked-but-not-ignored."""
+    """Files git would commit: tracked plus untracked-but-not-ignored.
+
+    Returns (names, None), or (None, why they cannot be listed).
+    """
     try:
         out = subprocess.run(
             ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             cwd=REPO, capture_output=True, check=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return None
+    except OSError:
+        return None, "git is not available"
+    except subprocess.CalledProcessError:
+        # A copy without its .git folder (a ZIP download, say).
+        return None, "not a git checkout"
     names = [n for n in out.decode("utf-8", "replace").split("\0") if n]
-    return sorted(set(names))
+    return sorted(set(names)), None
 
 
 def private_terms():
-    paths = [os.path.join(REPO, ".git", "info", "private-terms")]
-    base = os.environ.get("SETTINGS_BASE")
-    if base:
-        paths.append(os.path.join(base, "private-terms.txt"))
+    # The folder of config.json, found as the tools find it (common.settings_base).
+    base = os.environ.get("SETTINGS_BASE") or REPO
+    paths = [os.path.join(REPO, ".git", "info", "private-terms"),
+             os.path.join(base, "private-terms.txt")]
     terms = []
     for path in paths:
         if not os.path.isfile(path):
@@ -136,9 +144,9 @@ def scan_line(line):
 class RepoHygieneTest(unittest.TestCase):
 
     def setUp(self):
-        self.files = candidate_files()
+        self.files, why = candidate_files()
         if self.files is None:
-            self.skipTest("git is not available")
+            self.skipTest(why)
 
     def iter_text_files(self):
         for name in self.files:
@@ -200,6 +208,8 @@ class RepoHygieneTest(unittest.TestCase):
             "config.json", "data/images.db", "data/thumbs/thumb-0000.dat",
             "site/index.html", "site.zip", "site_demo.zip", "exports/x/index.html",
             "abort", "abort.txt", "_error_0001.txt", "world_map.png",
+            # The private word list itself (when the data folder is the program folder).
+            "private-terms.txt", "private-terms-old.txt",
             "__pycache__/x.cpython-314.pyc",
             "my_helper.py", "local/config.json", "models/x.gguf",
             # Key files a user might create next to config.json.

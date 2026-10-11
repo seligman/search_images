@@ -135,12 +135,8 @@ def admin_allowed(request, enabled=True):
 
 
 def config_token():
-    """A token that changes whenever config.json does (its modification time and size)."""
-    try:
-        stat = os.stat(common.config_path())
-    except OSError:
-        return "none"
-    return "%d-%d" % (stat.st_mtime_ns, stat.st_size)
+    """A token that changes whenever config.json does (see common.config_token)."""
+    return common.config_token()
 
 
 def redact_tree(value, secrets=()):
@@ -163,9 +159,10 @@ def _raw_endpoints(config):
     if isinstance(endpoints, list):
         return [item for item in endpoints if isinstance(item, dict)]
     legacy = config.get("endpoint")
-    if isinstance(legacy, list):
-        return [item for item in legacy if isinstance(item, dict)]
-    return [legacy] if isinstance(legacy, dict) else []
+    items = legacy if isinstance(legacy, list) else [legacy]
+    # (endpoint_list leaves out an unused older placeholder too.)
+    return [item for item in items
+            if isinstance(item, dict) and not common.is_placeholder_endpoint(item)]
 
 
 def probe_view(info):
@@ -239,6 +236,44 @@ def endpoint_view(config, endpoint, raw=None, status=None, key_info=None):
     return view
 
 
+def _key_source(settings):
+    """("env", name) or ("file", full path) of the key an endpoint reads, or None.
+
+    Only the sources resolve_api_key reads from outside config.json; the
+    file is not opened.
+    """
+    if settings["api_key_env"]:
+        return ("env", settings["api_key_env"])
+    if settings["api_key_file"]:
+        full = common.resolve_config_relative(settings["api_key_file"])
+        return ("file", os.path.normcase(os.path.abspath(full)))
+    return None
+
+
+def unsaved_key_problem(saved_config, endpoint):
+    """Why an endpoint that is not saved must not send the key it names, or None.
+
+    Listing models saves nothing, so its request may name any key file or
+    environment variable together with any address. Such a key is only
+    sent where a saved endpoint already sends it, or to the cloud service
+    of the endpoint's preset (its own address): any program on this
+    computer can call these routes, and must not be able to read a file
+    or variable through them.
+    """
+    settings = common.endpoint_settings(endpoint)
+    source = _key_source(settings)
+    if source is None:
+        return None
+    if settings["preset"] in common.CLOUD_PRESETS and common.preset_host(
+            settings["preset"], common.url_host(settings["base_url"])):
+        return None
+    for saved in common.endpoint_list(saved_config):
+        if _key_source(saved) == source and saved["base_url"] == settings["base_url"]:
+            return None
+    return ("Save the endpoint first: a key from a file or an environment variable is only "
+            "sent to an address a saved endpoint uses, or to the service its kind names.")
+
+
 def preset_views():
     """{preset name: {label, kind, base_url, key_env, concurrency, notes, cloud}}."""
     return {name: dict(info, cloud=name in common.CLOUD_PRESETS)
@@ -264,7 +299,9 @@ def library_endpoint_info(config, library, key_info=None, status_of=None):
     {"name", "endpoints", "ready", "problem", "warning", "cloud",
     "cloud_hosts"}. ready is False when no endpoint has a model, or the only
     ones are cloud services without an API key (nothing may be sent
-    without one); problem then says why. warning mentions a local model
+    without one); problem then says why. cloud and cloud_hosts only count
+    endpoints with a model: one without can send nothing anywhere. warning
+    mentions a local model
     server that is not running (status_of(endpoint) gives its probe_view,
     when the caller knows it): describing works again once it is started.
     key_info(endpoint) gives (key, source) (default common.resolve_api_key).
@@ -272,7 +309,8 @@ def library_endpoint_info(config, library, key_info=None, status_of=None):
     key_info = key_info or common.resolve_api_key
     wanted = library.get("endpoint") or common.default_endpoint_name(config)
     endpoints = common.endpoints_for_library(config, library)
-    cloud = [endpoint for endpoint in endpoints if not common.is_local_endpoint(endpoint)]
+    cloud = [endpoint for endpoint in endpoints
+             if endpoint["model"] and not common.is_local_endpoint(endpoint)]
     usable, problems, warnings = [], [], []
     for endpoint in endpoints:
         if not endpoint["model"]:
@@ -488,6 +526,9 @@ def apply_endpoint(config, data, original_name=None, replace=False, require_mode
                                  "variable; type keys in the API key field."
                                  if common.looks_like_key(env_name) else
                                  "Use letters, digits and _ only.")
+    if working.get("api_key_file"):
+        # Quotes around a pasted path (Explorer's "Copy as path") are not part of it.
+        settings.set_setting(working, "api_key_file", common.unquote_path(working["api_key_file"]))
     key_file = working.get("api_key_file", "")
     if key_file and common.looks_like_key(key_file) and _file_check(
             os.path.exists, common.resolve_config_relative(key_file)) is False:
@@ -719,6 +760,14 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
         if conn is None:
             conn = g.db_conn = db.connect()
         return conn
+
+    @bp.teardown_request
+    def close_conn(_error):
+        # (serve.py closes the same connection when the app context ends;
+        # whichever runs first closes it.)
+        conn = g.pop("db_conn", None)
+        if conn is not None:
+            conn.close()
 
     def body():
         data = request.get_json(silent=True)
@@ -1459,6 +1508,9 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
             fields["name"] = "new-endpoint-%d" % number
         entry, _cleared, _warnings = apply_endpoint(config, fields, original,
                                                     require_model=False)
+        problem = unsaved_key_problem(state.config(), entry)
+        if problem:
+            raise AdminError(400, problem)
         try:
             models = library_ops.run_with_timeout(llm.list_models, MODELS_TIMEOUT,
                                                   common.endpoint_settings(entry))

@@ -49,17 +49,10 @@ SENTINELS = (FILE_KEY, LITERAL_KEY, ENV_KEY, NEW_KEY, HEX_KEY)
 NOW = 1700000000.0
 
 
-def quiet(*_args, **_kwargs):
-    pass
+quiet = support.quiet
 
 
-def wait_for(condition, timeout=10.0, interval=0.02):
-    deadline = time.monotonic() + timeout
-    while True:
-        value = condition()
-        if value or time.monotonic() > deadline:
-            return value
-        time.sleep(interval)
+wait_for = support.wait_for
 
 
 def insert_image(conn, library_id, path, **fields):
@@ -75,9 +68,7 @@ def insert_image(conn, library_id, path, **fields):
     return cursor.lastrowid
 
 
-def page_config(html):
-    match = re.search(r'<script type="application/json" id="app-config">(.*?)</script>', html)
-    return json.loads(match.group(1))
+page_config = support.page_config
 
 
 def gate_runner(started, release):
@@ -481,7 +472,9 @@ class LibraryRoutesTest(AdminFixture, unittest.TestCase):
         self.assertTrue(any("overlaps" in warning for warning in answer["warnings"]))
         missing = self.base.join("libraries", "not-there")
         answer = self.ok(self.post("/libraries", {"path": missing, "name": "Away"}), 201)
-        self.assertTrue(any("cannot be reached" in warning for warning in answer["warnings"]))
+        # (Its drive is there, so on Windows it is said to be missing, not offline.)
+        self.assertTrue(any("cannot be reached" in warning or "does not exist" in warning
+                            for warning in answer["warnings"]), answer["warnings"])
         self.assertEqual(len(self.config()["libraries"]), 3)
 
     def test_edit_rename_and_relocate_keep_the_id(self):
@@ -607,6 +600,14 @@ class LibraryRoutesTest(AdminFixture, unittest.TestCase):
                                  ("delete_library", {"confirm_name": "Journeys"}))
             finally:
                 writer.rollback()
+            # Let the background retries finish while the retry interval is
+            # still short and this test's data folder still exists; a later
+            # try would otherwise open index.db in whatever folder
+            # SETTINGS_BASE names by then (the program folder, or another
+            # test's).
+            self.assertTrue(wait_for(lambda: not any(
+                thread.name == "register-libraries" and thread.is_alive()
+                for thread in threading.enumerate())))
         self.assertIn("trying again", errors.getvalue())
         self.assertEqual([item["id"] for item in self.config()["libraries"]], ["lib_family1"])
 
@@ -1002,9 +1003,10 @@ class EndpointRoutesTest(AdminFixture, unittest.TestCase):
                                                       "base_url": "http://127.0.0.1:1234/v2"},
                                          "original_name": "studio"}))
         self.assertEqual(self.stored("studio")["api_key"], NEW_KEY)
-        # Another host without a new key: the key is not sent there.
+        # Another host without a new key: the key is not sent there. (Another
+        # loopback address: the server checks it, and tests stay on this computer.)
         answer = self.ok(self.post("/endpoints", {"endpoint": {
-            "name": "studio", "base_url": "http://192.0.2.10:1234/v1"},
+            "name": "studio", "base_url": "http://127.0.0.2:1234/v1"},
             "original_name": "studio"}))
         self.assertTrue(answer["key_cleared"])
         self.assertNotIn("api_key", self.stored("studio"))
@@ -1170,6 +1172,98 @@ class SettingsConsoleTest(support.TempBaseMixin, unittest.TestCase):
             settings.set_library_folder(config, 0, common.data_dir())
         # Relative folders are still accepted on the console, as before.
         settings.add_library(config, "relative-folder", "Relative")
+
+
+class FirstRunTest(AdminFixture, unittest.TestCase):
+    """A new install where a library is added before any endpoint."""
+
+    def test_no_phantom_endpoint_before_the_first_one_is_added(self):
+        os.remove(common.config_path())
+        answer = self.ok(self.post("/libraries", {"path": self.family}), 201)
+        info = answer["library"]["endpoint_info"]
+        # Nothing is said to go to a cloud service: there is no endpoint.
+        self.assertFalse(info["cloud"])
+        self.assertEqual(info["cloud_hosts"], [])
+        self.assertEqual(info["endpoints"], [])
+        with open(common.config_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertNotIn("endpoint", saved)
+        self.assertEqual(saved["endpoints"], [])
+        state = self.ok(self.get("/state"))
+        self.assertEqual(state["endpoints"], [])
+        self.assertEqual(state["default_endpoint"], "")
+
+    def test_the_placeholder_of_older_versions_is_no_endpoint(self):
+        self.write_config(endpoints=None, default_endpoint=None)
+        self.base.write_config([support.library("Family", self.family, id="lib_family1")],
+                               endpoint={"kind": "openai", "base_url": "", "api_key": "",
+                                         "model": ""})
+        state = self.ok(self.get("/state"))
+        self.assertEqual(state["endpoints"], [])
+        self.assertEqual(state["default_endpoint"], "")
+        info = state["libraries"][0]["endpoint_info"]
+        self.assertFalse(info["cloud"])
+        self.assertIn("No AI model", info["problem"])
+
+    def test_an_endpoint_without_a_model_sends_nothing_anywhere(self):
+        self.endpoints.append({"name": "nomodel", "preset": "openai"})
+        self.write_config([support.library("Family", self.family, id="lib_family1",
+                                           endpoint="nomodel")])
+        info = self.ok(self.get("/state"))["libraries"][0]["endpoint_info"]
+        self.assertFalse(info["ready"])
+        self.assertFalse(info["cloud"])
+        self.assertIn("no model", info["problem"])
+
+    def test_quoted_library_folder(self):
+        folder = self.base.library_folder("Quoted")
+        answer = self.ok(self.post("/libraries", {"path": '"%s"' % folder}), 201)
+        self.assertEqual(answer["library"]["path"], folder)
+        self.assertEqual(answer["library"]["name"], "Quoted")
+        checked = self.ok(self.post("/paths/check", {"path": '"%s"' % folder}))
+        self.assertEqual(checked["problem"], "")
+        self.assertEqual(checked["path"], folder)
+
+
+@unittest.skipIf(fake_llm is None, "Pillow is not installed")
+class UnsavedKeyTest(AdminFixture, unittest.TestCase):
+    """Listing models never sends a key from a file or variable to a new address."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = fake_llm.FakeLLM().start()
+        self.addCleanup(self.fake.stop)
+
+    def keys_sent(self):
+        return [entry["headers"].get("authorization") for entry in self.fake.requests
+                if "headers" in entry]
+
+    def test_a_key_file_or_variable_needs_a_saved_endpoint(self):
+        for source in ({"api_key_file": self.key_file},
+                       {"api_key_env": "SEARCH_IMAGES_TEST_KEY"}):
+            fields = dict(source, preset="custom", base_url=self.fake.base_url)
+            response = self.post("/endpoints/models", {"endpoint": fields})
+            self.assertEqual(response.status_code, 400, source)
+            self.assertIn("Save the endpoint first", response.get_json()["error"])
+            # A saved endpoint moved elsewhere in the request: the same.
+            response = self.post("/endpoints/models", {
+                "endpoint": {"base_url": self.fake.base_url}, "original_name": "env"})
+            self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.fake.requests, [])
+        # A key typed in the request is the caller's own: fine.
+        # Not a real key: a made-up value used only by this test.
+        typed = "sk-test-typed-in-request-0000"
+        self.ok(self.post("/endpoints/models", {"endpoint": {
+            "preset": "custom", "base_url": self.fake.base_url, "api_key": typed}}))
+        self.assertIn("Bearer " + typed, self.keys_sent())
+
+    def test_a_saved_endpoint_lists_its_models_with_its_key(self):
+        self.ok(self.post("/endpoints", {"endpoint": {
+            "name": "gateway", "preset": "custom", "base_url": self.fake.base_url,
+            "model": "m", "api_key_file": self.key_file}}))
+        answer = self.ok(self.post("/endpoints/models", {
+            "endpoint": {"api_key_file": self.key_file}, "original_name": "gateway"}))
+        self.assertTrue(answer["models"])
+        self.assertIn("Bearer " + FILE_KEY, self.keys_sent())
 
 
 if __name__ == "__main__":

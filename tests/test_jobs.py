@@ -261,5 +261,30 @@ class WorkerLockTest(support.TempBaseMixin, unittest.TestCase):
         self.assertIsNone(re.search(r"\bos\.kill\b|\bkill\(", source))
 
 
+class CtrlCTest(unittest.TestCase):
+    """The first Ctrl+C asks a command line job to stop; a second one stops at once."""
+
+    def test_first_asks_second_interrupts(self):
+        import signal
+        before = signal.getsignal(signal.SIGINT)
+        ctx = jobs.ConsoleContext("test", stream=io.StringIO())
+        with ctx.stop_on_ctrl_c():
+            handler = signal.getsignal(signal.SIGINT)
+            self.assertIsNot(handler, before)
+            handler(signal.SIGINT, None)
+            self.assertTrue(ctx.should_stop())
+            self.assertIn("Ctrl+C", ctx.stream.getvalue())
+            with self.assertRaises(KeyboardInterrupt):
+                handler(signal.SIGINT, None)
+        self.assertIs(signal.getsignal(signal.SIGINT), before)
+
+    def test_other_contexts_know_of_no_removed_library(self):
+        ctx = jobs.JobContext("test")
+        self.assertFalse(jobs.library_removed(ctx, "lib_a"))
+        ctx.remove_library("lib_a")
+        self.assertTrue(jobs.library_removed(ctx, "lib_a"))
+        self.assertFalse(jobs.library_removed(object(), "lib_a"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Search the image database, and export a library as a static website.
 
-Run with no arguments (or "serve") to start the interactive Flask server.
+Run with no arguments (or "serve") to start the interactive Flask server;
+its options (--host, --port) work with or without "serve".
 Run with "package" to export one library as a static website that searches
 in the browser with no server (see export.py, which does the work).
 """
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -24,7 +26,6 @@ import common
 import db
 import imageinfo
 import jobs
-import prompts
 import search_index
 import world_map
 
@@ -108,16 +109,6 @@ def script_json(value):
     """
     text = json.dumps(value, allow_nan=False)
     return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-
-
-def search_text(name, path, info, taken_at="", projection=""):
-    """The lower-cased text the search page matches a query against.
-
-    See prompts.search_terms: the words of the description (info, a dict
-    or None; any prompt version), the file name and path, and the capture
-    year and month, and "360 panorama" for a 360-degree photo.
-    """
-    return prompts.search_terms(info, name, path, taken_at, projection)
 
 
 def provenance_record(text):
@@ -376,11 +367,15 @@ class ServerState:
     The config is re-read when config.json changes, so library renames and
     enable/disable show up without a restart. The thumbnail store keeps one
     connection that all request threads share. index answers /api/index
-    (search_index.IndexService).
+    (search_index.IndexService). helper is what requests read originals
+    through: its load_image and stat hooks take turns with each other and
+    with the jobs' (common.thread_safe_helper), as the helper module was
+    promised; module is the helper module itself.
     """
 
     def __init__(self, helper=None):
-        self.helper = helper
+        self.module = helper
+        self.helper = common.thread_safe_helper(helper)
         self.previews = cache.PreviewStore()
         self.index = search_index.IndexService()
         self._lock = threading.Lock()
@@ -776,8 +771,8 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             return not_found()
         images = _images()
         if images is not None:
-            mime = images.sniff_mime(head)
-            displayable = mime is not None and images.browser_can_display(mime)
+            mime = imageinfo.sniff_mime(head)
+            displayable = mime is not None and imageinfo.browser_can_display(mime)
             if mime is None and not row["name"].lower().endswith(CONVERTED_EXTENSIONS):
                 # Unknown to the sniffer: let the browser try it as named.
                 mime = mimetypes.guess_type(row["name"])[0]
@@ -857,11 +852,56 @@ def package(output_dir=None, library=None, log=print, options=None, ctx=None):
         conn.close()
 
 
-def main():
+def port_problem(host, port):
+    """Why the server cannot listen on host:port (a sentence), or None.
+
+    On Windows a second server may share a port another one already listens
+    on (Werkzeug lets sockets reuse addresses): it says it is running while
+    every request still goes to the first one. So the port is first taken
+    on its own (SO_EXCLUSIVEADDRUSE) for a moment. Elsewhere such a second
+    server fails to start with a clear message by itself, so nothing is
+    checked.
+    """
+    if os.name != "nt" or not hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        return None
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        address = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM,
+                                     socket.IPPROTO_TCP)[0][4]
+    except (OSError, IndexError, UnicodeError):
+        return None         # the server's own start reports a bad host
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        probe.bind(address)
+    except OSError as error:
+        code = getattr(error, "winerror", None)
+        if error.errno == errno.EADDRINUSE or code == 10048:
+            return ("Port %d is already in use (is another serve.py still running?). Stop "
+                    "it, or start this one with --port and another number." % port)
+        if code == 10013:
+            return ("Port %d cannot be used: another program holds it, or Windows keeps it "
+                    "for itself. Start the server with --port and another number." % port)
+        return None
+    finally:
+        probe.close()
+    return None
+
+
+def _command_line(argv):
+    """argv with "serve" put first when it starts with an option ("--port 8080")."""
+    argv = list(argv)
+    if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
+        argv.insert(0, "serve")
+    return argv
+
+
+def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(
-        description="Search and package the image database.",
+        description="Search and package the image database. With no command (or with "
+                    "options such as --host and --port only) the search server starts.",
         epilog="Run '%(prog)s <command> --help' for options on a specific command.")
     sub = parser.add_subparsers(dest="command")
 
@@ -880,7 +920,7 @@ def main():
         help="The library to export (name or id); needed when more than one "
              "library is enabled.")
 
-    args = parser.parse_args()
+    args = parser.parse_args(_command_line(sys.argv[1:] if argv is None else argv))
 
     try:
         db.init()
@@ -892,6 +932,9 @@ def main():
         try:
             summary = package(args.output, library=args.library,
                               ctx=jobs.ConsoleContext("export"))
+        except KeyboardInterrupt:
+            raise SystemExit("\nStopped (Ctrl+C). Run the same command again to finish the "
+                             "export; what is done is kept.")
         except (export.ExportError, common.ConfigError, db.DatabaseError) as error:
             raise SystemExit("Error: %s" % error)
         except OSError as error:
@@ -903,6 +946,9 @@ def main():
 
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 5000)
+    problem = port_problem(host, port)
+    if problem:
+        raise SystemExit("Error: " + problem)
     try:
         app = build_app(init_db=False, bind_host=host)
     except common.ConfigError as error:

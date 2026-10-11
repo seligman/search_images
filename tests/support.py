@@ -15,6 +15,7 @@ python -m unittest discover -s tests.
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -131,6 +132,45 @@ class TempBaseMixin:
         self.base = TempBase()
         self.base.__enter__()
         self.addCleanup(self.base.__exit__, None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Small helpers several test modules use
+
+def quiet(*_args, **_kwargs):
+    """A log function that drops everything."""
+
+
+def wait_for(condition, timeout=10.0, interval=0.01):
+    """Poll condition() until it is true; returns its last value."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = condition()
+        if value or time.monotonic() > deadline:
+            return value
+        time.sleep(interval)
+
+
+def strict_json(text):
+    """json.loads that rejects NaN/Infinity, like a browser's JSON.parse."""
+    def reject(token):
+        raise ValueError("non-finite number in JSON: " + token)
+    return json.loads(text, parse_constant=reject)
+
+
+def page_config(html):
+    """The page settings a page carries in its JSON block (read strictly)."""
+    match = re.search(r'<script type="application/json" id="app-config">(.*?)</script>',
+                      html, re.S)
+    return strict_json(match.group(1))
+
+
+def code_only(text):
+    """JavaScript text without comments and string literals (rough, but enough here)."""
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"(?m)^\s*//.*$", " ", text)
+    text = re.sub(r"\s//[^\n]*", " ", text)
+    return re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
 
 
 # ---------------------------------------------------------------------------

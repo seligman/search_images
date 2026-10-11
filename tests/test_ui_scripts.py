@@ -46,12 +46,7 @@ def read(*parts):
         return handle.read()
 
 
-def code_only(text):
-    """The text without comments and string literals (rough, but enough here)."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    text = re.sub(r"(?m)^\s*//.*$", " ", text)
-    text = re.sub(r"\s//[^\n]*", " ", text)
-    return re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
+code_only = support.code_only
 
 
 def scripts_of(html):
@@ -220,7 +215,8 @@ class ServerRecordsTest(fixtures.IndexFixture, unittest.TestCase):
         fixtures.insert_image(conn, "lib_other001", "cars/old.jpg", described=1, prompt_ver=4,
                               info={"description": "Old style description of a red car",
                                     "subjects": ["car"], "text": "", "tags": ["Car", "red"],
-                                    "colors": ["Red"]},
+                                    "colors": ["Red"], "sharpness": 0.8,
+                                    "aesthetic_score": 0.9},
                               taken_at="2015-07-01T12:00:00")
         fixtures.insert_image(conn, "lib_family1", "new.jpg")
 
@@ -232,6 +228,10 @@ class ServerRecordsTest(fixtures.IndexFixture, unittest.TestCase):
         records = index.get_json()["records"]
         self.assertEqual(len(records), 5)
         self.assertTrue(any("dg" in rec for rec in records))
+        # Version 4 rated sharpness from 0 to 1: it is no 1-5 score.
+        (old,) = [rec for rec in records if rec.get("v4")]
+        self.assertNotIn("sh", old)
+        self.assertNotIn("q", old)
         pairs = []
         for rec in records:
             detail = self.client.get("/api/image/%d" % rec["i"])

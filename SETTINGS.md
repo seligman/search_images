@@ -6,8 +6,11 @@ links in the page header) and the `settings.py` script edit the most common
 fields, but the file is just JSON and you can edit it by hand whenever you
 need a setting they do not cover. The pages re-read the file before every
 change, so hand edits are kept; a page that was open while you edited the
-file asks you to reload it before it saves anything. The helper module path
-can only be set in the file or with `settings.py`, never from a web page.
+file asks you to reload it before it saves anything. `settings.py` checks
+too: if the file changed while it was open, **Save and exit** asks whether
+to save over those changes, reload the file or exit without saving. The
+helper module path can only be set in the file or with `settings.py`, never
+from a web page.
 
 ## Where the file lives
 
@@ -90,8 +93,8 @@ An endpoint has these settings. Only `name`, `preset` (or `kind`) and
   requests to send at once (see the table below). Left out, it is guessed:
   `kind` `claude` means `anthropic`, `ollama` means `ollama`, an `openai`
   endpoint without a base URL is `openai`, one on a cloud service's host
-  gets that service's preset, and one on this computer or the local network
-  is treated like llama.cpp.
+  gets that service's preset, one on this computer or the local network
+  gets `local` (treated like llama.cpp), and anything else gets `custom`.
 - `kind` - the API itself: `openai` (chat completions, also spoken by most
   local servers), `claude` (Anthropic's Messages API) or `ollama` (Ollama's
   own API). The preset sets it; you only need it without a preset.
@@ -110,8 +113,8 @@ An endpoint has these settings. Only `name`, `preset` (or `kind`) and
   to `config.json`). Keep it outside the program folder.
 - `api_key` - the key itself, stored in `config.json` (not recommended).
 - `concurrency` - how many requests to keep in flight at once. By default,
-  llama.cpp's slot count (its `--parallel` setting), 4 for cloud services and
-  1 for other local servers.
+  the server's slot count for `llamacpp` and `local` (llama.cpp's
+  `--parallel` setting), 4 for the cloud services and 1 for the others.
 - `max_image_edge` - the longest image edge sent, in pixels (default 1536).
   Tall screenshots keep a short side of at least 768 pixels so their text
   stays legible.
@@ -140,11 +143,15 @@ another key. Keys are never printed, logged or stored with the descriptions;
 the tools only say where a key comes from ("env OPENAI_API_KEY", "file",
 "config", "none"). Changing an endpoint's address (its base URL, or its
 preset when it has no base URL of its own) in `settings.py` removes a key
-typed into it.
+typed into it. **List models** on the Settings page, for an endpoint not
+saved yet (or with unsaved changes), only uses a key from `api_key_env` or
+`api_key_file` when a saved endpoint sends that same key to the same
+address, or when the address is the preset's own service.
 
 | Preset | Service | Default base URL | Key variable |
 |---|---|---|---|
 | `llamacpp` | llama.cpp's `llama-server` | `http://127.0.0.1:8080/v1` | |
+| `local` | any OpenAI-compatible server on this computer or the local network, treated like llama.cpp | `http://127.0.0.1:8080/v1` | |
 | `lmstudio` | LM Studio | `http://127.0.0.1:1234/v1` | |
 | `vllm` | vLLM or SGLang | `http://127.0.0.1:8000/v1` | |
 | `ollama` | Ollama's own API | `http://127.0.0.1:11434` | |
@@ -205,9 +212,10 @@ saves them in the newer `endpoints` form, keeping those names.
 
 ## helper
 
-Optional path to a Python file that wraps the LLM calls. See
-`example_helper.py` for the available hooks. Leave blank if you do not need
-one.  Can be useful, for instance, to start and stop the endpoint automatically.
+Optional path to a Python file that wraps the LLM calls and the file
+access. See `example_helper.py` for the available hooks. Leave blank if you
+do not need one. It can, for instance, start the model server before
+describing and stop it afterwards.
 
 ```
 "helper": "my_helper.py"
@@ -216,6 +224,24 @@ one.  Can be useful, for instance, to start and stop the endpoint automatically.
 A relative path is relative to the folder holding `config.json`. (Older
 versions used the current directory; a helper found only there, or next to
 the scripts, is still loaded, with a warning.)
+
+Which tools use which hooks:
+
+- `before_launch()` and `after_launch()` run around every describe run
+  that has pictures to describe: the describe step of `scan.py`, and the
+  Describe, Scan + describe, Process all and Re-describe jobs of the Manage
+  page (and "Describe again" in the viewer). Jobs run inside the web
+  server's process, so a server started there belongs to `serve.py`. A
+  local server that `before_launch` started is waited for (up to three
+  minutes) while it loads its model.
+- `call_api()` runs before each request of a describe run.
+- The endpoint tests (**Test** on the Settings page, the test in
+  `settings.py`, `scan.py --test-endpoint`) and `compare_models.py` use none
+  of these three: start the model server yourself before using them.
+- `walk_library()` lists a library's files for scans (and the Build
+  previews job). `load_image()` and `stat()` are used wherever originals
+  are read: scans, describing, the search server (originals, and previews
+  it makes on the fly) and exports.
 
 The `call_api(prompt, image_path)` hook gets the text sent after the image
 (the system prompt, with the instructions, is sent as it is) and a temporary
@@ -247,10 +273,16 @@ A list of folders to scan. Each library is one object:
   or copy it.
 - `name` - a short label shown in the search UI. Must be unique (ignoring
   case).
-- `path` - the absolute folder to scan (`~` is expanded). All image files
-  found anywhere under this folder are added to the library, with the folder
-  structure preserved as part of the search text. Symbolic links and
-  directory junctions inside it are not followed.
+- `path` - the absolute folder to scan (`~` is expanded), such as
+  `C:\Photos\Family`, `\\server\share\Photos` or `/home/you/Pictures`
+  (in the JSON file each backslash is doubled, as in the examples below).
+  All image files found anywhere under this folder are added to the
+  library, with the folder structure preserved as part of the search text.
+  Symbolic links and directory junctions inside it are not followed. The
+  pages and `settings.py` refuse a folder inside the program folder or the
+  data folder (copy pictures from there to a folder of their own).
+  `settings.py` also takes a relative path, which is then relative to the
+  folder the tools are run from; the pages need a full path.
 - `ignore` - optional list of wildcard patterns. Any file whose path,
   relative to the library root, matches one of these patterns is skipped.
   See "Ignore patterns" below.
@@ -263,8 +295,8 @@ A list of folders to scan. Each library is one object:
 - `previews` - `true` (the default) keeps a 2048 px preview of every image
   in the data folder, used by the detail page and for describing, and for
   larger 360-degree photos also a panorama up to 4096 px wide for the 360
-  view. With `false` they are made from the original each time they are
-  shown.
+  view. They take about 0.5 MB per picture (about 50 GB per 100,000). With
+  `false` they are made from the original each time they are shown.
 - `newest_first` - describe the most recently taken images first (default
   `true`).
 - `endpoint` - the endpoint (or group) that describes this library's
@@ -287,7 +319,8 @@ A list of folders to scan. Each library is one object:
   - `title` - the site's name; blank (the default) uses the library name.
   - `images` - `"web"` (the default: 2048 px pictures), `"original"` (the
     originals with their metadata removed; HEIC, HEIF, AVIF and TIFF become
-    JPEG, BMP becomes PNG) or `"none"` (thumbnails only).
+    JPEG, BMP becomes PNG, and an unstitched dual-fisheye 360-degree photo
+    becomes its stitched panorama) or `"none"` (thumbnails only).
   - `location` - `true` adds GPS positions (rounded to about 10 m), the map,
     and the AI model's separate landmark and place-guess fields (extended
     metadata); default `false`. Titles and descriptions are published as
@@ -315,13 +348,17 @@ A list of folders to scan. Each library is one object:
     Hidden pictures are never published.
   - `credits` - a line of plain text shown at the foot of the pages.
   - `zip` - `true` also writes `<folder>.zip` next to the output folder.
+    An existing file of that name is only replaced when an earlier export
+    made it and it was not changed since; otherwise the export stops.
   - `allow_indexing` - `true` lets search engines index the pages
     (default `false`: the pages and a `robots.txt` ask them not to list
     the pages or their pictures; anyone with the address can still open
     them).
 
 A library removed from the file is not deleted from the database: its images
-stay there, unused, until you delete them or attach them to a library again.
+stay there, unused, until you delete them or attach them to a library again
+(the Manage page shows such data in a notice, with **Re-attach to...** and
+**Delete...**).
 
 Minimal example:
 
@@ -364,14 +401,23 @@ on every platform:
 }
 ```
 
-A few more examples:
+A `*` matches any characters, `/` included, so a pattern that starts with
+`*` matches at any depth, while one that starts with a name is anchored at
+the library root. A pattern that matches a folder skips the folder and
+everything in it. Matching ignores case on Windows only. A few more
+examples:
 
 - `Private/*` - skip everything under the top-level `Private` folder.
-- `*.tmp` - skip files named like `something.tmp` at the library root.
-- `*/cache/*` - skip a `cache` folder one level deep, regardless of its
-  parent.
-- `Originals` - skip a single file or folder named exactly `Originals` at
-  the root. Use `Originals/*` if you want to skip its contents.
+- `Originals` - skip the file or folder named `Originals` at the root, and
+  everything in it (`x/Originals` is kept).
+- `*.tmp` - skip `.tmp` files anywhere in the library.
+- `*/cache/*` - skip every `cache` folder below the root, at any depth (add
+  `cache` as well to skip one at the root too).
+- `IMG_*.png` - skip matching files at the root only; `*/IMG_*.png` skips
+  them in subfolders.
+
+The **Add library** and edit dialogs on the Manage page preview which files
+the patterns skip, so you can check a pattern before saving it.
 
 A file that was scanned previously and is now covered by an `ignore` pattern
 is marked missing on the next full scan (and removed after

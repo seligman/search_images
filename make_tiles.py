@@ -138,12 +138,12 @@ def write_tile(path, data):
     """Write one tile's bytes: to <path>.part, then renamed to path.
 
     An interrupted run leaves at most the .part file (removed by the next
-    run), never a half-written tile under its real name.
+    run), never a half-written tile under its real name. The rename is
+    retried for a moment while the server is sending the old tile (Windows
+    refuses to replace an open file); the next run repairs a tile that a
+    crash cut short, so it is not flushed to the disk first.
     """
-    temp = path + ".part"
-    with open(temp, "wb") as handle:
-        handle.write(data)
-    os.replace(temp, path)
+    common.write_file_atomic(path, data, tmp_path=path + ".part", fsync=False)
 
 
 def slice_zoom(source, zoom, quality, force):
@@ -210,7 +210,7 @@ def main():
                              "Each step quadruples the tile count."
                              % DEFAULT_MAX_ZOOM)
     parser.add_argument("--quality", type=int, default=82,
-                        help="JPEG quality for output tiles.")
+                        help="JPEG quality for output tiles (default: %(default)s).")
     parser.add_argument("--force", action="store_true",
                         help="Rewrite tiles even if they already exist.")
     args = parser.parse_args()
@@ -223,10 +223,14 @@ def main():
     if removed:
         print("Removed %d half-written tile(s) of an interrupted run." % removed)
     print("Slicing " + source_path)
-    with Image.open(source_path) as source:
-        source = source.convert("RGB")
-        for zoom in range(args.max_zoom + 1):
-            slice_zoom(source, zoom, args.quality, args.force)
+    try:
+        with Image.open(source_path) as source:
+            source = source.convert("RGB")
+            for zoom in range(args.max_zoom + 1):
+                slice_zoom(source, zoom, args.quality, args.force)
+    except KeyboardInterrupt:
+        raise SystemExit("Stopped (Ctrl+C). The tiles written so far are kept; run "
+                         "make_tiles.py again to fill in the rest.")
     write_manifest(args.max_zoom)
     print("Done. Wrote tiles to " + common.tiles_dir())
 

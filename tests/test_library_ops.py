@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import unittest
+from unittest import mock
 
 import support
 
@@ -147,7 +148,14 @@ class FolderHelpersTest(support.TempBaseMixin, unittest.TestCase):
                         ["reachable"])
         status = library_ops.folder_status(self.base.join("nothing"))
         self.assertFalse(status["reachable"])
-        self.assertIn("cannot be reached", status["message"])
+        # A folder that is not there on a drive that is: moved or renamed, not
+        # offline (Windows can tell; elsewhere a share is just a folder).
+        self.assertIn("does not exist (moved or renamed?)" if os.name == "nt"
+                      else "cannot be reached (offline?)", status["message"])
+        # A drive (or share) that does not answer: that may well be offline.
+        with mock.patch.object(library_ops.os.path, "isdir", return_value=False):
+            self.assertIn("cannot be reached (offline?)",
+                          library_ops.missing_folder_message(self.base.join("nothing")))
         self.assertFalse(library_ops.folder_status("")["reachable"])
 
     def test_run_with_timeout(self):

@@ -2,8 +2,12 @@
 """Manage settings for the image database tools.
 
 Run this script to edit the LLM endpoints, the optional helper module, and
-the image libraries to monitor. Settings are stored in config.json (in the
-SETTINGS_BASE folder) and are only written when you choose "Save and exit".
+the image libraries to monitor. Settings are stored in config.json (next to
+the scripts, or in the folder the SETTINGS_BASE environment variable names)
+and are only written when you choose "Save and exit". If config.json was
+changed elsewhere in the meantime (on the web server's Manage or Settings
+page, or by hand), Save and exit says so and asks before writing over those
+changes.
 
 At any prompt, press Enter to keep the current value or type "-" to clear it.
 API keys are never shown and are typed without echo; better still, keep them
@@ -14,6 +18,8 @@ Editing endpoints saves them in the newer "endpoints" form (an older
 "default").
 """
 
+import argparse
+import copy
 import getpass
 import os
 import sys
@@ -303,12 +309,6 @@ def set_preset(endpoint, preset):
     return forget_key_if_moved(endpoint, old)
 
 
-def _inside(path, folder):
-    path = os.path.normcase(os.path.abspath(path))
-    folder = os.path.normcase(os.path.abspath(folder))
-    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
-
-
 def set_setting(endpoint, key, value):
     """Set an endpoint setting; None or "" removes it (so the default applies)."""
     if value is None or value == "":
@@ -385,8 +385,9 @@ def configure_key(endpoint):
             endpoint.pop("api_key", None)
             endpoint.pop("api_key_file", None)
     elif pick == 1:
-        path = prompt_text("Key file (relative paths are next to config.json)",
-                           endpoint.get("api_key_file", ""))
+        path = common.unquote_path(prompt_text(
+            "Key file (relative paths are next to config.json)",
+            endpoint.get("api_key_file", "")))
         set_setting(endpoint, "api_key_file", path)
         if path:
             endpoint.pop("api_key", None)
@@ -394,7 +395,8 @@ def configure_key(endpoint):
             full = common.resolve_config_relative(path)
             if not os.path.isfile(full):
                 print("Warning: that file does not exist yet.")
-            if _inside(full, common.BASE_DIR) and not _inside(full, common.data_dir()):
+            if (library_ops.is_within(full, common.BASE_DIR)
+                    and not library_ops.is_within(full, common.data_dir())):
                 print("Warning: that file is inside the program folder, where git could "
                       "pick it up. Keep key files outside it.")
     elif pick == 2:
@@ -411,7 +413,17 @@ def configure_key(endpoint):
 def test_endpoint_now(endpoint):
     """Describe the sample image with an endpoint and print the outcome."""
     # Imported here: they need Pillow, which the rest of the settings do not.
-    import scan
+    # Without it the test is not possible, but the session (and its unsaved
+    # changes) goes on.
+    try:
+        import scan
+    except SystemExit as error:         # images.py says how to install Pillow
+        print(error)
+        return
+    except ImportError as error:
+        print("Testing an endpoint needs Pillow (%s). Install it with: python -m pip "
+              "install Pillow" % error)
+        return
     config = {"endpoints": [dict(endpoint)]}
     scan.test_endpoint(config, endpoint.get("name", ""))
 
@@ -555,8 +567,8 @@ def configure_endpoints(config):
 
 
 def configure_helper(config):
-    config["helper"] = prompt_text(
-        "Helper module path (blank for none)", config.get("helper", ""))
+    config["helper"] = common.unquote_path(prompt_text(
+        "Helper module path (blank for none)", config.get("helper", "")))
     if config["helper"] and not os.path.isfile(
             common.resolve_config_relative(config["helper"])):
         print("Warning: that file does not exist yet. A relative path is "
@@ -582,7 +594,7 @@ def library_folder_error(path):
     Unlike the web UI, a relative path is accepted, as before: it is
     relative to the folder the tools are run from.
     """
-    if not (path or "").strip():
+    if not common.unquote_path(path):
         return "A library needs a folder."
     return library_ops.path_error(path, require_absolute=False)
 
@@ -590,11 +602,12 @@ def library_folder_error(path):
 def add_library(config, path, name=None):
     """Add a library and give it an id; return it.
 
-    The name defaults to common.default_library_name(path). Raises
-    ValueError if the folder is empty or cannot be used (inside the data
-    or program folder), or the name is missing or taken.
+    The name defaults to common.default_library_name(path). Quotes around
+    the folder (Explorer's "Copy as path") are dropped. Raises ValueError
+    if the folder is empty or cannot be used (inside the data or program
+    folder), or the name is missing or taken.
     """
-    path = (path or "").strip()
+    path = common.unquote_path(path)
     error = library_folder_error(path)
     if error:
         raise ValueError(error)
@@ -624,7 +637,7 @@ def set_library_folder(config, index, path):
     Images are matched by their path inside the library, so descriptions
     are kept for files whose relative path is unchanged.
     """
-    path = (path or "").strip()
+    path = common.unquote_path(path)
     error = library_folder_error(path)
     if error:
         raise ValueError(error)
@@ -727,7 +740,7 @@ def manage_libraries(config):
         if index == -1:
             return
         if index == 0:
-            path = input("Folder to scan: ").strip()
+            path = common.unquote_path(input("Folder to scan: "))
             if not path:
                 print("A folder is required.")
                 continue
@@ -803,9 +816,93 @@ def save(config, start_ids=None):
     common.save_config(config)
 
 
+class Session:
+    """The settings being edited: the config as loaded, and what is needed to save it."""
+
+    def __init__(self):
+        self.load()
+
+    def load(self):
+        """(Re)read config.json; this session's unsaved changes are dropped."""
+        token = common.config_token()
+        try:
+            config = common.load_config()
+        except common.ConfigError as error:
+            raise SystemExit("Error: %s" % error)
+        # (The token is taken before reading: a change made while reading
+        # shows as a change.)
+        self.token = token
+        common.ensure_library_ids(config)
+        self.config = config
+        self.loaded = copy.deepcopy(config)
+        self.start_ids = {library["id"] for library in config.get("libraries", [])}
+
+    def changed_elsewhere(self):
+        """True when config.json changed since this session read it."""
+        return common.config_token() != self.token
+
+
+def save_and_exit(session):
+    """Save, unless config.json changed elsewhere and the user says no. True when done.
+
+    The Manage and Settings pages (or a hand edit) may have changed the
+    file while settings.py was open; saving would silently undo that, so
+    the user chooses: save over it, reload it (dropping the changes made
+    here) or exit without saving.
+    """
+    if not session.changed_elsewhere():
+        save(session.config, session.start_ids)
+        print("Saved to " + common.config_path())
+        return True
+    print()
+    print("config.json was changed by something else (the web server's Manage or Settings "
+          "page, or a hand edit) after settings.py read it.")
+    if session.config == session.loaded:
+        print("Nothing was changed here, so it is left as it is.")
+        return True
+    pick = choose("Saving now would undo those changes. What should happen?", [
+        "Save the settings shown here anyway (the other changes are lost)",
+        "Reload config.json and drop the changes made here",
+        "Exit without saving"])
+    if pick == 0:
+        save(session.config, session.start_ids)
+        print("Saved to " + common.config_path())
+        return True
+    if pick == 1:
+        session.load()
+        print("Reloaded. Make your changes again, then choose Save and exit.")
+        return False
+    if pick == 2:
+        print("Nothing was saved.")
+        return True
+    return False
+
+
+def parse_command_line(argv):
+    """Check the command line: there are no options, only --help."""
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.parse_args(argv)
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")
+    try:
+        run()
+    except KeyboardInterrupt:
+        # Ctrl+C at a prompt: no traceback.
+        print()
+        print("Stopped; nothing was saved.")
+        raise SystemExit(130)
+    except EOFError:
+        # The input ended (closed, or a file that ran out of answers).
+        print()
+        print("No more input; nothing was saved.")
+        raise SystemExit(1)
+
+
+def run():
     try:
         # Done first, before anything can be renamed: the first run imports
         # the old database, matching its libraries by their current names,
@@ -815,15 +912,11 @@ def main():
         raise SystemExit("Error: %s" % error)
     except db.DatabaseError as error:
         print("Warning: %s" % error)
-    try:
-        config = common.load_config()
-    except common.ConfigError as error:
-        raise SystemExit("Error: %s" % error)
-    common.ensure_library_ids(config)
-    start_ids = {library["id"] for library in config.get("libraries", [])}
+    session = Session()
     print("Settings file: " + common.config_path())
     print("At any prompt, press Enter to keep the current value or type - to clear it.")
     while True:
+        config = session.config
         index = choose("Image database settings", [
             "Configure LLM endpoints",
             "Configure helper module",
@@ -839,13 +932,13 @@ def main():
         elif index == 3:
             show_settings(config)
         elif index == 4:
-            save(config, start_ids)
-            print("Saved to " + common.config_path())
-            return
+            if save_and_exit(session):
+                return
         elif index == -1:
             if confirm("Exit without saving?"):
                 return
 
 
 if __name__ == "__main__":
+    parse_command_line(sys.argv[1:])
     main()

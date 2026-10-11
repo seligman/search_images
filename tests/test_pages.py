@@ -6,7 +6,6 @@ look up exists in their page, they never build HTML from strings, and
 (when Node.js is installed) they parse.
 """
 
-import json
 import os
 import re
 import shutil
@@ -35,8 +34,7 @@ CREATED_IDS = {"shell-header", "shell-toasts", "shell-library", "shell-job",
                "no-endpoint-notice", "server-gone"}
 
 
-def quiet(*_args, **_kwargs):
-    pass
+quiet = support.quiet
 
 
 def read(*parts):
@@ -44,10 +42,7 @@ def read(*parts):
         return handle.read()
 
 
-def page_config(html):
-    match = re.search(r'<script type="application/json" id="app-config">(.*?)</script>',
-                      html, re.S)
-    return json.loads(match.group(1))
+page_config = support.page_config
 
 
 def assets_of(html):

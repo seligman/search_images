@@ -8,7 +8,8 @@ import hashlib
 import io
 import json
 import os
-import re
+import socket
+import subprocess
 import sys
 import time
 import unittest
@@ -40,15 +41,10 @@ NOW = 1700000000.0
 REMOTE = {"REMOTE_ADDR": "192.0.2.5"}
 
 
-def quiet(*_args, **_kwargs):
-    pass
+quiet = support.quiet
 
 
-def strict_json(text):
-    """json.loads that fails on NaN/Infinity, like a browser's JSON.parse."""
-    def reject(name):
-        raise ValueError("non-finite number in JSON: " + name)
-    return json.loads(text, parse_constant=reject)
+strict_json = support.strict_json
 
 
 def insert_image(conn, library_id, path, **fields):
@@ -65,10 +61,7 @@ def insert_image(conn, library_id, path, **fields):
     return cursor.lastrowid
 
 
-def app_config_of(html):
-    """The page settings written into a page's JSON block."""
-    match = re.search(r'<script type="application/json" id="app-config">(.*?)</script>', html)
-    return strict_json(match.group(1))
+app_config_of = support.page_config
 
 
 class ServerFixture(support.TempBaseMixin):
@@ -740,6 +733,50 @@ class PanoramaPackageTest(PanoramaFixture, unittest.TestCase):
         # The dual-fisheye and the stitched one are 360 photos; the
         # unchecked row is not. (The beach's thumbnail is no JPEG: skipped.)
         self.assertEqual(marked, ["", "360", "360"])
+
+
+class CommandLineTest(support.TempBaseMixin, unittest.TestCase):
+    """serve.py --host / --port work without the "serve" command; a busy port is said so."""
+
+    def test_options_without_a_command_mean_serve(self):
+        self.assertEqual(serve._command_line(["--port", "8080"]), ["serve", "--port", "8080"])
+        self.assertEqual(serve._command_line(["--host", "0.0.0.0"]),
+                         ["serve", "--host", "0.0.0.0"])
+        for argv in ([], ["serve", "--port", "1"], ["package", "out"], ["-h"], ["--help"]):
+            self.assertEqual(serve._command_line(argv), argv)
+        # The serve command's own help, reached with an option first.
+        result = subprocess.run([sys.executable, "serve.py", "--port", "8080", "--help"],
+                                cwd=support.REPO, env=support.child_env(),
+                                capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"--host", result.stdout)
+
+    def test_a_port_another_server_listens_on_is_refused(self):
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        # As Werkzeug binds its socket (which lets a second one share it on Windows).
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        problem = serve.port_problem("127.0.0.1", port)
+        if os.name == "nt":
+            self.assertIn("Port %d is already in use" % port, problem)
+        else:
+            self.assertIsNone(problem)      # the server's own start says so there
+        listener.close()
+        self.assertIsNone(serve.port_problem("127.0.0.1", port))
+
+    def test_requests_read_originals_through_the_shared_helper_lock(self):
+        helper = mock.Mock(spec=["load_image", "stat", "__file__"],
+                           __file__=os.path.join(self.base.path, "helper.py"))
+        state = serve.ServerState(helper)
+        self.addCleanup(state.close)
+        self.assertIs(state.module, helper)
+        self.assertIsNot(state.helper, helper)
+        state.helper.load_image("a.jpg")
+        helper.load_image.assert_called_once_with("a.jpg")
+        self.assertIsNone(serve.ServerState(None).helper)
 
 
 if __name__ == "__main__":

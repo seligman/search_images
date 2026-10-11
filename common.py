@@ -118,13 +118,15 @@ def ensure_dir(path):
     return path
 
 
-def write_file_atomic(path, data, tmp_path=None):
+def write_file_atomic(path, data, tmp_path=None, fsync=True):
     """Write bytes (or UTF-8 text) to path so readers never see a partial file.
 
     The data goes to a temporary file in the same folder first, which then
     replaces the target with os.replace. On Windows the replace can fail for
-    a moment while another process has the target open, so it is retried
-    briefly before giving up.
+    a moment while another process has the target open (a server sending
+    the file, say), so it is retried briefly before giving up. fsync=False
+    skips flushing the data to the disk first: for files that are checked
+    (and made again) when a crash cut them short.
     """
     if isinstance(data, str):
         data = data.encode("utf-8")
@@ -133,8 +135,9 @@ def write_file_atomic(path, data, tmp_path=None):
     try:
         with open(tmp_path, "wb") as handle:
             handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+            if fsync:
+                handle.flush()
+                os.fsync(handle.fileno())
         for attempt in range(10):
             try:
                 os.replace(tmp_path, path)
@@ -154,8 +157,16 @@ def write_file_atomic(path, data, tmp_path=None):
 # ---------------------------------------------------------------------------
 # Config
 
+# What an older "endpoint" setting is filled in with (see load_config).
+LEGACY_ENDPOINT_DEFAULTS = {"kind": "openai", "base_url": "", "api_key": "", "model": ""}
+# Settings that make an endpoint more than an unused placeholder.
+_ENDPOINT_SET_KEYS = ("model", "base_url", "api_key", "api_key_env", "api_key_file")
+
+# A new config.json starts with no endpoint at all: older versions wrote an
+# empty "endpoint" placeholder, which is still read (and then ignored, see
+# is_placeholder_endpoint).
 DEFAULT_CONFIG = {
-    "endpoint": {"kind": "openai", "base_url": "", "api_key": "", "model": ""},
+    "endpoints": [],
     "helper": "",
     "reader_threads": 6,
     "purge_after_days": 30,
@@ -192,10 +203,22 @@ def default_config():
 
 
 def _merge_endpoint(stored_endpoint):
-    endpoint = dict(DEFAULT_CONFIG["endpoint"])
+    endpoint = dict(LEGACY_ENDPOINT_DEFAULTS)
     if isinstance(stored_endpoint, dict):
         endpoint.update(stored_endpoint)
     return endpoint
+
+
+def is_placeholder_endpoint(item):
+    """True for an older-form endpoint with nothing set: no model, base URL or key (source).
+
+    Older versions wrote one ({"kind": "openai", "base_url": "", ...}) into
+    every new config.json. It cannot describe anything, so it is not an
+    endpoint: endpoint_list() leaves it out, and it never makes a library
+    look as if it sent pictures to a cloud service.
+    """
+    return isinstance(item, dict) and not any(
+        isinstance(item.get(key), str) and item[key].strip() for key in _ENDPOINT_SET_KEYS)
 
 
 def apply_library_defaults(library):
@@ -248,29 +271,37 @@ def load_config():
     if not os.path.exists(path):
         return config
     try:
-        stored = json.loads(_read_config_text(path))
+        text = _read_config_text(path)
+        # An empty file (made by hand, say) is an empty config, not an error
+        # that stops every tool, settings.py included.
+        stored = json.loads(text) if text.strip() else {}
     except OSError as error:
         raise ConfigError("Could not read %s: %s" % (path, error))
     except ValueError as error:
         if isinstance(error, ConfigError):
             raise
-        raise ConfigError("Could not read %s: %s" % (path, error))
+        raise ConfigError("Could not read %s: %s. Fix it, or delete it to start again with "
+                          "the Settings page or settings.py." % (path, error))
     if not isinstance(stored, dict):
         raise ConfigError("Could not read %s: the top level is not an object" % path)
     config.update(stored)
-    if "endpoints" in stored and "endpoint" not in stored:
-        # Only the newer "endpoints" list: no placeholder for the older
-        # "endpoint" key, which would otherwise be saved back into the file.
-        config.pop("endpoint", None)
-    else:
+    legacy = stored.get("endpoint")
+    if "endpoint" in stored and "endpoints" not in stored:
+        items = legacy if isinstance(legacy, list) else [legacy]
+        if all(is_placeholder_endpoint(item) for item in items if isinstance(item, dict)):
+            # Only an unused placeholder (older versions wrote one into
+            # every new file): the same as no endpoint at all.
+            config.pop("endpoint", None)
+        else:
+            config.pop("endpoints", None)
+    if "endpoint" in config:
         # Endpoint keys are merged separately so older config files keep
         # working. A list of endpoints (round robin) merges the defaults
         # into each item.
-        stored_endpoint = stored.get("endpoint", {})
-        if isinstance(stored_endpoint, list):
-            config["endpoint"] = [_merge_endpoint(item) for item in stored_endpoint]
+        if isinstance(legacy, list):
+            config["endpoint"] = [_merge_endpoint(item) for item in legacy]
         else:
-            config["endpoint"] = _merge_endpoint(stored_endpoint)
+            config["endpoint"] = _merge_endpoint(legacy)
     libraries = config.get("libraries")
     if not isinstance(libraries, list):
         libraries = []
@@ -295,6 +326,20 @@ def save_config(config):
     tmp_path = os.path.join(os.path.dirname(path), "config.tmp-%d.json" % os.getpid())
     with _config_lock:
         write_file_atomic(path, text, tmp_path)
+
+
+def config_token():
+    """A token that changes whenever config.json does (its modification time and size).
+
+    Tools that keep the settings open for a while (the web pages,
+    settings.py) compare it before saving, so a change made elsewhere in
+    the meantime is never silently overwritten.
+    """
+    try:
+        stat = os.stat(config_path())
+    except OSError:
+        return "none"
+    return "%d-%d" % (stat.st_mtime_ns, stat.st_size)
 
 
 def new_library_id(existing=()):
@@ -324,10 +369,8 @@ def ensure_library_ids(config):
 
 
 def _folder_key(library):
-    path = library.get("path")
-    if not isinstance(path, str) or not path.strip():
-        return ""
-    return os.path.normcase(os.path.normpath(os.path.expanduser(path.strip())))
+    root = library_root(library)
+    return os.path.normcase(root) if root else ""
 
 
 def _name_key(library):
@@ -376,15 +419,31 @@ def copy_library_ids(target, source, only_missing=False, keep=()):
     return changed
 
 
+def unquote_path(path):
+    """A typed path without surrounding spaces and one pair of surrounding quotes.
+
+    Windows Explorer's "Copy as path" puts double quotes around the path,
+    and Windows never allows " in a file name, so they are never part of
+    it. Anything that is not text gives ''.
+    """
+    if not isinstance(path, str):
+        return ""
+    text = path.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text
+
+
 def library_root(library):
     """The folder of a library: its path with ~ expanded ('' if none is set).
 
     Relative paths stay relative to the current directory, as before.
+    Quotes around the path (see unquote_path) are not part of it.
     """
-    path = library.get("path") if isinstance(library, dict) else None
-    if not isinstance(path, str) or not path.strip():
+    path = unquote_path(library.get("path") if isinstance(library, dict) else None)
+    if not path:
         return ""
-    return os.path.normpath(os.path.expanduser(path.strip()))
+    return os.path.normpath(os.path.expanduser(path))
 
 
 # A leading date: a year (1900-2099), optionally with month and day, using one
@@ -806,6 +865,7 @@ def endpoint_list(config):
     Uses config["endpoints"] when the config has that list; otherwise the
     older config["endpoint"] (one object, or a round-robin list whose
     members become the group "default"), named "default", "default-2", ...
+    (an unused placeholder there is left out: is_placeholder_endpoint).
     Names are made unique (case-insensitively) by adding "-2", "-3", ...
     Disabled endpoints are included. Change config["endpoints"] (or
     config["endpoint"]) to change settings, not these copies.
@@ -836,6 +896,9 @@ def endpoint_list(config):
         endpoint["name"] = _unique_name(wanted, taken)
         if label_was_name:
             endpoint["label"] = endpoint["name"]
+        # (Named first, as convert_legacy_endpoints names them.)
+        if legacy_group is not None and is_placeholder_endpoint(item):
+            continue
         result.append(endpoint)
     return result
 
@@ -865,13 +928,12 @@ def convert_legacy_endpoints(config):
         entry["name"] = _unique_name(name.strip() or "default", taken)
         if isinstance(legacy, list) and not entry.get("group"):
             entry["group"] = "default"
-        if not any(isinstance(entry.get(key), str) and entry[key].strip()
-                   for key in ("model", "base_url", "api_key", "api_key_env", "api_key_file")):
+        if is_placeholder_endpoint(entry):
             continue
         endpoints.append(entry)
     config["endpoints"] = endpoints
     name = config.get("default_endpoint")
-    if not isinstance(name, str) or not name.strip():
+    if endpoints and (not isinstance(name, str) or not name.strip()):
         config["default_endpoint"] = "default"
     return True
 
@@ -895,7 +957,8 @@ def default_endpoint_name(config):
     """The endpoint (or group) name libraries use when they do not name one.
 
     config["default_endpoint"] when set; otherwise "default" for the older
-    single-endpoint or round-robin forms. Without a default_endpoint, the
+    single-endpoint or round-robin forms (none when they only hold an
+    unused placeholder). Without a default_endpoint, the
     newer form falls back to the first enabled endpoint on this computer or
     the local network, and to none ('') when there is no such endpoint:
     pictures are never sent to a cloud service nobody chose for them.
@@ -904,7 +967,7 @@ def default_endpoint_name(config):
     if isinstance(name, str) and name.strip():
         return name.strip()
     if isinstance(config, dict) and not isinstance(config.get("endpoints"), list):
-        return "default"
+        return "default" if endpoint_list(config) else ""
     for endpoint in endpoint_list(config):
         if endpoint["enabled"] and is_local_endpoint(endpoint):
             return endpoint["name"]
@@ -1061,9 +1124,28 @@ def is_image_file(name):
     return name.lower().endswith(IMAGE_EXTENSIONS)
 
 
-def is_heic_like(name):
-    """True for HEIC/HEIF/AVIF names, which need a plugin and browser conversion."""
-    return name.lower().endswith(HEIC_EXTENSIONS)
+# Windows reparse tag of a directory junction (stat.IO_REPARSE_TAG_MOUNT_POINT).
+JUNCTION_TAG = 0xA0000003
+
+
+def is_link(entry):
+    """True for an os.scandir() entry that is a symlink or a Windows directory junction.
+
+    Library walks never follow either. Python 3.12+ says whether an entry
+    is a junction; older ones are asked for its reparse tag.
+    """
+    try:
+        if entry.is_symlink():
+            return True
+        check = getattr(entry, "is_junction", None)       # Python 3.12+
+        if check is not None:
+            return bool(check())
+        if os.name != "nt":
+            return False
+        tag = getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0)
+        return tag == JUNCTION_TAG
+    except OSError:
+        return False
 
 
 # Junk that NAS boxes and operating systems leave in photo folders. Each
@@ -1211,18 +1293,42 @@ def load_image_bytes(helper, path):
         return handle.read()
 
 
+_helper_locks = {}
+_helper_locks_guard = threading.Lock()
+
+
+def _helper_lock(helper):
+    """The lock of a helper module: one per helper file in this process.
+
+    Each job (and the web server) loads the helper afresh, so the lock goes
+    with the module's file, not with the module object: the server's
+    requests and the jobs it runs then take turns too.
+    """
+    path = getattr(helper, "__file__", None)
+    if not isinstance(path, str) or not path:
+        return threading.RLock()
+    key = os.path.normcase(os.path.abspath(path))
+    with _helper_locks_guard:
+        lock = _helper_locks.get(key)
+        if lock is None:
+            lock = _helper_locks[key] = threading.RLock()
+        return lock
+
+
 def thread_safe_helper(helper):
     """A stand-in for the helper whose load_image and stat hooks run one at a time.
 
-    Files are read by several threads at once (scanning, describing), and
-    helpers written for the old one-at-a-time scanner may not expect that.
+    Files are read by several threads at once (scanning, describing, the
+    web server's requests), and helpers written for the old one-at-a-time
+    scanner may not expect that. Every stand-in for the same helper file
+    shares one lock, so the calls take turns across the whole process.
     Decoding still runs in parallel. A helper module that sets THREAD_SAFE =
     True is used as is. The stand-in only has load_image and stat; use the
     helper itself for its other hooks.
     """
     if helper is None or getattr(helper, "THREAD_SAFE", False):
         return helper
-    lock = threading.Lock()
+    lock = _helper_lock(helper)
     proxy = types.SimpleNamespace()
 
     def locked(func):

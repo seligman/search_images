@@ -19,8 +19,8 @@ also makes a larger panorama of a 360 photo (PANO_EDGE wide) for the
 interactive 360 view.
 
 The EXIF helpers (sanitize_exif, parse_capture_date, exif_gps_to_decimal,
-camera_name, exif_metadata) and sniff_mime() live in imageinfo.py, which needs
-no Pillow; they are re-exported here for convenience.
+camera_name, exif_metadata), sniff_mime() and the colour profile scrubbing
+live in imageinfo.py, which needs no Pillow.
 """
 
 import contextlib
@@ -42,15 +42,6 @@ import imageinfo
 from imageinfo import (
     AVIF_BRANDS, HEIF_BRANDS, exif_metadata, parse_capture_date, sanitize_exif, sniff_mime,
 )
-
-# The rest of imageinfo's helpers, available through this module as before.
-BROWSER_MIME_TYPES = imageinfo.BROWSER_MIME_TYPES
-MAX_TEXT = imageinfo.MAX_TEXT
-browser_can_display = imageinfo.browser_can_display
-camera_name = imageinfo.camera_name
-clean_exif_value = imageinfo.clean_exif_value
-exif_gps_to_decimal = imageinfo.exif_gps_to_decimal
-normalize_offset = imageinfo.normalize_offset
 
 THUMB_SIZE = 320          # thumbnails fit in a THUMB_SIZE x THUMB_SIZE box
 THUMB_QUALITY = 85
@@ -369,15 +360,26 @@ def _is_wide_gamut_profile(icc):
     return b"sRGB" not in icc and "sRGB".encode("utf-16-be") not in icc
 
 
-def _encode_jpeg(image, quality, icc=None):
-    """JPEG bytes for an RGB image. No EXIF is written.
+def _kept_profile(image, icc):
+    """The colour profile to write with an RGB picture made from image, or None.
 
     A non-sRGB RGB colour profile (Display P3, Adobe RGB, ...) is kept so
-    browsers show the colours correctly; sRGB is the default anyway.
+    browsers show the colours correctly (sRGB is the default anyway), with
+    its free text replaced (imageinfo.scrub_icc): a profile's description,
+    copyright and device names can name a person or a computer, and these
+    pictures go to the LLM, the browser and the static export.
     """
-    options = {"quality": quality}
     if image.mode == "RGB" and _is_wide_gamut_profile(icc):
-        options["icc_profile"] = icc
+        return imageinfo.scrub_icc(icc)
+    return None
+
+
+def _encode_jpeg(image, quality, icc=None):
+    """JPEG bytes for an RGB image. No EXIF is written; see _kept_profile for the profile."""
+    options = {"quality": quality}
+    profile = _kept_profile(image, icc)
+    if profile:
+        options["icc_profile"] = profile
     buffer = io.BytesIO()
     image.save(buffer, "JPEG", **options)
     return buffer.getvalue()
@@ -478,9 +480,8 @@ def _encode_preview(image, icc, mime, original_size):
     jpeg = _encode_jpeg(image, PREVIEW_QUALITY, icc)
     if mime not in _LOSSLESS_MIME_TYPES or len(jpeg) <= original_size:
         return jpeg
-    options = {}
-    if image.mode == "RGB" and _is_wide_gamut_profile(icc):
-        options["icc_profile"] = icc
+    # (Always named: Pillow would otherwise copy the image's own profile, text and all.)
+    options = {"icc_profile": _kept_profile(image, icc)}
     buffer = io.BytesIO()
     image.save(buffer, "PNG", **options)
     png = buffer.getvalue()
@@ -1217,8 +1218,10 @@ def png_from_bytes(data):
                 frame = image
                 if frame.mode not in ("1", "L", "LA", "P", "RGB", "RGBA"):
                     frame = to_rgb(frame)
+                # The colour profile stays, without its texts (see _kept_profile).
+                icc = image.info.get("icc_profile")
                 buffer = io.BytesIO()
-                frame.save(buffer, "PNG")
+                frame.save(buffer, "PNG", icc_profile=imageinfo.scrub_icc(icc) if icc else None)
                 return buffer.getvalue()
     except ImageReadError:
         raise

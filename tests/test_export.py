@@ -63,8 +63,7 @@ LANDMARK = "Secret Landmark"
 GPS = (48.8566, 2.3522)
 
 
-def quiet(*_args, **_kwargs):
-    pass
+quiet = support.quiet
 
 
 def info(title, tags, photo_type="photo", **fields):
@@ -1726,6 +1725,172 @@ class StripTest(unittest.TestCase):
         self.assertEqual(ext, "png")
         self.assertNotIn(b"BMP-TRAILER-SECRET", clean)
         self.assertEqual(self.pixels(clean), self.pixels(bmp.getvalue()))
+
+
+@unittest.skipIf(imagegen is None, "Pillow is not installed")
+class FolderAndZipTest(support.TempBaseMixin, unittest.TestCase):
+    """The default folder does not move; a zip someone else made is never replaced;
+    a site of the first versions is replaced; a dual-fisheye original is stitched."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = self.base.library_folder("Vacation")
+        shutil.copyfile(os.path.join(SAMPLES, "01-cat.jpg"), os.path.join(self.folder, "cat.jpg"))
+        self.base.write_config([support.library("Vacation Zürich", self.folder,
+                                                id="lib_zurich01")])
+        db.init(log=quiet)
+        self.library_id = "lib_zurich01"
+        self.conn = db.connect()
+        self.addCleanup(self.conn.close)
+        self.scan_and_describe()
+
+    def scan_and_describe(self):
+        import scan
+        scan.run(common.load_config(), jobs.JobContext("test"), describe_images=False)
+        self.conn.execute("UPDATE images SET described = 1, prompt_ver = 5, info = ?",
+                          (json.dumps(info("Something", ["thing"])),))
+        self.conn.commit()
+
+    def export(self, out=None, options=None):
+        return export.export_library(export.LogContext(quiet), self.conn, common.load_config(),
+                                     self.library_id, out, options)
+
+    def test_the_default_folder_stays_when_a_similar_name_is_added(self):
+        plain = os.path.join(common.exports_dir(), "vacation-zurich")
+        first = self.export()
+        self.assertEqual(first["output"], plain)
+        marker = export.read_marker(plain)
+        # A library whose name gives the same folder name is added later.
+        other = self.base.library_folder("Other")
+        config = common.load_config()
+        config["libraries"].append(support.library("Vacation Zurich", other, id="lib_other001"))
+        common.save_config(config)
+        config = common.load_config()
+        self.assertEqual(export.default_output_dir(config, config["libraries"][0]), plain)
+        self.assertEqual(export.default_output_dir(config, config["libraries"][1]),
+                         plain + "-lib-other001")
+        again = self.export()
+        self.assertEqual(again["output"], plain)
+        self.assertEqual(export.read_marker(plain), marker)      # same ids, same links
+
+    def test_a_zip_this_program_did_not_make_is_never_replaced(self):
+        out = os.path.join(self.base.path, "Site")
+        zip_path = out + ".zip"
+        with open(zip_path, "wb") as handle:
+            handle.write(b"my own archive")
+        with self.assertRaises(export.ExportError) as caught:
+            self.export(out, {"zip": True})
+        self.assertIn("was not made by an export", str(caught.exception))
+        with open(zip_path, "rb") as handle:
+            self.assertEqual(handle.read(), b"my own archive")
+        self.assertFalse(os.path.exists(out))         # refused before anything was written
+        os.remove(zip_path)
+        self.export(out, {"zip": True})
+        self.assertTrue(zipfile.is_zipfile(zip_path))
+        # Its own zip, as it left it: made again (or kept) without a word.
+        self.export(out, {"zip": True, "title": "Another title"})
+        self.assertTrue(zipfile.is_zipfile(zip_path))
+        # Changed since: left alone.
+        with open(zip_path, "ab") as handle:
+            handle.write(b"more")
+        with self.assertRaises(export.ExportError):
+            self.export(out, {"zip": True})
+
+    def test_a_site_of_the_first_versions_is_replaced(self):
+        out = os.path.join(self.base.path, "OldSite")
+        files = {"index.html": b"<script>window.APP_CONFIG = {};</script>",
+                 "site.js": b"old", "app.js": b"old", "style.css": b"old",
+                 "images/12.jpg": b"old", "data/data-0000.json": b"[]",
+                 "data/manifest.json": b'{"shards": ["data-0000.json"], "generated": 1}',
+                 "data/locations.json": b"[]", "tiles/0/0/0.jpg": b"old",
+                 "notes.txt": b"mine"}
+        for rel, data in files.items():
+            path = os.path.join(out, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(data)
+        self.export(out)
+        left = set(files_of(out))
+        for rel in ("site.js", "app.js", "images/12.jpg", "data/data-0000.json",
+                    "data/manifest.json", "data/locations.json", "tiles/0/0/0.jpg"):
+            self.assertNotIn(rel, left)
+        self.assertIn("notes.txt", left)
+        self.assertIn(export.MARKER, left)
+        # A folder that only looks a little like one is still refused.
+        other = os.path.join(self.base.path, "NotASite")
+        os.makedirs(os.path.join(other, "data"))
+        for name in ("index.html", "site.js", "app.js"):
+            with open(os.path.join(other, name), "wb") as handle:
+                handle.write(b"x")
+        with self.assertRaises(export.ExportError):
+            self.export(other)
+
+    def test_a_dual_fisheye_original_is_exported_stitched(self):
+        exif = imagegen.make_exif(make="Arashi Vision", model="Insta360 OneR",
+                                  date="2019:05:14 14:23:01", offset=None)
+        exif[0x010E] = "IMG_20190514_142301_00_001.insp"
+        import images
+        frame = imagegen.dual_fisheye_image((1024, 512), offsets=images.INSTA360_PARAMS["offsets"])
+        imagegen.write_bytes(self.folder, "IMG_20190514_142301_00_001.insp",
+                             imagegen.jpeg_bytes(frame, exif))
+        os.remove(os.path.join(self.folder, "cat.jpg"))
+        self.scan_and_describe()
+        row = self.conn.execute("SELECT projection FROM images WHERE missing_since IS NULL"
+                                ).fetchone()
+        self.assertEqual(row["projection"], "dual_fisheye")
+        shipped = {}
+        for mode in ("web", "original"):
+            out = os.path.join(self.base.path, "site-" + mode)
+            self.export(out, {"images": mode})
+            (name,) = os.listdir(os.path.join(out, "images"))
+            self.assertTrue(name.endswith(".jpg"), name)
+            with open(os.path.join(out, "images", name), "rb") as handle:
+                shipped[mode] = handle.read()
+            (record,) = read_records(out)
+            self.assertNotIn("ix", record)
+        # The pages show the stitched panorama, never the two raw circles.
+        self.assertEqual(shipped["original"], shipped["web"])
+
+
+@unittest.skipIf(imagegen is None, "Pillow is not installed")
+class ReencodedProfileTest(unittest.TestCase):
+    """Pictures made anew (not stripped in place) keep their profile, not its texts."""
+
+    def picture(self, kind):
+        image = imagegen.blocks_image(12).resize((96, 64)).convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, kind, icc_profile=personal_icc())
+        data = buffer.getvalue()
+        with Image.open(io.BytesIO(data)) as image:
+            self.assertEqual(image.info.get("icc_profile"), personal_icc(), kind)
+        return data
+
+    def assert_scrubbed(self, data, what):
+        self.assertFalse(has_icc_secret(data), what)
+        # (A PNG keeps its profile compressed: it is looked at decoded.)
+        with Image.open(io.BytesIO(data)) as image:
+            self.assertEqual(image.info.get("icc_profile"), export.scrub_icc(personal_icc()),
+                             what)
+
+    def test_no_profile_text_survives_a_new_encoding(self):
+        import images
+        png, tiff, jpeg = self.picture("PNG"), self.picture("TIFF"), self.picture("JPEG")
+        for data, orientation in ((tiff, None), (png, 6)):
+            clean, extension = export.original_picture(data, orientation)
+            self.assertEqual(extension, "jpg")
+            self.assert_scrubbed(clean, "original %s" % orientation)
+        # A PNG preview (screenshots, drawings) becomes a JPEG.
+        self.assert_scrubbed(export.web_jpeg(png), "web")
+        self.assert_scrubbed(export.clean_jpeg(png), "clean")
+        self.assert_scrubbed(images.png_from_bytes(png), "png")
+        # What a vision model is sent.
+        self.assert_scrubbed(images.prepare_for_llm(jpeg), "llm")
+        if heic_bytes() is not None:        # (pillow-heif can write one)
+            buffer = io.BytesIO()
+            imagegen.marker_image((96, 64)).save(buffer, "HEIF", quality=90,
+                                                 icc_profile=personal_icc())
+            clean, _extension = export.original_picture(buffer.getvalue())
+            self.assertFalse(has_icc_secret(clean), "heic")
 
 
 if __name__ == "__main__":

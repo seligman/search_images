@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw                        # noqa: E402
 from PIL.TiffImagePlugin import IFDRational             # noqa: E402
 
 import imagegen                                         # noqa: E402
+import imageinfo                                        # noqa: E402
 import images                                           # noqa: E402
 
 RESULT_KEYS = {
@@ -91,7 +92,7 @@ def reference_dhash(image):
     return "%016x" % bits
 
 
-def strict_json(value):
+def strict_dumps(value):
     """json.dumps that refuses NaN/Infinity, like the database writers."""
     return json.dumps(value, allow_nan=False)
 
@@ -157,7 +158,7 @@ class ReadImageJpegTest(unittest.TestCase):
         self.assertEqual(exif["DateTimeOriginal"], "2019:05:14 14:23:01")
         self.assertEqual(exif["GPS"]["GPSLatitudeRef"], "N")
         self.assertEqual(exif["GPS"]["GPSLongitudeRef"], "W")
-        strict_json(exif)
+        strict_dumps(exif)
 
     def test_gps_southern_eastern_hemisphere(self):
         path = imagegen.jpeg_with_exif(self.dir, "south.jpg", gps=(-33.8568, 151.2153))
@@ -366,7 +367,7 @@ class ReadImageFormatsTest(unittest.TestCase):
         self.assertEqual(result["taken_at"], "2019-05-14T14:23:01")
         pixels = corners(decode(result["thumb"]))
         self.assertTrue(is_red(pixels[1]), pixels)
-        strict_json(result["exif"])
+        strict_dumps(result["exif"])
 
     def test_avif(self):
         path = imagegen.avif_file(self.dir, orientation=6)
@@ -425,7 +426,7 @@ class ExifSanitizingTest(unittest.TestCase):
     def test_zero_denominator_rationals(self):
         result = images.read_image(imagegen.jpeg_zero_rationals(self.dir))
         exif = result["exif"]
-        strict_json(exif)
+        strict_dumps(exif)
         self.assertNotIn("FNumber", exif)
         self.assertNotIn("ExposureBiasValue", exif)
         self.assertNotIn("GPSAltitude", exif["GPS"])
@@ -456,12 +457,12 @@ class ExifSanitizingTest(unittest.TestCase):
         )
         for value, expected in cases:
             with self.subTest(value=repr(value)):
-                cleaned = images.clean_exif_value(value)
+                cleaned = imageinfo.clean_exif_value(value)
                 self.assertEqual(cleaned, expected)
-                strict_json(cleaned)
+                strict_dumps(cleaned)
 
     def test_long_text_is_capped(self):
-        self.assertEqual(len(images.clean_exif_value("x" * 10000)), images.MAX_TEXT)
+        self.assertEqual(len(imageinfo.clean_exif_value("x" * 10000)), imageinfo.MAX_TEXT)
 
     def test_sanitize_legacy_json_with_nan(self):
         # Rows written by older versions contain bare NaN tokens.
@@ -471,7 +472,7 @@ class ExifSanitizingTest(unittest.TestCase):
         cleaned = images.sanitize_exif(legacy)
         self.assertEqual(cleaned, {"Model": "X", "Flash": 16,
                                    "GPS": {"GPSLongitude": [1, None, 2]}})
-        strict_json(cleaned)
+        strict_dumps(cleaned)
         self.assertEqual(images.sanitize_exif(None), {})
         self.assertEqual(images.sanitize_exif("text"), {})
 
@@ -503,8 +504,8 @@ class ExifSanitizingTest(unittest.TestCase):
                 continue
             with self.subTest(path=os.path.basename(path)):
                 result = images.read_image(path)
-                strict_json(result["exif"])
-                strict_json(dict((k, v) for k, v in result.items()
+                strict_dumps(result["exif"])
+                strict_dumps(dict((k, v) for k, v in result.items()
                                  if not isinstance(v, bytes)))
 
 
@@ -634,7 +635,7 @@ class CaptureDateTest(unittest.TestCase):
                  ("2:00", ""), ("+15:00", ""), ("+02:60", ""), (3, ""))
         for value, expected in cases:
             with self.subTest(value=value):
-                self.assertEqual(images.normalize_offset(value), expected)
+                self.assertEqual(imageinfo.normalize_offset(value), expected)
 
 
 class GpsTest(unittest.TestCase):
@@ -667,7 +668,7 @@ class GpsTest(unittest.TestCase):
         )
         for gps, expected in cases:
             with self.subTest(gps=gps):
-                lat, lon = images.exif_gps_to_decimal(gps)
+                lat, lon = imageinfo.exif_gps_to_decimal(gps)
                 self.assertAlmostEqual(lat, expected[0], places=4)
                 self.assertAlmostEqual(lon, expected[1], places=4)
 
@@ -697,7 +698,7 @@ class GpsTest(unittest.TestCase):
         )
         for gps in cases:
             with self.subTest(gps=gps):
-                self.assertEqual(images.exif_gps_to_decimal(gps), (None, None))
+                self.assertEqual(imageinfo.exif_gps_to_decimal(gps), (None, None))
 
 
 class CameraNameTest(unittest.TestCase):
@@ -723,7 +724,7 @@ class CameraNameTest(unittest.TestCase):
         )
         for exif, expected in cases:
             with self.subTest(exif=exif):
-                self.assertEqual(images.camera_name(exif), expected)
+                self.assertEqual(imageinfo.camera_name(exif), expected)
 
     def test_exif_metadata(self):
         exif = {"Make": "Apple", "Model": "iPhone 12",
@@ -945,9 +946,9 @@ class SniffMimeTest(unittest.TestCase):
 
     def test_browser_can_display(self):
         for mime in ("image/jpeg", "image/png", "image/gif", "image/webp"):
-            self.assertTrue(images.browser_can_display(mime), mime)
+            self.assertTrue(imageinfo.browser_can_display(mime), mime)
         for mime in ("image/heic", "image/heif", "image/avif", "image/tiff", None):
-            self.assertFalse(images.browser_can_display(mime), mime)
+            self.assertFalse(imageinfo.browser_can_display(mime), mime)
 
 
 class ThreadingTest(unittest.TestCase):

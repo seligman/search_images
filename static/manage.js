@@ -32,7 +32,11 @@
     var REVIEW_PAGE = 60;       // pictures of a group the export review shows at first
     var COUNT_DELAY = 400;      // ms after a change before the export count is asked again
     var CLOUD_OK_KEY = "searchImages.cloudOk.";
-    var TEST_COST_KEY = "searchImages.testCost.";
+    var TEST_COST_KEY = SHELL.TEST_COST_KEY;
+    var field = SHELL.field;
+    var notice = SHELL.notice;
+    var warningList = SHELL.warningList;
+    var money = fmt.money;
     var PATH_PLACEHOLDER = "C:\\Photos\\Family  or  \\\\server\\share\\Photos";
 
     var state = null;           // the last /state reply
@@ -146,17 +150,6 @@
         }
     }
 
-    function notice(kind, content, actions) {
-        var box = el("div", {className: "notice " + (kind || "")});
-        box.appendChild(SHELL.append(el("div", {className: "notice-text"}), content));
-        (actions || []).forEach(function (action) {
-            if (action) {
-                box.appendChild(action);
-            }
-        });
-        return box;
-    }
-
     // A notice above the libraries that stays until it is dismissed.
     function showNotice(kind, content) {
         var holder = byId("manage-notices");
@@ -167,42 +160,6 @@
         });
         holder.appendChild(box);
         return box;
-    }
-
-    function warningList(warnings) {
-        if (warnings.length === 1) {
-            return warnings[0];
-        }
-        return el("ul", {className: "warning-list"}, warnings.map(function (text) {
-            return el("li", {text: text});
-        }));
-    }
-
-    var fieldCount = 0;
-
-    // A labelled field. The label (and the hint) are tied to the control
-    // by id, also when the field holds more than the control (options.div).
-    function field(label, control, options) {
-        options = options || {};
-        fieldCount += 1;
-        var labelId = "manage-field-" + fieldCount;
-        var error = el("span", {className: "field-error", hidden: true,
-                                attrs: {"aria-live": "polite"}});
-        var labelNode = el("span", {className: "field-label", id: labelId}, [label]);
-        if (options.optional) {
-            labelNode.appendChild(el("span", {className: "optional", text: " (optional)"}));
-        }
-        var hint = options.hint ? el("span", {className: "field-hint", id: labelId + "-hint"},
-                                     options.hint) : null;
-        var node = el(options.div ? "div" : "label", {className: "field"}, [
-            labelNode, control, hint, options.after || null, error
-        ]);
-        var target = options.control || control;
-        target.setAttribute("aria-labelledby", labelId);
-        if (hint) {
-            target.setAttribute("aria-describedby", labelId + "-hint");
-        }
-        return {node: node, error: error, control: target};
     }
 
     function check(label, checked, hint) {
@@ -778,10 +735,6 @@
             text += " (" + money(cost) + " per picture, measured by the last Test)";
         }
         return {text: text, costKnown: cost !== null};
-    }
-
-    function money(value) {
-        return "$" + value.toFixed(value < 1 ? 3 : 2);
     }
 
     // The first time a library that uses a cloud service is described, say
@@ -1553,9 +1506,18 @@
             endpointNote.hidden = !endpointNote.textContent;
         }
 
+        // A folder refused when saving: the message goes once the folder
+        // is changed or a Test finds it usable, not only on the next save.
+        function clearPathError() {
+            fields.path.error.hidden = true;
+            fields.path.error.textContent = "";
+            fields.path.control.removeAttribute("aria-invalid");
+        }
+
         function pathChanged() {
             relocate.hidden = adding || path.value.trim() === lib.path;
             resultLine(pathResult, "");
+            clearPathError();
         }
 
         function testPath() {
@@ -1576,6 +1538,7 @@
                 if (reply.problem) {
                     resultLine(pathResult, reply.problem, "bad");
                 } else if (reply.readable && reply.is_dir) {
+                    clearPathError();
                     var count = reply.more ? "at least " + fmt.plural(reply.sample_images,
                         "picture") + " found (still counting when the check stopped)" :
                         fmt.plural(reply.sample_images, "picture") + " found";

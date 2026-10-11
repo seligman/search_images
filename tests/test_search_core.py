@@ -30,12 +30,7 @@ def read(path):
         return handle.read()
 
 
-def code_only(text):
-    """The text without comments and string literals (rough, but enough here)."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    text = re.sub(r"(?m)^\s*//.*$", " ", text)
-    text = re.sub(r"\s//[^\n]*", " ", text)
-    return re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
+code_only = support.code_only
 
 
 class SearchCoreSourceTest(unittest.TestCase):

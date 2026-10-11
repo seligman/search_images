@@ -561,8 +561,12 @@ var SITE = (function () {
             if (words.length) {
                 rec.ex = words.join(", ");
             }
-            var aesthetic = score(info.aesthetic);
-            var sharpness = score(info.sharpness);
+            var version = detail.provenance && detail.provenance.prompt_ver;
+            var older = typeof version === "number" ? version <= 4
+                : info.photo_type === undefined && info.title === undefined;
+            // Version 4 rated sharpness from 0 to 1: no 1-5 scores then.
+            var aesthetic = older ? null : score(info.aesthetic);
+            var sharpness = older ? null : score(info.sharpness);
             if (aesthetic !== null) {
                 rec.q = aesthetic;
             }
@@ -573,9 +577,7 @@ var SITE = (function () {
                 rec.pr = 1;
             }
             rec.ds = 1;
-            var version = detail.provenance && detail.provenance.prompt_ver;
-            if (typeof version === "number" ? version <= 4
-                    : info.photo_type === undefined && info.title === undefined) {
+            if (older) {
                 rec.v4 = 1;
             }
         }
@@ -902,15 +904,12 @@ var SITE = (function () {
     }
 
     return {
-        mode: cfg.mode,
         page: cfg.page || "",
-        libraries: cfg.libraries || [],
         // [{id, name}] of the libraries the page may show.
         libraryList: cfg.libraryList || [],
         // admin: Manage and Settings may be used; static: an export.
         capabilities: capabilities,
         adminApi: cfg.adminApi || null,
-        config: cfg,
         isStatic: isStatic,
         // The name of the site: an export's title, else the program's.
         title: typeof cfg.title === "string" && cfg.title ? cfg.title : "Image Search",
@@ -951,7 +950,6 @@ var SITE = (function () {
             copy.ids = "";
             return withQuery(isStatic ? "map.html" : "/map", searchParams(copy));
         },
-        hasMap: hasMap,
         thumbUrl: thumbUrl,
         imageUrl: imageUrl,
         previewUrl: previewUrl,

@@ -59,9 +59,10 @@ import cache
 import common
 import imageinfo
 import images
+import jobs
 import llm
 import prompts
-from prompts import PROMPT_VER, SYSTEM_PROMPT  # noqa: F401  (re-exported)
+from prompts import PROMPT_VER
 
 # Unusable replies (cut off, refused, not valid JSON, no description) are
 # asked for this many more times in one run before the image counts as
@@ -1105,7 +1106,8 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
             used.setdefault(endpoint["name"], endpoint)
     if not any(endpoint["model"] and endpoint["enabled"]
                for endpoint in common.endpoint_list(config)):
-        ctx.log("No LLM model configured; skipping descriptions. Run settings.py.")
+        ctx.log("No LLM model configured; skipping descriptions. Add an endpoint on the "
+                "Settings page or with settings.py.")
         return summary
     kept = []
     unrouted = collections.Counter()
@@ -1224,6 +1226,9 @@ class _DescribeRun:
         self.last_position = 0
         self.requeued = collections.Counter()      # image id -> times put back
         self.done_hashes = set()                   # (content hash, profile, user text)
+        self.removed_logged = set()                # removed libraries already logged
+        # (Images skipped before this run started are not in its counts.)
+        self.skipped_before = summary["skipped"]
         self.in_flight = {}                        # future -> (task, endpoint)
         self.stop_event = threading.Event()
         self.stopping = False
@@ -1367,6 +1372,16 @@ class _DescribeRun:
 
     # -- running ----------------------------------------------------------------
 
+    def skip_removed(self, task):
+        """Skip an image of a library removed from the settings while the job runs."""
+        library_id = task.row["library_id"]
+        if library_id not in self.removed_logged:
+            self.removed_logged.add(library_id)
+            self.ctx.log("Library %s was removed from the settings: its other pictures are "
+                         "not described." % library_id, "warn")
+        self.summary["skipped"] += 1
+        self.step(task)
+
     def fill(self, pool):
         """Give every endpoint with a free slot its next image."""
         while not self.stopping:
@@ -1378,6 +1393,9 @@ class _DescribeRun:
                 if task is None:
                     continue
                 submitted = True
+                if jobs.library_removed(self.ctx, task.row["library_id"]):
+                    self.skip_removed(task)
+                    continue
                 content_hash = task.row["content_hash"]
                 if content_hash and (content_hash, task.profile,
                                      task.user_text) in self.done_hashes:
@@ -1448,9 +1466,14 @@ class _DescribeRun:
             return
         self.last_progress = now
         elapsed = max(now - self.started, 1e-6)
-        rate = self.handled / elapsed * 60.0
+        # Skipped images took no work: they do not count towards the rate.
+        skipped = self.summary["skipped"] - self.skipped_before
+        worked = self.handled - skipped
+        rate = worked / elapsed * 60.0
         text = "Progress: %d/%d image(s)" % (self.handled, self.total)
-        if self.handled:
+        if skipped:
+            text += ", %d skipped" % skipped
+        if worked > 0:
             text += ", %.1f images/min" % rate
             remaining = self.total - self.handled
             if remaining > 0 and rate > 0:

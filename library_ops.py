@@ -91,8 +91,12 @@ def run_with_timeout(func, timeout, *args, **kwargs):
 # Paths
 
 def expand_path(path):
-    """A folder typed by the user: stripped, ~ expanded, separators normalised."""
-    text = path.strip() if isinstance(path, str) else ""
+    """A folder typed by the user: stripped, unquoted, ~ expanded, separators normalised.
+
+    Quotes around the path (Windows Explorer's "Copy as path" adds them)
+    are not part of it: see common.unquote_path.
+    """
+    text = common.unquote_path(path)
     if not text:
         return ""
     full = os.path.normpath(os.path.expanduser(text))
@@ -109,7 +113,7 @@ def is_device_path(path):
     """
     if os.name != "nt" or not isinstance(path, str):
         return False
-    text = path.strip()
+    text = common.unquote_path(path)
     return text[:2] in ("\\\\", "//") and text[2:3] in ("?", ".") and text[3:4] in ("\\", "/")
 
 
@@ -168,7 +172,7 @@ def path_error(path, require_absolute=True):
     folder means nothing to the user) it must also be a full path; other
     callers may keep relative paths, which are then not checked further.
     """
-    text = path.strip() if isinstance(path, str) else ""
+    text = common.unquote_path(path)
     if not text:
         return "Choose the folder that holds the pictures."
     if is_device_path(text):
@@ -281,7 +285,7 @@ def clean_library_fields(config, fields, library=None, require_absolute=True):
         if problem:
             errors["path"] = problem
         else:
-            changes["path"] = path.strip()
+            changes["path"] = common.unquote_path(path)
     if "name" in fields or library is None:
         name = fields.get("name")
         if name is not None and not isinstance(name, str):
@@ -363,16 +367,6 @@ def reachability_warning(path, timeout=5.0):
 # ---------------------------------------------------------------------------
 # Looking at folders
 
-def _is_link(entry):
-    try:
-        if entry.is_symlink():
-            return True
-        check = getattr(entry, "is_junction", None)       # Python 3.12+
-        return bool(check()) if check is not None else False
-    except OSError:
-        return False
-
-
 class FolderWalk:
     """The image files below a folder, for quick checks (not the scanner's walk).
 
@@ -412,7 +406,7 @@ class FolderWalk:
             for entry in entries:
                 rel = rel_dir + "/" + entry.name if rel_dir else entry.name
                 try:
-                    if _is_link(entry):
+                    if common.is_link(entry):
                         continue
                     if entry.is_dir(follow_symlinks=False):
                         inner = pruned or (rel if common.should_prune_dir(rel, self.patterns)
@@ -426,6 +420,21 @@ class FolderWalk:
                 except OSError:
                     continue
             stack.extend(reversed(subdirs))
+
+
+def missing_folder_message(full):
+    """Why a library folder that is not there is not there, as far as can be told.
+
+    On Windows, when its drive or network share answers, the folder itself
+    is gone (moved, renamed or a typo); otherwise the drive or share is not
+    connected. Elsewhere a share is a folder like any other, so it cannot
+    be told apart.
+    """
+    if os.name == "nt":
+        drive = os.path.splitdrive(full)[0]
+        if drive and os.path.isdir(drive + "\\"):
+            return "The folder does not exist (moved or renamed?)."
+    return "The folder cannot be reached (offline?)."
 
 
 def folder_status(path, timeout=None):
@@ -442,7 +451,7 @@ def folder_status(path, timeout=None):
 
     def look():
         if not os.path.isdir(full):
-            return "The folder cannot be reached (offline?)."
+            return missing_folder_message(full)
         with os.scandir(full) as listing:
             next(listing, None)
         return ""

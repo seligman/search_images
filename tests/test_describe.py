@@ -1453,5 +1453,50 @@ class LlmTest(unittest.TestCase):
         self.assertEqual(describe.PROMPT_VER, 5)
 
 
+class RemovedLibraryDescribeTest(DescribeTestCase):
+
+    def test_a_library_removed_during_the_job_is_not_described(self):
+        other = self.base.library_folder("Other")
+        self.small_images(2)
+        self.small_images(2, folder=other, prefix="other", first_block=20)
+        self.configure([support.library("Family", self.folder),
+                        support.library("Other", other)])
+        self.index()
+        other_id = self.config["libraries"][1]["id"]
+        # Removed on the Manage page while this job of every library runs.
+        self.ctx = jobs.JobContext("describe", log_limit=5000)
+        self.ctx.remove_library(other_id)
+        conn = db.connect()
+        try:
+            summary = describe.describe_pending(conn, self.config, self.ctx,
+                                                sleep=self.sleeps.append)
+        finally:
+            conn.close()
+        described = sorted(path for path, row in self.rows().items() if row["described"])
+        self.assertEqual(described, ["photo0.jpg", "photo1.jpg"])
+        self.assertEqual(len(self.server.describe_requests()), 2)
+        self.assertEqual(summary["skipped"], 2)
+        self.assertIn("was removed from the settings", self.log_text())
+        # And a scan of every library leaves it out too.
+        ctx = jobs.JobContext("scan")
+        ctx.remove_library(other_id)
+        result = scan.run(self.config, ctx, describe_images=False)
+        self.assertEqual([item["name"] for item in result["libraries"]], ["Family"])
+
+
+class ProgressLineTest(DescribeTestCase):
+
+    def test_skipped_pictures_are_not_counted_as_work(self):
+        self.small_images(2)
+        self.configure(endpoint=self.endpoint(base_url="http://127.0.0.1:%d/v1" % closed_port()))
+        self.index()
+        with mock.patch.object(describe, "PROGRESS_SECONDS", 0):
+            summary = self.describe()
+        self.assertEqual(summary["described"], 0)
+        text = self.log_text()
+        self.assertIn("Progress: 2/2 image(s), 2 skipped, 0 failed.", text)
+        self.assertNotIn("images/min", text)
+
+
 if __name__ == "__main__":
     unittest.main()

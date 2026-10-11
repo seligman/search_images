@@ -1120,7 +1120,9 @@ var MAP = (function () {
             ids.forEach(function (id) {
                 picked[id] = true;
             });
-            selection = {ids: ids, picked: picked, shown: 0};
+            // point: where the list's pin is, to open it again after a change.
+            selection = {ids: ids, picked: picked, shown: 0,
+                         point: unproject(group.x, group.y, width())};
             markPicked();
             clear(panelList);
             panelTitle.textContent = fmt.plural(ids.length, "picture");
@@ -1246,10 +1248,19 @@ var MAP = (function () {
                         viewerPushed = false;
                         window.history.back();
                     }
-                    var item = panelList.querySelector('a[data-index="' + ids.indexOf(id) + '"]');
+                    var at = selection ? selection.ids.indexOf(id) : -1;
+                    var item = at < 0 ? null : panelList.querySelector('a[data-index="' + at + '"]');
                     if (item) {
                         item.focus({preventScroll: false});
                     }
+                },
+                onHidden: function () {
+                    // Hidden (or shown again) from the viewer: the pins, the
+                    // open list and its grid link follow, as the grid does.
+                    if (selection && selection.point) {
+                        startPin = selection.point;
+                    }
+                    applySearch(false);
                 }
             });
             if (opened) {

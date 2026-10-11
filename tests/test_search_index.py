@@ -30,8 +30,7 @@ NOW = 1700000000.0
 REMOTE = {"REMOTE_ADDR": "192.0.2.5"}
 
 
-def quiet(*_args, **_kwargs):
-    pass
+quiet = support.quiet
 
 
 def insert_image(conn, library_id, path, **fields):
@@ -226,8 +225,10 @@ class RecordTest(IndexFixture, unittest.TestCase):
                          "chair, Eiffel Tower, running, cheerful, Paris")
 
     def test_older_and_undescribed_pictures(self):
+        # Version 4 rated sharpness from 0 to 1: it never becomes a 1-5 score.
         v4 = {"description": "A Sunny Beach", "subjects": ["Dog"], "text": "OPEN",
-              "tags": ["Sand", "sea"], "colors": ["Blue"]}
+              "tags": ["Sand", "sea"], "colors": ["Blue"], "sharpness": 0.8,
+              "aesthetic_score": 0.9}
         old = insert_image(self.conn, "lib_family1", "old.jpg", described=1, prompt_ver=4,
                            info=v4)
         fresh = insert_image(self.conn, "lib_family1", "new.jpg", width=0, height=0,
@@ -297,8 +298,9 @@ class RecordTest(IndexFixture, unittest.TestCase):
 
     def test_coordinates_never_appear(self):
         insert_image(self.conn, "lib_family1", "a.jpg", lat=12.3456, lon=-65.4321)
-        text = json.dumps(search_index.index_payload(
-            self.conn, self.config, {"lib_family1": "Family"}, include_hidden=True))
+        _status, body, _headers = search_index.IndexService(watch=False).respond(
+            self.conn, self.config, {"lib_family1": "Family"}, include_hidden=True)
+        text = body.decode("utf-8")
         self.assertNotIn("12.3456", text)
         self.assertNotIn("65.4321", text)
 

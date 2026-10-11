@@ -18,9 +18,11 @@ scanner and the describer (which need Pillow) only when a job runs.
 """
 
 import collections
+import contextlib
 import json
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -71,6 +73,7 @@ class JobContext:
         self.counts = {}
         self.warnings = 0
         self.errors = 0
+        self._removed = set()
 
     def add_secret(self, value):
         """Mask this value (an API key, say) in every later log line."""
@@ -134,6 +137,20 @@ class JobContext:
     def should_stop(self):
         return self._stop.is_set()
 
+    def remove_library(self, library_id):
+        """Say that a library was removed from the settings while the job runs.
+
+        A job that works on several libraries skips the rest of its work on
+        that one (see library_removed): nothing more of it is described.
+        """
+        with self._lock:
+            self._removed.add(library_id)
+
+    def library_removed(self, library_id):
+        """True when the library was removed from the settings during the job."""
+        with self._lock:
+            return library_id in self._removed
+
     def pause(self):
         self._running.clear()
 
@@ -185,6 +202,12 @@ class JobContext:
         pass
 
 
+def library_removed(ctx, library_id):
+    """ctx.library_removed(library_id) for any context (False for those without it)."""
+    check = getattr(ctx, "library_removed", None)
+    return bool(check is not None and check(library_id))
+
+
 class ConsoleContext(JobContext):
     """A JobContext for the command line.
 
@@ -229,6 +252,31 @@ class ConsoleContext(JobContext):
                 self.request_stop()
                 self.log("Stopping: found " + found)
         return JobContext.should_stop(self)
+
+    @contextlib.contextmanager
+    def stop_on_ctrl_c(self):
+        """While inside, the first Ctrl+C asks the work to stop, as the abort file does.
+
+        The work then stops at its next safe point and keeps what it has
+        done; a second Ctrl+C raises KeyboardInterrupt at once. Outside the
+        main thread nothing changes.
+        """
+        def handler(_signum, _frame):
+            if JobContext.should_stop(self):
+                raise KeyboardInterrupt
+            self.log("Ctrl+C: stopping after the work in progress (press Ctrl+C again to "
+                     "stop at once).", "warn")
+            self.request_stop()
+
+        try:
+            previous = signal.signal(signal.SIGINT, handler)
+        except ValueError:
+            previous = None         # not the main thread
+        try:
+            yield self
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGINT, previous)
 
     def _print(self, text):
         stream = self.stream or sys.stdout
@@ -421,10 +469,8 @@ class WorkerLock:
 # ---------------------------------------------------------------------------
 # Jobs run by the web server
 
-JOB_KINDS = ("scan", "describe", "process", "previews", "delete_library", "export")
 ACTIVE_STATES = ("running", "paused", "cancelling")
 FINISHED_STATES = ("done", "failed", "cancelled", "interrupted")
-JOB_STATES = ("queued",) + ACTIVE_STATES + FINISHED_STATES
 # A job in one of these states makes an identical new one unnecessary.
 TWIN_STATES = ("queued", "running", "paused")
 # The stage of a job that waits for another process (scan.py) to finish.
@@ -604,7 +650,7 @@ class UIContext(JobContext):
                 if self._file is None:
                     common.ensure_dir(os.path.dirname(os.path.abspath(self.log_path)))
                     self._file = open(self.log_path, "a", encoding="utf-8",
-                                      errors="backslashreplace")
+                                      errors="backslashreplace", newline="\n")
                 self._file.write(text)
                 self._file.flush()
             except OSError:
@@ -1072,11 +1118,25 @@ class JobManager:
                 conn.close()
 
     def cancel_library_jobs(self, library_id):
-        """Cancel the queued jobs of one library (not the running one). Returns how many."""
+        """Stop the work on a library that was removed from the settings.
+
+        Its queued jobs are cancelled (returns how many). Its running job
+        is cancelled too, at its next safe point; a running job of every
+        library skips the rest of this one's pictures (JobContext.
+        remove_library), so nothing more of it is described or paid for.
+        """
         with self._queue_lock:
             with self._lock:
                 current = self._current
                 skip = current["job"]["id"] if current is not None else -1
+                running = current["job"] if current is not None else None
+                ctx = current["ctx"] if current is not None else None
+            if running is not None and running["library_id"] == library_id:
+                self.cancel(running["id"])
+            elif running is not None and running["library_id"] is None and ctx is not None:
+                ctx.remove_library(library_id)
+                ctx.log("Library %s was removed from the settings; this job skips the rest "
+                        "of its pictures." % library_id, "warn")
             conn = self._connect()
             try:
                 with conn:
@@ -1283,7 +1343,7 @@ class JobManager:
                                "page." % status["holder"]}
         path = common.abort_path()
         common.ensure_dir(os.path.dirname(path))
-        with open(path, "w", encoding="utf-8") as handle:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
             handle.write("Stop requested from the web page at %s\n"
                          % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         with self._lock:

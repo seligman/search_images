@@ -261,8 +261,11 @@ test("a full record becomes the compact search record", function () {
         hgt: 3000, p: "360", h: 1
     });
     var old = SITE.compactRecord({id: 3, library: "Old", path: "a.jpg", name: "a.jpg",
-                                  info: {description: "An old one", tags: ["X"]}});
+                                  info: {description: "An old one", tags: ["X"],
+                                         sharpness: 0.8}});
     assert.strictEqual(old.v4, 1);
+    // Version 4 rated sharpness from 0 to 1: no "1/5" for a sharp picture.
+    assert.ok(!("sh" in old));
     assert.strictEqual(old.l, "Old");
     assert.ok(!("f" in old));
     var bare = SITE.compactRecord({id: 4, library_id: "lib_x", name: "b.jpg", path: "b.jpg",

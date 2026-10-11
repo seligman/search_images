@@ -180,19 +180,17 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(
-        description="Show progress on the current work.",
-        # epilog="Run '%(prog)s <command> --help' for options on a specific command.",
+        description="Show progress on the current work. With no command, shows the counts.",
     )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("counts", help="Show overall counts.")
+    sub.add_parser("counts", help="Show overall counts (the default).")
 
     sub.add_parser("files", help="Show a list of images that need processing.")
 
     args = parser.parse_args()
-    if args.command not in ("counts", "files"):
-        parser.print_help()
-        return
+    if args.command is None:
+        args.command = "counts"
 
     try:
         db.init()
