@@ -24,11 +24,13 @@ import imagegen
 import common
 import db
 import describe
+import image_edits
 import images
 import jobs
 import llm
 import prompts
 import scan
+import search_index
 
 # Not a real key: a made-up value used to check that keys never leak.
 SECRET = "sk-test-0123456789abcdefSECRETKEY"
@@ -1406,6 +1408,34 @@ class ChosenPicturesTest(DescribeTestCase):
         rows = self.rows()
         self.assertEqual(rows["photo1.jpg"]["info"], old["photo1.jpg"]["info"])
         self.assertEqual(rows["photo2.jpg"]["describe_attempts"], 0)
+
+    def test_describing_again_keeps_the_owners_edit(self):
+        self.small_images(2)
+        self.configure()
+        self.index()
+        self.describe()
+        ids = self.ids()
+        conn = db.connect()
+        try:
+            image_edits.save(conn, ids["photo0.jpg"], {"title": "Our first photo",
+                                                       "tags_add": ["rex"]})
+            conn.commit()
+        finally:
+            conn.close()
+        self.server.queue(reply(title="Described again"))
+        summary = self.describe(ids=[ids["photo0.jpg"]], force=True)
+        self.assertEqual(summary["described"], 1)
+        # The model's text is new; the owner's edit is still laid over it.
+        self.assertEqual(self.titles()["photo0.jpg"], "Described again")
+        conn = db.connect()
+        try:
+            edit = image_edits.load(conn, ids["photo0.jpg"])
+            record = search_index.picture_record(conn, ids["photo0.jpg"], edit)
+        finally:
+            conn.close()
+        self.assertEqual((edit["title"], edit["tags_add"]), ("Our first photo", ["rex"]))
+        self.assertEqual(record["t"], "Our first photo")
+        self.assertEqual(record["g"][0], "rex")
 
     def test_chosen_copies_share_the_new_description(self):
         self.small_images(1)

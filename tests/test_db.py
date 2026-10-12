@@ -22,7 +22,7 @@ IMAGE_COLUMNS = [
     "content_hash", "dhash", "taken_at", "taken_source", "tz_offset", "camera", "lat",
     "lon", "exif", "info", "described", "prompt_ver", "provenance", "describe_attempts",
     "describe_error", "hidden", "has_preview", "missing_since", "added", "updated",
-    "projection",
+    "projection", "place_city", "place_region", "place_country", "place_cc", "place_km",
 ]
 
 
@@ -545,12 +545,13 @@ class MigrationToV2Test(support.TempBaseMixin, unittest.TestCase):
             (7, "IMG_1.INSP", 300, 300, 0), (8, "unknown.jpg", 0, 0, 0),
             (9, "wide.jpg", 2100, 1000, 0)])
         report = db.init(common.load_config(), log=self.log.append)
-        self.assertEqual((report["from_version"], report["version"]), (1, 2))
+        self.assertEqual((report["from_version"], report["version"]), (1, db.SCHEMA_VERSION))
         self.assertFalse(report["created"])
-        self.assertTrue(any("from version 1 to 2" in line for line in self.log))
+        self.assertTrue(any("from version 1 to %d" % db.SCHEMA_VERSION in line
+                            for line in self.log))
         conn = db.connect()
         self.addCleanup(conn.close)
-        self.assertEqual(db.user_version(conn), 2)
+        self.assertEqual(db.user_version(conn), db.SCHEMA_VERSION)
         rows = {row["name"]: row for row in conn.execute("SELECT * FROM images")}
         self.assertEqual({name: row["projection"] for name, row in rows.items()}, {
             "pano.jpg": "?", "near.jpg": "?", "photo.jpg": "", "tall.jpg": "",
@@ -572,7 +573,7 @@ class MigrationToV2Test(support.TempBaseMixin, unittest.TestCase):
             old.close()
         # Running again changes nothing.
         report = db.init(common.load_config(), log=self.log.append)
-        self.assertEqual(report["from_version"], 2)
+        self.assertEqual(report["from_version"], db.SCHEMA_VERSION)
 
     def test_new_database_needs_no_backup(self):
         db.init(common.load_config(), log=self.log.append)

@@ -37,7 +37,7 @@ EXAMPLE_LIMIT = 10          # example paths in an ignore preview
 NOTES_LIMIT = 2000          # characters of context notes
 METADATA_PROFILES = ("core", "extended")
 LIBRARY_FIELDS = ("name", "path", "enabled", "ignore", "default_ignores", "previews",
-                  "newest_first", "endpoint", "metadata", "context_notes", "export")
+                  "newest_first", "endpoint", "metadata", "context_notes", "export", "refine")
 BOOL_FIELDS = ("enabled", "default_ignores", "previews", "newest_first")
 # Folder names the folder picker does not offer (system and NAS folders).
 HIDDEN_FOLDERS = {"system volume information", "@eadir", "#recycle", "#snapshot",
@@ -337,6 +337,14 @@ def clean_library_fields(config, fields, library=None, require_absolute=True):
             errors["context_notes"] = "Keep context notes under %d characters." % NOTES_LIMIT
         else:
             changes["context_notes"] = notes.strip()
+    if "refine" in fields:
+        # The refine pass (see refine.py), replaced as a whole.
+        import refine
+        stored, problems = refine.clean(config, fields["refine"])
+        if problems:
+            errors.update(problems)
+        else:
+            changes["refine"] = stored
     if "export" in fields:
         # The saved export options, replaced as a whole (only the ones that
         # differ from the defaults are stored).

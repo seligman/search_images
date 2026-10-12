@@ -31,7 +31,7 @@ import common
 import imageinfo
 import jobs
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 # The schema for SCHEMA_VERSION 1. Later versions add migrations below rather
 # than editing this list.
@@ -317,11 +317,50 @@ def _migrate_to_2(conn):
     mark_possible_360(conn)
 
 
+# The owner's own titles, descriptions and tags (see image_edits.py). NULL
+# title or description: the model's is used; the tag lists are JSON. The
+# rows go when their picture's row does (connect() turns foreign keys on).
+SCHEMA_V3 = (
+    """CREATE TABLE IF NOT EXISTS image_edits (
+        image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+        title TEXT,
+        description TEXT,
+        tags_add TEXT NOT NULL DEFAULT '[]',
+        tags_remove TEXT NOT NULL DEFAULT '[]',
+        updated REAL NOT NULL
+    )""",
+)
+
+
+def _migrate_to_3(conn):
+    for statement in SCHEMA_V3:
+        conn.execute(statement)
+
+
+# Place names (see places.py): the nearest town of a picture's GPS position
+# (when it is near enough), its region and country, and how far away it is.
+# place_km NULL: not looked up yet; -1: no town anywhere near.
+SCHEMA_V4 = (
+    "ALTER TABLE images ADD COLUMN place_city TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE images ADD COLUMN place_region TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE images ADD COLUMN place_country TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE images ADD COLUMN place_cc TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE images ADD COLUMN place_km REAL",
+)
+
+
+def _migrate_to_4(conn):
+    for statement in SCHEMA_V4:
+        conn.execute(statement)
+
+
 # Ordered (version, function, rewrites_data). A migration that rewrites
 # existing data gets a backup copy (index.db.bak-v<old version>) first.
 MIGRATIONS = (
     (1, _migrate_to_1, False),
     (2, _migrate_to_2, True),
+    (3, _migrate_to_3, True),
+    (4, _migrate_to_4, True),
 )
 
 

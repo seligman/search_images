@@ -28,6 +28,7 @@ import urllib.parse
 import common
 import db
 import library_ops
+import local_server
 
 CLEAR = "-"
 # Characters endpoint names may not contain (compare_models.py takes
@@ -246,6 +247,13 @@ def rename_endpoint(config, old, new):
     for library in config.get("libraries", []):
         if str(library.get("endpoint") or "").strip().casefold() == old_key:
             library["endpoint"] = entry["name"]
+        refine = library.get("refine")
+        if (isinstance(refine, dict)
+                and str(refine.get("endpoint") or "").strip().casefold() == old_key):
+            refine["endpoint"] = entry["name"]
+    for server in local_server.raw_entries(config):
+        if str(server.get("endpoint") or "").strip().casefold() == old_key:
+            server["endpoint"] = entry["name"]
     return entry
 
 

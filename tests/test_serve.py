@@ -701,6 +701,30 @@ class PanoRouteTest(PanoramaFixture, unittest.TestCase):
         self.assertEqual(self.client.get("/pano/%d" % self.stitched).data,
                          b"\xff\xd8\xff\xe0stored pano")
 
+    def test_pictures_made_on_the_fly_change_with_the_stitching(self):
+        # No stored preview or pano (previews off): made from the original,
+        # with an ETag that changes when the stitching does (here the pole fill).
+        tags = {}
+        for kind in ("preview", "pano"):
+            response = self.client.get("/%s/%d" % (kind, self.dual))
+            self.assertEqual(response.status_code, 200, kind)
+            tags[kind] = response.headers["ETag"].strip('"')
+            again = self.client.get("/%s/%d" % (kind, self.dual),
+                                    headers={"If-None-Match": tags[kind]})
+            self.assertEqual(again.status_code, 304, kind)
+        plain = self.client.get("/pano/%d" % self.stitched).headers["ETag"].strip('"')
+        config = common.load_config()
+        config["nadir_fill_deg"] = 6
+        common.save_config(config)
+        for kind in ("preview", "pano"):
+            response = self.client.get("/%s/%d" % (kind, self.dual),
+                                       headers={"If-None-Match": tags[kind]})
+            self.assertEqual(response.status_code, 200, kind)
+            self.assertNotEqual(response.headers["ETag"].strip('"'), tags[kind], kind)
+        # Other pictures do not depend on it.
+        self.assertEqual(self.client.get("/pano/%d" % self.stitched).headers["ETag"].strip('"'),
+                         plain)
+
     def test_no_original_no_pano(self):
         os.remove(os.path.join(self.family_dir, "360", "pano.jpg"))
         self.assertEqual(self.client.get("/pano/%d" % self.stitched).status_code, 404)

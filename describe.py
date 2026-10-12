@@ -12,7 +12,26 @@ Each library uses its own endpoint (or group of endpoints, which share the
 work); see common.endpoints_for_library. Every endpoint gets as many worker
 threads as its concurrency setting (for llama.cpp, the server's slot
 count), so several requests are in flight at once. Only the calling thread
-writes to the database.
+writes to the database. Hidden pictures only go to endpoints on this
+computer or the local network (others skip them). A model server that
+config.json's local_server runs for an endpoint is started when a run
+needs it (local_server.Lease).
+
+refine_pending() is the refine pass: documents and screenshots that are
+described already are described again by the library's refine endpoint
+(see refine.py), and their provenance says tier "refine".
+
+A reply cut off at the length limit is used when it got as far as the
+title and the description (repair; the provenance says "truncated"),
+unless its transcribed text ended in a loop: the image is then asked for
+again, as it is for broken JSON, and the repaired reply is only used when
+the retries do no better. A reply cut off before the title is asked for
+again with twice the endpoint's max_output_tokens (once; when the
+endpoint refuses that many, the remaining tries use its own setting).
+The fields a cut-off reply did not reach are filled in by fill_missing:
+the refine pass keeps the old description's values for them (and its
+privacy flags), and otherwise a private_info that was not reached is
+True.
 
 What happens when something goes wrong (see llm.ProviderError for kinds):
 - retryable (rate limits, busy or restarting servers, time-outs) -- asked
@@ -46,6 +65,7 @@ The command line entry point is scan.py, which indexes and then describes.
 
 import collections
 import concurrent.futures
+import copy
 import inspect
 import json
 import math
@@ -105,6 +125,9 @@ LOOP_REPEATS = 10
 LOOP_PHRASE_WORDS = 12
 # Sampling changes for asking a local model again after an unusable reply.
 RETRY_REPEAT_PENALTY = 1.1
+# A reply cut off at the length limit is asked for again with twice the
+# endpoint's max_output_tokens, but never more than this.
+MAX_OUTPUT_TOKENS = 1000000
 
 TMP_PREFIX = "describe-"
 
@@ -119,6 +142,9 @@ class ContentError(ValueError):
 _WORD_RE = re.compile(r"\w+")
 _TOKEN_RE = re.compile(r"\S+")
 _SPACES_RE = re.compile(r"\s+")
+# Half of a UTF-16 surrogate pair on its own (an escaped emoji whose other
+# half is missing): it cannot be stored as UTF-8, so it is dropped.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
 _ENUM_SEPARATORS_RE = re.compile(r"[\s\-/]+")
 _NOTHING = ("none", "null", "nil", "n_a", "na", "nothing", "no", "unknown", "")
 
@@ -272,6 +298,7 @@ def _as_text(value, multiline=False):
         value = ("\n" if multiline else " ").join(part for part in parts if part)
     if not isinstance(value, str):
         return ""
+    value = _SURROGATE_RE.sub("", value)
     if not multiline:
         return _SPACES_RE.sub(" ", value).strip()
     lines = [line.rstrip() for line in value.replace("\r\n", "\n").replace("\r", "\n")
@@ -548,6 +575,79 @@ def parse_reply(text, profile="core"):
     return info
 
 
+Repaired = collections.namedtuple("Repaired", "info missing looped")
+
+
+def repair(text, profile="core"):
+    """A description from a reply that was cut off (llm.repair_json), or None.
+
+    Only a reply that got as far as both a description and a title is
+    used. Returns Repaired(info, missing, looped): info as coerce_info
+    makes it (the fields after the cut get their empty values), missing
+    the names of the fields the reply did not reach (an enum field the cut
+    came in or right after counts as missing: its value may be cut short),
+    looped True when the transcribed text ended in a loop (_cut_loop
+    trimmed it), which is likely why the reply ran out of room.
+    """
+    try:
+        data = llm.repair_json(text or "")
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not _as_text(data.get("description")) \
+            or not _as_text(data.get("title")):
+        return None
+    try:
+        info = coerce_info(data, profile)
+    except ContentError:
+        return None
+    if not info.get("description") or not info.get("title"):
+        return None
+    fields = prompts.fields(prompts.check_profile(profile))
+    missing = [field.name for field in fields if field.name not in data]
+    last = next(iter(reversed(list(data))), None)
+    if any(field.name == last and field.kind == "enum" for field in fields):
+        missing.append(last)
+    raw = _as_text(data.get("text"), multiline=True)
+    return Repaired(info, missing, bool(raw) and _cut_loop(raw) != raw)
+
+
+def repair_reply(text, profile="core"):
+    """The description of repair() (or None): a cut-off reply's fields up to the cut."""
+    repaired = repair(text, profile)
+    return repaired.info if repaired is not None else None
+
+
+# The privacy fields, and how strong each "sensitive" value is.
+_SENSITIVE_ORDER = {value: index for index, value in enumerate(prompts.SENSITIVE)}
+
+
+def fill_missing(info, missing, previous=None):
+    """A cut-off reply's description made safe to store (a new dict).
+
+    missing names the fields the reply did not reach (repair()). With
+    previous (the description it replaces, as in the refine pass), those
+    fields keep their previous values, and the privacy fields can only get
+    stronger: private_info stays True when either says so, and the more
+    serious "sensitive" value is kept. Without one, a private_info the
+    reply did not reach is True (unknown is treated as possibly private, so
+    exports leave the picture out unless private pictures are included).
+    """
+    info = dict(info)
+    missing = set(missing or ())
+    if isinstance(previous, dict):
+        for name in missing:
+            if name in previous:
+                info[name] = copy.deepcopy(previous[name])
+        info["private_info"] = bool(info.get("private_info")) or \
+            previous.get("private_info") is True
+        before = previous.get("sensitive")
+        if _SENSITIVE_ORDER.get(before, -1) > _SENSITIVE_ORDER.get(info.get("sensitive"), -1):
+            info["sensitive"] = before
+    elif "private_info" in missing:
+        info["private_info"] = True
+    return info
+
+
 # ---------------------------------------------------------------------------
 # What to describe, and in which order
 
@@ -577,7 +677,7 @@ def capture_sort_key(row):
 
 _PENDING_SQL = """
     SELECT id, library_id, path, name, content_hash, taken_at, mtime, described,
-           prompt_ver, describe_attempts, has_preview, projection
+           prompt_ver, describe_attempts, has_preview, projection, hidden
     FROM images
     WHERE library_id = ? AND missing_since IS NULL AND (described = 0 OR %s)
     ORDER BY id"""
@@ -809,16 +909,27 @@ def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
     every request (image_id and source_path are passed on to it); an image
     it swaps in is read through read_helper (default: helper).
 
+    A reply cut off at the length limit is closed (repair) and used when
+    it got as far as the description and the title ("truncated" is then
+    True), unless its transcribed text ended in a loop: then, as for a
+    reply whose JSON breaks off, the image is asked for again, and the
+    repaired reply is only used when the retries do no better ("truncated"
+    or "repaired"; "missing" names the fields it did not reach). A reply
+    cut off before the title is asked for again (once) with twice the
+    endpoint's max_output_tokens; when the endpoint refuses that many, the
+    image's remaining tries use its own setting.
+
     Returns {"status": "ok" or "error", "kind" (a ProviderError kind, or
     "local" for a failure on this side; None when ok), "error" (redacted
     text), "exception" (the ProviderError, if any), "info" (parse_reply's
-    dict when ok), "model" (as the reply names it), "usage" (of the last
-    reply), "finish", "seconds" (time spent in requests), "requests" (HTTP
-    requests that carried the image, retries included), "tokens_in",
-    "tokens_out" and "cost" (totals over every reply; None when unknown),
-    "content_errors"}.
+    dict when ok), "truncated", "repaired", "missing", "model" (as the
+    reply names it), "usage" (of the last reply), "finish", "seconds" (time
+    spent in requests), "requests" (HTTP requests that carried the image,
+    retries included), "tokens_in", "tokens_out" and "cost" (totals over
+    every reply; None when unknown), "content_errors"}.
     """
     settings = common.endpoint_settings(endpoint)
+    request_settings = settings
     key, _source = common.resolve_api_key(settings)
     secrets = [key] if key else []
     profile = prompts.check_profile(profile)
@@ -828,6 +939,7 @@ def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
         user_text = prompts.user_text(None)
     helper_lock = helper_lock or threading.Lock()
     result = {"status": "error", "kind": None, "error": "", "exception": None, "info": None,
+              "truncated": False, "repaired": False, "missing": [],
               "model": "", "usage": {"input_tokens": None, "output_tokens": None},
               "finish": "", "seconds": 0.0, "requests": 0, "tokens_in": None,
               "tokens_out": None, "cost": None, "content_errors": 0}
@@ -840,7 +952,15 @@ def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
         if value is not None:
             result[key_name] = (result[key_name] or 0) + value
 
+    def use(repaired, cut):
+        """The result for a repaired reply (cut: it stopped at the length limit)."""
+        result.update(status="ok", info=repaired.info, missing=list(repaired.missing),
+                      truncated=cut, repaired=not cut, kind=None, error="", exception=None)
+        return result
+
     last_error = None
+    fallback = None         # (Repaired, cut): the best repaired reply so far
+    doubled = False         # more room was asked for already
     for attempt in range(1 + CONTENT_RETRIES):
         if attempt and should_stop is not None and should_stop():
             break
@@ -851,16 +971,32 @@ def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
                 text, data, mime = _helper_request(helper, helper_lock, text, jpeg, image_id,
                                                    source_path, read_helper)
             reply = llm.describe_with_retries(
-                settings, system, text, data, schema, should_stop=should_stop,
+                request_settings, system, text, data, schema, should_stop=should_stop,
                 max_retries=retries, sleep=sleep, mime=mime,
                 request_extra=retry_extra(settings) if attempt else None,
                 on_retry=count_retry, max_timeout_retries=TIMEOUT_RETRIES)
         except llm.ProviderError as error:
             result["requests"] += 1
             result["seconds"] += time.monotonic() - started
+            if (request_settings is not settings and error.kind in ("endpoint", "image")
+                    and error.status in (400, 413, 422)):
+                # The endpoint refused room for a longer answer (more output
+                # tokens than its model allows): this image's answer does not
+                # fit, which is not the endpoint's fault. The image's other
+                # tries use the endpoint's own setting.
+                request_settings = settings
+                last_error = ContentError("%s, and the endpoint refused room for a longer one "
+                                          "(%s)" % (_FINISH_TEXT["length"],
+                                                    _error_text(error, secrets)))
+                result["content_errors"] += 1
+                continue
+            if fallback is not None and error.kind != "fatal":
+                return use(*fallback)
             result.update(kind=error.kind, error=_error_text(error, secrets), exception=error)
             return result
         except Exception as error:
+            if fallback is not None:
+                return use(*fallback)
             result.update(kind="local", error=_error_text(error, secrets))
             return result
         result["requests"] += 1
@@ -870,21 +1006,41 @@ def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
         add("tokens_out", usage.get("output_tokens"))
         add("cost", llm.estimate_cost(settings, usage))
         result.update(model=reply["model"], usage=usage, finish=reply["finish"])
-        if reply["finish"] != "ok":
+        cut = reply["finish"] == "length"
+        if reply["finish"] not in ("ok", "length"):
             message = _FINISH_TEXT.get(reply["finish"], reply["finish"])
             if reply.get("detail"):
                 message += ": " + reply["detail"]
             last_error = ContentError(message)
         else:
             try:
+                if cut:
+                    raise ContentError(_FINISH_TEXT["length"])
                 info = parse_reply(reply["text"], profile)
             except ContentError as error:
                 last_error = error
+                repaired = repair(reply["text"], profile)
+                if repaired is not None:
+                    if cut and not repaired.looped:
+                        # The answer was simply longer than the room it had.
+                        return use(repaired, cut)
+                    if fallback is None or len(repaired.missing) < len(fallback[0].missing):
+                        fallback = (repaired, cut)
+                    if repaired.looped:
+                        last_error = ContentError("the reply was cut off while its text "
+                                                  "repeated itself")
+                elif cut and not doubled:
+                    # Asked again (once) with room for twice as long an answer.
+                    doubled = True
+                    request_settings = dict(settings, max_output_tokens=min(
+                        settings["max_output_tokens"] * 2, MAX_OUTPUT_TOKENS))
             else:
                 result.update(status="ok", info=info)
                 return result
         result["content_errors"] += 1
         llm.log_error(reply["text"], last_error, secrets)
+    if fallback is not None:
+        return use(*fallback)
     result.update(kind="content", error=_error_text(last_error or "stopped", secrets))
     return result
 
@@ -962,6 +1118,14 @@ def record_failure(conn, row, error):
     conn.commit()
 
 
+def _json_dict(text):
+    try:
+        value = json.loads(text or "")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _who(settings):
     """'The OpenAI endpoint 'cloud'', for messages."""
     return "The %s endpoint '%s'" % (common.ENDPOINT_PRESETS[settings["preset"]]["label"],
@@ -1017,10 +1181,17 @@ class _Endpoint:
         return reply_model or self.served_model or self.settings["model"]
 
 
+def _new_summary():
+    return {"described": 0, "shared": 0, "failed": 0, "skipped": 0, "skipped_failed": 0,
+            "skipped_offline": 0, "skipped_hidden": 0, "pending": 0, "stale": 0,
+            "stopped": False, "error": "", "fatal": False, "retired": [], "requests": 0,
+            "tokens_in": 0, "tokens_out": 0, "cost": None}
+
+
 def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_first=None,
                      retry_failed=False, redescribe_stale=False, limit=None,
                      endpoint_name=None, previews=None, sleep=time.sleep, ids=None,
-                     force=False):
+                     force=False, servers=None):
     """Describe the images that need it. Returns a summary dict.
 
     conn is an index.db connection; ctx a jobs.JobContext. Only enabled
@@ -1040,18 +1211,20 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
 
     Images without a preview are read from their library's folder; when
     that folder cannot be reached (an offline share) they are left for a
-    later run (skipped_offline) instead of failing one by one.
+    later run (skipped_offline) instead of failing one by one. Hidden
+    pictures are only sent to endpoints on this computer or the local
+    network; those that would go elsewhere are skipped (skipped_hidden).
+    A model server that config.json's local_server runs for an endpoint is
+    started first when needed (see local_server.Lease; servers is the
+    local_server.ServerManager to use, by default the process's own).
 
     Summary keys: described, shared (copies that got the same description),
-    failed, skipped, skipped_failed, skipped_offline, pending, stale
-    (described with an older prompt and not included), stopped, error,
-    fatal, retired (endpoint names), requests, tokens_in, tokens_out, cost
-    (None when unknown).
+    failed, skipped, skipped_failed, skipped_offline, skipped_hidden,
+    pending, stale (described with an older prompt and not included),
+    stopped, error, fatal, retired (endpoint names), requests, tokens_in,
+    tokens_out, cost (None when unknown).
     """
-    summary = {"described": 0, "shared": 0, "failed": 0, "skipped": 0,
-               "skipped_failed": 0, "skipped_offline": 0, "pending": 0, "stale": 0,
-               "stopped": False, "error": "", "fatal": False, "retired": [], "requests": 0,
-               "tokens_in": 0, "tokens_out": 0, "cost": None}
+    summary = _new_summary()
     libraries = selected_libraries(config, library_ids)
     if ids is not None:
         ids = {image_id for image_id in ids
@@ -1072,14 +1245,9 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
         ctx.log("%d image(s) have descriptions from an older prompt; Re-describe out of date "
                 "on the Manage page (or scan.py --redescribe-stale) updates them."
                 % summary["stale"])
-    if limit is not None and len(rows) > max(0, limit):
-        ctx.log("Describing %d of %d image(s) (limit)." % (max(0, limit), len(rows)))
-        rows = rows[:max(0, limit)]
-    summary["pending"] = len(rows)
+    summary["pending"] = len(rows) if limit is None else min(len(rows), max(0, limit))
     if not rows:
-        if limit == 0:
-            ctx.log("Nothing to describe (limit 0).")
-        elif ids is not None and not summary["skipped_offline"]:
+        if ids is not None and not summary["skipped_offline"]:
             ctx.log("Nothing to describe: the chosen pictures already have descriptions, "
                     "are gone, or belong to a disabled library.")
         elif not summary["skipped_offline"]:
@@ -1095,29 +1263,19 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
             ctx.log(summary["error"] + " See scan.py --list-endpoints.", "error")
             return summary
     routes = {}
-    used = collections.OrderedDict()
     waiting = {row["library_id"] for row in rows}
     for library in libraries:
         if library["id"] not in waiting:
             continue
         found = chosen if chosen is not None else common.endpoints_for_library(config, library)
         routes[library["id"]] = [endpoint for endpoint in found if endpoint["model"]]
-        for endpoint in routes[library["id"]]:
-            used.setdefault(endpoint["name"], endpoint)
     if not any(endpoint["model"] and endpoint["enabled"]
                for endpoint in common.endpoint_list(config)):
         ctx.log("No LLM model configured; skipping descriptions. Add an endpoint on the "
                 "Settings page or with settings.py.")
         return summary
-    kept = []
-    unrouted = collections.Counter()
-    for row in rows:
-        if routes.get(row["library_id"]):
-            kept.append(row)
-        else:
-            unrouted[row["library_id"]] += 1
-    for library_id, count in unrouted.items():
-        library = by_library[library_id]
+
+    def unrouted(library, count):
         wanted = library.get("endpoint") or common.default_endpoint_name(config)
         if wanted:
             ctx.log("Library %s: no enabled endpoint with a model is named %r; skipping its "
@@ -1126,44 +1284,215 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
             ctx.log("Library %s names no endpoint and no default endpoint is set; skipping "
                     "its %d image(s). Choose one with settings.py." % (
                         common.library_label(library), count), "warn")
-        summary["skipped"] += count
-    rows = kept
-    summary["pending"] = len(rows)
-    if not rows:
-        return summary
 
+    # (The limit counts pictures that can be sent: hidden ones that may not
+    # go to the library's endpoints would otherwise fill it on every run.)
+    assigned = _limited(_assign_routes(rows, routes, by_library, ctx, summary, unrouted),
+                        limit, ctx, "Describing %d of %d image(s) (limit).")
+    summary["pending"] = len(assigned)
+    if not assigned:
+        if limit == 0 and rows:
+            ctx.log("Nothing to describe (limit 0).")
+        return summary
+    return _execute(conn, config, ctx, summary, assigned, by_library, helper, previews, sleep,
+                    servers, redescribe_stale=redescribe_stale,
+                    force_ids=ids if force else None)
+
+
+def _limited(assigned, limit, ctx, message):
+    """The first limit of the assigned pictures (all of them without a limit)."""
+    if limit is not None and len(assigned) > max(0, limit):
+        if limit > 0:
+            ctx.log(message % (limit, len(assigned)))
+        assigned = assigned[:max(0, limit)]
+    return assigned
+
+
+def _is_hidden(row):
+    return "hidden" in row.keys() and bool(row["hidden"])
+
+
+def _assign_routes(rows, routes, by_library, ctx, summary, unrouted):
+    """[(row, endpoints)]: the endpoints each row may be sent to, in order.
+
+    routes maps library ids to their endpoints. A row whose library has
+    none is skipped (unrouted(library, count) says so, once per library).
+    A hidden picture only goes to the endpoints on this computer or the
+    local network; when its library has none, it is skipped and counted
+    in summary["skipped_hidden"] (one line says where they were not sent).
+    """
+    assigned = []
+    missing = collections.Counter()
+    held = collections.Counter()
+    for row in rows:
+        route = routes.get(row["library_id"]) or []
+        if not route:
+            missing[row["library_id"]] += 1
+            continue
+        if _is_hidden(row):
+            local = [endpoint for endpoint in route if common.is_local_endpoint(endpoint)]
+            if not local:
+                held[", ".join(sorted({common.url_host(endpoint["base_url"]) or endpoint["name"]
+                                       for endpoint in route}))] += 1
+                continue
+            route = local
+        assigned.append((row, route))
+    for library_id, count in missing.items():
+        unrouted(by_library[library_id], count)
+        summary["skipped"] += count
+    for hosts, count in sorted(held.items()):
+        ctx.log("%d hidden picture(s) were not sent to %s: hidden pictures are only described "
+                "by endpoints on this computer or the local network." % (count, hosts), "warn")
+        summary["skipped"] += count
+        summary["skipped_hidden"] += count
+    return assigned
+
+
+def _execute(conn, config, ctx, summary, assigned, by_library, helper, previews, sleep,
+             servers, redescribe_stale=False, force_ids=None, tier="", token_limits=None,
+             stage="describe", verb="Describing"):
+    """Describe the assigned (row, endpoints) pairs; returns summary, filled in.
+
+    tier ("refine" for the refine pass) is recorded in the provenance, which
+    then also keeps the model and endpoint of the description it replaces;
+    the refine pass always asks for the core profile. token_limits ({endpoint
+    name: max_output_tokens}) overrides the endpoints' own setting.
+    """
     run = _DescribeRun(conn, ctx, summary, helper, previews or cache.PreviewStore(), sleep)
     run.redescribe_stale = redescribe_stale
-    run.force_ids = ids if force else None
+    run.force_ids = force_ids
+    run.tier = tier
+
+    def profile_of(library):
+        return "core" if tier == "refine" else library_profile(library)
+
     # Exact copies only share a description within libraries that ask for
     # the same thing (metadata profile and context notes).
     for library in config.get("libraries", []):
         if isinstance(library, dict) and library.get("id"):
-            signature = (library_profile(library), prompts.user_text(library))
+            signature = (profile_of(library), prompts.user_text(library))
             run.share_ids.setdefault(signature, []).append(library["id"])
-    for endpoint in used.values():
+    used = collections.OrderedDict()
+    for _row, route in assigned:
+        for endpoint in route:
+            used.setdefault(endpoint["name"], endpoint)
+    for name, endpoint in used.items():
+        if token_limits and token_limits.get(name):
+            endpoint = dict(endpoint, max_output_tokens=token_limits[name])
         run.add_endpoint(endpoint)
-    roots = {library["id"]: common.library_root(library) for library in libraries}
-    for position, row in enumerate(rows):
+    roots = {library_id: common.library_root(library)
+             for library_id, library in by_library.items()}
+    for position, (row, route) in enumerate(assigned):
         library = by_library[row["library_id"]]
-        route = tuple(endpoint["name"] for endpoint in routes[row["library_id"]])
-        run.add_task(Task(position, row, route, roots.get(row["library_id"], ""),
-                          library_profile(library),
+        run.add_task(Task(position, row, tuple(endpoint["name"] for endpoint in route),
+                          roots.get(row["library_id"], ""), profile_of(library),
                           prompts.user_text(library, projection=_projection(row))))
     clean_tmp()
-    ctx.stage("describe", total=len(rows))
-    ctx.log("Describing %d image(s)..." % len(rows))
+    ctx.stage(stage, total=len(assigned))
+    ctx.log("%s %d image(s)..." % (verb, len(assigned)))
+    import local_server     # stdlib only; imported here to keep this module's imports short
+    lease = local_server.lease_for(ctx, config, list(used), manager=servers)
     try:
+        for name, problem in lease.acquire().items():
+            run.server_problem = run.server_problem or problem
+            run.retire(run.by_name[name], problem)
         if helper is not None and hasattr(helper, "before_launch"):
             helper.before_launch()
         run.prepare_endpoints(started_by_helper=helper is not None
                               and hasattr(helper, "before_launch"))
         run.run()
     finally:
-        if helper is not None and hasattr(helper, "after_launch"):
-            helper.after_launch()
+        try:
+            if helper is not None and hasattr(helper, "after_launch"):
+                helper.after_launch()
+        finally:
+            lease.release()
     run.finish()
     return summary
+
+
+def refine_pending(conn, config, ctx, helper=None, library_ids=None, limit=None,
+                   retry_failed=False, newest_first=None, previews=None, sleep=time.sleep,
+                   servers=None, only_library=False):
+    """The refine pass: describe documents and screenshots again with a stronger model.
+
+    For each enabled library (limited to library_ids) that names a refine
+    endpoint (refine.settings), its described pictures of the chosen kinds
+    that are not refined yet with the current prompt (refine.candidate_rows)
+    are described again with that endpoint, with the core profile, the
+    usual prompt and the refine setting's max_output_tokens. The new
+    description replaces the old one; its provenance has tier "refine" and
+    the model and endpoint of the one before ("previous"). Pictures that
+    failed MAX_FAILURES times are skipped unless retry_failed is set; at
+    most limit pictures are done. only_library: the run was asked for one
+    library, so that library having no refine endpoint is an error.
+    Hidden pictures, offline folders and model servers are handled as in
+    describe_pending, whose summary keys this returns too.
+    """
+    import refine
+    summary = _new_summary()
+    libraries = selected_libraries(config, library_ids)
+    chosen = [library for library in libraries if refine.enabled(library)]
+    if not chosen:
+        if only_library and len(libraries) == 1:
+            summary["error"] = ("Library %s has no refine endpoint: choose one in its settings "
+                                "on the Manage page." % common.library_label(libraries[0]))
+            ctx.log(summary["error"], "error")
+        else:
+            ctx.log("No library names a refine endpoint; nothing to refine.")
+        return summary
+    rows = []
+    for library in chosen:
+        found = refine.candidate_rows(conn, library)
+        if not retry_failed:
+            kept = [row for row in found if row["describe_attempts"] < MAX_FAILURES]
+            summary["skipped_failed"] += len(found) - len(kept)
+            found = kept
+        order = library.get("newest_first", True) if newest_first is None else newest_first
+        found.sort(key=capture_sort_key, reverse=bool(order))
+        found.sort(key=lambda row: row["describe_attempts"] > 0)     # stable
+        rows.extend(found)
+    if summary["skipped_failed"]:
+        ctx.log("Skipping %d picture(s) that failed %d times; Retry failed (or scan.py "
+                "--refine --retry-failed) tries them again."
+                % (summary["skipped_failed"], MAX_FAILURES))
+    rows, summary["skipped_offline"] = _drop_unreachable(rows, chosen, ctx, helper)
+    summary["pending"] = len(rows) if limit is None else min(len(rows), max(0, limit))
+    if not rows:
+        if not summary["skipped_offline"]:
+            ctx.log("Nothing to refine: every document and screenshot is refined already.")
+        return summary
+    by_library = {library["id"]: library for library in chosen}
+    routes, token_limits = {}, {}
+    for library in chosen:
+        wanted = refine.settings(library)
+        routes[library["id"]] = [endpoint for endpoint in
+                                 common.resolve_endpoints(config, wanted["endpoint"])
+                                 if endpoint["model"]]
+        for endpoint in routes[library["id"]]:
+            # More room than the endpoint's own setting, never less (a
+            # thinking model may have been given more).
+            own = common.endpoint_settings(endpoint)["max_output_tokens"]
+            token_limits[endpoint["name"]] = max(token_limits.get(endpoint["name"], 0),
+                                                 wanted["max_output_tokens"], own)
+
+    def unrouted(library, count):
+        ctx.log("Library %s: no enabled endpoint with a model is named %r (its refine "
+                "endpoint); skipping its %d picture(s)." % (
+                    common.library_label(library), refine.settings(library)["endpoint"], count),
+                "warn")
+
+    assigned = _limited(_assign_routes(rows, routes, by_library, ctx, summary, unrouted),
+                        limit, ctx, "Refining %d of %d picture(s) (limit).")
+    summary["pending"] = len(assigned)
+    if not assigned:
+        if only_library and not summary["skipped_hidden"] and limit != 0:
+            summary["error"] = "The refine endpoint of this library cannot be used."
+        return summary
+    return _execute(conn, config, ctx, summary, assigned, by_library, helper, previews, sleep,
+                    servers, force_ids={row["id"] for row, _route in assigned}, tier="refine",
+                    token_limits=token_limits, stage="refine",
+                    verb="Describing again (refine pass):")
 
 
 def _drop_unreachable(rows, libraries, ctx, helper=None, timeout=None):
@@ -1219,6 +1548,8 @@ class _DescribeRun:
         self.sleep = sleep
         self.redescribe_stale = False
         self.force_ids = None                      # ids described again on request
+        self.tier = ""                             # "refine" for the refine pass
+        self.server_problem = ""                   # why a model server could not be used
         self.share_ids = {}                        # (profile, user text) -> library ids
         self.endpoints = []
         self.by_name = {}
@@ -1267,6 +1598,8 @@ class _DescribeRun:
         """
         for state in self.endpoints:
             settings = state.settings
+            if state.retired:
+                continue        # (its model server could not be started)
             if settings["preset"] in common.CLOUD_PRESETS and not state.secrets:
                 # Never send pictures to a cloud service without a key.
                 self.retire(state, "no API key is set (%s), so no picture was sent. Set the "
@@ -1348,7 +1681,9 @@ class _DescribeRun:
                 queue.clear()
                 self.step(last, count)
         if not self.stopping and all(state.retired for state in self.endpoints):
-            if not self.summary["error"]:
+            if not self.summary["error"] and self.server_problem:
+                self.summary["error"] = self.server_problem
+            elif not self.summary["error"]:
                 self.summary["error"] = "No usable LLM endpoint is left."
                 self.ctx.log(self.summary["error"] + " Check that the model server is "
                              "running and the endpoint settings are right.", "error")
@@ -1637,6 +1972,15 @@ class _DescribeRun:
         row = task.row
         model = state.model_name(result.get("model") or "")
         info = dict(result["info"])
+        partial = result.get("truncated") or result.get("repaired")
+        if partial:
+            # The fields the reply did not reach: the refine pass keeps the
+            # old description's (and never weakens its privacy flags);
+            # otherwise an unknown private_info counts as private.
+            previous = None
+            if self.tier and "info" in row.keys():
+                previous = _json_dict(row["info"]) or None
+            info = fill_missing(info, result.get("missing"), previous)
         info["_model_name"] = model
         # Tokens, cost, time and requests of every request this image took
         # (content retries included), as the run's summary counts them.
@@ -1649,6 +1993,19 @@ class _DescribeRun:
                       "at": _utc_now()}
         if result.get("cost") is not None:
             provenance["cost"] = round(result["cost"], 8)
+        if result.get("truncated"):
+            provenance["truncated"] = True
+        elif result.get("repaired"):
+            provenance["repaired"] = True
+        if partial and result.get("missing"):
+            provenance["missing_fields"] = list(result["missing"])
+        if self.tier:
+            provenance["tier"] = self.tier
+            before = _json_dict(row["provenance"] if "provenance" in row.keys() else "")
+            previous = {key: before[key] for key in ("model", "endpoint", "at", "tier")
+                        if isinstance(before.get(key), str) and before[key]}
+            if previous:
+                provenance["previous"] = previous
         signature = (task.profile, task.user_text)
         stored, shared = store_description(self.conn, row, info, provenance,
                                            library_ids=self.share_ids.get(signature, []),
@@ -1659,7 +2016,13 @@ class _DescribeRun:
             self.summary["shared"] += shared
             if row["content_hash"]:
                 self.done_hashes.add((row["content_hash"],) + signature)
-            self.ctx.log("Described %s (%.1f s)" % (row["path"], result["seconds"]))
+            note = ""
+            if result.get("truncated"):
+                note = ", cut off at the length limit"
+            elif result.get("repaired"):
+                note = ", from a reply whose JSON broke off"
+            self.ctx.log("%s %s (%.1f s)%s" % ("Refined" if self.tier else "Described",
+                                                 row["path"], result["seconds"], note))
         else:
             self.summary["skipped"] += 1
             self.ctx.log("Not saved: %s changed while it was being described." % row["path"],
@@ -1669,7 +2032,8 @@ class _DescribeRun:
         summary = self.summary
         if self.total and self.handled:
             self.progress(force=True)
-        parts = ["Described %d image(s)" % summary["described"]]
+        parts = ["%s %d image(s)" % ("Refined" if self.tier else "Described",
+                                     summary["described"])]
         if summary["shared"]:
             parts.append("%d exact copies shared a description" % summary["shared"])
         if summary["failed"]:

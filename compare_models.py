@@ -32,8 +32,10 @@ prepared preview, the system prompt, the library's context notes); the
 helper module's hooks are not used. Unless libraries are named with
 --library, an endpoint that is not on this computer or the local network
 gets no images from libraries whose own "endpoint" setting keeps them on
-local endpoints. An endpoint whose first MAX_ENDPOINT_FAILURES images all
-fail (or that fails that many times in a row) is not sent the rest.
+local endpoints, and hidden pictures are never sent to such an endpoint
+(they are listed as not run). An endpoint whose first
+MAX_ENDPOINT_FAILURES images all fail (or that fails that many times in a
+row) is not sent the rest.
 Reports are written to data/reports/ by default. They contain thumbnails
 and text from your pictures: keep them private.
 """
@@ -84,7 +86,7 @@ def stratum(row):
 
 
 _ROW_SQL = ("SELECT id, library_id, path, name, camera, has_preview, taken_at, "
-            "content_hash, width, height FROM images WHERE missing_since IS NULL ")
+            "content_hash, width, height, hidden FROM images WHERE missing_since IS NULL ")
 
 
 def candidate_rows(conn, library_ids):
@@ -218,7 +220,9 @@ def _record(result):
             "seconds": round(result.get("seconds") or 0.0, 3),
             "requests": result.get("requests", 0), "tokens_in": result.get("tokens_in"),
             "tokens_out": result.get("tokens_out"), "cost": result.get("cost"),
-            "content_errors": result.get("content_errors", 0)}
+            "content_errors": result.get("content_errors", 0),
+            "truncated": bool(result.get("truncated")),
+            "repaired": bool(result.get("repaired")), "missing": result.get("missing") or []}
 
 
 def run_endpoint(endpoint, items, profile, ctx, previews, sleep=time.sleep):
@@ -343,6 +347,10 @@ def summarize(entry):
         "images": len(records), "described": len(described),
         "failures": len(records) - len(described),
         "parse_failures": sum(1 for record in records if record["kind"] == "content"),
+        # Used, but cut off at the length limit (or with broken JSON closed):
+        # the fields after the cut are empty.
+        "truncated": sum(1 for record in described
+                         if record.get("truncated") or record.get("repaired")),
         "content_retries": sum(record.get("content_errors", 0) for record in records),
         "not_run": len(entry["results"]) - len(records),
         "mean_seconds": _mean(seconds),
@@ -424,6 +432,11 @@ def _answer_cell(record):
     else:
         info = record.get("info") or {}
         parts = ["<td>"]
+        if record.get("truncated") or record.get("repaired"):
+            parts.append('<p class="warn">%s</p>' % _escape(
+                ("cut off at the length limit" if record.get("truncated")
+                 else "broken JSON, closed") + (": no %s" % ", ".join(record["missing"])
+                                                if record.get("missing") else "")))
         if info.get("title"):
             parts.append('<div class="title">%s</div>' % _escape(info["title"]))
         kind = [info.get("photo_type")]
@@ -490,9 +503,9 @@ def render_html(report):
         out.append(", seed %s" % _escape(report["seed"]))
     out.append(".</p>\n<h2>Summary</h2>\n<table class=\"summary\">\n<tr>")
     for heading in ("Endpoint", "Model", "Images", "Failed", "Unusable replies",
-                    "Mean s/image", "Median s/image", "Images/min (wall clock)",
-                    "Mean tokens in / out", "Requests", "Est. cost per 10k images",
-                    "Notes"):
+                    "Cut off (used)", "Mean s/image", "Median s/image",
+                    "Images/min (wall clock)", "Mean tokens in / out", "Requests",
+                    "Est. cost per 10k images", "Notes"):
         out.append("<th>%s</th>" % _escape(heading))
     out.append("</tr>\n")
     for entry in endpoints:
@@ -502,7 +515,8 @@ def render_html(report):
             _escape(entry["name"]),
             _escape(entry.get("served_model") or entry.get("model")),
             _number(summary["images"]), _number(summary["failures"]),
-            _number(summary["parse_failures"]), _number(summary["mean_seconds"]),
+            _number(summary["parse_failures"]), _number(summary.get("truncated", 0)),
+            _number(summary["mean_seconds"]),
             _number(summary["median_seconds"]), _number(summary["images_per_minute"], 1),
             "%s / %s" % (_number(summary["mean_tokens_in"], 0),
                          _number(summary["mean_tokens_out"], 0)),
@@ -511,7 +525,7 @@ def render_html(report):
             _escape(entry.get("stopped") or ""),
         ]
         out.append("<tr>%s</tr>\n" % "".join(
-            '<td class="number">%s</td>' % cell if 2 <= index <= 10 else "<td>%s</td>" % cell
+            '<td class="number">%s</td>' % cell if 2 <= index <= 11 else "<td>%s</td>" % cell
             for index, cell in enumerate(cells)))
     out.append("</table>\n<h2>Images</h2>\n<table class=\"images\">\n<tr><th>Image</th>")
     for entry in endpoints:
@@ -654,17 +668,31 @@ def compare(config, endpoint_names, library_names=None, sample=DEFAULT_SAMPLE, i
                         % (len(held), endpoint["name"], ", ".join(sorted(
                             {common.library_label(item["library"]) for item in held}))),
                         "warn")
+        hidden = []
+        if not common.is_local_endpoint(endpoint):
+            # Hidden pictures never leave this computer and network.
+            hidden = [item for item in chosen if item["row"]["hidden"]]
+            chosen = [item for item in chosen if not item["row"]["hidden"]]
+            if hidden:
+                ctx.log("%d hidden picture(s) were not sent to %s (%s): hidden pictures are "
+                        "only described by endpoints on this computer or the local network."
+                        % (len(hidden), endpoint["name"], common.url_host(endpoint["base_url"])),
+                        "warn")
         limit = limits.get(endpoint["name"].casefold())
         if limit is not None:
             chosen = chosen[:limit]
         for key in (endpoint.get("api_key"), common.resolve_api_key(endpoint)[0]):
             ctx.add_secret(key)
         entry = run_endpoint(endpoint, chosen, profile, ctx, previews, sleep)
-        if held:
-            for item in held:
-                entry["results"][str(item["row"]["id"])] = {
-                    "ok": False, "kind": "not_run", "info": None, "requests": 0,
-                    "error": "its library is kept on local endpoints"}
+        for item in held:
+            entry["results"][str(item["row"]["id"])] = {
+                "ok": False, "kind": "not_run", "info": None, "requests": 0,
+                "error": "its library is kept on local endpoints"}
+        for item in hidden:
+            entry["results"][str(item["row"]["id"])] = {
+                "ok": False, "kind": "not_run", "info": None, "requests": 0,
+                "error": "hidden pictures are not sent outside this computer and network"}
+        if held or hidden:
             entry["summary"] = summarize(entry)
         report["endpoints"].append(entry)
     return report
@@ -734,9 +762,11 @@ def main(argv=None):
     html_path, json_path = write_report(report, args.out)
     for entry in report["endpoints"]:
         summary = entry["summary"]
-        print("%s: %d described, %d failed, %s s/image (median), %s requests"
-              % (entry["name"], summary["described"], summary["failures"],
-                 _number(summary["median_seconds"]), summary["requests"]))
+        print("%s: %d described%s, %d failed, %s s/image (median), %s requests"
+              % (entry["name"], summary["described"],
+                 " (%d cut off)" % summary["truncated"] if summary.get("truncated") else "",
+                 summary["failures"], _number(summary["median_seconds"]),
+                 summary["requests"]))
     print("Report: %s\nResults: %s" % (html_path, json_path))
     return 0
 

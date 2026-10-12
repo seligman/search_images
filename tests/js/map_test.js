@@ -451,6 +451,21 @@ test("the open list reads back from the address and finds its pin again", functi
     });
 });
 
+test("a chip of the viewer opens a new search, without the timeline's dates", function () {
+    var state = {q: "beach", lib: "lib_family1", filters: {type: ["photo"]}, from: "2019",
+                 to: "2019", view: "20.8,-156.4,9", ids: "", group: true};
+    var target = MAP.chipState(state, "place", "United States|Hawaii|Hilo");
+    assert.deepStrictEqual(target, {q: "", lib: "lib_family1",
+                                    filters: {place: ["United States|Hawaii|Hilo"]},
+                                    from: "", to: "", view: "", ids: "", group: true});
+    target = MAP.chipState(state, "q", "tag:sunset");
+    assert.strictEqual(target.q, "tag:sunset");
+    assert.deepStrictEqual(target.filters, {});
+    assert.strictEqual(target.from + target.to, "");
+    // The state it was made from is left as it was.
+    assert.strictEqual(state.from, "2019");
+});
+
 /* ---------- Running -------------------------------------------------------------------- */
 
 var failures = 0;

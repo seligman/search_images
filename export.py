@@ -28,7 +28,8 @@ missing, not checked (not described, or described by the older version 4
 prompt), screenshots, documents (also by their document type, see
 _reasons), or flagged as private or sensitive are left out unless the
 options say otherwise; file names, folders and GPS positions with the map
-(and the extended profile's landmark and place-guess fields) only go out
+(and the town, region and country of each position from the place names,
+and the extended profile's landmark and place-guess fields) only go out
 when switched on. The descriptions themselves go out as written. Paths,
 hashes, file times (also as a picture's date), the describing model and
 its costs, other libraries and endpoint settings never do.
@@ -88,6 +89,7 @@ import db
 import imageinfo
 import jobs
 import library_ops
+import places
 import prompts
 import search_index
 import world_map
@@ -116,6 +118,10 @@ LOCATION_DECIMALS = 4
 IMAGE_MODES = ("web", "original", "none")
 MAX_TITLE = 200
 MAX_CREDITS = 2000
+# The credit an export with place names carries (CC BY 4.0, see places.py).
+PLACES_CREDIT = ('Place names: <a href="%s">GeoNames</a> (<a href="%s" rel="license">'
+                 'CC BY 4.0</a>)' % (html.escape(places.ATTRIBUTION_URL),
+                                     html.escape(places.LICENSE_URL)))
 MAX_ID_LIST = 100000
 # Scripts and the style sheet every export carries (map.js only with the map).
 ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "viewer.js", "app.js",
@@ -186,7 +192,7 @@ _ZIP_DATE = (1980, 1, 1, 0, 0, 0)
 DEFAULT_OPTIONS = {
     "title": "",                    # "" = the library's name
     "images": "web",                # "web" (2048 px) | "original" | "none" (thumbnails only)
-    "location": False,              # GPS positions, the map, landmark/place-guess fields
+    "location": False,              # GPS positions, place names, the map, landmark/place-guess
     "file_names": False,
     "folders": False,
     "exclude_types": ["screenshot", "document"],    # photo types left out
@@ -1815,9 +1821,11 @@ def render_page(template, title, page_title, capabilities, export_id, options,
     The page settings (JSON block) name this export's one library, its
     capabilities and title, and data_version (the hash of data/manifest.js);
     the page asks search engines not to index it (or its pictures) unless
-    options allow it, and shows the credits line at its foot. versions
-    ({asset name: hash}) go into the addresses of the scripts and the
-    style sheet.
+    options allow it, and shows the credits line at its foot -- with the
+    GeoNames credit when the export holds place names (capabilities
+    "places"; the map page, which has no foot, shows only that credit, in
+    a corner of the map). versions ({asset name: hash}) go into the addresses of the
+    scripts and the style sheet.
     """
     import serve
     location = options["location"]
@@ -1845,12 +1853,21 @@ def render_page(template, title, page_title, capabilities, export_id, options,
             raise ExportError("The page template %s has no charset line." % template)
         text = text.replace(anchor, anchor + '\n<meta name="robots" content="noindex, '
                                               'noimageindex">', 1)
-    if options["credits"] and template != "map.html":
+    credits = [html.escape(options["credits"])] if options["credits"] else []
+    if capabilities.get("places"):
+        credits.append(PLACES_CREDIT)
+    if credits and template != "map.html":
         anchor = '<script type="application/json" id="app-config">'
         if anchor not in text:
             raise ExportError("The page template %s has no page settings." % template)
-        footer = '<footer class="export-credits">%s</footer>\n' % html.escape(options["credits"])
+        footer = '<footer class="export-credits">%s</footer>\n' % "<br>".join(credits)
         text = text.replace(anchor, footer + anchor, 1)
+    elif template == "map.html" and capabilities.get("places"):
+        anchor = '<div id="map-message"'
+        if anchor not in text:
+            raise ExportError("The page template %s has no map message." % template)
+        text = text.replace(anchor, '<p id="map-credit" class="export-credits map-credit">'
+                                    '%s</p>\n%s' % (PLACES_CREDIT, anchor), 1)
     return text
 
 
@@ -2029,8 +2046,13 @@ class _Export:
                 return None
             return "%s:%d:%s:%d:%d" % (kind, PICTURE_VERSION, row["content_hash"],
                                        stat.st_size, stat.st_mtime_ns)
-        return "%s:%d:%s:%d:%r" % (kind, PICTURE_VERSION, row["content_hash"],
-                                   row["size"] or 0, row["mtime"])
+        sig = "%s:%d:%s:%d:%r" % (kind, PICTURE_VERSION, row["content_hash"],
+                                  row["size"] or 0, row["mtime"])
+        if kind != "original" and row["projection"] == imageinfo.PROJECTION_DUAL_FISHEYE:
+            # Made by stitching the original: a new way of stitching (or
+            # other pole fills) makes a new picture.
+            sig += ":" + _images().stitch_key()
+        return sig
 
     def _thumb(self, picture):
         row = picture.row
@@ -2600,6 +2622,9 @@ class _Export:
                             "panos": any(picture.pano for picture in pictures),
                             "file_names": self.options["file_names"],
                             "folders": self.options["folders"]}
+            if location and any(record.get("co") for record in records):
+                # Place names (and with them the GeoNames credit, render_page).
+                capabilities["places"] = True
             files, manifest = self.data_files(pictures, records, capabilities)
             for rel in sorted(files):
                 self.writer.write(rel, files[rel].encode("ascii"))
@@ -2803,9 +2828,11 @@ def main(argv=None):
                         help="web: 2048 px pictures (default); original: the originals, "
                              "metadata removed; none: thumbnails only")
     parser.add_argument("--location", action="store_true",
-                        help="include GPS positions, the map and the AI model's separate "
-                             "landmark and place-guess fields (titles and descriptions are "
-                             "published as written either way)")
+                        help="include GPS positions, the town, region and country names "
+                             "(when place names were downloaded; with a GeoNames credit), "
+                             "the map and the AI model's separate landmark and place-guess "
+                             "fields (titles and descriptions are published as written "
+                             "either way)")
     parser.add_argument("--file-names", action="store_true", help="include file names")
     parser.add_argument("--folders", action="store_true", help="include folder names")
     parser.add_argument("--include-screenshots", action="store_true",

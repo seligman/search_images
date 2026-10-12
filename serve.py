@@ -24,6 +24,7 @@ import admin
 import cache
 import common
 import db
+import image_edits
 import imageinfo
 import jobs
 import search_index
@@ -61,7 +62,8 @@ CONTENT_SECURITY_POLICY = ("default-src 'self'; img-src 'self' data: blob:; "
                            "base-uri 'none'; form-action 'self'; object-src 'none'")
 # The name each page template goes by in the page settings ("page").
 PAGE_NAMES = {"page.html": "search", "detail.html": "detail", "map.html": "map",
-              "manage.html": "manage", "settings.html": "settings"}
+              "manage.html": "manage", "settings.html": "settings",
+              "duplicates.html": "duplicates"}
 
 
 def _images():
@@ -200,10 +202,33 @@ def projection_of(row):
     return projection if projection in imageinfo.PROJECTIONS_360 else ""
 
 
-def detail_record(row, library_name):
-    """Build the full metadata record used by the detail page."""
+def place_of(row):
+    """The place names of a row (places.py) as /api/image sends them, or None.
+
+    {"city" ("" when no town is near enough), "region", "country", "cc",
+    "km" (how far the town is, when there is one)}.
+    """
+    if not row["place_country"]:
+        return None
+    place = {"city": row["place_city"], "region": row["place_region"],
+             "country": row["place_country"], "cc": row["place_cc"]}
+    km = finite(row["place_km"])
+    if place["city"] and km is not None and km >= 0:
+        place["km"] = km
+    return place
+
+
+def detail_record(row, library_name, edit=None, for_admin=False):
+    """Build the full metadata record used by the detail page.
+
+    info is the description as shown and searched: the model's with the
+    owner's edit (image_edits) laid over it. For the admin (for_admin)
+    also edited, whether there is one, model_info, the model's own
+    description, and edits, the edit itself (image_edits.view).
+    """
     exif = load_json(row["exif"], {})
-    return {
+    model_info = load_json(row["info"], None)
+    record = {
         "id": row["id"],
         "library": library_name,
         "library_id": row["library_id"],
@@ -221,11 +246,19 @@ def detail_record(row, library_name):
         "camera": row["camera"],
         "lat": finite(row["lat"]),
         "lon": finite(row["lon"]),
+        "place": place_of(row),
         "hidden": bool(row["hidden"]),
-        "info": load_json(row["info"], None),
+        "info": image_edits.apply(model_info, edit),
+        "described": bool(row["described"]),
+        "prompt_ver": row["prompt_ver"],
         "exif": exif if isinstance(exif, dict) else {},
         "provenance": provenance_record(row["provenance"]),
     }
+    if for_admin:
+        record["edited"] = not image_edits.is_empty(edit)
+        record["model_info"] = model_info
+        record["edits"] = image_edits.view(edit)
+    return record
 
 
 # --- Map tiles ---------------------------------------------------------------
@@ -448,10 +481,20 @@ def _read_head(helper, path):
         return handle.read(64), None
 
 
-def _source_etag(kind, image_id, stat):
-    """An ETag for something derived from an original: changes with the file."""
-    text = "%s:%d:%d:%r" % (kind, image_id, stat.st_size, stat.st_mtime)
+def _source_etag(kind, image_id, stat, made_by=""):
+    """An ETag for something derived from an original: changes with the file,
+    and with made_by (what else the picture depends on, such as the way
+    360-degree photos are stitched, images.stitch_key())."""
+    text = "%s:%d:%d:%r:%s" % (kind, image_id, stat.st_size, stat.st_mtime, made_by)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:24]
+
+
+def _made_by(images, row):
+    """What a preview or pano made from row's original depends on besides the
+    file: the stitching, for an unstitched 360 photo ("" otherwise)."""
+    if images is not None and row["projection"] == imageinfo.PROJECTION_DUAL_FISHEYE:
+        return images.stitch_key()
+    return ""
 
 
 def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
@@ -569,8 +612,9 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
 
     def admin_page(name):
         if not is_admin():
-            return Response("Manage and Settings only work on this computer, when the "
-                            "server listens on localhost.", status=403, mimetype="text/plain")
+            return Response("Manage, Settings and Duplicates only work on this computer, when "
+                            "the server listens on localhost.", status=403,
+                            mimetype="text/plain")
         # The query string opens dialogs (?dialog=...). A link on another
         # site gets the bare page, so it can never start anything there.
         if request.query_string and request.headers.get("Sec-Fetch-Site") in ("cross-site",
@@ -597,6 +641,10 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     @app.route("/settings")
     def settings_page():
         return admin_page("settings.html")
+
+    @app.route("/duplicates")
+    def duplicates_page():
+        return admin_page("duplicates.html")
 
     @app.route("/api/locations")
     def api_locations():
@@ -646,7 +694,8 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         if row is None:
             return jsonify({"error": "not found"}), 404
         names = visible_libraries(state.config())
-        return jsonify(detail_record(row, names[row["library_id"]]))
+        edit = image_edits.load(get_conn(), image_id)
+        return jsonify(detail_record(row, names[row["library_id"]], edit, for_admin=is_admin()))
 
     @app.route("/thumb/<int:image_id>")
     def thumb(image_id):
@@ -658,7 +707,7 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
 
     @app.route("/preview/<int:image_id>")
     def preview(image_id):
-        row = visible_row(image_id, "id, path, name, has_preview")
+        row = visible_row(image_id, "id, path, name, has_preview, projection")
         if row is None:
             return not_found()
         path = None
@@ -677,10 +726,10 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         full, stat = original_path(row)
         if full is None:
             return not_found()
-        etag = _source_etag("preview", row["id"], stat)
+        images = _images()
+        etag = _source_etag("preview", row["id"], stat, _made_by(images, row))
         if request.if_none_match.contains(etag):
             return not_modified(etag)
-        images = _images()
         if images is None:
             return not_found()
         try:
@@ -718,7 +767,7 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         full, stat = original_path(row)
         if full is None:
             return not_found()
-        etag = _source_etag("pano", row["id"], stat)
+        etag = _source_etag("pano", row["id"], stat, _made_by(images, row))
         if request.if_none_match.contains(etag):
             return not_modified(etag)
         if images is None:
@@ -954,12 +1003,15 @@ def main(argv=None):
     except common.ConfigError as error:
         raise SystemExit("Error: %s" % error)
     manager = app.extensions["search_images_jobs"]
+    model_servers = app.extensions["search_images_model_servers"]
     base_url = "http://%s:%d" % ("[%s]" % host if ":" in host else host, port)
     print("Serving on %s (press Ctrl+C to stop)" % base_url)
     if admin.is_loopback_host(host):
         # Jobs run in this process only, never in a reloader's second one.
         if not manager.start():
             print("Warning: " + manager.message)
+        # The daily stop time of a model server started from the Settings page.
+        model_servers.start_scheduler(app.extensions["search_images"].config)
         print("Manage libraries: %s/manage" % base_url)
         print("Settings:         %s/settings" % base_url)
     else:
@@ -972,6 +1024,8 @@ def main(argv=None):
     finally:
         # A running job stops at its next safe point and can be resumed.
         manager.stop(timeout=5)
+        # A model server a job started (with auto_stop) is stopped too.
+        model_servers.shutdown()
         # Closing the shared thumbnail connection lets SQLite tidy up its
         # -wal/-shm files when the server stops (Ctrl+C).
         app.extensions["search_images"].close()

@@ -239,11 +239,15 @@ test("counts, size and details in words", function () {
     assert.strictEqual(R.detailsText(options), "Published with each picture: its title, " +
         "description, tags, any text read in the picture, the day it was taken (from the " +
         "camera or the file name) and camera model and settings. Not its file name, " +
-        "folder or location.");
+        "folder or location (GPS position and place names).");
     options.file_names = options.folders = true;
-    assert.ok(/Not its location\.$/.test(R.detailsText(options)), R.detailsText(options));
+    assert.ok(/Not its location \(GPS position and place names\)\.$/.test(
+        R.detailsText(options)), R.detailsText(options));
     options.location = true;
-    assert.ok(/file name, folder and location\.$/.test(R.detailsText(options)));
+    assert.ok(/file name, folder and location \(GPS position and place names\)\.$/.test(
+        R.detailsText(options)));
+    // The Location option says that it publishes the place names.
+    assert.ok(/town, region and country/.test(R.OPTIONS.location.hint));
     // Only this computer can open the site the command serves.
     assert.strictEqual(R.serveCommand("C:\\Photos\\Family"),
                        "python -m http.server --bind 127.0.0.1 --directory " +

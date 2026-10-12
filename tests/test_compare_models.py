@@ -257,8 +257,10 @@ class CompareTest(support.TempBaseMixin, unittest.TestCase):
     def test_unusable_endpoint_is_not_sent_the_whole_sample(self):
         # A cloud endpoint whose replies are always cut off (say, too few
         # output tokens) stops after a few images instead of costing three
-        # requests for every image of the sample.
-        self.cloud.reply = fake_llm.Reply(finish="length")
+        # requests for every image of the sample. (Cut before the title, so
+        # the reply cannot be repaired.)
+        self.cloud.reply = fake_llm.Reply(json.dumps(fake_llm.DEFAULT_REPLY)[:40],
+                                          finish="length")
         report = compare_models.compare(self.config, "cloud", sample=6,
                                         ctx=jobs.JobContext("compare"),
                                         sleep=lambda seconds: None)
@@ -268,6 +270,21 @@ class CompareTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual(cloud["summary"]["not_run"], 3)
         tries = 1 + describe.CONTENT_RETRIES
         self.assertLessEqual(len(self.cloud.describe_requests()), 4 * tries)
+
+    def test_replies_that_were_cut_off_are_counted_and_marked(self):
+        text = json.dumps(dict(fake_llm.DEFAULT_REPLY, title="Cut", text="A line.\n" * 50))
+        self.cloud.reply = fake_llm.Reply(text[:text.index('"text"') + 40], finish="length")
+        report = compare_models.compare(self.config, "cloud", sample=3,
+                                        ctx=jobs.JobContext("compare"),
+                                        sleep=lambda seconds: None)
+        [cloud] = report["endpoints"]
+        self.assertEqual((cloud["summary"]["described"], cloud["summary"]["truncated"]), (3, 3))
+        record = next(iter(cloud["results"].values()))
+        self.assertTrue(record["truncated"])
+        self.assertIn("tags", record["missing"])
+        page = compare_models.render_html(report)
+        self.assertIn("Cut off (used)", page)
+        self.assertIn("cut off at the length limit: no ", page)
 
     def test_requests_cut_short_by_a_stop_are_not_failures(self):
         self.cloud.queue(fake_llm.HttpError(503), fake_llm.unauthorized())
@@ -293,7 +310,10 @@ class CompareTest(support.TempBaseMixin, unittest.TestCase):
         for key in other_ids:
             self.assertEqual(cloud["results"][key]["kind"], "not_run")
             self.assertIn("kept on local endpoints", cloud["results"][key]["error"])
-        self.assertEqual(cloud["summary"]["described"], len(report["images"]) - len(other_ids))
+        self.assertEqual(cloud["summary"]["described"], len(report["images"]) - len(other_ids),
+                         (cloud["stopped"], {key: (record["kind"], record["error"])
+                                             for key, record in cloud["results"].items()
+                                             if not record["ok"]}))
         sent = [request["prompt"] for request in self.cloud.describe_requests()]
         self.assertFalse(any("Notes for the other library." in text for text in sent))
         # Named with --library, it is sent.

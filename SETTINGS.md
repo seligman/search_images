@@ -10,7 +10,8 @@ file asks you to reload it before it saves anything. `settings.py` checks
 too: if the file changed while it was open, **Save and exit** asks whether
 to save over those changes, reload the file or exit without saving. The
 helper module path can only be set in the file or with `settings.py`, never
-from a web page.
+from a web page, and so can the program and command line of the model
+server (`local_server`).
 
 ## Where the file lives
 
@@ -36,6 +37,9 @@ The same variable is honored by every script.
     "helper":   "path/to/helper.py",
     "reader_threads": 6,
     "purge_after_days": 30,
+    "local_server": { ... },
+    "nadir_fill_deg": 0,
+    "zenith_fill_deg": 0,
     "libraries": [ { ... }, { ... } ]
 }
 ```
@@ -120,7 +124,15 @@ An endpoint has these settings. Only `name`, `preset` (or `kind`) and
   stays legible.
 - `timeout` - seconds to wait for a reply (default 180).
 - `max_output_tokens` - the longest reply (default 4000; 8000 for Claude
-  models that always think, since thinking counts against it).
+  models that always think, since thinking counts against it). A reply cut
+  off at this limit is kept when it got as far as the title and the
+  description (the rest of it is left out; its provenance says `truncated`
+  and lists the `missing_fields`); otherwise the picture is asked for again
+  with twice the limit (once; when the service refuses that many tokens,
+  the picture's other tries use this limit). A reply whose transcribed
+  text loops until it is cut off is asked for again first, and kept only
+  when the retries do no better. A cut-off reply that did not reach
+  `private_info` is stored as showing private information.
 - `extra` - fields merged into every request, for anything the presets do
   not cover, for example `{"temperature": 0.2}` or
   `{"reasoning_effort": "low"}`. Nested objects are merged; a `null` value
@@ -250,6 +262,106 @@ JPEG holding the image as it will be sent. Declare a third parameter,
 original file. The `stat(path)` hook, when present, supplies the size and
 time of every image the scanner lists.
 
+## local_server
+
+Optional: lets the Settings page (and describing) start and stop a local
+model server, llama.cpp's `llama-server`, for one of the endpoints. Without
+it, start the server yourself.
+
+```
+"local_server": {
+    "enabled": true,
+    "endpoint": "local",
+    "binary": "C:\\path\\to\\llama-server.exe",
+    "models_dir": "C:\\path\\to\\models",
+    "model": "model.gguf",
+    "port": 8080,
+    "slots": 4,
+    "ctx_per_slot": 8192,
+    "stop_at": "03:30"
+}
+```
+
+- `enabled` - `true` turns it on (default `false`).
+- `endpoint` - the endpoint the server answers for. Its base URL must be
+  `http://127.0.0.1:<port>/v1` (or `localhost`); the Settings page says so
+  when it is not, and moves it along when you change the port there (an
+  API key typed for the endpoint is then removed, as for any change of
+  its address).
+- `models_dir` - the folder with the model files (`.gguf`); a relative path
+  is next to `config.json`. The Settings page offers the files in it and
+  in its sub-folders (one level down) and nothing else.
+- `model` - the model file, relative to `models_dir`.
+- `mmproj` - the vision projector, relative to `models_dir`; `""` (the
+  default) finds it: the file named like the model with `mmproj` added
+  before the extension (`model.mmproj.gguf` for `model.gguf`), or, for a
+  model in a sub-folder, the file there with `mmproj` in its name. After
+  starting, the server must report that it can see images, or it is
+  stopped again.
+- `binary` - the `llama-server` program (a full path, a path relative to
+  `config.json`, or a name found on the PATH).
+- `port` (default 8091), `slots` (requests at the same time, `-np`; default
+  4) and `ctx_per_slot` (context per slot, default 8192; the server gets
+  `-c slots * ctx_per_slot`).
+- `extra_args` - more arguments for `llama-server`, such as
+  `["--threads", "8"]`.
+- `launch_command` - a command line of your own that replaces the
+  program and its arguments, as a list, for a wrapper script (one that
+  takes a lock first, say). These words in it are replaced: `{model_path}`,
+  `{mmproj_path}` (the full paths; `""` without a projector), `{port}`,
+  `{slots}`, `{ctx}` (slots times context), `{ctx_per_slot}`, `{stop_at}`
+  (the `stop_at` time, `""` for none) and `{python}` (the Python that runs
+  the server). `extra_args` is not added to it. The wrapper should stop its
+  own `llama-server` when it gets Ctrl+Break (Windows) or SIGTERM; if it
+  ends without doing so, the server it started is still stopped (see
+  below).
+- `auto_start` - a Describe, Scan + describe or Refine job (and `scan.py`)
+  that uses this endpoint starts the server when it is not running, and
+  waits for it to load the model (default `true`).
+- `auto_stop` - such a job stops the server again when it has finished, if
+  it started it itself (default `true`). A server started on the Settings
+  page keeps running.
+- `stop_at` - `"HH:MM"` (24-hour clock, local time), or `""` for none:
+  every day the web server stops the server at that time, if these tools
+  started it before that time (it keeps trying for an hour if the stop
+  fails; a server started with **Start** after the stop time keeps
+  running, also when the web server is restarted). Jobs that use this
+  endpoint stop ten minutes before (they are listed as interrupted and can
+  be resumed), and from then until an hour after that time no job uses it
+  or starts it; a job started then fails with a message that says until
+  when. **Start** on the Settings page still works in that hour.
+- `start_timeout` - seconds to wait for the server to load its model
+  (default 900); after that it is stopped again.
+
+The server starts in its own process group, listening on `127.0.0.1` only,
+with `-fa on --reasoning off --no-webui`; its output goes to
+`data/logs/model-server.log`. **Stop** asks it to stop (Ctrl+Break on
+Windows, SIGTERM elsewhere) and, if it is still running after 20 seconds,
+ends it and every process it started. Only a server started by these tools
+is ever stopped (its process id and start time are kept in
+`data/model-server.json`, so a restarted web server can still stop it); a
+server that already answers on the port is used as it is (also while it
+still loads its model) and left alone. The processes the server started
+count as part of it, even when a wrapper in `launch_command` has ended
+before them (on Windows: the processes whose parent it was, started after
+it; elsewhere: its process group). If its port still answers after the
+stop, the panel says so instead of "stopped". The web server, its jobs and
+`scan.py` share `data/model-server.json`, and change it only while they
+hold `data/model-server.lock`.
+
+The Settings page may change `model`, `mmproj`, `slots`, `ctx_per_slot`,
+`port`, `stop_at`, `auto_start` and `auto_stop`. The other settings
+(`enabled`, `endpoint`, `binary`, `models_dir`, `extra_args`,
+`launch_command`, `start_timeout`) are only changed here, in
+`config.json`: a web page can never choose which program runs.
+
+`local_server` may also be a list of such objects, one per endpoint (for
+example a small model for describing and a larger one for the refine
+pass); each then logs to `data/logs/model-server-<endpoint>.log`. Most
+graphics cards hold one model at a time: a job that needs the other
+server waits for it to start, so stop the first one (auto_stop does this
+after each job).
+
 ## reader_threads
 
 How many images the scanner reads and decodes at the same time (1 to 32,
@@ -259,9 +371,30 @@ memory.
 ## purge_after_days
 
 A file that disappears from a library is marked missing rather than removed,
-so its description comes back if the file returns. After this many days
-(default 30) missing files are removed from the database. Use a negative
-number to never remove them.
+so its description (and your own edits of it) comes back if the file
+returns. After this many days (default 30) missing files are removed from
+the database, with your edits of them (a copy of the picture that is still
+in a library keeps the edits). Use a negative number to never remove
+them.
+
+## nadir_fill_deg, zenith_fill_deg
+
+Unstitched 360-degree photos (Insta360 `.insp` frames) are stitched into a
+panorama here. Right below the camera there may be a tripod's legs, or the
+hand that held it. `nadir_fill_deg` covers that many degrees around the
+bottom of the panorama with a soft fill: the colours around it, spread
+smoothly towards the middle, with no hard edge (it also fades in over 3
+more degrees). It is off by default (0), because on clean ground the fill
+only leaves a grey disc where the ground was. Turn it on, for example with
+6 (about what a tripod's legs or a hand take), if your 360 photos show a
+tripod or a hand at the bottom. A hand-held selfie stick lies between the
+two lenses, where the stitch hides it anyway. `zenith_fill_deg` does the
+same at the top (default 0: none; set it when the camera hung from
+something). At most 30. Panoramas the camera stitched itself, and other
+360 photos, are shown as they are.
+
+After a change, the next scan stitches the 360-degree photos in the index
+again (their previews, panoramas and thumbnails; descriptions are kept).
 
 ## libraries
 
@@ -311,6 +444,29 @@ A list of folders to scan. Each library is one object:
   letters". It can help the descriptions, but it is sent to the endpoint's
   service, so do not put anything private here. Names of people in the
   notes are not used to identify anyone.
+- `refine` - optional: a second endpoint that describes the library's
+  documents and screenshots again (the refine pass; see README, "Refining
+  documents and screenshots"). `{}` or no `endpoint` turns it off (the
+  default):
+  - `endpoint` - the endpoint (or group) that refines.
+  - `photo_types` - the kinds of picture refined; default
+    `["screenshot", "document", "scan"]` (the others are `photo`,
+    `artwork`, `meme` and `diagram`).
+  - `document_types` - and the document types refined whatever the kind of
+    picture; default `["receipt", "letter", "form", "card_or_id", "ticket",
+    "chat", "web", "app", "handwriting", "book_page", "slide"]` (the others
+    are `whiteboard`, `sign`, `menu` and `map`).
+  - `max_output_tokens` - the longest answer, in tokens (default 8000; at
+    least 500). It is used for the refine pass when it is larger than the
+    endpoint's own `max_output_tokens`.
+
+  The refine pass always asks for the standard (core) fields. Hidden
+  pictures are only refined by an endpoint on this computer or the local
+  network (with only cloud refine endpoints, the Manage page leaves them
+  out of the count). A refine endpoint for a cloud service needs its API
+  key before the pass can start. A cut-off refine answer keeps the earlier
+  description's values for the fields it did not reach, and never clears
+  its private or sensitive flags.
 - `export` - optional saved options for publishing the library as a static
   website (see README, "Publishing a library"). The Export dialog on the
   Manage page writes them when an export starts (only the options that
@@ -322,9 +478,13 @@ A list of folders to scan. Each library is one object:
     JPEG, BMP becomes PNG, and an unstitched dual-fisheye 360-degree photo
     becomes its stitched panorama) or `"none"` (thumbnails only).
   - `location` - `true` adds GPS positions (rounded to about 10 m), the map,
-    and the AI model's separate landmark and place-guess fields (extended
-    metadata); default `false`. Titles and descriptions are published as
-    written either way, and can name a place a picture shows.
+    the place names (town, region and country, when they were downloaded:
+    see "Place names" in the README; the pages then credit GeoNames at their
+    foot, the map in a corner) and the AI model's separate landmark and place-guess fields
+    (extended metadata); default `false`. Titles and descriptions are
+    published as written either way (with your own edits to the title,
+    description and tags in place of the model's), and can name a place a
+    picture shows.
   - `file_names`, `folders` - `true` publishes file names or folder names
     (searchable); default `false`.
   - `exclude_types` - picture types left out; default
@@ -461,6 +621,58 @@ count towards the "most of the library vanished" safety check.
             "endpoint": "cloud",
             "metadata": "extended",
             "context_notes": "Holiday photos: beaches, hiking and old towns."
+        }
+    ]
+}
+```
+
+With a model server the Settings page starts and stops, and a stronger
+model for the documents of the Family library (`local_server` and
+`refine`, both optional):
+
+```
+{
+    "endpoints": [
+        {
+            "name": "local",
+            "preset": "llamacpp",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "model": "your-vision-model"
+        },
+        {
+            "name": "large",
+            "preset": "llamacpp",
+            "base_url": "http://127.0.0.1:8081/v1",
+            "model": "your-larger-model"
+        }
+    ],
+    "default_endpoint": "local",
+    "local_server": [
+        {
+            "enabled": true,
+            "endpoint": "local",
+            "binary": "C:\\path\\to\\llama-server.exe",
+            "models_dir": "C:\\path\\to\\models",
+            "model": "model.gguf",
+            "port": 8080,
+            "stop_at": "03:30"
+        },
+        {
+            "enabled": true,
+            "endpoint": "large",
+            "binary": "C:\\path\\to\\llama-server.exe",
+            "models_dir": "C:\\path\\to\\models",
+            "model": "your-model.gguf",
+            "port": 8081,
+            "slots": 2,
+            "ctx_per_slot": 16384
+        }
+    ],
+    "libraries": [
+        {
+            "name": "Family",
+            "path": "C:\\Photos\\Family",
+            "refine": {"endpoint": "large"}
         }
     ]
 }

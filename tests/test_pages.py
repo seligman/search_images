@@ -28,7 +28,8 @@ TEMPLATES = os.path.join(support.REPO, "templates")
 # Each page: (URL, template, the script that runs it).
 PAGES = (("/", "page.html", "app.js"), ("/detail", "detail.html", "detail.js"),
          ("/map", "map.html", "map.js"), ("/manage", "manage.html", "manage.js"),
-         ("/settings", "settings.html", "settings.js"))
+         ("/settings", "settings.html", "settings.js"),
+         ("/duplicates", "duplicates.html", "duplicates.js"))
 # Element ids the scripts create themselves (not in a template).
 CREATED_IDS = {"shell-header", "shell-toasts", "shell-library", "shell-job",
                "no-endpoint-notice", "server-gone"}
@@ -148,7 +149,7 @@ class ScriptTest(unittest.TestCase):
 
     def test_new_scripts_use_only_text_for_data(self):
         # The admin pages build every element with SHELL.el / textContent.
-        for name in ("shell.js", "manage.js", "settings.js"):
+        for name in ("shell.js", "manage.js", "settings.js", "duplicates.js"):
             self.assertIsNone(re.search(r"\.(innerHTML|outerHTML)\b", read(STATIC, name)),
                               name)
 
@@ -206,7 +207,8 @@ class ExportPageTest(support.TempBaseMixin, unittest.TestCase):
         # The admin pages and their scripts are not part of an export (nor,
         # without location, the map).
         for name in ("manage.html", "settings.html", "manage.js", "settings.js",
-                     "assets/manage.js", "assets/settings.js", "map.html", "assets/map.js"):
+                     "assets/manage.js", "assets/settings.js", "map.html", "assets/map.js",
+                     "duplicates.html", "assets/duplicates.js", "assets/duplicates.css"):
             self.assertFalse(os.path.exists(os.path.join(output, name)), name)
 
 

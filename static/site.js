@@ -34,20 +34,25 @@
      SITE.imageUrl(record)         the original (or what an export ships), or null
      SITE.tileUrl(z, x, y), SITE.tilesMax(), SITE.tileSize()   map tiles
 
+   SITE.shuffleSeed(renew) is the seed of the "shuffle" sort: one per
+   browser tab (a new one with renew).
+
    SITE.title is the name of the site ("Image Search", or an export's
    title); SITE.originalLabel the words of the link to SITE.imageUrl.
 
    Search state in the address (SITE.searchState)
      read(search)  -> {q, lib, sort, filters: {group: [values]}, group,
-                       size, hidden, junk, sensitive, ids, view} from a
-                       query string (default: the page's)
+                       size, hidden, junk, sensitive, ids, view, from, to}
+                       from a query string (default: the page's)
      params(state) -> the query string for a state ("" when all default)
      The facet selections use the group names of SearchCore.FACETS as
      parameter names, one per value: ?q=beach&type=photo&tags=sunset.
      ids holds the pictures picked on the map ("Show these in the grid"),
      written by SITE.idList.encode; view the map's centre and zoom
      ("lat,lon,zoom"), so the search page can lead back to the same place.
-     The map itself never takes ids (mapUrl leaves them out).
+     The map itself never takes ids (mapUrl leaves them out). from and to
+     are the timeline's choice of dates (SearchCore's range option:
+     "YYYY", "YYYY-MM" or "YYYY-MM-DD").
 
    SITE.idList.encode(ids, records) -> the ids value for a list of picture
      ids; SITE.idList.decode(text, records) -> {ids: [...], stale} (stale:
@@ -100,9 +105,9 @@ var SITE = (function () {
 
     // The facet groups of SearchCore.FACETS (a test keeps the two in step).
     var FACET_KEYS = ["library", "type", "people", "setting", "time", "event", "year", "month",
-                      "camera", "has", "tags", "subjects", "animals", "food", "vehicles",
-                      "colors"];
-    var SORTS = ["relevance", "newest", "oldest", "name", "quality"];
+                      "place", "camera", "has", "tags", "subjects", "animals", "food",
+                      "vehicles", "colors"];
+    var SORTS = ["relevance", "newest", "oldest", "name", "quality", "shuffle"];
     var SIZES = ["s", "m", "l"];
     var SENSITIVE = ["show", "strict"];
     // At most this many values per facet group are taken from an address.
@@ -111,12 +116,14 @@ var SITE = (function () {
     // The longest ids value read from an address (see idList).
     var MAX_IDS_TEXT = 200000;
     var IDS_RE = /^[0-9a-z]+(?:[._-][0-9a-z]+)*$/;
+    // A date of the timeline's range: "YYYY", "YYYY-MM" or "YYYY-MM-DD".
+    var DATE_KEY_RE = /^\d{4}(?:-(?:0[1-9]|1[0-2])(?:-(?:0[1-9]|[12]\d|3[01]))?)?$/;
     // "lat,lon,zoom" of the map (see readView).
     var VIEW_RE = /^(-?\d{1,3}(?:\.\d{1,8})?),(-?\d{1,3}(?:\.\d{1,8})?),(\d{1,2})$/;
 
     function emptyState() {
         return {q: "", lib: "", sort: "", filters: {}, group: true, size: "",
-                hidden: false, junk: false, sensitive: "", ids: "", view: ""};
+                hidden: false, junk: false, sensitive: "", ids: "", view: "", from: "", to: ""};
     }
 
     // A map view from an address: "lat,lon,zoom" with the latitude within
@@ -164,6 +171,10 @@ var SITE = (function () {
         var ids = params.get("ids") || "";
         state.ids = ids.length <= MAX_IDS_TEXT && IDS_RE.test(ids) ? ids : "";
         state.view = readView(params.get("view"));
+        ["from", "to"].forEach(function (key) {
+            var value = params.get(key) || "";
+            state[key] = DATE_KEY_RE.test(value) ? value : "";
+        });
         return state;
     }
 
@@ -209,7 +220,42 @@ var SITE = (function () {
         if (view) {
             params.set("view", view);
         }
+        ["from", "to"].forEach(function (key) {
+            if (typeof state[key] === "string" && DATE_KEY_RE.test(state[key])) {
+                params.set(key, state[key]);
+            }
+        });
         return params.toString();
+    }
+
+    /* ---------- The shuffled order ------------------------------------------- */
+
+    // The seed of the "shuffle" sort (SearchCore): one per browser tab
+    // (sessionStorage), so the order holds while the grid grows, on the map
+    // and after a reload. renew: a new one (choosing "Shuffle" again).
+    var SHUFFLE_KEY = "searchImages.shuffleSeed";
+    var shuffleValue = null;
+
+    function shuffleSeed(renew) {
+        if (shuffleValue !== null && !renew) {
+            return shuffleValue;
+        }
+        var stored = null;
+        try {
+            stored = root.sessionStorage ? root.sessionStorage.getItem(SHUFFLE_KEY) : null;
+        } catch (error) {
+            stored = null;
+        }
+        shuffleValue = !renew && /^\d{1,10}$/.test(stored || "") ? Number(stored) >>> 0
+            : Math.floor(Math.random() * 4294967296) >>> 0;
+        try {
+            if (root.sessionStorage) {
+                root.sessionStorage.setItem(SHUFFLE_KEY, String(shuffleValue));
+            }
+        } catch (error) {
+            // Only this page keeps it, then.
+        }
+        return shuffleValue;
     }
 
     /* ---------- Lists of pictures in an address (idList) --------------------- */
@@ -561,8 +607,11 @@ var SITE = (function () {
             if (words.length) {
                 rec.ex = words.join(", ");
             }
-            var version = detail.provenance && detail.provenance.prompt_ver;
-            var older = typeof version === "number" ? version <= 4
+            var version = typeof detail.prompt_ver === "number" ? detail.prompt_ver
+                : detail.provenance && detail.provenance.prompt_ver;
+            // (Only an edit of the owner's, on a picture not described yet.)
+            var described = detail.described !== false;
+            var older = !described ? false : typeof version === "number" ? version <= 4
                 : info.photo_type === undefined && info.title === undefined;
             // Version 4 rated sharpness from 0 to 1: no 1-5 scores then.
             var aesthetic = older ? null : score(info.aesthetic);
@@ -576,7 +625,9 @@ var SITE = (function () {
             if (info.private_info === true) {
                 rec.pr = 1;
             }
-            rec.ds = 1;
+            if (described) {
+                rec.ds = 1;
+            }
             if (older) {
                 rec.v4 = 1;
             }
@@ -585,12 +636,28 @@ var SITE = (function () {
         if (/^\d{4}-\d{2}-\d{2}/.test(taken)) {
             rec.dk = taken.slice(0, 10);
             rec.ts = taken;
+            // (A date from the file's time is no date taken: see du.)
+            if (detail.taken_source === "mtime") {
+                rec.du = 1;
+            }
         }
         if (detail.camera) {
             rec.cm = detail.camera;
         }
         if (typeof detail.lat === "number" && typeof detail.lon === "number") {
             rec.gp = 1;
+        }
+        var place = detail.place && typeof detail.place === "object" ? detail.place : null;
+        if (place && text(place.country)) {
+            [["ci", "city"], ["rg", "region"], ["co", "country"], ["cc", "cc"]].forEach(
+                function (pair) {
+                    if (text(place[pair[1]])) {
+                        rec[pair[0]] = text(place[pair[1]]);
+                    }
+                });
+            if (rec.ci && typeof place.km === "number" && place.km >= 0) {
+                rec.km = Math.round(place.km);
+            }
         }
         if (detail.width) {
             rec.w = detail.width;
@@ -603,6 +670,9 @@ var SITE = (function () {
         }
         if (detail.hidden) {
             rec.h = 1;
+        }
+        if (detail.edited) {
+            rec.ed = 1;
         }
         return rec;
     }
@@ -974,7 +1044,8 @@ var SITE = (function () {
         refreshIndex: refreshIndex,
         loadRecord: loadRecord,
         loadLocations: loadLocations,
-        compactRecord: compactRecord
+        compactRecord: compactRecord,
+        shuffleSeed: shuffleSeed
     };
 })();
 

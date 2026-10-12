@@ -461,6 +461,12 @@
             if (counts.hidden) {
                 stats.appendChild(stat("hidden", counts.hidden, "Pictures hidden from search"));
             }
+            if (counts.pending_hidden) {
+                stats.appendChild(stat("hidden, kept here", counts.pending_hidden, "Hidden " +
+                    "pictures are never sent to " + (info.cloud_hosts || []).join(", ") +
+                    ", so they stay undescribed unless an endpoint on this computer or " +
+                    "network describes them"));
+            }
             card.appendChild(stats);
         } else if (!off) {
             card.appendChild(el("p", {className: "card-note", text: counts.missing ?
@@ -481,6 +487,16 @@
         if (info.ready && info.warning) {
             card.appendChild(el("p", {className: "card-note card-problem", text: info.warning +
                 " Start it before describing; scanning works without it."}));
+        }
+        var refining = lib.refine_info || {};
+        if (refining.enabled) {
+            card.appendChild(el("p", {className: "card-note" + (refining.ready ? "" :
+                " card-problem"), text: refining.ready ? "Documents and screenshots are " +
+                "described again (refined) by " + refining.settings.endpoint +
+                (refining.cloud ? ", which sends them to " + refining.cloud_hosts.join(", ")
+                    : "") + "." + (refining.hidden ? " " + fmt.plural(refining.hidden,
+                    "hidden picture") + " stay as they are (hidden pictures are not sent " +
+                    "there)." : "") : refining.problem}));
         }
 
         var actions = el("div", {className: "card-actions"});
@@ -516,6 +532,26 @@
                 fmt.number(counts.stale) + ")", "", "describe", {redescribe_stale: true},
                 lib.id + ":stale", off || noModel,
                 modelTitle || "Describe again the pictures described with older instructions"));
+        }
+        var refineInfo = lib.refine_info || {};
+        if (refineInfo.enabled) {
+            var refinePending = refineInfo.pending;
+            actions.appendChild(jobButton("Refine documents" + (typeof refinePending === "number" ?
+                " (" + fmt.number(refinePending) + ")" : ""), "", "refine", {}, lib.id + ":refine",
+                off || !refineInfo.ready || refinePending === 0,
+                !refineInfo.ready ? refineInfo.problem : refinePending === 0 ?
+                    "Every document and screenshot is refined already" :
+                    "Describe the documents and screenshots again with " +
+                    refineInfo.settings.endpoint + ", which reads their text more fully"));
+            if (refineInfo.failed) {
+                actions.appendChild(jobButton("Retry failed refine (" +
+                    fmt.number(refineInfo.failed) + ")", "", "refine", {retry_failed: true},
+                    lib.id + ":refine-retry", off || !refineInfo.ready,
+                    !refineInfo.ready ? refineInfo.problem : "Try again to refine the " +
+                        fmt.plural(refineInfo.failed, "picture") + " that failed 3 times, " +
+                        "with the others still waiting (their earlier descriptions are kept " +
+                        "until then)"));
+            }
         }
         if (counts.failed) {
             actions.appendChild(jobButton("Retry failed (" + fmt.number(counts.failed) + ")",
@@ -788,10 +824,36 @@
                         library: lib ? lib.name : "", params: params});
     }
 
+    // A refine job whose endpoint is a cloud service: say what goes where (every time).
+    function confirmRefine(lib, params) {
+        var info = lib && lib.refine_info;
+        if (!info || !info.cloud) {
+            return Promise.resolve(true);
+        }
+        // (The counts leave out hidden pictures, which are never sent there.)
+        var number = params && params.retry_failed && typeof info.pending === "number" ?
+            info.pending + (info.failed || 0) : info.pending;
+        var count = typeof number === "number" ? fmt.plural(number, "picture") :
+            "The documents and screenshots";
+        return SHELL.confirm({
+            title: "Send documents to a cloud service?",
+            message: [
+                el("p", {text: count + " of " + lib.name + " will be sent to " +
+                    info.cloud_hosts.join(", ") + " (the refine endpoint " +
+                    info.settings.endpoint + ") to be described again. Documents and " +
+                    "screenshots often show private text; hidden pictures are never sent."}),
+                el("p", {className: "muted", text: "The service charges for each picture."})
+            ],
+            confirmText: "Send pictures"
+        });
+    }
+
     function queueJob(kind, lib, params, found) {
         params = params || {};
         var libraries = lib ? [lib] : enabledLibraries();
-        return confirmCloud(kind, libraries, params, found).then(function (ok) {
+        var ask = kind === "refine" ? confirmRefine(lib, params) :
+            confirmCloud(kind, libraries, params, found);
+        return ask.then(function (ok) {
             if (!ok) {
                 return null;
             }
@@ -1331,6 +1393,119 @@
         select.value = current || "";
     }
 
+    // "card_or_id" -> "card or ID", "book_page" -> "book page".
+    function kindLabel(value) {
+        return value === "card_or_id" ? "card or ID" : value.replace(/_/g, " ");
+    }
+
+    // The library dialog's refine pass settings: {node, value(), same(value)}.
+    // fields.refine gets the server's error message for them.
+    function refineSection(lib, fields) {
+        var choices = state.refine_choices || {photo_types: [], document_types: [],
+                                               defaults: {}};
+        var info = (lib && lib.refine_info ? lib.refine_info.settings : choices.defaults) || {};
+        var endpoint = el("select");
+        endpoint.appendChild(el("option", {value: "", text: "Off (no refine pass)"}));
+        var seen = {};
+        state.endpoints.forEach(function (item) {
+            if (item.enabled === false || !item.model) {
+                return;
+            }
+            seen[item.name.toLowerCase()] = true;
+            endpoint.appendChild(el("option", {value: item.name, text: item.name + " \u2014 " +
+                item.model + (item.local ? "" : " (cloud: " + item.host + ")")}));
+        });
+        if (info.endpoint && !seen[info.endpoint.toLowerCase()]) {
+            endpoint.appendChild(el("option", {value: info.endpoint, text: info.endpoint +
+                                               " (not available: missing or turned off)"}));
+        }
+        endpoint.value = info.endpoint || "";
+        var note = el("span", {className: "field-hint"});
+        var endpointField = field("Refine with", endpoint, {after: note, hint: "Usually a " +
+            "larger model than the one that describes the library."});
+
+        function boxes(values, chosen) {
+            var inputs = {};
+            var row = el("div", {className: "check-columns"});
+            values.forEach(function (value) {
+                var item = check(kindLabel(value), (chosen || []).indexOf(value) >= 0);
+                inputs[value] = item.input;
+                row.appendChild(item.node);
+            });
+            return {node: row, inputs: inputs};
+        }
+        var photoTypes = boxes(choices.photo_types, info.photo_types);
+        var documentTypes = boxes(choices.document_types, info.document_types);
+        var tokens = el("input", {type: "number", className: "input", min: 500, step: 500,
+                                  inputMode: "numeric",
+                                  value: String(info.max_output_tokens || "")});
+        var tokensField = field("Longest answer (tokens)", tokens, {hint: "Room for the " +
+            "transcribed text; " + ((choices.defaults || {}).max_output_tokens || 8000) +
+            " by default."});
+        var error = el("span", {className: "field-error", hidden: true,
+                                attrs: {"aria-live": "polite"}});
+        var details = el("div", {className: "refine-details"}, [
+            el("div", {className: "field"}, [
+                el("span", {className: "field-label", text: "Kinds of picture"}),
+                photoTypes.node]),
+            el("div", {className: "field"}, [
+                el("span", {className: "field-label", text: "Kinds of document"}),
+                documentTypes.node]),
+            tokensField.node
+        ]);
+        var node = el("details", {className: "more", open: Boolean(info.endpoint)}, [
+            el("summary", {text: "Refine documents and screenshots"}),
+            el("p", {className: "field-hint", text: "Pictures of these kinds that are already " +
+                "described can be described again by another endpoint, with more room for " +
+                "their text: receipts, letters and screenshots get a fuller transcription. " +
+                "Start it with Refine documents on the library's card."}),
+            endpointField.node, details, error
+        ]);
+        fields.refine = {node: node, error: error, control: endpoint};
+
+        function chosen(inputs) {
+            return Object.keys(inputs).filter(function (key) {
+                return inputs[key].checked;
+            });
+        }
+
+        function update() {
+            details.hidden = !endpoint.value;
+            var picked = endpointByName(endpoint.value);
+            note.textContent = picked && !picked.local ? "Sends these pictures to " +
+                picked.host + " (" + picked.preset_label + ")." : "";
+            note.className = "field-hint" + (note.textContent ? " result-line bad" : "");
+            note.hidden = !note.textContent;
+        }
+        endpoint.addEventListener("change", update);
+        update();
+
+        function value() {
+            var number = parseInt(tokens.value, 10);
+            return {endpoint: endpoint.value, photo_types: chosen(photoTypes.inputs),
+                    document_types: chosen(documentTypes.inputs),
+                    max_output_tokens: isFinite(number) ? number : null};
+        }
+
+        function same(current) {
+            var stored = (lib && lib.refine_info ? lib.refine_info.settings : null) || {};
+            if (!current.endpoint && !stored.endpoint) {
+                return true;
+            }
+            function sorted(list) {
+                return (list || []).slice().sort();
+            }
+            return JSON.stringify([current.endpoint, sorted(current.photo_types),
+                                   sorted(current.document_types),
+                                   current.max_output_tokens]) ===
+                JSON.stringify([stored.endpoint || "", sorted(stored.photo_types),
+                                sorted(stored.document_types),
+                                stored.max_output_tokens || null]);
+        }
+
+        return {node: node, value: value, same: same};
+    }
+
     function endpointByName(name) {
         var found = null;
         state.endpoints.forEach(function (endpoint) {
@@ -1459,10 +1634,11 @@
         fields.context_notes = field("Context notes", notes, {optional: true, hint: "Sent with " +
             "every picture to the AI model to help it, and may show up in descriptions. " +
             "Leave out anything private."});
+        var refineBox = refineSection(lib, fields);
         body.appendChild(el("fieldset", {className: "group"}, [
             el("legend", {text: "Describing"}), order,
             el("div", {className: "field-grid"}, [fields.endpoint.node, fields.metadata.node]),
-            fields.context_notes.node
+            fields.context_notes.node, refineBox.node
         ]));
 
         // Other
@@ -1644,8 +1820,15 @@
                 previews: previews.input.checked,
                 enabled: enabled.input.checked
             };
+            var refineValue = refineBox.value();
             if (adding) {
+                if (refineValue.endpoint) {
+                    data.refine = refineValue;
+                }
                 return data;
+            }
+            if (!refineBox.same(refineValue)) {
+                data.refine = refineValue.endpoint ? refineValue : {};
             }
             // Only what changed: a library set up by hand may hold values
             // (such as a relative folder) that this page would not accept.

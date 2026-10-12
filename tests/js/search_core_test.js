@@ -1038,6 +1038,514 @@ test("did you mean", function () {
     assert.strictEqual(SearchCore.suggest(records, ""), null);
 });
 
+/* ---------- Synonyms, real things and text-only matches --------------------- */
+
+test("synonyms find other words, below the word itself", function () {
+    var records = [
+        {i: 1, t: "Children at the park", g: ["child", "park"], dk: "2024-01-01"},
+        {i: 2, t: "Kids on the swings", g: ["kid", "swing"], dk: "2019-01-01"},
+        {i: 3, t: "Toddler in a sandbox", dk: "2023-01-01"},
+        {i: 4, t: "Adults at the park", dk: "2025-01-01"}
+    ];
+    // The word itself first (although older), then its synonyms.
+    assert.deepStrictEqual(items(records, "kids"), [2, 1, 3]);
+    assert.deepStrictEqual(items(records, "children"), [1, 2, 3]);
+    // A toddler is a kid, but most kids are not toddlers.
+    assert.deepStrictEqual(items(records, "toddler"), [3]);
+    // Never for quoted words or other fields than tag: and animal:.
+    assert.deepStrictEqual(items(records, "\"kids\""), [2]);
+    assert.deepStrictEqual(items(records, "title:kids"), [2]);
+    assert.deepStrictEqual(items(records, "tag:kids"), [2, 1]);
+    // A synonym scores less than the word itself, in the same field.
+    var cars = [
+        {i: 1, t: "Automobile at the show", dk: "2025-01-01"},
+        {i: 2, t: "Car at the show", dk: "2018-01-01"}
+    ];
+    assert.deepStrictEqual(items(cars, "car"), [2, 1]);
+    assert.deepStrictEqual(items(cars, "automobile"), [1, 2]);
+    // Excluding a word excludes its synonyms too.
+    assert.deepStrictEqual(items(records, "park -kids"), [4]);
+    // The synonyms are marked as matches.
+    assert.deepStrictEqual(SearchCore.highlights("Children at the park", "kids"), [[0, 8]]);
+    assert.deepStrictEqual(SearchCore.highlights("Children at the park", "\"kids\""), []);
+});
+
+test("a synonym stays below the word itself in tags, and out of the text in a picture", function () {
+    var records = [
+        {i: 1, t: "Mother duck with her ducklings", s: ["mother duck"], a: ["duck"],
+         dk: "2025-01-01"},
+        {i: 2, t: "Woman holding a toddler", g: ["mom", "toddler"], dk: "2010-01-01"},
+        {i: 3, t: "Newspaper on a table", o: "MOTHER'S DAY SALE", dk: "2024-01-01"}
+    ];
+    // The picture tagged "mom" first; a newspaper that reads "mother" is
+    // not found at all (the word itself finds it).
+    assert.deepStrictEqual(items(records, "mom"), [2, 1]);
+    assert.deepStrictEqual(items(records, "mother"), [1, 2, 3]);
+});
+
+test("a word with other meanings only finds its synonym one way", function () {
+    var records = [
+        {i: 1, t: "Autumn leaves in the park", dk: "2025-01-01"},
+        {i: 2, t: "Rock fall warning sign", dk: "2024-01-01"},
+        {i: 3, t: "Walk in the woods", dk: "2023-01-01"},
+        {i: 4, t: "Old wood table", dk: "2022-01-01"},
+        {i: 5, t: "Forest trail", dk: "2021-01-01"},
+        {i: 6, t: "A gift for grandma", dk: "2020-01-01"},
+        {i: 7, t: "Present day skyline", dk: "2019-01-01"}
+    ];
+    // "fall leaves" are autumn leaves; but "autumn" is no rock fall.
+    assert.deepStrictEqual(items(records, "fall"), [2, 1]);
+    assert.deepStrictEqual(items(records, "autumn"), [1]);
+    // "forest" does not find every wooden table.
+    assert.deepStrictEqual(items(records, "forest"), [5]);
+    assert.deepStrictEqual(items(records, "woods").slice(0, 2), [3, 4]);
+    assert.ok(items(records, "woods").indexOf(5) > 0);
+    // A gift is a present; "present" is not always a gift.
+    assert.deepStrictEqual(items(records, "gift"), [6]);
+    assert.deepStrictEqual(items(records, "present"), [7, 6]);
+});
+
+test("facet values of tags and subjects group plurals", function () {
+    var records = [
+        {i: 1, g: ["dog", "glass"], s: ["Golden Retriever"]},
+        {i: 2, g: ["dogs", "glasses"], s: ["golden retrievers"]},
+        {i: 3, g: ["Dogs"], s: ["golden retrievers"]},
+        {i: 4, g: ["cat"]}
+    ];
+    var result = search(records, "");
+    // One value, shown the way it is written most often.
+    assert.deepStrictEqual(counts(result, "tags"),
+                           {dogs: 3, glass: 1, glasses: 1, cat: 1});
+    assert.deepStrictEqual(counts(result, "subjects"), {"golden retrievers": 3});
+    // Either form selects all of them; the entry shows it as selected.
+    [["dog"], ["dogs"], ["Dog"]].forEach(function (chosen) {
+        var picked = search(records, "", {filters: {tags: chosen}});
+        assert.deepStrictEqual(picked.items.slice().sort(), [1, 2, 3], chosen[0]);
+        var entry = picked.facets.tags.filter(function (item) {
+            return item.selected;
+        });
+        assert.strictEqual(entry.length, 1);
+        assert.strictEqual(entry[0].value, chosen[0].toLowerCase());
+        assert.strictEqual(entry[0].count, 3);
+    });
+    // "glasses" are not glass -- but wine glasses are wine glasses.
+    assert.deepStrictEqual(search(records, "", {filters: {tags: ["glasses"]}}).items, [2]);
+    var drinks = [{i: 1, s: ["wine glasses"]}, {i: 2, s: ["wine glass"]},
+                  {i: 3, s: ["wine glasses"]}, {i: 4, s: ["reading glasses"]},
+                  {i: 5, s: ["reading glass"]}];
+    assert.deepStrictEqual(counts(search(drinks, ""), "subjects"),
+                           {"wine glasses": 3, "reading glasses": 1, "reading glass": 1});
+});
+
+test("the real animal, vehicle or food ranks above toys, statues and pictures of it", function () {
+    var records = [
+        {i: 1, t: "Stuffed toy dog on a bed", s: ["stuffed dog"], g: ["dog", "toy"],
+         ty: "photo", dk: "2025-01-01"},
+        {i: 2, t: "Brown dog in the yard", a: ["brown dog"], g: ["dog"], ty: "photo",
+         dk: "2015-01-01"},
+        {i: 3, t: "A dog in watercolor", g: ["dog", "painting"], ty: "artwork",
+         dk: "2024-01-01"},
+        {i: 4, t: "Bronze dog statue in a park", g: ["dog", "statue"], ty: "photo",
+         dk: "2023-01-01"},
+        {i: 5, t: "Puppy asleep on a rug", a: ["puppy"], g: ["puppy"], dk: "2014-01-01"},
+        {i: 6, d: "A large painting of a dog hangs over the sofa.", dk: "2022-01-01"},
+        {i: 7, t: "Dog on the beach", a: ["dog"], dk: "2013-01-01"},
+        {i: 8, t: "Dog at the vet", a: ["dog"], dk: "2012-01-01"},
+        {i: 9, t: "Hot dog with mustard", fo: ["hot dog"], dk: "2026-01-01"},
+        {i: 10, t: "Dog and its rubber toy", a: ["dog"], s: ["rubber toy"], dk: "2011-01-01"}
+    ];
+    var found = items(records, "dog");
+    // The real dogs (a puppy is one too) first.
+    assert.deepStrictEqual(found.slice(0, 5).sort(), [10, 2, 5, 7, 8].sort());
+    // The toy, the painting, the statue, the dog in a painting and the hot
+    // dog (no dog at all) last.
+    assert.deepStrictEqual(found.slice(5).sort(), [1, 3, 4, 6, 9]);
+    // Unless they are what is asked for: then they come first, even when
+    // a real dog (a puppy) plays with a toy.
+    records.push({i: 11, t: "Puppy plays with a toy", a: ["puppy"], g: ["puppy", "toy"],
+                  dk: "2027-01-01"});
+    assert.strictEqual(items(records, "toy dog")[0], 1);
+    assert.strictEqual(items(records, "dog statue")[0], 4);
+    assert.strictEqual(items(records, "hot dog")[0], 9);
+    // Art and documents ask for depictions too.
+    var art = [
+        {i: 1, t: "Dog at the fair", a: ["dog"], g: ["dog", "art"], dk: "2025-01-01"},
+        {i: 2, t: "Paper dog collage", g: ["dog", "art"], ty: "artwork", dk: "2010-01-01"}
+    ];
+    assert.deepStrictEqual(items(art, "dog art"), [2, 1]);
+    assert.deepStrictEqual(items(art, "dog"), [1, 2]);
+    // A thing named in the title is real even when its field is empty, but
+    // one only in a corner of the picture (in its food list) ranks below.
+    var beers = [
+        {i: 1, t: "Driver's license in a wallet", fo: ["beer"], d: "A beer in the background.",
+         dk: "2025-01-01"},
+        {i: 2, t: "Beer bottles on a table", d: "Three beer bottles.", dk: "2010-01-01"}
+    ];
+    assert.deepStrictEqual(items(beers, "beer"), [2, 1]);
+    // A material only makes a depiction of the word it ends with.
+    var cups = [
+        {i: 1, t: "Paper coffee cup", fo: ["latte"], dk: "2015-01-01"},
+        {i: 2, t: "Plastic coffee", fo: ["latte"], dk: "2014-01-01"},
+        {i: 3, t: "Coffee at breakfast", fo: ["coffee"], dk: "2010-01-01"}
+    ];
+    assert.deepStrictEqual(items(cups, "coffee"), [3, 1, 2]);
+});
+
+test("a word is no thing because a few lists end with it", function () {
+    var records = [
+        {i: 1, t: "Light painting in the living room", g: ["light painting"], dk: "2015-01-01"},
+        {i: 2, t: "Street at night", v: ["street light"], g: ["light"], dk: "2025-01-01"}
+    ];
+    for (var k = 3; k < 15; k++) {
+        records.push({i: k, d: "Soft light through a window.", dk: "2010-01-01"});
+    }
+    // "light" ends one vehicle list, but most pictures with it are about
+    // something else: no bonus, no picture of a light.
+    assert.deepStrictEqual(items(records, "light").slice(0, 2), [1, 2]);
+    // Words for kinds of things are things: a stuffed animal is no animal,
+    // nor are animal tracks; any real animal is one.
+    var animals = [
+        {i: 1, t: "Stuffed animal on a bed", dk: "2025-01-01"},
+        {i: 2, t: "Animal tracks in the snow", dk: "2015-01-01"},
+        {i: 3, t: "Tapir in the woods", g: ["animal", "tapir"], a: ["tapir"],
+         dk: "2010-01-01"}
+    ];
+    var found = items(animals, "animal");
+    assert.strictEqual(found[0], 3);
+    assert.deepStrictEqual(found.slice(1).sort(), [1, 2]);
+});
+
+test("one word only in the text of a picture ranks below pictures about it", function () {
+    var records = [
+        {i: 1, o: "DOG FOOD 2 FOR 1", dk: "2025-01-01"},
+        {i: 2, d: "A dog asleep in the sun.", dk: "2015-01-01"}
+    ];
+    assert.deepStrictEqual(items(records, "dog"), [2, 1]);
+    // (With more words to look for, every field counts as before.)
+    assert.deepStrictEqual(items(records, "text:dog"), [1]);
+    assert.deepStrictEqual(items(records, "dog food"), [1]);
+});
+
+test("is:edited finds the pictures the owner edited", function () {
+    var records = [{i: 1, t: "Rex", ed: 1}, {i: 2, t: "Beach"}];
+    assert.deepStrictEqual(items(records, "is:edited"), [1]);
+    assert.deepStrictEqual(items(records, "-is:edited"), [2]);
+});
+
+/* ---------- Places, dates and shuffling ----------------------------------- */
+
+var PLACED = [
+    {i: 1, t: "Beach at sunset", g: ["beach"], dk: "2019-05-14", co: "United States",
+     rg: "Hawaii", ci: "Kahului", cc: "US", km: 3},
+    {i: 2, t: "Harbour", g: ["boat"], dk: "2019-05-20", co: "United States", rg: "Hawaii",
+     ci: "Lahaina", cc: "US", km: 1},
+    {i: 3, t: "Golden Gate bridge", g: ["bridge"], dk: "2020-10-11", co: "United States",
+     rg: "California", ci: "San Francisco", cc: "US", km: 2},
+    {i: 4, t: "Out at sea", g: ["ocean"], dk: "2021-10-11", co: "United States",
+     rg: "Hawaii", cc: "US"},
+    {i: 5, t: "Tower", g: ["tower"], dk: "2021-10-11", co: "France", rg: "Ile-de-France",
+     ci: "Paris", cc: "FR"},
+    {i: 6, t: "Palace", g: ["palace"], dk: "2022-03-01", co: "Monaco", ci: "Monaco", cc: "MC"},
+    {i: 7, t: "Pub", g: ["beer"], dk: "2023-10-11", co: "United Kingdom", rg: "England",
+     ci: "London", cc: "GB"},
+    {i: 8, t: "No place", g: ["beach"], dk: "2026-10-11"},
+    {i: 9, t: "No date", g: ["beach"]}
+];
+
+function ids(result) {
+    return result.items.slice().sort(function (a, b) {
+        return a - b;
+    });
+}
+
+test("place words find the pictures taken there", function () {
+    assert.deepStrictEqual(ids(search(PLACED, "hawaii")), [1, 2, 4]);
+    assert.deepStrictEqual(ids(search(PLACED, "kahului")), [1]);
+    assert.deepStrictEqual(ids(search(PLACED, "\"united states\"")), [1, 2, 3, 4]);
+    assert.deepStrictEqual(ids(search(PLACED, "new york")), []);
+    // Other names of the country.
+    assert.deepStrictEqual(ids(search(PLACED, "usa")), [1, 2, 3, 4]);
+    assert.deepStrictEqual(ids(search(PLACED, "america beach")), [1]);
+    assert.deepStrictEqual(ids(search(PLACED, "uk")), [7]);
+    assert.deepStrictEqual(ids(search(PLACED, "britain")), [7]);
+    // Accents do not matter.
+    assert.deepStrictEqual(ids(search(PLACED, "\u00eele-de-france")), [5]);
+    // "us" alone is the country; with other words it is skipped like "me".
+    assert.deepStrictEqual(ids(search(PLACED, "us")), [1, 2, 3, 4]);
+    assert.deepStrictEqual(ids(search(PLACED, "pictures of us at the beach")), [1, 8, 9]);
+    // place: looks at the place only.
+    assert.deepStrictEqual(ids(search(PLACED, "place:beach")), []);
+    assert.deepStrictEqual(ids(search(PLACED, "place:paris")), [5]);
+    assert.deepStrictEqual(ids(search(PLACED, "place:\"san francisco\"")), [3]);
+    assert.deepStrictEqual(ids(search(PLACED, "beach -place:hawaii")), [8, 9]);
+    // A word in the title ranks above the same word in the place.
+    var records = PLACED.concat([{i: 10, t: "Paris poster", g: ["poster"], dk: "2020-01-01"}]);
+    assert.strictEqual(search(records, "paris").items[0], 10);
+    // "US" in capitals is the country, also next to other words.
+    assert.deepStrictEqual(ids(search(PLACED, "beach US")), [1]);
+    assert.deepStrictEqual(ids(search(PLACED, "beach us")), [1, 8, 9]);
+    // A lower-case "us" after other words is skipped, but the words
+    // together still come first.
+    var pages = [{i: 1, t: "Contact form", d: "A contact form.", o: "Contact"},
+                 {i: 2, t: "Contact page", d: "A web page.", o: "Contact us"}];
+    assert.deepStrictEqual(search(pages, "contact us").items, [2, 1]);
+});
+
+test("a word only in the place names ranks below the same word anywhere else", function () {
+    // Town names hold everyday words: a room in Long Beach is no beach.
+    var records = [
+        {i: 1, t: "Living room", g: ["sofa"], d: "A sofa by the window.", dk: "2021-06-01",
+         co: "United States", rg: "California", ci: "Long Beach", cc: "US", km: 1},
+        {i: 2, t: "Sunset", g: ["sunset"], d: "Waves roll onto a sandy beach.", dk: "2019-06-01"},
+        {i: 3, t: "Receipt", g: ["receipt"], d: "A receipt from a shop.", dk: "2022-01-01",
+         co: "United States", rg: "California", ci: "Mountain View", cc: "US", km: 3},
+        {i: 4, t: "Peak", g: ["snow"], d: "A snowy mountain above the clouds.",
+         dk: "2018-01-01"},
+        {i: 5, t: "Office", g: ["desk"], d: "A desk with a laptop.", dk: "2023-01-01",
+         co: "Turkey", rg: "Istanbul", ci: "Istanbul", cc: "TR", km: 2},
+        {i: 6, t: "Dinner", g: ["food"], d: "A roast turkey on the table.", dk: "2017-11-23"}
+    ];
+    assert.deepStrictEqual(search(records, "beach").items, [2, 1]);
+    assert.deepStrictEqual(search(records, "mountain").items, [4, 3]);
+    assert.deepStrictEqual(search(records, "turkey").items, [6, 5]);
+    // Newest first stays newest first.
+    assert.deepStrictEqual(search(records, "beach", {sort: "newest"}).items, [1, 2]);
+    // place: looks at the place names only, at full weight.
+    assert.deepStrictEqual(search(records, "place:beach").items, [1]);
+    // A town's whole name still finds it first.
+    assert.strictEqual(search(records, "long beach").items[0], 1);
+});
+
+test("the place facet is a tree that opens where a place is chosen", function () {
+    var result = search(PLACED, "");
+    var entries = result.facets.place;
+    assert.deepStrictEqual(entries.map(function (entry) {
+        return [entry.value, entry.count, entry.level];
+    }), [["United States", 4, 0], ["France", 1, 0], ["Monaco", 1, 0],
+         ["United Kingdom", 1, 0]]);
+    result = search(PLACED, "", {filters: {place: ["United States"]}});
+    assert.deepStrictEqual(ids(result), [1, 2, 3, 4]);
+    assert.deepStrictEqual(result.facets.place.map(function (entry) {
+        return entry.value;
+    }), ["United States", "United States|Hawaii", "United States|California", "France",
+         "Monaco", "United Kingdom"]);
+    result = search(PLACED, "", {filters: {place: ["United States|Hawaii"]}});
+    assert.deepStrictEqual(ids(result), [1, 2, 4]);
+    var byValue = {};
+    result.facets.place.forEach(function (entry) {
+        byValue[entry.value] = entry;
+    });
+    assert.ok(byValue["United States"].open);
+    assert.ok(!byValue["United States"].selected);
+    assert.ok(byValue["United States|Hawaii"].selected);
+    assert.strictEqual(byValue["United States|Hawaii|Kahului"].level, 2);
+    assert.strictEqual(byValue["United States|Hawaii|Kahului"].label, "Kahului");
+    // The other countries keep their counts (the facet is disjunctive).
+    assert.strictEqual(byValue.France.count, 1);
+    // A town without a known region hangs under its country.
+    result = search(PLACED, "", {filters: {place: ["Monaco"]}});
+    assert.deepStrictEqual(result.facets.place.filter(function (entry) {
+        return entry.level;
+    }).map(function (entry) {
+        return entry.value;
+    }), ["Monaco||Monaco"]);
+    assert.strictEqual(SearchCore.placeParent("Monaco||Monaco"), "Monaco");
+    assert.strictEqual(SearchCore.placeParent("United States|Hawaii|Kahului"),
+                       "United States|Hawaii");
+    assert.strictEqual(SearchCore.placeParent("France"), "");
+    assert.strictEqual(SearchCore.placeLabel("United States|Hawaii|Kahului"),
+                       "Kahului, Hawaii, United States");
+    assert.strictEqual(SearchCore.placeLabel("Monaco||Monaco"), "Monaco, Monaco");
+    assert.strictEqual(SearchCore.facetLabel("place", "United States|Hawaii"), "Hawaii");
+    assert.strictEqual(SearchCore.placeOf(PLACED[0]), "United States|Hawaii|Kahului");
+    assert.strictEqual(SearchCore.placeOf(PLACED[3]), "United States|Hawaii");
+    assert.strictEqual(SearchCore.placeOf(PLACED[7]), "");
+    // A chosen place no picture has is still listed, under its parents.
+    result = search(PLACED, "", {filters: {place: ["Japan|Tokyo"]}});
+    assert.strictEqual(result.total, 0);
+    assert.deepStrictEqual(result.facets.place.filter(function (entry) {
+        return entry.selected || entry.open;
+    }).map(function (entry) {
+        return [entry.value, entry.count];
+    }), [["Japan", 0], ["Japan|Tokyo", 0]]);
+});
+
+test("on: finds a day of the year", function () {
+    var today = {today: "2026-10-11"};
+    // This day in earlier years: not this year's.
+    assert.deepStrictEqual(ids(search(PLACED, "on:today", today)), [3, 4, 5, 7]);
+    assert.deepStrictEqual(search(PLACED, "on:today", today).items, [7, 5, 4, 3]);
+    assert.deepStrictEqual(ids(search(PLACED, "on:10-11")), [3, 4, 5, 7, 8]);
+    assert.deepStrictEqual(ids(search(PLACED, "on:5-14")), [1]);
+    assert.deepStrictEqual(ids(search(PLACED, "on:2021-10-11")), [4, 5]);
+    assert.deepStrictEqual(ids(search(PLACED, "on:today place:usa", today)), [3, 4]);
+    assert.deepStrictEqual(ids(search(PLACED, "beach -on:today", today)), [1, 8, 9]);
+    ["on:13-01", "on:02-32", "on:tomorrow", "on:2019"].forEach(function (query) {
+        var result = search(PLACED, query, today);
+        assert.strictEqual(result.warnings.length, 1, query);
+        assert.ok(/on:today/.test(result.warnings[0]), query);
+    });
+    // Without today, this computer's date.
+    assert.strictEqual(search(PLACED, "on:today").warnings.length, 0);
+});
+
+test("the range option keeps the pictures taken in it", function () {
+    function within(from, to) {
+        return ids(search(PLACED, "", {range: {from: from, to: to}}));
+    }
+    assert.deepStrictEqual(within("2019", "2019"), [1, 2]);
+    assert.deepStrictEqual(within("2019-05-15", "2019-05"), [2]);
+    assert.deepStrictEqual(within("2020", "2021-10-11"), [3, 4, 5]);
+    assert.deepStrictEqual(within("2022", ""), [6, 7, 8]);
+    assert.deepStrictEqual(within("", "2019-05-14"), [1]);
+    // Backwards, it is turned round; nonsense is no range.
+    assert.deepStrictEqual(within("2021", "2020"), [3, 4, 5]);
+    assert.strictEqual(search(PLACED, "", {range: {from: "2019-13", to: "x"}}).total, 9);
+    assert.strictEqual(search(PLACED, "", {range: "2019"}).total, 9);
+    // The facets count within it.
+    var result = search(PLACED, "", {range: {from: "2019", to: "2019"}});
+    assert.deepStrictEqual(counts(result, "year"), {"2019": 2});
+});
+
+test("the timeline counts per year, per month of one year, per day of one month", function () {
+    // Only when asked for (the search page; not the map or the empty-results notes).
+    assert.strictEqual(SearchCore.search(PLACED, "", {}).timeline, null);
+    function timed(records, query, options) {
+        var asked = {timeline: true};
+        Object.keys(options || {}).forEach(function (key) {
+            asked[key] = options[key];
+        });
+        return SearchCore.search(records, query, asked);
+    }
+    var line = timed(PLACED, "").timeline;
+    assert.strictEqual(line.level, "year");
+    assert.strictEqual(line.dated, 8);
+    assert.strictEqual(line.undated, 1);
+    assert.deepStrictEqual(line.bars.map(function (bar) {
+        return bar.key + ":" + bar.count;
+    }), ["2019:2", "2020:1", "2021:2", "2022:1", "2023:1", "2024:0", "2025:0", "2026:1"]);
+    line = timed(PLACED, "", {range: {from: "2019", to: "2019-12"}}).timeline;
+    assert.strictEqual(line.level, "day");
+    assert.strictEqual(line.bars.length, 31);
+    assert.strictEqual(line.bars[13].key, "2019-05-14");
+    assert.strictEqual(line.bars[13].count, 1);
+    assert.strictEqual(line.undated, 0);
+    var records = PLACED.concat([{i: 20, dk: "2019-02-03"}]);
+    line = timed(records, "", {range: {from: "2019", to: "2019"}}).timeline;
+    assert.strictEqual(line.level, "month");
+    assert.deepStrictEqual(line.bars.map(function (bar) {
+        return bar.count;
+    }), [0, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
+    // February has 28 or 29 days.
+    line = timed([{i: 1, dk: "2024-02-01"}, {i: 2, dk: "2024-02-29"}], "").timeline;
+    assert.strictEqual(line.bars.length, 29);
+    line = timed([{i: 1, dk: "2023-02-01"}], "").timeline;
+    assert.strictEqual(line.bars.length, 28);
+    // Nothing dated: no timeline.
+    line = timed([{i: 1}, {i: 2, dk: "x"}], "").timeline;
+    assert.deepStrictEqual(line, {level: null, bars: [], dated: 0, undated: 2});
+    // The matches of the query, before duplicates are stacked.
+    line = timed(PLACED, "hawaii").timeline;
+    assert.deepStrictEqual(line.bars.map(function (bar) {
+        return bar.key;
+    }), ["2019", "2020", "2021"]);
+});
+
+test("a date that is only the file's time is no date taken", function () {
+    // (du: the server's records of pictures dated by their file's time.)
+    var records = PLACED.concat([{i: 30, t: "Copied", g: ["beach"], dk: "2021-10-11", du: 1},
+                                 {i: 31, t: "Copied", g: ["beach"], dk: "2016-03-02", du: 1}]);
+    var today = {today: "2026-10-11"};
+    assert.deepStrictEqual(ids(search(records, "on:today", today)), [3, 4, 5, 7]);
+    assert.deepStrictEqual(ids(search(records, "on:2021-10-11")), [4, 5]);
+    assert.deepStrictEqual(ids(search(records, "", {range: {from: "2021", to: "2021"}})),
+                           [4, 5]);
+    var line = search(records, "", {timeline: true}).timeline;
+    assert.strictEqual(line.dated, 8);
+    assert.strictEqual(line.undated, 3);
+    assert.strictEqual(line.bars[0].key, "2019");
+    // The other date filters keep them (as before).
+    assert.deepStrictEqual(ids(search(records, "year:2016")), [31]);
+});
+
+test("choosing bars of the timeline, with Shift for a range", function () {
+    var bars = [{key: "2015", count: 3}, {key: "2016", count: 0}, {key: "2017", count: 2},
+                {key: "2018", count: 1}];
+    var none = {anchor: "", pending: false};
+    // A bar alone; it becomes the anchor.
+    assert.deepStrictEqual(SearchCore.timelineChoice(bars, 2, false, none),
+                           {anchor: "2017", pending: false, from: "2017", to: "2017"});
+    // Shift with no anchor among the bars: the first end, nothing chosen yet ...
+    var first = SearchCore.timelineChoice(bars, 0, true, {anchor: "2019-05", pending: false});
+    assert.deepStrictEqual(first, {anchor: "2015", pending: true});
+    // ... and Shift on another bar chooses the bars from one to the other.
+    assert.deepStrictEqual(SearchCore.timelineChoice(bars, 3, true, first),
+                           {anchor: "2015", pending: false, from: "2015", to: "2018"});
+    assert.deepStrictEqual(SearchCore.timelineChoice(bars, 0, true,
+                                                     {anchor: "2018", pending: true}),
+                           {anchor: "2018", pending: false, from: "2015", to: "2018"});
+    // Shift on the first end again: that bar alone.
+    assert.deepStrictEqual(SearchCore.timelineChoice(bars, 0, true, first),
+                           {anchor: "2015", pending: false, from: "2015", to: "2015"});
+    // A range may end at a bar without pictures; that bar alone is nothing.
+    assert.deepStrictEqual(SearchCore.timelineChoice(bars, 1, true, first),
+                           {anchor: "2015", pending: false, from: "2015", to: "2016"});
+    assert.strictEqual(SearchCore.timelineChoice(bars, 1, false, first), null);
+    assert.strictEqual(SearchCore.timelineChoice(bars, 1, true, none), null);
+    assert.strictEqual(SearchCore.timelineChoice(bars, 9, false, none), null);
+});
+
+test("dates in words", function () {
+    assert.strictEqual(SearchCore.dateLabel("2019"), "2019");
+    assert.strictEqual(SearchCore.dateLabel("2019-05"), "May 2019");
+    assert.strictEqual(SearchCore.dateLabel("2019-05-04"), "May 4, 2019");
+    assert.strictEqual(SearchCore.dateLabel("2019-13"), "");
+    var dash = " \u2013 ";
+    assert.strictEqual(SearchCore.rangeLabel("2015", "2017"), "2015" + dash + "2017");
+    assert.strictEqual(SearchCore.rangeLabel("2019-03", "2019-05"), "March" + dash + "May 2019");
+    assert.strictEqual(SearchCore.rangeLabel("2019-05-03", "2019-05-09"),
+                       "May 3" + dash + "9, 2019");
+    assert.strictEqual(SearchCore.rangeLabel("2019-05-03", "2019-06-09"),
+                       "May 3" + dash + "June 9, 2019");
+    assert.strictEqual(SearchCore.rangeLabel("2019-11", "2020-02"),
+                       "November 2019" + dash + "February 2020");
+    assert.strictEqual(SearchCore.rangeLabel("2019-05", "2019-05"), "May 2019");
+    assert.strictEqual(SearchCore.rangeLabel("2019", ""), "since 2019");
+    assert.strictEqual(SearchCore.rangeLabel("", "2019-05"), "until May 2019");
+    assert.strictEqual(SearchCore.rangeLabel("", ""), "");
+});
+
+test("shuffle: a random order that stays the same for a seed", function () {
+    var records = makeRecords(500, 5);
+    var index = SearchCore.prepare(records);
+    var first = index.search("", {sort: "shuffle", seed: 42}).items;
+    var again = index.search("", {sort: "shuffle", seed: 42}).items;
+    var other = index.search("", {sort: "shuffle", seed: 43}).items;
+    var newest = index.search("", {sort: "newest"}).items;
+    assert.strictEqual(first.length, newest.length);
+    assert.deepStrictEqual(first, again);
+    assert.notDeepStrictEqual(first, other);
+    assert.notDeepStrictEqual(first, newest);
+    assert.deepStrictEqual(first.slice().sort(), newest.slice().sort());
+    // A search within it keeps the shuffled order of what it finds.
+    var beach = index.search("beach", {sort: "shuffle", seed: 42});
+    var place = {};
+    first.forEach(function (id, at) {
+        place[id] = at;
+    });
+    for (var k = 1; k < beach.items.length; k++) {
+        assert.ok(place[beach.items[k - 1]] < place[beach.items[k]]);
+    }
+    assert.strictEqual(beach.sort, "shuffle");
+    // Spread evenly: the first half holds about half of the older pictures.
+    var older = newest.slice(newest.length / 2);
+    var early = first.slice(0, first.length / 2).filter(function (id) {
+        return older.indexOf(id) >= 0;
+    }).length;
+    assert.ok(early > 90 && early < 160, String(early));
+    assert.ok(SearchCore.SORTS.indexOf("shuffle") >= 0);
+});
+
 /* ---------- Many records --------------------------------------------------- */
 
 var WORDS = ("beach sunset dog cat car tree mountain lake river city street house garden " +
@@ -1057,6 +1565,10 @@ var DOCS = ["receipt", "chat", "web", "menu", "sign", "letter"];
 var PEOPLE = ["none", "none", "1", "2", "3-5", "6-10", "crowd"];
 var SETTINGS = ["indoor", "outdoor", "outdoor", "vehicle", "unknown"];
 var EVENTS = ["none", "none", "none", "birthday", "wedding", "travel", "party", "meal"];
+var PLACES = [["United States", "US", "California", "Oakland"],
+              ["United States", "US", "Hawaii", "Hilo"], ["France", "FR", "Bretagne", "Brest"],
+              ["Japan", "JP", "Tokyo", "Shinjuku"], ["Singapore", "SG", "", "Singapore"],
+              ["Iceland", "IS", "Capital Region", ""]];
 
 function makeRecords(count, seed) {
     var random = randomSource(seed);
@@ -1122,6 +1634,16 @@ function makeRecords(count, seed) {
         }
         if (random() < 0.5) {
             rec.gp = 1;
+            var place = pick(PLACES);
+            rec.co = place[0];
+            rec.cc = place[1];
+            if (place[2]) {
+                rec.rg = place[2];
+            }
+            if (place[3] && random() < 0.8) {
+                rec.ci = place[3];
+                rec.km = Math.floor(random() * 40);
+            }
         }
         if (random() < 0.01) {
             rec.p = "360";
@@ -1200,7 +1722,8 @@ test("10k records: every query under 50 ms", function () {
     var queries = ["", "beach", "b", "bea", "sunset beach", "\"red car\"", "beach -dog",
                    "cat OR dog", "tag:beach year:2015-2019", "type:screenshot", "has:text receipt",
                    "people:none outdoor", "dog on the beach", "s", "x", "zzzzzz",
-                   "camera:iphone after:2019", "is:duplicate", "red blue green yellow"];
+                   "camera:iphone after:2019", "is:duplicate", "red blue green yellow",
+                   "place:tokyo", "usa beach", "on:05-14", "on:today"];
     var typing = "sunset by the lake";
     for (var k = 1; k <= typing.length; k++) {
         queries.push(typing.slice(0, k));

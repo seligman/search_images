@@ -418,6 +418,7 @@ class StateTest(AdminFixture, unittest.TestCase):
         self.assertEqual(endpoints["env"]["key_source"], "env SEARCH_IMAGES_TEST_KEY")
         self.assertTrue(endpoints["local"]["default"])
         self.assertEqual(endpoints["local"]["used_by"], ["lib_family1"])
+        self.assertEqual(endpoints["local"]["refined_by"], [])
         for item in endpoints.values():
             self.assertNotIn("api_key", item)
             self.assertNotIn("api_key", item["stored"])

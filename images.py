@@ -13,31 +13,35 @@ converts originals a browser cannot show (HEIC, TIFF, ...) to JPEG.
 
 360-degree photos are recognised by detect_projection(). Unstitched
 dual-fisheye frames (Insta360 .insp) are stitched into an equirectangular
-panorama by dual_fisheye_to_equirect(), and front_view() cuts a natural
-looking picture from a panorama for the thumbnail. read_image(want_pano=True)
-also makes a larger panorama of a 360 photo (PANO_EDGE wide) for the
-interactive 360 view.
+panorama by dual_fisheye_to_equirect() (the two lenses evened out and
+blended at the seams, a tripod under a soft fill at the bottom), and
+front_view() cuts a natural looking picture from a panorama for the
+thumbnail. read_image(want_pano=True) also makes a larger panorama of a
+360 photo (PANO_EDGE wide) for the interactive 360 view.
 
 The EXIF helpers (sanitize_exif, parse_capture_date, exif_gps_to_decimal,
 camera_name, exif_metadata), sniff_mime() and the colour profile scrubbing
 live in imageinfo.py, which needs no Pillow.
 """
 
+import collections
 import contextlib
 import hashlib
 import io
+import itertools
 import math
 import os
 import threading
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageChops, ImageFilter, ImageStat
     from PIL.ExifTags import GPSTAGS, TAGS
 except ImportError:
     raise SystemExit(
         "This tool needs Pillow. Install it with:\n"
         "    python -m pip install Pillow")
 
+import common
 import imageinfo
 from imageinfo import (
     AVIF_BRANDS, HEIF_BRANDS, exif_metadata, parse_capture_date, sanitize_exif, sniff_mime,
@@ -106,20 +110,64 @@ INSP_CORNER_RATIO = 0.5             # the looser test for .insp originals
 #   mirror    True if the halves are mirror images (they are not)
 #   offsets   lens centres relative to the quarter points, in units of R,
 #             (dx, dy) for the left and right half (default circles only)
+#   blend     degrees on either side of the plane between the lenses over
+#             which their pictures are mixed (0: hard seams); at most what
+#             the lenses see beyond 180 degrees, fov / 2 - 90
 # Derived empirically from sample frames of an Insta360 ONE R 360 lens
 # (6080x3040, circles as tall as the frame): all orientations were rendered
 # and the one with level horizons, an upright scene, readable (not mirrored)
 # text and halves meeting at the seams was kept; with the forward lens on
 # the left the panorama's centre shows the scene rather than the person
 # holding the camera. Then fov and the centres were tuned to minimise the
-# difference between the two lenses' pictures along the seams.
+# difference between the two lenses' pictures along the seams. The blend
+# was chosen by looking at the seams of such frames: from 2 degrees on the
+# line between the lenses is gone, and at 5 nearby things that parallax
+# moves (a person beside the camera) show doubled over a wide band; 3 is
+# a softer join with little doubling.
 INSTA360_PARAMS = {
     "fov": 199.0,
     "front": "left",
     "rotation": (90, 270),
     "mirror": False,
     "offsets": ((-0.009, 0.0), (0.0, 0.0)),
+    "blend": 3.0,
 }
+# Evening out the two lenses (see _lens_gains): only pixels with levels in
+# this range in both lenses count (not nearly black, not clipped) ...
+SEAM_GAIN_LEVELS = (16, 240)
+# ... that differ by at most this much (not a nearby thing parallax moved) ...
+SEAM_GAIN_DIFFERENCE = 48
+# ... and there must be this many of them (per 2048 px wide panorama).
+SEAM_GAIN_MIN_PIXELS = 200
+# The most either lens is brightened or darkened, per channel.
+SEAM_GAIN_LIMIT = 1.25
+# A gain fades out towards white (see _gain_table), so clipped skies stay
+# white and nothing new clips; the higher this power, the later it fades.
+# (SEAM_GAIN_ROLLOFF * ln(SEAM_GAIN_LIMIT) must stay below 1, or brighter
+# levels would come out darker.)
+SEAM_GAIN_ROLLOFF = 4
+# The soft fill over a pole (see _fill_pole): it fades in over this many
+# degrees beyond the size asked for, the view it is made in shows this many
+# more round it, and each blur size spreads the colours this many times.
+POLE_FEATHER_DEG = 3.0
+POLE_MARGIN_DEG = 3.0
+POLE_FILL_PASSES = 2
+# How many degrees around the bottom (nadir) and top (zenith) of a stitched
+# dual-fisheye photo get that fill, unless config.json says otherwise
+# ("nadir_fill_deg", "zenith_fill_deg"; 0 = none, at most POLE_FILL_MAX).
+# None by default: on clean ground the fill only leaves a grey disc. A
+# tripod's legs (or a hand holding the camera) reach about 5 degrees from
+# the nadir, so 6 hides them; a hand-held camera's stick lies between the
+# lenses and the stitch hides it already. Changing these changes
+# stitch_key(), so the stored 360 photos are stitched again.
+NADIR_FILL_DEG = 0.0
+ZENITH_FILL_DEG = 0.0
+POLE_FILL_MAX = 30.0
+# Raise when dual_fisheye_to_equirect() makes different pictures: the scan's
+# back-fill stage then stitches the 360 photos stored before again (their
+# previews, panos, thumbnails and dHashes; never their descriptions). See
+# stitch_key().
+STITCH_VERSION = 2
 
 HEIF_MISSING = ("HEIC/HEIF images need pillow-heif; install it with: "
                 "python -m pip install pillow-heif")
@@ -129,6 +177,7 @@ AVIF_MISSING = ("AVIF images need a Pillow with AVIF support; upgrade it with: "
 _LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 _BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
 _BOX = getattr(Image, "Resampling", Image).BOX
+_NEAREST = getattr(Image, "Resampling", Image).NEAREST
 _MESH = getattr(Image, "Transform", Image).MESH
 _TRANSPOSE = getattr(Image, "Transpose", Image)
 
@@ -819,33 +868,358 @@ def _fisheye_point(circle, back, rotation, mirror, half_fov):
     return point
 
 
+def stitch_options(config):
+    """{"nadir_fill_deg": .., "zenith_fill_deg": ..} from a config dict.
+
+    Missing or unusable values (not numbers, negative) take the defaults
+    (NADIR_FILL_DEG, ZENITH_FILL_DEG); larger ones are cut to POLE_FILL_MAX.
+    """
+    options = {}
+    for key, default in (("nadir_fill_deg", NADIR_FILL_DEG), ("zenith_fill_deg", ZENITH_FILL_DEG)):
+        value = config.get(key, default) if isinstance(config, dict) else default
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            value = default
+        options[key] = min(float(value), POLE_FILL_MAX)
+    return options
+
+
+_stitch_lock = threading.Lock()
+_stitch_memo = [None, None]         # [config.json's (path, mtime, size), options]
+
+
+def stitch_settings():
+    """stitch_options() of config.json, read again only when the file changes."""
+    path = common.config_path()
+    try:
+        stat = os.stat(path)
+        key = (path, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = (path, None, None)
+    with _stitch_lock:
+        if _stitch_memo[0] == key:
+            return dict(_stitch_memo[1])
+    try:
+        config = common.load_config()
+    except common.ConfigError:
+        config = {}
+    options = stitch_options(config)
+    with _stitch_lock:
+        _stitch_memo[0], _stitch_memo[1] = key, options
+    return dict(options)
+
+
+def stitch_key(options=None):
+    """What the panoramas stitched from dual-fisheye frames depend on, as text.
+
+    STITCH_VERSION and the pole fills (options, default stitch_settings()):
+    when it changes, the scan's back-fill stage stitches the stored 360
+    photos again (see scan.backfill).
+    """
+    options = options or stitch_settings()
+    return "%d n%g z%g" % (STITCH_VERSION, options["nadir_fill_deg"], options["zenith_fill_deg"])
+
+
 def _fisheye_source_edge(out_width, params=INSTA360_PARAMS):
     """Frame width at which a dual-fisheye frame has the detail of an
     equirectangular panorama out_width wide (the long edge to decode it at)."""
     return int(math.ceil(out_width * float(params["fov"]) / 180.0))
 
 
-def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARAMS):
+def _seam_reach(cos_lat, blend):
+    """Degrees of longitude, either side of a seam, that the blend band covers
+    at a latitude with this cosine (90 or more: the whole row)."""
+    if cos_lat <= 1e-9:
+        return 180.0
+    ratio = math.sin(blend) / cos_lat
+    return 180.0 if ratio >= 1.0 else math.degrees(math.asin(ratio))
+
+
+_seam_masks = collections.OrderedDict()     # (width, height, blend) -> mask image
+_seam_masks_lock = threading.Lock()
+_SEAM_MASKS_KEPT = 4
+_SEAM_MASK_EDGE = 2048          # masks are worked out at most this wide, then scaled
+
+
+def _seam_mask(width, height, blend):
+    """The mask (mode L) that mixes the two lenses' layers: 255 where the front
+    lens alone shows, 0 where the back lens does, and a smooth ramp across
+    the band of blend radians either side of the plane between the lenses.
+
+    A direction's angle from that plane is asin(cos(latitude) * cos(longitude)),
+    so the band is narrow at the horizon and covers whole rows near the poles.
+    The same for every frame of a size, so it is kept (a few sizes).
+    """
+    key = (width, height, round(blend, 6))
+    with _seam_masks_lock:
+        mask = _seam_masks.get(key)
+        if mask is not None:
+            _seam_masks.move_to_end(key)
+            return mask
+    scale = min(1.0, float(_SEAM_MASK_EDGE) / width)
+    small_w = max(8, int(round(width * scale)) // 4 * 4)
+    small_h = max(4, small_w // 2)
+    quarter = small_w // 4
+    data = bytearray(small_w * small_h)
+    cos_lon = [math.cos(((x + 0.5) / small_w - 0.5) * 2.0 * math.pi) for x in range(small_w)]
+    full = b"\xff" * (2 * quarter)
+    for y in range(small_h):
+        cos_lat = math.cos((0.5 - (y + 0.5) / small_h) * math.pi)
+        base = y * small_w
+        data[base + quarter:base + 3 * quarter] = full
+        reach = _seam_reach(cos_lat, blend)
+        if reach >= 90.0:
+            columns = range(small_w)
+        else:
+            span = int(math.ceil(reach * small_w / 360.0)) + 1
+            columns = itertools.chain(
+                range(max(0, quarter - span), min(small_w, quarter + span)),
+                range(max(0, 3 * quarter - span), min(small_w, 3 * quarter + span)))
+        for x in columns:
+            # Signed angle from the seam plane, towards the front lens.
+            angle = math.asin(max(-1.0, min(1.0, cos_lat * cos_lon[x])))
+            t = min(1.0, max(0.0, 0.5 + 0.5 * angle / blend))
+            data[base + x] = int(round(255.0 * t * t * (3.0 - 2.0 * t)))
+    mask = Image.frombytes("L", (small_w, small_h), bytes(data))
+    if mask.size != (width, height):
+        mask = mask.resize((width, height), _BILINEAR)
+    with _seam_masks_lock:
+        _seam_masks[key] = mask
+        while len(_seam_masks) > _SEAM_MASKS_KEPT:
+            _seam_masks.popitem(last=False)
+    return mask
+
+
+def _level_mask(value_low, value_high):
+    return [255 if value_low <= value <= value_high else 0 for value in range(256)]
+
+
+def _gain_estimate(strips, masks, width):
+    """Per-channel square roots of back / front over the masked pixels of
+    strips [(front strip, back strip)], or None when too few pixels count."""
+    sums_front = [0.0, 0.0, 0.0]
+    sums_back = [0.0, 0.0, 0.0]
+    count = 0.0
+    for (strip_front, strip_back), mask in zip(strips, masks):
+        pixels = ImageStat.Stat(mask).sum[0] / 255.0
+        if pixels < 1:
+            continue
+        for sums, strip in ((sums_front, strip_front), (sums_back, strip_back)):
+            for channel, value in enumerate(ImageStat.Stat(strip, mask).sum):
+                sums[channel] += value
+        count += pixels
+    if count < SEAM_GAIN_MIN_PIXELS * (width / 2048.0) ** 2:
+        return None
+    if min(sums_front) <= 0 or min(sums_back) <= 0:
+        return None
+    return tuple(math.sqrt(back / front) for front, back in zip(sums_front, sums_back))
+
+
+def _lens_gains(front_layer, back_layer, blend):
+    """Per-channel gains ((front r, g, b), (back r, g, b)) that give the two
+    lenses the same brightness and colour where they overlap.
+
+    Compared along both seams within 60 degrees of the horizon (the poles
+    hold the camera's stick and the sky's glare), on pixels that are
+    neither nearly black nor clipped in either lens (SEAM_GAIN_LEVELS) and,
+    once a first estimate has evened the lenses out, that the two lenses
+    see about alike (SEAM_GAIN_DIFFERENCE; not a nearby thing that parallax
+    moved). Each lens gets half the correction, at most SEAM_GAIN_LIMIT.
+    """
+    width, height = front_layer.size
+    quarter = width // 4
+    span = max(2, int(round(math.degrees(blend) * width / 360.0)))
+    top, bottom = height // 6, height - height // 6
+    usable_levels = _level_mask(SEAM_GAIN_LEVELS[0], SEAM_GAIN_LEVELS[1])
+    alike = [255 if value <= SEAM_GAIN_DIFFERENCE else 0 for value in range(256)]
+    strips, usable = [], []
+    for seam in (quarter, 3 * quarter):
+        box = (seam - span, top, seam + span, bottom)
+        strip_front, strip_back = front_layer.crop(box), back_layer.crop(box)
+        strips.append((strip_front, strip_back))
+        usable.append(ImageChops.multiply(strip_front.convert("L").point(usable_levels),
+                                          strip_back.convert("L").point(usable_levels)))
+    first = _gain_estimate(strips, usable, width)
+    if first is None:
+        return (1.0, 1.0, 1.0), (1.0, 1.0, 1.0)
+    masks = []
+    for (strip_front, strip_back), mask in zip(strips, usable):
+        evened_front = _apply_gains(strip_front, first).convert("L")
+        evened_back = _apply_gains(strip_back, [1.0 / gain for gain in first]).convert("L")
+        masks.append(ImageChops.multiply(
+            mask, ImageChops.difference(evened_front, evened_back).point(alike)))
+    gains = _gain_estimate(strips, masks, width) or first
+    gains = [min(SEAM_GAIN_LIMIT, max(1.0 / SEAM_GAIN_LIMIT, gain)) for gain in gains]
+    return tuple(gains), tuple(1.0 / gain for gain in gains)
+
+
+def _gain_table(gain):
+    """The 256 levels of a channel brightened or darkened by gain.
+
+    Dark and middle levels are multiplied by about gain; towards white the
+    gain fades out (v * gain ** (1 - (v / 255) ** SEAM_GAIN_ROLLOFF)), so
+    0 and 255 stay where they are: a clipped sky stays neutral white in
+    both lenses, and no level below 255 becomes 255. Brighter levels never
+    come out darker.
+    """
+    table = []
+    for value in range(255):
+        level = value * gain ** (1.0 - (value / 255.0) ** SEAM_GAIN_ROLLOFF)
+        table.append(min(254, int(round(level))))
+    table.append(255)
+    return table
+
+
+def _apply_gains(image, gains):
+    if all(abs(gain - 1.0) < 0.002 for gain in gains):
+        return image
+    table = []
+    for gain in gains:
+        table.extend(_gain_table(gain))
+    return image.point(table)
+
+
+def _row_mask(width, weights):
+    """A mode L mask width wide whose rows have the given weights (0.0-1.0), top to bottom."""
+    data = bytes(int(round(255.0 * min(1.0, max(0.0, weight)))) for weight in weights)
+    return Image.frombytes("L", (1, len(data)), data).resize((width, len(data)), _NEAREST)
+
+
+def _pole_view_point(size, focal, bottom):
+    """A function mapping an equirectangular panorama position (longitude,
+    latitude in radians) to its place in a view of size x size pixels
+    looking straight down (bottom) or up, as equirect_view() draws it."""
+    half = size / 2.0
+
+    def point(longitude, latitude):
+        across = math.cos(latitude) * math.sin(longitude)
+        ahead = math.cos(latitude) * math.cos(longitude)
+        height = max(1e-6, -math.sin(latitude) if bottom else math.sin(latitude))
+        scale = focal / height
+        if bottom:
+            return (half + across * scale, half - ahead * scale)
+        return (half + across * scale, half + ahead * scale)
+    return point
+
+
+def _fill_disc(view, radius):
+    """view (RGB, square) with the disc of radius pixels round its centre filled in.
+
+    The disc is painted from its surroundings inwards: it starts as their
+    mean colour and is blurred again and again, from coarse to fine, with
+    the pixels outside kept as they are. That spreads the colours at its
+    edge smoothly over it, the way heat spreads (no spokes, no copied
+    shapes).
+    """
+    size = view.size[0]
+    centre = size / 2.0
+    inside = bytearray(size * size)
+    for y in range(size):
+        dy = y + 0.5 - centre
+        reach = radius * radius - dy * dy
+        if reach <= 0:
+            continue
+        span = math.sqrt(reach)
+        left = max(0, int(math.floor(centre - span)))
+        right = min(size, int(math.ceil(centre + span)))
+        inside[y * size + left:y * size + right] = b"\xff" * (right - left)
+    mask = Image.frombytes("L", (size, size), bytes(inside))
+    outside = ImageChops.invert(mask)
+    if not ImageStat.Stat(outside).sum[0]:
+        return view
+    mean = tuple(int(round(value)) for value in ImageStat.Stat(view, outside).mean)
+    filled = Image.composite(Image.new("RGB", view.size, mean), view, mask)
+    blur = max(1.0, radius / 2.0)
+    while True:
+        for _ in range(POLE_FILL_PASSES):
+            filled = Image.composite(filled.filter(ImageFilter.GaussianBlur(blur)), view, mask)
+        if blur <= 1.0:
+            return filled
+        blur = max(1.0, blur / 2.0)
+
+
+def _fill_pole(panorama, degrees, bottom=True):
+    """Cover one pole of a panorama with a soft fill made from the ring around it.
+
+    The rows within degrees of the pole (the nadir when bottom, else the
+    zenith) are painted over, which hides a tripod's legs (a hand-held
+    stick lies between the lenses, where the stitch already hides it) and
+    what blending makes of them. The fill is made in a view looking straight
+    at the pole, where it is a round disc: the colours round its edge are
+    spread smoothly over it (_fill_disc), and the result is drawn back into
+    the panorama, fading in over POLE_FEATHER_DEG so it has no hard edge.
+    Returns the panorama (changed in place).
+    """
+    width, height = panorama.size
+    degrees = min(float(degrees), 45.0)
+    feather = POLE_FEATHER_DEG
+    rows = int(round(height * (degrees + feather) / 180.0))
+    if int(round(height * degrees / 180.0)) < 1:
+        return panorama
+    # The view covers the disc and a margin round it.
+    view_degrees = degrees + feather + POLE_MARGIN_DEG
+    size = min(1024, max(32, int(round(width * 2.0 * view_degrees / 360.0))))
+    focal = (size / 2.0) / math.tan(math.radians(view_degrees))
+    view = equirect_view(panorama, (size, size), fov=2.0 * view_degrees,
+                         pitch=-90.0 if bottom else 90.0)
+    view = _fill_disc(view, focal * math.tan(math.radians(degrees + feather)))
+    point = _pole_view_point(size, focal, bottom)
+    top = height - rows if bottom else 0
+
+    def mesh_point(x, y):
+        longitude = (float(x) / width - 0.5) * 2.0 * math.pi
+        latitude = (0.5 - float(top + y) / height) * math.pi
+        return point(longitude, latitude)
+    strip = view.transform((width, rows), _MESH,
+                           _mesh(_cells(0, width), _cells(0, rows), mesh_point), _BILINEAR)
+    # Rows of the strip fade in from the outer edge over the feather.
+    feather_rows = max(1.0, height * feather / 180.0)
+    weights = []
+    for row in range(rows):
+        distance = (row + 0.5) if bottom else (rows - row - 0.5)     # from the outer edge
+        t = min(1.0, distance / feather_rows)
+        weights.append(t * t * (3.0 - 2.0 * t))
+    panorama.paste(strip, (0, top), _row_mask(width, weights))
+    return panorama
+
+
+def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARAMS,
+                             nadir_fill=None, zenith_fill=None):
     """Stitch a dual-fisheye frame into an equirectangular panorama.
 
     image holds the two lens circles side by side (see find_lens_circles()
     and INSTA360_PARAMS for the lens model). Returns an RGB image
     out_width x out_width/2 (out_width rounded down to a multiple of 4): the
-    front lens fills the middle half, the back lens the outer quarters. Every
-    cell of the mesh takes its pixels from exactly one lens, and the cell
-    edges lie on the two seams (longitude -90 and 90 degrees), so the lenses
-    meet in sharp lines without blending and one Image.transform() call does
-    the whole job.
+    front lens fills the middle half, the back lens the outer quarters.
+
+    The seams (longitude -90 and 90 degrees, and the poles, where the plane
+    between the lenses cuts the sphere) are blended: each lens is drawn into
+    a layer of its own a little beyond its half (params["blend"] degrees
+    past the plane; the lenses see 199 degrees, so both see that band), the
+    two layers are given the same brightness and colour where they overlap
+    (_lens_gains), and they are mixed with a smooth ramp across the band
+    (_seam_mask). blend 0 joins them in hard lines instead.
+
+    nadir_fill and zenith_fill are degrees around the bottom and top pole to
+    cover with a soft fill (_fill_pole; 0 = none); None takes the settings
+    of config.json (stitch_settings()).
     """
     if image.mode != "RGB":
         image = to_rgb(image)
     out_width = max(8, int(out_width) // 4 * 4)
     out_height = out_width // 2
+    if nadir_fill is None or zenith_fill is None:
+        settings = stitch_settings()
+        nadir_fill = settings["nadir_fill_deg"] if nadir_fill is None else nadir_fill
+        zenith_fill = settings["zenith_fill_deg"] if zenith_fill is None else zenith_fill
     circles = find_lens_circles(image, params)
     half_fov = math.radians(float(params["fov"]) / 2.0)
     front = 0 if params.get("front", "left") == "left" else 1
     rotation = params.get("rotation") or (0, 0)
     mirror = bool(params.get("mirror"))
+    # The band may not reach past the edge of what the lenses see.
+    blend = math.radians(min(max(0.0, float(params.get("blend", 0.0))),
+                             max(0.0, float(params["fov"]) / 2.0 - 90.0)))
     lenses = [_fisheye_point(circles[half], half != front, rotation[half], mirror, half_fov)
               for half in (0, 1)]
     seam_left, seam_right = out_width // 4, out_width * 3 // 4
@@ -855,17 +1229,52 @@ def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARA
     for y in rows:
         latitude = (0.5 - float(y) / out_height) * math.pi
         sin_lat[y], cos_lat[y] = math.sin(latitude), math.cos(latitude)
-    mesh = []
-    for start, stop, half in ((0, seam_left, 1 - front), (seam_left, seam_right, front),
-                              (seam_right, out_width, 1 - front)):
-        lens = lenses[half]
 
-        def point(x, y, lens=lens):
-            longitude = (float(x) / out_width - 0.5) * 2.0 * math.pi
-            return lens(cos_lat[y] * math.sin(longitude), sin_lat[y],
-                        cos_lat[y] * math.cos(longitude))
-        mesh.extend(_mesh(_cells(start, stop), rows, point))
-    return image.transform((out_width, out_height), _MESH, mesh, _BILINEAR)
+    def lens_point(half):
+        lens = lenses[half]
+        known = {}          # (Neighbouring row bands share their edge points.)
+
+        def point(x, y):
+            found = known.get((x, y))
+            if found is None:
+                longitude = (float(x) / out_width - 0.5) * 2.0 * math.pi
+                found = known[x, y] = lens(cos_lat[y] * math.sin(longitude), sin_lat[y],
+                                           cos_lat[y] * math.cos(longitude))
+            return found
+        return point
+
+    if blend <= 0:
+        mesh = []
+        for start, stop, half in ((0, seam_left, 1 - front), (seam_left, seam_right, front),
+                                  (seam_right, out_width, 1 - front)):
+            mesh.extend(_mesh(_cells(start, stop), rows, lens_point(half)))
+        panorama = image.transform((out_width, out_height), _MESH, mesh, _BILINEAR)
+    else:
+        layers = []
+        for half, is_front in ((front, True), (1 - front, False)):
+            point = lens_point(half)
+            mesh = []
+            for index in range(len(rows) - 1):
+                top, bottom = rows[index], rows[index + 1]
+                reach = _seam_reach(min(cos_lat[top], cos_lat[bottom]), blend)
+                extra = int(math.ceil(reach * out_width / 360.0)) + MESH_CELL
+                if extra >= seam_left:
+                    spans = [(0, out_width)]
+                elif is_front:
+                    spans = [(seam_left - extra, seam_right + extra)]
+                else:
+                    spans = [(0, seam_left + extra), (seam_right - extra, out_width)]
+                for start, stop in spans:
+                    mesh.extend(_mesh(_cells(start, stop), (top, bottom), point))
+            layers.append(image.transform((out_width, out_height), _MESH, mesh, _BILINEAR))
+        gains = _lens_gains(layers[0], layers[1], blend)
+        layers = [_apply_gains(layer, gain) for layer, gain in zip(layers, gains)]
+        panorama = Image.composite(layers[0], layers[1], _seam_mask(out_width, out_height, blend))
+    if nadir_fill:
+        _fill_pole(panorama, nadir_fill, bottom=True)
+    if zenith_fill:
+        _fill_pole(panorama, zenith_fill, bottom=False)
+    return panorama
 
 
 # equirect_view(): a mesh cell whose corners lie further apart than this in

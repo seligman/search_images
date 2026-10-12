@@ -256,6 +256,99 @@ def extract_json(text):
         raise ValueError("invalid JSON in the response: " + str(error))
 
 
+# How many shorter versions of a cut-off reply repair_json tries at most.
+REPAIR_TRIES = 200
+
+
+def _closers(stack):
+    return "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+
+
+def repair_json(text):
+    """The JSON object a reply starts, closed and parsed when it was cut off.
+
+    For a reply that stopped at the length limit (or broke off): an open
+    string is closed (an unfinished escape dropped, and so is the first
+    half of an escaped surrogate pair whose second half is missing), then
+    open arrays and objects; when that is not valid JSON (the cut came
+    after a key, a colon or inside a number or a word), the text is cut
+    back to the last comma that ends a complete value, and so on. A number
+    at the very end may have been cut short, so it is never used as it is
+    (true, false and null are). A reply that holds a whole object is
+    parsed as it is. Returns a dict; raises ValueError when nothing usable
+    is found.
+    """
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("no JSON object found in the response")
+    body = text[start:]
+    stack = []
+    in_string = escape = False
+    hex_left = 0        # digits still to come of a \uXXXX escape
+    escape_at = 0
+    high = None         # (start, end) of the last complete \uD800-\uDBFF escape
+    cuts = []           # (index of a comma, the openers before it)
+    for index, char in enumerate(body):
+        if in_string:
+            if hex_left:
+                hex_left -= 1
+                if not hex_left and body[escape_at + 2:escape_at + 4].upper() in (
+                        "D8", "D9", "DA", "DB"):
+                    high = (escape_at, index + 1)
+            elif escape:
+                escape = False
+                if char == "u":
+                    hex_left = 4
+            elif char == "\\":
+                escape, escape_at = True, index
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if not stack or (char == "}") != (stack[-1] == "{"):
+                raise ValueError("invalid JSON in the response")
+            stack.pop()
+            if not stack:
+                try:
+                    data = json.loads(body[:index + 1])
+                except ValueError as error:
+                    raise ValueError("invalid JSON in the response: %s" % error)
+                if not isinstance(data, dict):
+                    raise ValueError("the reply is not a JSON object")
+                return data
+        elif char == ",":
+            cuts.append((index, tuple(stack)))
+    candidates = []
+    if in_string:
+        # An unfinished escape (a lone backslash, part of \\uXXXX) is dropped,
+        # and so is a high surrogate whose low half did not come (a lone
+        # surrogate cannot be stored as UTF-8).
+        kept = body[:escape_at] if escape or hex_left else body
+        if high is not None and high[1] == len(kept):
+            kept = body[:high[0]]
+        candidates.append(kept + '"' + _closers(stack))
+    else:
+        tail = body.rstrip()
+        word = re.search(r"[A-Za-z0-9.+-]+$", tail)
+        if word is None or word.group(0) in ("true", "false", "null"):
+            # (A number at the end may have been cut short: 12 cut to 1.)
+            candidates.append(tail + _closers(stack))
+    candidates.extend(body[:index] + _closers(openers)
+                      for index, openers in reversed(cuts[-REPAIR_TRIES:]))
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            return data
+    raise ValueError("the reply was cut off before any complete field")
+
+
 def merge_body(body, extra):
     """A copy of a request body with extra merged in.
 

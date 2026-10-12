@@ -34,6 +34,7 @@ import support
 import common
 import db
 import export
+import image_edits
 import jobs
 
 if support.pillow_available():
@@ -476,6 +477,32 @@ class ExportFixture(unittest.TestCase):
 
 
 class ExportTest(ExportFixture):
+
+    def test_the_owners_edits_are_published_and_the_text_they_replace_is_not(self):
+        cat = self.ids[FOLDER + "/Trip/" + FILE_PREFIX + "_0002.jpg"]
+        image_edits.save(self.conn, cat, {"title": "Tom asleep", "description": "Our Tom.",
+                                          "tags_add": ["tom"], "tags_remove": ["cat"]})
+        self.conn.commit()
+
+        def undo():
+            image_edits.save(self.conn, cat, {"title": None, "description": None,
+                                              "tags_add": [], "tags_remove": []})
+            self.conn.commit()
+        self.addCleanup(undo)
+        out = self.out("edited")
+        self.export(out)
+        records = self.by_title(out)
+        self.assertNotIn("Cat on a sofa", records)
+        record = records["Tom asleep"]
+        self.assertEqual((record["d"], record["g"]), ("Our Tom.", ["tom"]))
+        # That the owner edited it is no business of an export.
+        self.assertFalse([item for item in read_records(out) if "ed" in item])
+        for name in files_of(out):
+            if name.startswith("data/"):
+                with open(os.path.join(out, *name.split("/")), encoding="utf-8") as handle:
+                    text = handle.read()
+                self.assertNotIn("A picture of cat on a sofa.", text, name)
+                self.assertNotIn("model_info", text, name)
 
     def test_default_export_holds_only_what_may_be_published(self):
         out = self.out("default")
@@ -1850,6 +1877,44 @@ class FolderAndZipTest(support.TempBaseMixin, unittest.TestCase):
             self.assertNotIn("ix", record)
         # The pages show the stitched panorama, never the two raw circles.
         self.assertEqual(shipped["original"], shipped["web"])
+
+    def test_a_new_stitch_is_exported_again_without_previews(self):
+        # A library without previews: the export stitches the original, and
+        # stitches it again once the stitching changes (here the pole fill).
+        exif = imagegen.make_exif(make="Arashi Vision", model="Insta360 OneR",
+                                  date="2019:05:14 14:23:01", offset=None)
+        exif[0x010E] = "IMG_20190514_142301_00_001.insp"
+        import images
+        frame = imagegen.dual_fisheye_image((4400, 2200),
+                                            offsets=images.INSTA360_PARAMS["offsets"])
+        imagegen.write_bytes(self.folder, "IMG_20190514_142301_00_001.insp",
+                             imagegen.jpeg_bytes(frame, exif))
+        os.remove(os.path.join(self.folder, "cat.jpg"))
+        library = support.library("Vacation Z\u00fcrich", self.folder, id="lib_zurich01",
+                                  previews=False)
+        self.base.write_config([library])
+        self.scan_and_describe()
+        out = os.path.join(self.base.path, "site")
+
+        def shipped():
+            found = {}
+            for folder in ("images", "panos"):
+                (name,) = os.listdir(os.path.join(out, folder))
+                with open(os.path.join(out, folder, name), "rb") as handle:
+                    found[folder] = handle.read()
+            return found
+        self.export(out, {"images": "web"})
+        before = shipped()
+        self.assertEqual(self.export(out, {"images": "web"})["written"], 0)
+        self.base.write_config([library], nadir_fill_deg=6)
+        second = self.export(out, {"images": "web"})
+        after = shipped()
+        self.assertGreaterEqual(second["written"], 2)
+        for folder in ("images", "panos"):
+            self.assertNotEqual(after[folder], before[folder], folder)
+        fresh = images.read_image(os.path.join(self.folder, "IMG_20190514_142301_00_001.insp"),
+                                  None, want_pano=True)
+        self.assertEqual(after["panos"], export.clean_jpeg(fresh["pano"]))
 
 
 @unittest.skipIf(imagegen is None, "Pillow is not installed")

@@ -27,9 +27,12 @@ import cache
 import common
 import db
 import describe
+import image_edits
 import images
 import jobs
+import not_duplicates
 import scan
+import search_index
 
 SAMPLES = os.path.join(support.REPO, "sample", "images")
 DAY = 86400.0
@@ -892,6 +895,88 @@ class CarryOverTest(ScanTestCase):
             self.scan()
         self.assertEqual(self.rows()["copy.jpg"]["hidden"], 1)
 
+    def keep_one_of_two_copies(self, keep, hide, describe=False):
+        """Two identical files; the Duplicates page kept one and hid the other."""
+        path = write_jpeg(os.path.join(self.folder, keep), seed=7)
+        os.makedirs(os.path.dirname(os.path.join(self.folder, hide)), exist_ok=True)
+        shutil.copy2(path, os.path.join(self.folder, hide))
+        self.configure()
+        self.scan()
+        if describe:
+            self.describe_row(keep)
+            self.describe_row(hide)
+        self.execute("UPDATE images SET hidden = 1 WHERE path = ?", (hide,))
+
+    def shown(self):
+        """{path: shown} of the files present."""
+        return {path: row["hidden"] == 0 for path, row in self.rows().items()
+                if row["missing_since"] is None}
+
+    def test_the_kept_copy_stays_shown_when_it_moves(self):
+        self.keep_one_of_two_copies("a/x.jpg", "b/x.jpg")
+        os.makedirs(os.path.join(self.folder, "c"))
+        os.replace(os.path.join(self.folder, "a", "x.jpg"),
+                   os.path.join(self.folder, "c", "x.jpg"))
+        self.scan()
+        self.assertEqual(self.shown(), {"b/x.jpg": False, "c/x.jpg": True})
+
+    def test_the_kept_described_copy_stays_shown_when_it_moves(self):
+        # The moved file takes the description of a copy (the hidden one,
+        # found first, which has the lower id): never its hidden flag.
+        path = write_jpeg(os.path.join(self.folder, "d", "y.jpg"), seed=7)
+        os.makedirs(os.path.join(self.folder, "e"))
+        shutil.copy2(path, os.path.join(self.folder, "e", "y.jpg"))
+        self.configure()
+        self.scan()
+        self.describe_row("d/y.jpg")
+        self.describe_row("e/y.jpg")
+        rows = self.rows()
+        hide, keep = sorted(("d", "e"), key=lambda name: rows[name + "/y.jpg"]["id"])
+        self.execute("UPDATE images SET hidden = 1 WHERE path = ?", (hide + "/y.jpg",))
+        os.replace(os.path.join(self.folder, keep), os.path.join(self.folder, "f"))
+        self.scan()
+        self.assertEqual(self.shown(), {hide + "/y.jpg": False, "f/y.jpg": True})
+        self.assertEqual(self.rows()["f/y.jpg"]["described"], 1)
+
+    def test_the_kept_copy_stays_shown_when_it_moves_over_two_scans(self):
+        # Moved out of the library first (missing), then back at another path.
+        self.keep_one_of_two_copies("a/x.jpg", "b/x.jpg")
+        outside = os.path.join(self.base.path, "x.jpg")
+        os.replace(os.path.join(self.folder, "a", "x.jpg"), outside)
+        self.scan()
+        os.makedirs(os.path.join(self.folder, "c"))
+        os.replace(outside, os.path.join(self.folder, "c", "x.jpg"))
+        summary = self.scan()
+        self.assertEqual(summary["moved"], 1)
+        self.assertEqual(self.shown(), {"b/x.jpg": False, "c/x.jpg": True})
+
+    def test_deleting_the_hidden_copy_keeps_the_kept_one_shown(self):
+        self.keep_one_of_two_copies("a/x.jpg", "b/x.jpg")
+        os.remove(os.path.join(self.folder, "b", "x.jpg"))
+        self.scan()
+        self.assertEqual(self.shown(), {"a/x.jpg": True})
+
+    def test_both_copies_moved_keep_their_flags(self):
+        self.keep_one_of_two_copies("a/x.jpg", "b/x.jpg")
+        os.makedirs(os.path.join(self.folder, "2020"))
+        for name in ("a", "b"):
+            os.replace(os.path.join(self.folder, name), os.path.join(self.folder, "2020", name))
+        self.scan()
+        self.assertEqual(self.shown(), {"2020/a/x.jpg": True, "2020/b/x.jpg": False})
+        # The hidden one moved alone (another name) stays hidden.
+        os.replace(os.path.join(self.folder, "2020", "b", "x.jpg"),
+                   os.path.join(self.folder, "2020", "b", "renamed.jpg"))
+        self.scan()
+        self.assertEqual(self.shown(), {"2020/a/x.jpg": True, "2020/b/renamed.jpg": False})
+
+    def test_a_new_copy_of_a_kept_picture_is_shown(self):
+        # The picture is shown anyway: a new copy is shown too (and stacks
+        # with the kept one on the Duplicates page).
+        self.keep_one_of_two_copies("a/x.jpg", "b/x.jpg")
+        shutil.copy2(os.path.join(self.folder, "a", "x.jpg"), os.path.join(self.folder, "d.jpg"))
+        self.scan()
+        self.assertEqual(self.shown(), {"a/x.jpg": True, "b/x.jpg": False, "d.jpg": True})
+
     def test_hidden_flag_moves_with_imported_rows(self):
         # Rows without a content hash are matched by size and dHash when the
         # old row is removed; the new row inherits the flag then.
@@ -926,6 +1011,315 @@ class CarryOverTest(ScanTestCase):
         rows = self.rows()
         self.assertNotIn("old.jpg", rows)
         self.assertEqual(self.description_of("new.jpg"), "described late")
+
+
+class NotDuplicatesFollowTest(ScanTestCase):
+    """Pictures kept apart as not duplicates stay apart when their files change."""
+
+    def picture(self):
+        image = Image.new("RGB", (640, 480), (30, 120, 200))
+        draw = ImageDraw.Draw(image)
+        for left in range(0, 640, 40):
+            draw.rectangle([left, (left * 7) % 400, left + 20, (left * 7) % 400 + 60],
+                           fill=(200, left % 255, 50))
+        return image
+
+    def groups(self):
+        conn = db.connect()
+        try:
+            records = search_index.build_records(conn, self.config, [self.library_id])
+        finally:
+            conn.close()
+        return {record["n"]: record.get("dg") for record in records}
+
+    def keys(self):
+        return {path: not_duplicates.unit_key(row["id"], row["content_hash"])
+                for path, row in self.rows().items()}
+
+    def test_a_file_changed_in_place_stays_apart(self):
+        image = self.picture()
+        image.save(os.path.join(self.folder, "one.jpg"), quality=95)
+        image.save(os.path.join(self.folder, "two.jpg"), quality=70)
+        self.configure()
+        self.scan()
+        groups = self.groups()
+        self.assertTrue(groups["one.jpg"] and groups["one.jpg"] == groups["two.jpg"], groups)
+        old_keys = self.keys()
+        not_duplicates.change(not_duplicates.pairs_among(old_keys.values()))
+        self.assertEqual(self.groups(), {"one.jpg": None, "two.jpg": None})
+        # Re-saved in place (rotated, or a rating written into it elsewhere).
+        image.save(os.path.join(self.folder, "two.jpg"), quality=72)
+        later = time.time() + 10
+        os.utime(os.path.join(self.folder, "two.jpg"), (later, later))
+        summary = self.scan()
+        self.assertEqual(summary["changed"], 1)
+        new_keys = self.keys()
+        self.assertNotEqual(new_keys["two.jpg"], old_keys["two.jpg"])
+        self.assertIn(tuple(sorted((new_keys["one.jpg"], new_keys["two.jpg"]))),
+                      not_duplicates.pairs())
+        self.assertEqual(self.groups(), {"one.jpg": None, "two.jpg": None})
+        self.assertIn("Kept 1 pair(s) of pictures apart", self.log_text())
+
+    def test_imported_rows_keep_their_pairs_when_their_hash_is_found(self):
+        image = self.picture()
+        image.save(os.path.join(self.folder, "one.jpg"), quality=95)
+        image.save(os.path.join(self.folder, "two.jpg"), quality=70)
+        self.configure()
+        self.scan()
+        # As rows imported from the old database: no content hash yet.
+        self.execute("UPDATE images SET content_hash = ''")
+        old_keys = self.keys()
+        self.assertEqual(sorted(old_keys.values()), sorted("#%d" % row["id"]
+                                                           for row in self.rows().values()))
+        not_duplicates.change(not_duplicates.pairs_among(old_keys.values()))
+        self.scan()
+        new_keys = self.keys()
+        self.assertTrue(all(not key.startswith("#") for key in new_keys.values()), new_keys)
+        self.assertIn(tuple(sorted(new_keys.values())), not_duplicates.pairs())
+        self.assertEqual(self.groups(), {"one.jpg": None, "two.jpg": None})
+
+
+class OwnersEditTest(ScanTestCase):
+    """The owner's edits (image_edits) follow moved files and go with removed ones."""
+
+    def save_edit(self, path, **changes):
+        conn = db.connect()
+        try:
+            image_id = conn.execute("SELECT id FROM images WHERE path = ?",
+                                    (path,)).fetchone()[0]
+            image_edits.save(conn, image_id, changes)
+            conn.commit()
+        finally:
+            conn.close()
+        return image_id
+
+    def edit_of(self, path):
+        conn = db.connect()
+        try:
+            row = conn.execute("SELECT id FROM images WHERE path = ?", (path,)).fetchone()
+            return image_edits.load(conn, row[0]) if row else None
+        finally:
+            conn.close()
+
+    def edit_count(self):
+        return self.query("SELECT COUNT(*) AS n FROM image_edits")[0]["n"]
+
+    def test_a_moved_file_keeps_its_edit(self):
+        names = self.copy_samples(4)
+        self.configure()
+        self.scan()
+        self.describe_row(names[0])
+        self.save_edit(names[0], title="Our cat", tags_add=["tom"])
+        os.makedirs(os.path.join(self.folder, "Moved"))
+        os.rename(os.path.join(self.folder, names[0]),
+                  os.path.join(self.folder, "Moved", "renamed.jpg"))
+        self.scan()
+        self.assertNotIn(names[0], self.rows())
+        edit = self.edit_of("Moved/renamed.jpg")
+        self.assertEqual((edit["title"], edit["tags_add"]), ("Our cat", ["tom"]))
+        self.assertEqual(self.edit_count(), 1)
+
+    def test_a_move_found_after_the_fact_keeps_the_edit(self):
+        path = write_jpeg(os.path.join(self.folder, "old.jpg"), seed=3)
+        write_jpeg(os.path.join(self.folder, "keep.jpg"), seed=4)
+        self.configure()
+        self.scan()
+        self.save_edit("old.jpg", tags_add=["porch"])
+        os.rename(path, os.path.join(self.folder, "new.jpg"))
+        conn = db.connect()
+        try:
+            with mock.patch.object(scan.LibraryScan, "_find_source",
+                                   lambda *args: (None, False)):
+                scan.scan_library(conn, self.config["libraries"][0], jobs.JobContext("test"))
+        finally:
+            conn.close()
+        self.assertNotIn("old.jpg", self.rows())
+        self.assertEqual(self.edit_of("new.jpg")["tags_add"], ["porch"])
+
+    def test_a_changed_file_keeps_its_edit_and_a_purged_one_loses_it(self):
+        names = self.copy_samples(4)
+        self.configure(purge_after_days=30)
+        self.scan()
+        self.save_edit(names[0], title="First")
+        self.save_edit(names[1], title="Second")
+        # New content at the same path: the same picture to its owner.
+        shutil.copy2(os.path.join(SAMPLES, names[3]), os.path.join(self.folder, names[1]))
+        os.remove(os.path.join(self.folder, names[0]))
+        start = time.time()
+        self.scan(now=start)
+        self.assertEqual(self.edit_of(names[1])["title"], "Second")
+        self.assertEqual(self.edit_of(names[0])["title"], "First")      # only missing
+        self.scan(now=start + 31 * DAY)
+        self.assertNotIn(names[0], self.rows())
+        self.assertEqual(self.edit_count(), 1)
+
+    def titles(self):
+        return {row["path"]: row["title"] for row in self.query(
+            "SELECT i.path, e.title FROM images AS i LEFT JOIN image_edits AS e "
+            "ON e.image_id = i.id WHERE i.missing_since IS NULL")}
+
+    def test_a_reused_name_leaves_the_edit_with_the_moved_picture(self):
+        # Cameras number their files: IMG_0001.jpg moves and a new photo is
+        # saved as IMG_0001.jpg. Either may be read first (a folder's files
+        # are listed before its subfolders).
+        for old, moved in (("IMG_0001.jpg", "Archive/IMG_0001.jpg"),
+                           ("Camera/IMG_0001.jpg", "IMG_0001-old.jpg")):
+            with self.subTest(moved=moved):
+                support.remove_tree(self.folder)
+                path = write_jpeg(os.path.join(self.folder, *old.split("/")), seed=3)
+                write_jpeg(os.path.join(self.folder, "keep.jpg"), seed=4)
+                self.configure(reader_threads=1)
+                self.execute("DELETE FROM images")
+                self.scan()
+                self.describe_row(old)
+                self.save_edit(old, title="Rex", tags_add=["rex"])
+                os.makedirs(os.path.dirname(os.path.join(self.folder, *moved.split("/"))),
+                            exist_ok=True)
+                os.rename(path, os.path.join(self.folder, *moved.split("/")))
+                write_jpeg(path, seed=9)
+                self.scan()
+                self.assertEqual(self.edit_of(moved)["tags_add"], ["rex"])
+                self.assertIsNone(self.edit_of(old))
+                self.assertEqual(self.rows()[moved]["described"], 1)
+                self.assertEqual(self.edit_count(), 1)
+                self.assertIn("Your edit of %s went with its picture to %s" % (old, moved),
+                              self.log_text())
+
+    def test_swapped_names_swap_the_edits(self):
+        a = write_jpeg(os.path.join(self.folder, "a.jpg"), seed=3)
+        b = write_jpeg(os.path.join(self.folder, "b.jpg"), seed=4)
+        write_jpeg(os.path.join(self.folder, "c.jpg"), seed=5)
+        self.configure(reader_threads=1)
+        self.scan()
+        self.save_edit("a.jpg", title="Rex")
+        self.save_edit("b.jpg", title="Tom")
+
+        def swap():
+            os.replace(a, a + ".tmp")
+            os.replace(b, a)
+            os.replace(a + ".tmp", b)
+            later = time.time() + 10
+            os.utime(a, (later, later))
+            os.utime(b, (later, later))
+
+        swap()
+        self.scan()
+        self.assertEqual(self.titles(), {"a.jpg": "Tom", "b.jpg": "Rex", "c.jpg": None})
+        # With only one of them edited, that edit moves.
+        self.save_edit("a.jpg", title=None)
+        swap()
+        self.scan()
+        self.assertEqual(self.titles(), {"a.jpg": "Rex", "b.jpg": None, "c.jpg": None})
+
+    def test_a_retouched_file_keeps_its_edit_and_the_kept_original_gets_it_too(self):
+        path = write_jpeg(os.path.join(self.folder, "IMG_1.jpg"), seed=3)
+        self.configure(reader_threads=1)
+        self.scan()
+        self.save_edit("IMG_1.jpg", title="Rex")
+        shutil.copy2(path, os.path.join(self.folder, "IMG_1_original.jpg"))
+        # The same picture saved again: other bytes, the same look.
+        with Image.open(path) as image:
+            image.load()
+            image.save(path, "JPEG", quality=60)
+        later = time.time() + 10
+        os.utime(path, (later, later))
+        self.scan()
+        self.assertEqual(self.titles(), {"IMG_1.jpg": "Rex", "IMG_1_original.jpg": "Rex"})
+
+    def test_a_file_changed_in_place_keeps_its_edit_next_to_an_old_copy(self):
+        # A copy of the old content that was there before is not where the
+        # file went: the edit stays.
+        path = write_jpeg(os.path.join(self.folder, "a.jpg"), seed=3)
+        shutil.copy2(path, os.path.join(self.folder, "copy.jpg"))
+        self.configure()
+        self.scan()
+        self.save_edit("a.jpg", title="Rex")
+        write_jpeg(path, seed=9)
+        later = time.time() + 10
+        os.utime(path, (later, later))
+        self.scan()
+        self.assertEqual(self.titles(), {"a.jpg": "Rex", "copy.jpg": None})
+
+    def test_a_move_next_to_a_copy_gives_the_edit_to_the_moved_file(self):
+        write_jpeg(os.path.join(self.folder, "copy.jpg"), seed=3)
+        write_jpeg(os.path.join(self.folder, "orig.jpg"), seed=3)
+        write_jpeg(os.path.join(self.folder, "other.jpg"), seed=5)
+        self.configure()
+        self.scan()
+        self.save_edit("orig.jpg", title="Original", tags_add=["mine"])
+        os.makedirs(os.path.join(self.folder, "Moved"))
+        os.rename(os.path.join(self.folder, "orig.jpg"),
+                  os.path.join(self.folder, "Moved", "orig.jpg"))
+        self.scan()
+        self.assertEqual(self.titles(), {"copy.jpg": None, "other.jpg": None,
+                                         "Moved/orig.jpg": "Original"})
+        # And when the copy has an edit of its own, both are kept.
+        self.save_edit("copy.jpg", title="Copy")
+        os.rename(os.path.join(self.folder, "Moved", "orig.jpg"),
+                  os.path.join(self.folder, "orig.jpg"))
+        self.scan()
+        self.assertEqual(self.titles(), {"copy.jpg": "Copy", "other.jpg": None,
+                                         "orig.jpg": "Original"})
+        self.assertEqual(self.edit_of("orig.jpg")["tags_add"], ["mine"])
+        self.assertEqual(self.edit_count(), 2)
+
+    def test_an_edit_no_copy_can_take_is_logged(self):
+        write_jpeg(os.path.join(self.folder, "a.jpg"), seed=3)
+        write_jpeg(os.path.join(self.folder, "b.jpg"), seed=3)
+        for index in range(3):
+            write_jpeg(os.path.join(self.folder, "k%d.jpg" % index), seed=10 + index)
+        self.configure()
+        self.scan()
+        self.save_edit("a.jpg", title="First")
+        self.save_edit("b.jpg", title="Second")
+        os.makedirs(os.path.join(self.folder, "Moved"))
+        os.rename(os.path.join(self.folder, "a.jpg"), os.path.join(self.folder, "Moved", "c.jpg"))
+        os.remove(os.path.join(self.folder, "b.jpg"))
+        self.scan()
+        titles = self.titles()
+        self.assertIn(titles.pop("Moved/c.jpg"), ("First", "Second"))
+        self.assertEqual(set(titles.values()), {None})
+        self.assertEqual(self.edit_count(), 1)
+        self.assertRegex(self.log_text(), r"Your edit of [ab]\.jpg \((First|Second)\) was "
+                                          r"removed with it: every copy")
+
+    def test_a_move_to_another_library_keeps_the_edit(self):
+        other = self.base.library_folder("Other")
+        family = support.library("Family", self.folder)
+        second = support.library("Other", other)
+        for order in ((family, second), (second, family)):
+            with self.subTest(first=order[0]["name"]):
+                for folder in (self.folder, other):
+                    support.remove_tree(folder)
+                path = write_jpeg(os.path.join(self.folder, "a.jpg"), seed=3)
+                for index in range(3):
+                    write_jpeg(os.path.join(self.folder, "k%d.jpg" % index), seed=10 + index)
+                self.configure(list(order), purge_after_days=1)
+                self.execute("DELETE FROM images")
+                self.scan()
+                self.describe_row("a.jpg")
+                self.save_edit("a.jpg", title="Rex")
+                os.makedirs(other, exist_ok=True)
+                os.rename(path, os.path.join(other, "a.jpg"))
+                start = time.time()
+                self.scan(now=start)
+                # Read first, the old library hands the edit on as the file goes
+                # missing; read last, the new file takes it from the missing one.
+                self.assertIn("Kept your edit of a.jpg for "
+                              + ("a.jpg" if order[0] is family else
+                                 "its copy in another library"), self.log_text())
+                rows = self.query(
+                    "SELECT i.library_id, i.missing_since, e.title FROM images AS i "
+                    "JOIN image_edits AS e ON e.image_id = i.id WHERE i.path = 'a.jpg'")
+                present = [row for row in rows if row["missing_since"] is None]
+                self.assertEqual([(row["library_id"], row["title"]) for row in present],
+                                 [(self.config["libraries"][[item["name"] for item in order]
+                                                            .index("Other")]["id"], "Rex")])
+                # The old row goes after purge_after_days; the edit stays.
+                self.scan(now=start + 2 * DAY)
+                self.assertEqual(self.titles(), {"a.jpg": "Rex", "k0.jpg": None,
+                                                 "k1.jpg": None, "k2.jpg": None})
+                self.assertEqual(self.edit_count(), 1)
 
 
 class TrustTest(ScanTestCase):
@@ -1427,6 +1821,155 @@ class PanoramaScanTest(ScanTestCase):
         self.assertIn("(2 with a large panorama for the 360 view)", self.log_text())
         self.scan()
         self.assertEqual(self.reads, [])
+
+    def stitch_state(self):
+        conn = db.connect()
+        try:
+            return scan.stitch_state(conn, self.LIBRARY)
+        finally:
+            conn.close()
+
+    def set_stitch_state(self, key, pending=()):
+        conn = db.connect()
+        try:
+            scan.save_stitch_state(conn, self.LIBRARY, key, pending)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_a_new_library_is_stitched_once(self):
+        self.write("IMG_20190514_142301_00_001.insp", dual_fisheye_jpeg(insta360_exif()))
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        summary = self.scan()
+        self.assertEqual([os.path.basename(path) for path in self.reads],
+                         ["IMG_20190514_142301_00_001.insp"])
+        self.assertEqual(summary["backfill"]["restitched"], 0)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), []))
+        self.scan()
+        self.assertEqual(self.reads, [])
+
+    def test_photos_stitched_by_an_older_version_are_stitched_again(self):
+        self.write("IMG_20190514_142301_00_001.insp", dual_fisheye_jpeg(insta360_exif()))
+        write_jpeg(os.path.join(self.folder, "photo.jpg"), seed=3)
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        rows = self.rows()
+        insp_id = rows["IMG_20190514_142301_00_001.insp"]["id"]
+        self.describe_row("IMG_20190514_142301_00_001.insp")
+        # As an older version left it: a hard-seamed preview, no record.
+        store = cache.PreviewStore()
+        old_preview = imagegen.jpeg_bytes(Image.new("RGB", (1024, 512), (200, 0, 0)))
+        store.write(self.LIBRARY, insp_id, old_preview)
+        self.execute("DELETE FROM meta")
+        summary = self.scan()
+        self.assertEqual([os.path.basename(path) for path in self.reads],
+                         ["IMG_20190514_142301_00_001.insp"])
+        self.assertEqual(summary["backfill"]["restitched"], 1)
+        self.assertNotEqual(store.read(self.LIBRARY, insp_id), old_preview)
+        self.assertIn("Stitching 1 360-degree photo(s) in", self.log_text())
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), []))
+        row = self.rows()["IMG_20190514_142301_00_001.insp"]
+        self.assertEqual(row["described"], 1)                 # the description is kept
+        self.assertEqual(json.loads(row["info"]), INFO)
+        self.assertEqual(row["projection"], "dual_fisheye")
+        self.assertNotIn("describe them again", self.log_text())
+        self.scan()
+        self.assertEqual(self.reads, [])
+        # Other pole fill settings make another round.
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)],
+                       nadir_fill_deg=5)
+        self.assertEqual(self.scan()["backfill"]["restitched"], 1)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), []))
+
+    def test_photos_stitched_with_the_old_default_fill_are_stitched_again(self):
+        # An earlier version filled 6 degrees round the nadir by default;
+        # without that setting the photos it stitched are stitched again.
+        self.write("IMG_20190514_142301_00_001.insp", dual_fisheye_jpeg(insta360_exif()))
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        self.set_stitch_state(images.stitch_key({"nadir_fill_deg": 6.0,
+                                                 "zenith_fill_deg": 0.0}), [])
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["restitched"], 1)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), []))
+        self.assertEqual(self.scan()["backfill"]["restitched"], 0)
+
+    def test_a_stopped_round_carries_on(self):
+        for number in (1, 2, 3):
+            name = "IMG_20190514_14230%d_00_00%d.insp" % (number, number)
+            self.write(name, dual_fisheye_jpeg(insta360_exif(name)))
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        ids = sorted(row["id"] for row in self.rows().values())
+        # Two still pending from a run that was stopped.
+        self.set_stitch_state(images.stitch_key(), ids[1:])
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["restitched"], 2)
+        self.assertEqual(len(self.reads), 2)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), []))
+        # A pending row that is gone is dropped; one ignored now (so
+        # missing) waits until it is back.
+        ignored = self.rows()["IMG_20190514_142301_00_001.insp"]["id"]
+        self.set_stitch_state(images.stitch_key(), [ignored, 999999])
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY,
+                                        ignore=["IMG_20190514_142301_00_001.insp"])])
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["restitched"], 0)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), [ignored]))
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        summary = self.scan()
+        self.assertEqual(summary["restored"], 1)
+        self.assertEqual(summary["backfill"]["restitched"], 1)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), []))
+
+    def test_a_photo_that_cannot_be_read_for_now_stays_pending(self):
+        # A share that went away during the round: tried again next time.
+        self.write("IMG_20190514_142301_00_001.insp", dual_fisheye_jpeg(insta360_exif()))
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        insp_id = self.rows()["IMG_20190514_142301_00_001.insp"]["id"]
+        self.execute("DELETE FROM meta")            # as an older version left it
+
+        def unreachable(path, *args, **kwargs):
+            raise images.SourceReadError("cannot read the file: the share went away")
+        with mock.patch.object(images, "read_image", unreachable):
+            summary = self.scan()
+        self.assertEqual((summary["backfill"]["failed"], summary["backfill"]["restitched"]),
+                         (1, 0))
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), [insp_id]))
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["restitched"], 1)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), []))
+
+    def test_a_photo_missing_at_the_upgrade_is_stitched_when_it_is_back(self):
+        name = "IMG_20190514_142301_00_001.insp"
+        self.write(name, dual_fisheye_jpeg(insta360_exif()))
+        for seed in range(5):
+            write_jpeg(os.path.join(self.folder, "photo%d.jpg" % seed), seed=seed)
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        insp_id = self.rows()[name]["id"]
+        away = os.path.join(self.base.path, name)
+        os.replace(os.path.join(self.folder, name), away)
+        self.scan()
+        self.assertIsNotNone(self.rows()[name]["missing_since"])
+        self.execute("DELETE FROM meta")            # the upgrade
+        self.assertEqual(self.scan()["backfill"]["restitched"], 0)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), [insp_id]))
+        os.replace(away, os.path.join(self.folder, name))
+        summary = self.scan()
+        self.assertEqual(summary["restored"], 1)
+        self.assertEqual(summary["backfill"]["restitched"], 1)
+        self.assertEqual(self.stitch_state(), (images.stitch_key(), []))
+
+    def test_a_broken_record_counts_as_none(self):
+        self.write("IMG_20190514_142301_00_001.insp", dual_fisheye_jpeg(insta360_exif()))
+        self.configure([support.library("Family", self.folder, id=self.LIBRARY)])
+        self.scan()
+        self.execute("UPDATE meta SET value = '[1, 2' WHERE key = ?",
+                     (scan.STITCH_META + self.LIBRARY,))
+        self.assertEqual(self.stitch_state(), (None, []))
+        self.assertEqual(self.scan()["backfill"]["restitched"], 1)
 
     def test_a_pano_that_cannot_be_written_is_not_left_behind(self):
         self.write_360_set()

@@ -15,10 +15,15 @@ and Insta360 `.insp` photos. RAW files (`.dng`, `.arw`, ...) are not indexed.
 360-degree photos are recognised: stitched panoramas (2:1 images tagged as
 equirectangular, or from a known 360 camera) and unstitched Insta360 frames
 holding two fisheye circles. The latter are stitched into a panorama for the
-preview (and for the LLM), and thumbnails show a normal-looking view of the
-front of the scene. Each 360-degree photo larger than its 2048 px preview
-also gets a panorama up to 4096 px wide (made from the full-size original)
-so the 360 view stays sharp.
+preview (and for the LLM): the two lenses are given the same brightness and
+colour and blended where they meet (a hand-held stick is hidden by the
+stitch already). A tripod's legs or a hand right below the camera can be
+covered with a soft fill: set `nadir_fill_deg` in config.json (see
+SETTINGS.md), for example to 6, to turn it on. It is off by default, as on clean ground it only
+greys the ground. Thumbnails show a normal-looking view of the front of
+the scene. Each 360-degree photo larger than its 2048 px preview also gets
+a panorama up to 4096 px wide (made from the full-size original) so the
+360 view stays sharp.
 
 Coming from an older version? Read [Upgrading from an older
 version](#upgrading-from-an-older-version) first.
@@ -113,8 +118,19 @@ models need 24 GB or more. Without a GPU it works, slowly. LM Studio, vLLM
 and Ollama work too: pick their service when you add the endpoint, and load
 a vision model.
 
-The helper module can start the server before each describe run and stop
-it afterwards (see [helper](SETTINGS.md#helper) in SETTINGS.md).
+The Settings page can start and stop `llama-server` for you: add a
+`local_server` section to `config.json` (where the program and the models
+folder are; see [local_server](SETTINGS.md#local_server) in SETTINGS.md)
+and the **Model server** panel gets **Start** and **Stop** buttons, a
+choice of the models in that folder, the slots and context, and the
+server's log. Describing then starts the server when it is needed and
+stops it again afterwards, and a daily stop time keeps the graphics card
+free from that time on (jobs that use the server stop ten minutes before,
+can be resumed later, and do not use it again until an hour after). A
+server started any other way is used as it is (also while it is still
+loading its model) and never stopped from the page. The helper module can
+also start a server before each describe run (see
+[helper](SETTINGS.md#helper)).
 
 ### With a cloud service
 
@@ -133,11 +149,16 @@ Manage page says how many pictures will be sent and where. A cloud service
 whose API key is not set up is never sent a picture. To try a few pictures
 first, run `python scan.py --limit 20`.
 
-Hidden pictures (see [Searching](#searching)) are described too, so they
-are sent to the cloud service like the others: hiding only keeps them out
-of searches and exports. To keep pictures away from a cloud service, give
-their library a local endpoint, or skip them with `ignore` patterns (see
-SETTINGS.md).
+Hidden pictures (see [Searching](#searching)) are never sent to a cloud
+service, or to any endpoint outside this computer and your network: not
+for describing, refining or comparing models. They are skipped and
+counted ("3 hidden pictures were not sent to api.openai.com"), and a local
+endpoint (in the library's endpoint group, say) still describes them. The
+Manage page does not count them as waiting to be described (or refined)
+by such an endpoint: they show as "hidden, kept here". A `--limit` counts
+only the pictures that can be sent. To keep whole folders away from a
+cloud service, give their library a local endpoint, or skip them with
+`ignore` patterns (see SETTINGS.md).
 
 ### What a description holds
 
@@ -157,7 +178,38 @@ Several images are described at once: as many as the endpoint's concurrency
 allows (for llama.cpp, its slot count). Rate limits and busy servers are
 waited out, an unusable reply is asked for again, and an image that still
 fails is marked and retried on later runs (up to three times). A rejected
-API key or an empty account stops the run with a message.
+API key or an empty account stops the run with a message. A reply cut off
+at the endpoint's length limit (`max_output_tokens`), typically in the
+middle of a long transcription, is kept when it got as far as the title and
+the description (its provenance says `truncated` and lists the fields it
+did not reach); otherwise the picture is asked for again with twice the
+room. A reply whose text went round in a loop until it was cut off, or
+whose JSON broke off, is asked for again first, and only kept when the
+retries do no better. A cut-off reply that did not get as far as the
+private-information answer counts as showing private information, so
+exports leave the picture out unless private pictures are included.
+
+### Refining documents and screenshots
+
+A small model describes photos well but may cut the text of a long
+receipt, letter or chat screenshot short. A library can name a second,
+stronger endpoint for those: its **refine** setting (**Edit** on the
+Manage page, "Refine documents and screenshots"). The refine pass then
+describes the library's pictures of the chosen kinds again (by default
+screenshots, documents and scans, and receipts, letters, forms, ID cards,
+tickets, chats, web pages, apps, handwriting, book pages and slides,
+whatever kind of picture they are), with up to 8000 tokens for the answer,
+and the new description replaces the old one. Start it with **Refine
+documents** on the library's card (it shows how many pictures it would
+do), or with `python scan.py --refine`. A picture refined with the current
+prompt is not refined again, and regular describing never overwrites a
+refined description (**Re-describe out of date** does after a prompt
+change, and **Describe again** in the viewer does for one picture).
+When a refine answer is cut off, the fields it did not reach keep their
+earlier values, and it never clears the earlier description's private or
+sensitive flags. Pictures whose refine failed three times keep their
+earlier description and are skipped; **Retry failed refine** on the card
+tries them again.
 
 ## Scanning
 
@@ -178,6 +230,12 @@ most of a library seems to have vanished at once, nothing is marked; run
 `python scan.py --library NAME --allow-mass-removal` if that really was
 intended.
 
+When a new version stitches unstitched 360-degree photos differently (or
+`nadir_fill_deg` or `zenith_fill_deg` changes), the next scan stitches the
+ones in the index again: their previews, panoramas and thumbnails are made
+anew, their descriptions are kept. A scan stopped part way carries on with
+the rest the next time.
+
 ### From the command line
 
     python scan.py
@@ -195,6 +253,10 @@ Options:
 - `--limit N` describes at most N images in this run.
 - `--endpoint NAME` describes with this endpoint (or group) instead of each
   library's own.
+- `--refine` runs only the refine pass (see [Refining documents and
+  screenshots](#refining-documents-and-screenshots)): no scan, no regular
+  describing. `--library`, `--limit`, `--retry-failed` and the order options
+  work with it.
 - `--list-endpoints` lists the configured endpoints and where their keys come
   from; `--test-endpoint NAME [--image PATH]` describes one picture (a
   sample by default) and prints the result. Neither ever shows a key.
@@ -232,11 +294,34 @@ the page header or the filters.
 - **Filters** (the sidebar; on a phone a drawer, which also holds the sort
   order and the other view settings) count the matching pictures by
   library, type, people, setting, time of day, event, year (and month),
-  camera, tags, subjects, animals, food, vehicles and colors.
+  place, camera, tags, subjects, animals, food, vehicles and colors (a tag
+  and its plural, such as "dog" and "dogs", count as one, shown the way it
+  is written most often). **Place** lists countries; choosing one shows
+  its regions under it, and choosing a region its towns (see [Place
+  names](#place-names)).
   Values of one filter are alternatives, different filters must all match;
   the chosen ones show above the results with a button to remove each.
   "Hide blurry and accidental shots" and "Hide sensitive pictures" (on by
   default: explicit and graphic pictures) are there too.
+- **The timeline** above the grid counts the results per year (per month
+  when they are all of one year, per day when they are all of one month).
+  Click a bar to see only that year (month, day): the timeline then shows
+  its months (days). For several, drag across them, or hold Shift and
+  click (or press `Enter` on) the first and then the last (`Esc` forgets
+  the first). The dates show as a "Taken" chip above the results, **Zoom
+  out** widens them again, and Back goes back. The arrow keys move between
+  bars. The timeline folds away with its title (and stays folded). It
+  counts the dates pictures were taken, from the camera or the file name:
+  a picture dated only by its file's time (a copy, a download) counts as
+  "without a date" there and in **On this day**, though sorting by date
+  still uses that time.
+- **On this day** (in the page header; a calendar on a phone) shows the
+  pictures taken on today's date in earlier years, with the years ago
+  above each year's pictures (the search `on:today`).
+- **Surprise me** opens a random picture of the results (of everything
+  when nothing is searched). The **Shuffle** order puts the results in a
+  random order that stays the same while you scroll and in that browser
+  tab (choosing Shuffle again shuffles anew).
 - **Group similar** shows near-duplicates (and exact copies) within each
   library as one stack with a "x3" badge; click the badge to see them all
   (copies in two different libraries show separately). The stack shows its
@@ -247,15 +332,19 @@ the page header or the filters.
   then rather with each other than with a look-alike dated only by its
   file; pictures dated only by their file need a closer match. Shots of a
   burst or an exposure bracket (taken within two seconds) may differ a
-  little more. Documents and screenshots are only stacked with exact
-  copies, as different pages look alike to the comparison.
+  little more. Pictures of clearly different shapes (a photo and a
+  panorama, 4:3 and 16:9, or a landscape and an upright picture: more than
+  15% apart) are only stacked when they are identical files. Documents and
+  screenshots are only stacked with exact copies, as different pages look
+  alike to the comparison.
 - **The viewer** opens when you click a thumbnail: the picture at screen
   size, arrow keys (or swiping) for the next and previous result, zoom with
   the wheel, a pinch or a double click, and the information pane (`i`):
-  date, camera settings, the description and text in the picture with your
-  search words marked, clickable tags and other facts (each starts a search),
-  quality, and "More like this". 360-degree photos can be looked around in
-  by dragging (the flat panorama when the browser cannot show that).
+  date, place, camera settings, the description and text in the picture
+  with your search words marked, clickable tags and other facts (each
+  starts a search, the place too), quality, and "More like this".
+  360-degree photos can be looked around in by dragging (the flat
+  panorama when the browser cannot show that).
   "Details page" opens the same on a page of its own, to link to.
 - **The address** holds the search, the filters, the sort order and the open
   picture, so links, reloads and the Back button bring the same view back.
@@ -268,7 +357,25 @@ the page header or the filters.
   described (and sent to a cloud service if their library uses one);
   "Show hidden pictures" in the sidebar brings them back to unhide them.
   **Select** chooses many pictures at once (Shift-click for a range, or
-  "Select all") to hide, unhide or copy their file paths.
+  "Select all") to hide, unhide, add or remove tags, or copy their file
+  paths.
+- **Your own words** (on this computer too): **Edit** in the viewer (or
+  `E`) changes a picture's title, description and tags; `Ctrl+Enter`
+  saves, `Esc` cancels, and "Use the model's ..." puts the AI model's text
+  back. Tags you add are the way to teach the search a name, such as a
+  pet's or a place's: they are searched like the model's tags, show first,
+  and are marked "added by you". Edited pictures show an "Edited" badge
+  with the model's own text folded away under it, and `is:edited` finds
+  them. **Add tag...** and **Remove tag...** on the selection bar do the
+  same for many pictures at once. Your edits are kept apart from the
+  model's description: describing a picture again never changes them.
+  They belong to the picture, not to its file name: a file moved or
+  renamed (in its library or to another one) keeps them, and when a new
+  picture is saved under an old name (cameras reuse names) the edits stay
+  with the old picture at its new place. They go when the picture is
+  removed from the index, unless a copy of it is still there. Published
+  exports and other computers see your words (never the model's text you
+  replaced, nor which pictures you edited).
 - The **Map** shows the located pictures of the current search as pins; a
   pin with a number holds pictures taken close together, which come apart
   as you zoom in. Click a pin for a list of its pictures: click one to view
@@ -302,6 +409,25 @@ than a word in the description, a year (`receipt 2019`) prefers pictures
 taken that year, and pictures that contain your words in the same order
 come first.
 
+A few common words also find their synonyms, below the word itself (a
+picture tagged `mom` comes before a "mother duck"): `kids` finds children
+(and toddlers, boys and girls), `car` automobiles, `plane` airplanes and
+aircraft, `sea` the ocean, `mom` mothers, `couch` sofas, and so on. A
+broader word finds the narrower ones but not the other way round (`dog`
+finds puppies and retrievers, `puppy` only puppies), and so does a word
+with other meanings (`fall` finds autumn pictures, but `autumn` finds no
+waterfalls). Quoted words, the text in pictures and field filters other
+than `tag:` and `animal:` are never widened. For animals, vehicles and
+food (and flowers and plants), the real thing ranks above pictures of it:
+a dog the model listed among the picture's animals (or named in its
+title) comes before a stuffed dog, a dog statue, a drawing or a logo, a
+hot dog, and a menu or a screenshot that mentions one -- unless you ask
+for those (`toy car`, `dog statue`, `bird art`, `car document`), which
+then come first. `animal`, `vehicle` and `food` put pictures with real
+ones first. When you search for one word, pictures that have it only in
+the text in the picture (a sign, a page) come after the pictures that are
+about it.
+
 - `"red car"` - the words together, in this order
 - `beach -dog` - leave out pictures with a word (or `-"a phrase"`)
 - `cat OR dog` (or `cat or dog`) - either word
@@ -318,9 +444,60 @@ come first.
   (`YYYY`, `YYYY-MM` or `YYYY-MM-DD`)
 - `has:text`, `has:gps` - with text in the picture, with a GPS position
   (also `has:people`, `has:animals`)
-- `is:360`, `is:duplicate`, `is:undescribed` - 360-degree photos, pictures
-  with near-duplicates in the same library, pictures not described yet
+- `on:today` - taken on this day in earlier years; `on:05-14` - on May 14
+  of any year; `on:2019-05-14` - on that day (dates from the camera or the
+  file name only, not a file's time)
+- `place:hawaii`, `place:"new york"` - taken in a town, region or country
+  (see [Place names](#place-names)); place names are also found as ordinary
+  words (`beach hawaii`), and a few other names of countries too (`usa`,
+  `america`, `uk`, `britain`, `holland`, ...; `us` alone or as `US`: next
+  to other words a lower-case `us` is skipped like "me"). A word found only
+  in the place names ranks below the same word in what a picture shows: a
+  room in Long Beach comes after the pictures of beaches.
+- `is:360`, `is:duplicate`, `is:undescribed`, `is:edited` - 360-degree
+  photos, pictures with near-duplicates in the same library, pictures not
+  described yet, pictures whose title, description or tags you edited
 - `lib:name` - only the pictures of one library
+
+### Place names
+
+Pictures with a GPS position can be found by the town, region and country
+they were taken in. The place names come from
+[GeoNames](https://www.geonames.org/) (the towns of the world with 1,000
+people or more, under the Creative Commons Attribution 4.0 licence); they
+are not part of this program. Download them once with **Download place
+names** at the foot of the Manage page, or with
+
+    python make_places.py
+
+Either fetches three files (about 10 MB) from geonames.org into
+`data/places/`, builds the place index `data/places/places.db` from them,
+and then looks up the place of every picture with a GPS position. That is
+the only time anything goes over the network for place names: looking up a
+place happens on this computer, and nothing about your pictures is sent.
+`make_places.py --from DIR` builds the index from the files downloaded by
+hand (`cities1000.zip`, `admin1CodesASCII.txt` and `countryInfo.txt` from
+https://download.geonames.org/export/dump/), `--redo` looks up every
+picture again, and `--lookup LAT LON` prints the place of a position.
+
+A picture's place is the town nearest to its position, by great-circle
+distance: "Kahului, Hawaii, United States (3 km)" in the viewer. When the
+nearest town is more than 50 km away, only its region and country are
+kept (out in the country, or off the coast); when no town is within
+250 km (the open sea), the picture has no place. Neighbourhoods are not
+used as towns, so a picture in a city is in that city. Scans look up the
+places of new and changed pictures as they read them, and of pictures
+scanned before the place names were there afterwards; **Add place names**
+on Manage does it at once, for every library (also those turned off).
+**Download again** fetches newer files and looks up every place again; a
+download that arrives incomplete is not used, and the place names stay as
+they were.
+
+Place names are words about where a picture was taken: other computers
+see them like the GPS positions (see [Searching from other
+computers](#searching-from-other-computers)), and an export publishes them
+only when it publishes locations, with the GeoNames credit at the foot of
+its pages.
 
 ### Searching from other computers
 
@@ -337,27 +514,28 @@ other name, such as an alias your router hands out, is refused with
 "Unknown host name.".
 
 There is no login. Anyone who can reach the computer can search every
-library that is turned on, see file and folder names, dates, GPS positions
-and the map, camera EXIF data and the model that described each picture,
-download the original files with all their metadata, and turn off "Hide
-sensitive pictures". Hidden pictures and turned-off libraries stay out. In
-this mode Manage, Settings and jobs are off, on this computer too; to manage
-the libraries at the same time, run a second server without `--host` on
-another port (`python serve.py serve --port 5001`). To share pictures
-beyond your household, publish a library instead (see [Publishing a
-library](#publishing-a-library)): it leaves out what you choose.
+library that is turned on, see file and folder names, dates, GPS positions,
+place names and the map, camera EXIF data and the model that described each
+picture, download the original files with all their metadata, and turn off
+"Hide sensitive pictures". Hidden pictures and turned-off libraries stay
+out. In this mode Manage, Settings and jobs are off, on this computer too;
+to manage the libraries at the same time, run a second server without
+`--host` on another port (`python serve.py serve --port 5001`). To share
+pictures beyond your household, publish a library instead (see [Publishing
+a library](#publishing-a-library)): it leaves out what you choose.
 
 ## Managing libraries in the browser
 
-The header of every page links to **Manage** and **Settings** when the
-server runs on this computer (the default address, `127.0.0.1`). Most of
-what the command line does can be done there:
+The header of every page links to **Duplicates**, **Manage** and
+**Settings** when the server runs on this computer (the default address,
+`127.0.0.1`). Most of what the command line does can be done there:
 
 - **Manage** lists each library with its folder, whether the folder can be
   reached, how many pictures are described, waiting, out of date or failed,
   and the last job. Its buttons scan a library, describe it, do both, retry
-  failed pictures, re-describe pictures described with an older prompt, and
-  build missing previews. **Process all libraries** does a scan and describe
+  failed pictures, re-describe pictures described with an older prompt,
+  refine documents and screenshots (when the library names a refine
+  endpoint), and build missing previews. **Process all libraries** does a scan and describe
   of every library that is turned on. **Export...** publishes a library as
   a static website (see "Publishing a library").
 - **Add library** asks for the folder (type it, or use **Browse...**; a
@@ -390,14 +568,52 @@ what the command line does can be done there:
   library that uses a cloud service, the page says how many pictures will
   be sent and where. A cloud service whose API key is not set up is never
   sent a picture: Manage says what is missing and keeps the describe
-  buttons off.
+  buttons off. With a `local_server` section in `config.json`, the
+  **Model server** panel starts and stops the local model server and
+  shows its state, settings and log (see [On your own computer
+  (llama.cpp)](#on-your-own-computer-llamacpp)).
+- **Duplicates** goes through the stacks that **Group similar** makes on
+  the search page (identical files, and nearly the same shot taken at about
+  the same time), the largest first, 20 to a page, for the library picked
+  in the header: all of them, only identical files or only similar
+  pictures, and only stacks of 3, 5 or 10 or more if you like. Each stack
+  shows its pictures side by side with their size, file size and format,
+  date (and where it comes from), sharpness and looks, camera and file
+  name, and marks the **Best** one, saying why. The best is the full-size
+  picture rather than a smaller copy of it (less than half its pixels, the
+  same shape and nearly the same look; a smaller picture of another shape
+  or with other content is not taken for a copy); then the sharpest (when
+  all of them are described; identical files, and one picture saved in two
+  formats such as `IMG_0001.HEIC` and `IMG_0001.jpg`, count as one
+  picture); then the one that looks least like a copy (converted from the
+  camera's format, a file name such as `photo (1).jpg`, `photo - Copy.jpg`
+  or `photo_edited.jpg`, a picture saved from a chat app, a screenshot, no
+  camera data or a date from the file when the others have the camera's);
+  then the most pixels, the format cameras save in (HEIC, then JPEG or
+  TIFF, then the others), the largest file, the earliest, and the one
+  found first. **Keep best, hide the others** hides the rest of a stack,
+  **Keep only this** keeps another picture instead, **Hide** hides one
+  picture and **Not a duplicate** takes one out of its stack; **Not
+  duplicates** stops stacking the pictures of a stack of up to 100
+  (identical files always stay together); **Keep the best in every stack
+  on this page** keeps the best of each stack shown, after asking. Nothing
+  is deleted: hiding is the same as in the viewer, and **Undo** (or **Show
+  hidden pictures** on the search page) brings pictures back. A copy you
+  kept stays shown when its hidden twins are deleted or it is moved. "Not
+  duplicates" is remembered for each pair of pictures, by their content
+  (so it lasts through moves and renames, and a file changed in place
+  keeps it), in `data/not-duplicates.json`; the search page and exports
+  stop stacking them too. On the search page, an opened stack
+  (**Review**) and the viewer's note about a folded stack (**Review
+  duplicates**) open that stack on the Duplicates page.
 
 Only the command line can let a scan mark most of a library missing
 (`scan.py --allow-mass-removal`; a scan from Manage that stops for this
 says so in its log), describe at most N pictures (`--limit`), describe with
 another endpoint for one run (`--endpoint`), list every changed file
 (`--verbose`), and set the helper module (`settings.py`, or `helper` in
-`config.json`).
+`config.json`). The model server's program, models folder and command line
+are only set in `config.json` (`local_server`).
 
 These pages only answer requests from this computer, and are turned off
 when the server is started with `--host` (see [Searching from other
@@ -494,7 +710,8 @@ options.
   sensitive (`--include-private`, `--include-sensitive`), file names
   (`--file-names`), folder names (`--folders`), and GPS positions with the
   map (`--location`, which also adds the AI model's separate landmark and
-  place-guess fields). Hidden pictures are never published.
+  place-guess fields, and the place names: then the pages credit GeoNames
+  at their foot, the map in a corner). Hidden pictures are never published.
 - Titles, descriptions, tags and the text read from pictures are published
   as the AI model wrote them: they can name people or places a picture
   shows, whatever the options say. Read through what you publish.
@@ -546,7 +763,8 @@ sample is sent to that service and paid for.
   picks the images, `--library NAME` the libraries, `--profile extended` the
   extended metadata.
 - Libraries whose own `endpoint` setting keeps them on local endpoints are
-  not sent to a cloud endpoint unless you name them with `--library`. An
+  not sent to a cloud endpoint unless you name them with `--library`, and
+  hidden pictures are never sent to one (they are listed as not run). An
   endpoint whose first few images all fail (or that keeps failing) is not
   sent the rest of the sample.
 - Local servers that cannot run at the same time can be compared one by
@@ -571,8 +789,8 @@ private.
 Everything is kept in `config.json`: the endpoints, the libraries and a few
 general settings. The Settings and Manage pages edit most of it, and so
 does `python settings.py`; [SETTINGS.md](SETTINGS.md) describes every field,
-including the two only a text editor changes (`reader_threads` and
-`purge_after_days`).
+including those only a text editor changes (`reader_threads`,
+`purge_after_days`, `nadir_fill_deg` and `zenith_fill_deg`).
 
 `settings.py` writes nothing until you choose **Save and exit**. If
 `config.json` was changed in the meantime (on the Manage or Settings page,
@@ -587,24 +805,33 @@ left as it is.
 private:
 
 - `index.db` - the database: file names, folders, dates, camera, EXIF and
-  GPS data, and the descriptions.
+  GPS data, the descriptions, and your own titles, descriptions and tags
+  (kept apart from the model's).
 - `thumbs.db` and `previews/` - thumbnails, and 2048 px previews and 360
   panoramas (about 0.5 MB per picture).
 - `jobs.db` and `logs/` - the Manage page's jobs and their logs, which name
   files. With the `LOG_ERRORS` environment variable set, the LLM's replies
-  to failed requests are saved in `logs/` too.
+  to failed requests are saved in `logs/` too. `logs/model-server.log` is
+  the output of the model server the Settings page starts, and
+  `model-server.json` (changed under `model-server.lock`) records it (its
+  process id and start time) while it runs.
 - `exports/` - static sites (`exports/<library name>/`) and the list of
   files each export wrote (`exports/state/`).
 - `reports/` - model comparison reports.
+- `not-duplicates.json` - the pictures you said are not duplicates (the
+  Duplicates page).
 - `cache/` (near-duplicate groups, rebuilt when missing) and `tmp/`.
+- `places/` - the GeoNames files and the place index made from them (see
+  [Place names](#place-names)); not private, and made again by
+  `make_places.py`.
 - `tiles/` and `blue_marble.jpg` (from `make_tiles.py`), `world_map.png`
   (from `world_map.py`).
 - `images.db` and `thumbs/` - the database of older versions (see
   [Upgrading](#upgrading-from-an-older-version)).
 - `*.lock` files and `abort` - used while tools run.
 
-To keep the descriptions, back up `config.json` and `data/index.db` while
-no tool is running.
+To keep the descriptions, back up `config.json`, `data/index.db` and
+`data/not-duplicates.json` while no tool is running.
 
 ### Other tools
 
@@ -621,6 +848,11 @@ failure.
 draws a world map with a pin for each place pictures were taken (by default
 `data/world_map.png`).
 
+    python make_places.py
+
+downloads the place names and looks up the places of the pictures (see
+[Place names](#place-names)).
+
     python make_tiles.py
 
 downloads a detailed world image (about 27 MB, to `data/blue_marble.jpg`)
@@ -635,13 +867,23 @@ writes the missing or damaged ones.
 - `settings.py` - manage settings from a menu
 - `scan.py` - scan libraries, then request descriptions
 - `describe.py`, `prompts.py` - the describe step and the prompt it sends
+- `refine.py` - which pictures the refine pass describes again
+- `local_server.py` - starts and stops the local model server (Settings
+  page, describe jobs, the daily stop time)
 - `export.py` - publish one library as a static website
 - `compare_models.py` - compare how endpoints describe the same images
-- `progress.py`, `world_map.py`, `make_tiles.py` - see [Other
-  tools](#other-tools)
+- `progress.py`, `world_map.py`, `make_tiles.py`, `make_places.py` - see
+  [Other tools](#other-tools)
+- `places.py` - place names: the GeoNames download, the place index and
+  the nearest town of a GPS position (`static/place-names.js` is their
+  part of the Manage page)
 - `example_helper.py` - the hooks a helper module can have
 - `search_index.py` - the compact search records the search page downloads
   and searches in the browser, and the groups of near-duplicate pictures
+- `image_edits.py` - your own titles, descriptions and tags, kept apart
+  from the model's descriptions and laid over them
+- `duplicates.py`, `not_duplicates.py` - the Duplicates page's stacks and
+  best pictures, and the pictures kept apart as not duplicates
 - `admin.py`, `library_ops.py` - the Manage and Settings pages' server side
   (library changes, folder checks, jobs, endpoints)
 - `static/`, `templates/` - the web pages (`shell.js` is the header shared
@@ -649,8 +891,10 @@ writes the missing or damaged ones.
   server or from a static export; `search-core.js` is the search engine and
   `viewer.js` the picture viewer, both shared with a static export;
   `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
-  `manage.js` and `settings.js` run Manage and Settings, and
-  `export-review.js` holds the rules and words of the Export dialog)
+  `duplicates.js` the Duplicates page; `manage.js` and `settings.js` run
+  Manage and Settings, `model-server.js` the Settings page's Model server
+  panel, and `export-review.js` holds the rules and words of the Export
+  dialog)
 - `common.py`, `db.py`, `cache.py`, `jobs.py`, `images.py`, `imageinfo.py`,
   `llm.py` - shared helpers (settings, database, thumbnails and previews,
   job control, image reading, EXIF facts, LLM calls)
@@ -700,6 +944,15 @@ Other changes to be aware of:
 - The older `endpoint` setting (one endpoint, or a round-robin list) still
   works. Editing endpoints in `settings.py` saves them in the newer
   `endpoints` form.
+- When a newer version changes the database's layout (to keep your own
+  titles, descriptions and tags, say), the first run of any tool makes the
+  change and saves a copy of the database as it was first
+  (`data/index.db.bak-v<old version>`); delete the copy once all is well.
+  An older checkout cannot open the changed database.
+- Unstitched 360-degree photos (Insta360 `.insp`) are stitched again by the
+  first scan after upgrading, now with the seams blended: only their
+  previews, panoramas and thumbnails change. The soft fill over a tripod or
+  a hand at the bottom is off unless you set `nadir_fill_deg`.
 - `config.json` is now written with non-ASCII characters escaped (`\u00fc`),
   and read as UTF-8. A file saved in the system's encoding still loads, with a
   warning.
@@ -744,3 +997,8 @@ sample images are covered by their own licenses, listed in
 `static/worldmap.jpg` is an equirectangular projection derived from NASA's
 Blue Marble imagery and is in the public domain. Source:
 https://commons.wikimedia.org/wiki/File:Equirectangular-projection.jpg
+
+Place names (downloaded when you ask for them, see [Place
+names](#place-names)) are from GeoNames, https://www.geonames.org/, under
+the Creative Commons Attribution 4.0 licence
+(https://creativecommons.org/licenses/by/4.0/).

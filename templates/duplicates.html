@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duplicates - Image Search</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="__ASSET_PREFIX__style.css">
+<link rel="stylesheet" href="__ASSET_PREFIX__duplicates.css">
+</head>
+<body class="admin-page duplicates-page">
+<main id="duplicates" class="admin-main">
+<div class="page-head">
+<div>
+<h1>Duplicates</h1>
+<p class="lead">Pictures that look alike: identical files, and nearly the same shot taken at about the same time. Keep the best of each stack and hide the others, or say they are not duplicates. Hidden pictures are left out of searches and exports; nothing is deleted.</p>
+</div>
+<div class="page-actions">
+<button type="button" id="keep-all" class="button primary" hidden>Keep the best in every stack on this page</button>
+</div>
+</div>
+<div id="dup-tools" class="dup-tools">
+<div class="segmented" role="group" aria-label="Show">
+<button type="button" data-kind="all" aria-pressed="true">All stacks</button>
+<button type="button" data-kind="exact" aria-pressed="false">Identical files</button>
+<button type="button" data-kind="similar" aria-pressed="false">Similar pictures</button>
+</div>
+<label class="dup-min"><span>Stacks of</span>
+<select id="dup-min">
+<option value="2">2 or more</option>
+<option value="3">3 or more</option>
+<option value="5">5 or more</option>
+<option value="10">10 or more</option>
+</select></label>
+</div>
+<div id="dup-notices" aria-live="polite"></div>
+<p id="dup-summary" class="dup-summary"></p>
+<div id="dup-list"><p class="message">Loading...</p></div>
+<nav id="dup-pages" class="dup-pages" aria-label="Pages of stacks" hidden></nav>
+</main>
+<noscript><p>This page needs JavaScript.</p></noscript>
+<script type="application/json" id="app-config">__APP_CONFIG__</script>
+<script src="__ASSET_PREFIX__site.js"></script>
+<script src="__ASSET_PREFIX__shell.js"></script>
+<script src="__ASSET_PREFIX__duplicates.js"></script>
+</body>
+</html>

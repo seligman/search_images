@@ -73,6 +73,7 @@ class JobContext:
         self.counts = {}
         self.warnings = 0
         self.errors = 0
+        self.interrupted = ""   # why the job was stopped to be resumed later (interrupt)
         self._removed = set()
 
     def add_secret(self, value):
@@ -136,6 +137,19 @@ class JobContext:
 
     def should_stop(self):
         return self._stop.is_set()
+
+    def interrupt(self, message):
+        """Stop at the next check, as a job to resume later rather than a cancelled one.
+
+        The web server's jobs then end "interrupted" with message as their
+        error (the model server's daily stop time uses this).
+        """
+        with self._lock:
+            first = not self.interrupted
+            self.interrupted = message or "Interrupted."
+        if first:
+            self.log(self.interrupted, "warn")
+        self.request_stop()
 
     def remove_library(self, library_id):
         """Say that a library was removed from the settings while the job runs.
@@ -489,10 +503,14 @@ STAGE_LABELS = {
     "scan": "Looking for new and changed pictures",
     "previews": "Building previews",
     "describe": "Describing pictures",
+    "refine": "Describing documents and screenshots again",
     "delete": "Deleting indexed data",
     "export": "Exporting pictures",
     "zip": "Writing the zip file",
     WAITING_STAGE: "Waiting for another scan to finish",
+    "download": "Downloading place names",
+    "build places": "Building the place index",
+    "places": "Adding place names",
 }
 # The job queue lives in data/jobs.db, a database of its own: a running scan
 # keeps index.db's write lock almost all the time, and adding, pausing or
@@ -1262,11 +1280,15 @@ class JobManager:
             summary = summary if isinstance(summary, dict) else {}
             error = summary.get("error") or ""
             if ctx.should_stop():
-                state = "interrupted" if self._shutdown.is_set() else "cancelled"
+                state = self._stopped_state(ctx)
+                if state == "interrupted" and ctx.interrupted:
+                    error = ctx.interrupted
             else:
                 state = "failed" if error else "done"
         except JobStopped:
-            state = "interrupted" if self._shutdown.is_set() else "cancelled"
+            state = self._stopped_state(ctx)
+            if state == "interrupted":
+                error = ctx.interrupted
         except JobError as exc:
             state, error = "failed", str(exc)
         except BaseException as exc:
@@ -1277,6 +1299,19 @@ class JobManager:
                 self._worker_lock.release()
             if state is not None:
                 self._finish(job, ctx, state, error, summary)
+
+    def _stopped_state(self, ctx):
+        """How a job that stopped early ends: "interrupted" (to be resumed) or "cancelled".
+
+        Interrupted when the server is stopping, or when the job was
+        interrupted (ctx.interrupt) rather than cancelled by someone.
+        """
+        if self._shutdown.is_set():
+            return "interrupted"
+        with self._lock:
+            current = self._current
+            cancelling = current is not None and current["state"] == "cancelling"
+        return "interrupted" if ctx.interrupted and not cancelling else "cancelled"
 
     def _finish(self, job, ctx, state, error, summary):
         error = ctx.redact(error or "")[:1000]
@@ -1550,6 +1585,19 @@ def run_describe(ctx, conn, config, params, helper=None):
                                      **_describe_options(params))
 
 
+def run_refine(ctx, conn, config, params, helper=None):
+    """Describe the documents and screenshots of a library (or every enabled one) again
+    with its refine endpoint (describe.refine_pending)."""
+    import describe
+    libraries = job_libraries(config, params)
+    limit = params.get("limit")
+    return describe.refine_pending(
+        conn, config, ctx, helper=helper, library_ids=[library["id"] for library in libraries],
+        limit=limit if isinstance(limit, int) and not isinstance(limit, bool) else None,
+        retry_failed=bool(params.get("retry_failed")),
+        only_library=bool(params.get("library_id")))
+
+
 def run_process(ctx, conn, config, params, helper=None):
     """Scan, then describe: one library, or every enabled one ("Process all")."""
     import scan
@@ -1624,11 +1672,51 @@ def run_export(ctx, conn, config, params, helper=None):
         raise JobError(export.os_error_text(error))
 
 
+def run_places(ctx, conn, config, params, helper=None):
+    """Add place names to the pictures with a GPS position (places.py).
+
+    params "download": first download the GeoNames files again and build
+    the place index from them (the only network use), then look up every
+    picture again; "redo": look up every picture again. Without either,
+    only pictures not looked up yet. A place index made by another version
+    of this program is built again from the downloaded files first (then
+    every picture is looked up again). The pictures of every library are
+    looked up, enabled or not: it only touches the database, and the
+    Manage page counts them all (places.status). Raises JobError when
+    there are no place names (or the download fails).
+    """
+    import places
+    summary = {}
+    try:
+        if params.get("download"):
+            summary["index"] = places.update(ctx)
+            if ctx.should_stop():
+                return summary
+        else:
+            rebuilt = places.rebuild_if_needed(ctx)
+            if rebuilt is not None:
+                summary["index"] = rebuilt
+        if places.shared() is None:
+            raise JobError("There are no place names yet: download them first.")
+        summary["places"] = places.label_pictures(
+            conn, ctx, None, redo=bool(params.get("download") or params.get("redo")
+                                       or summary.get("index")))
+    except places.PlacesError as error:
+        if ctx.should_stop():
+            return summary          # (cancelled: no error)
+        raise JobError(str(error))
+    finally:
+        places.release()
+    return summary
+
+
 RUNNERS = {
     "scan": run_scan,
     "describe": run_describe,
+    "refine": run_refine,
     "process": run_process,
     "previews": run_previews,
     "delete_library": run_delete_library,
     "export": run_export,
+    "places": run_places,
 }

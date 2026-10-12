@@ -419,6 +419,26 @@ var MAP = (function () {
         return text === "-0" ? "0" : text;
     }
 
+    /* The search a chip of the viewer opens (a search state, see
+       SITE.searchState): just that value -- group "q" for words, else a
+       facet group -- without the query, filters, map view or dates
+       (state.from/to, the timeline's) of the search the map shows. */
+    function chipState(state, group, value) {
+        var target = {};
+        Object.keys(state || {}).forEach(function (key) {
+            target[key] = state[key];
+        });
+        target.q = group === "q" ? value : "";
+        target.filters = {};
+        target.view = "";
+        target.from = "";
+        target.to = "";
+        if (group !== "q") {
+            target.filters[group] = [value];
+        }
+        return target;
+    }
+
     // "lat,lon,zoom" for the address (SITE.searchState reads it back).
     function formatView(view) {
         return shortNumber(view.lat) + "," + shortNumber(normalizeLon(view.lon)) + "," +
@@ -1190,14 +1210,7 @@ var MAP = (function () {
 
         // (A new search: without this view, so its map fits it.)
         function chipUrl(group, value) {
-            var target = searchLinkState();
-            target.q = group === "q" ? value : "";
-            target.filters = {};
-            target.view = "";
-            if (group !== "q") {
-                target.filters[group] = [value];
-            }
-            return SITE.searchUrl(target);
+            return SITE.searchUrl(chipState(searchLinkState(), group, value));
         }
 
         function libraryName(id) {
@@ -1548,7 +1561,8 @@ var MAP = (function () {
             });
             Object.keys(search.filters).forEach(function (group) {
                 search.filters[group].forEach(function (value) {
-                    var label = group === "library" ? value : SearchCore.facetLabel(group, value);
+                    var label = group === "library" ? value : group === "place"
+                        ? SearchCore.placeLabel(value) : SearchCore.facetLabel(group, value);
                     indexLibraries.forEach(function (library) {
                         if (group === "library" && library.id === value) {
                             label = library.name;
@@ -1557,6 +1571,9 @@ var MAP = (function () {
                     parts.push((labels[group] || group) + ": " + label);
                 });
             });
+            if (search.from || search.to) {
+                parts.push("Taken: " + SearchCore.rangeLabel(search.from, search.to));
+            }
             return parts.join(" \u00b7 ");
         }
 
@@ -1583,7 +1600,8 @@ var MAP = (function () {
             var found = SearchCore.search(searchIndex, search.q, {
                 library: library || "", libraries: indexLibraries, filters: search.filters,
                 hidden: adminOn && search.hidden, sensitive: search.sensitive || undefined,
-                junk: search.junk, group: false, sort: search.sort || undefined
+                junk: search.junk, group: false, sort: search.sort || undefined,
+                range: {from: search.from, to: search.to}, seed: SITE.shuffleSeed()
             });
             rank = {};
             found.items.forEach(function (id, index) {
@@ -1704,6 +1722,7 @@ var MAP = (function () {
         fitView: fitView,
         formatView: formatView,
         parseView: parseView,
+        chipState: chipState,
         formatPoint: formatPoint,
         parsePoint: parsePoint,
         groupAt: groupAt

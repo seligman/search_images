@@ -25,6 +25,7 @@
 <option value="oldest">Oldest first</option>
 <option value="name">File name</option>
 <option value="quality">Best looking</option>
+<option value="shuffle">Shuffle</option>
 </select></label>
 <label class="tool tool-check"><input id="group" type="checkbox"> Group similar</label>
 <label class="tool tool-size"><span class="tool-label">Size</span><input id="size" type="range" min="0" max="2" step="1" aria-label="Thumbnail size"></label>
@@ -48,11 +49,13 @@
 <div id="results-head">
 <h1 id="result-count" aria-live="polite"></h1>
 <span id="result-notes"></span>
+<button id="surprise-button" type="button" class="button subtle small" title="Open a picture of these, chosen at random" hidden><span class="wide-only">Surprise me</span><span class="narrow-only">Surprise</span></button>
 <a id="map-link" class="button subtle small" hidden></a>
 </div>
 <p id="query-notes" hidden></p>
 <div id="active-filters" hidden></div>
 <div id="selection-bar" hidden></div>
+<section id="timeline" aria-label="Timeline" hidden></section>
 <div id="month-bar" aria-hidden="true"><span id="month-label" hidden></span></div>
 <div id="grid" aria-label="Pictures"></div>
 <div id="empty" hidden></div>

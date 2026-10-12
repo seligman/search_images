@@ -17,6 +17,7 @@ import support
 
 import common
 import db
+import image_edits
 import imageinfo
 import search_index
 import serve
@@ -92,26 +93,38 @@ def about_the_same_time(first, second):
     return abs((first[1] - second[1]).total_seconds()) <= 12 * 3600
 
 
+def shapes_fit(aspect, others, tolerance=0.15):
+    """True if aspect (or None) is within tolerance of every known aspect in others."""
+    if aspect is None:
+        return True
+    return all(max(aspect, other) <= min(aspect, other) * (1 + tolerance) + 1e-9
+               for other in others if other is not None)
+
+
 def brute_force_groups(items, threshold=8, undated_threshold=6, burst_threshold=12,
                        burst_seconds=2, burst_groups=8):
     """duplicate_groups() the slow and obvious way, for comparison."""
     units, order = {}, []
-    for item in sorted(items):
+    for item in sorted(items, key=lambda item: item[0]):
         image_id, dhash, content_hash = item[:3]
         taken = item[3] if len(item) > 3 else ""
+        aspect = item[4] if len(item) > 4 else None
         key = ("c", content_hash) if content_hash else ("i", image_id)
         if key not in units:
-            units[key] = [[], None, None]
+            units[key] = [[], None, None, None]
             order.append(key)
         units[key][0].append(image_id)
         if units[key][1] is None:
             units[key][1] = search_index.parse_dhash(dhash)
         if units[key][2] is None and taken:
             units[key][2] = parse_taken(taken)
+        if units[key][3] is None:
+            units[key][3] = aspect
     representatives, anchors, groups, alone = [], [], [], []
+    shapes = []                     # per group: the aspect ratios of its pictures
     started = {}                    # capture time -> groups started then
     for key in order:
-        ids, value, when = units[key]
+        ids, value, when, aspect = units[key]
         if value is None or search_index._low_detail(value):
             alone.append(ids)
             continue
@@ -120,6 +133,9 @@ def brute_force_groups(items, threshold=8, undated_threshold=6, burst_threshold=
             distance = bin(value ^ other).count("1")
             anchor = anchors[index]
             if when is not None and anchor is not None and not about_the_same_time(when, anchor):
+                continue
+            # Every two pictures of a group have about the same shape.
+            if not shapes_fit(aspect, shapes[index]):
                 continue
             if when is None or other_when is None:
                 limit = undated_threshold
@@ -138,10 +154,12 @@ def brute_force_groups(items, threshold=8, undated_threshold=6, burst_threshold=
             representatives.append((value, when))
             anchors.append(when)
             groups.append(list(ids))
+            shapes.append([aspect])
             if when is not None and when[1] is not None:
                 started[when[1]] = started.get(when[1], 0) + 1
         else:
             groups[best].extend(ids)
+            shapes[best].append(aspect)
             if anchors[best] is None:
                 anchors[best] = when
     result = [sorted(ids) for ids in groups + alone if len(ids) > 1]
@@ -270,7 +288,11 @@ class RecordTest(IndexFixture, unittest.TestCase):
         filed = insert_image(self.conn, "lib_family1", "copied.jpg", described=1, prompt_ver=5,
                              info=info, taken_at="2026-10-11T08:00:00", taken_source="mtime")
         self.assertEqual(self.records()[filed]["dk"], "2026-10-11")
+        # (On the server it is marked as a file time: no date taken.)
+        self.assertEqual(self.records()[filed]["du"], 1)
+        self.assertNotIn("du", self.records()[image_id])
         self.assertNotIn("dk", self.records(for_export=True)[filed])
+        self.assertNotIn("du", self.records(for_export=True)[filed])
         self.conn.execute("DELETE FROM images WHERE id = ?", (filed,))
         self.conn.commit()
         records = self.records(for_export=True)
@@ -303,6 +325,60 @@ class RecordTest(IndexFixture, unittest.TestCase):
         text = body.decode("utf-8")
         self.assertNotIn("12.3456", text)
         self.assertNotIn("65.4321", text)
+
+
+class EditedRecordTest(IndexFixture, unittest.TestCase):
+    """The owner's edits (image_edits) are laid over the descriptions."""
+
+    def test_records_use_the_owners_words(self):
+        image_id = insert_image(self.conn, "lib_family1", "dog.jpg", described=1,
+                                prompt_ver=5, info=V5_INFO)
+        plain = insert_image(self.conn, "lib_family1", "plain.jpg", described=1,
+                             prompt_ver=5, info=V5_INFO)
+        image_edits.save(self.conn, image_id, {"title": "Rex catching his frisbee",
+                                               "tags_add": ["Rex"], "tags_remove": ["beach"]})
+        self.conn.commit()
+        records = self.records()
+        record = records[image_id]
+        self.assertEqual((record["t"], record["d"], record["g"], record["ed"]),
+                         ("Rex catching his frisbee", "A dog on a beach.", ["rex", "dog"], 1))
+        self.assertNotIn("ed", records[plain])
+        self.assertEqual(records[plain]["g"], ["dog", "beach"])
+        # Only the admin's records (those with hidden pictures) tell which.
+        public = self.records(include_hidden=False)[image_id]
+        self.assertEqual(public, {key: value for key, value in record.items() if key != "ed"})
+        # An export publishes the owner's words, but not that they were edited.
+        exported = self.records(for_export=True)[image_id]
+        self.assertEqual((exported["t"], exported["g"]), ("Rex catching his frisbee",
+                                                          ["rex", "dog"]))
+        self.assertNotIn("ed", exported)
+        self.assertEqual(search_index.picture_record(self.conn, image_id,
+                                                     image_edits.load(self.conn, image_id)),
+                         dict(record, ed=1))
+        self.assertIsNone(search_index.picture_record(self.conn, 999999))
+
+    def test_a_picture_not_described_yet_can_be_edited(self):
+        image_id = insert_image(self.conn, "lib_family1", "new.jpg")
+        image_edits.save(self.conn, image_id, {"title": "Grandma's garden",
+                                               "description": "Taken in June.",
+                                               "tags_add": ["garden"]})
+        self.conn.commit()
+        record = self.records()[image_id]
+        self.assertEqual(record, {"i": image_id, "l": "lib_family1", "n": "new.jpg",
+                                  "t": "Grandma's garden", "d": "Taken in June.",
+                                  "g": ["garden"], "w": 640, "hgt": 480, "ed": 1})
+
+    def test_a_saved_edit_changes_the_index_state(self):
+        image_id = insert_image(self.conn, "lib_family1", "dog.jpg", described=1,
+                                prompt_ver=5, info=V5_INFO)
+        before = search_index.data_state(self.conn, ["lib_family1"])
+        image_edits.save(self.conn, image_id, {"tags_add": ["rex"]}, now=NOW + 60)
+        self.conn.commit()
+        after = search_index.data_state(self.conn, ["lib_family1"])
+        self.assertNotEqual(before, after)
+        image_edits.save(self.conn, image_id, {"tags_add": []}, now=NOW + 120)
+        self.conn.commit()
+        self.assertNotEqual(search_index.data_state(self.conn, ["lib_family1"]), after)
 
 
 class DuplicateGroupTest(unittest.TestCase):
@@ -465,6 +541,8 @@ class DuplicateGroupTest(unittest.TestCase):
     DATES = ("", "", "2020-01-01T10:00:00", "2020-01-01T10:00:02", "2020-01-01T10:00:05",
              "2020-01-01T23:30:00", "2020-01-02T09:00:00", "2020-01-02T20:00:00",
              "2020-01-05T12:00:00", "2020-01-05")
+    # Aspect ratios: unknown, 4:3, 3:2, a little wider, 16:9, upright, a panorama.
+    ASPECTS = (None, 4 / 3.0, 4 / 3.0, 1.5, 1.6, 16 / 9.0, 0.75, 3.5)
 
     def test_matches_a_brute_force_reference(self):
         for seed in range(4):
@@ -478,9 +556,12 @@ class DuplicateGroupTest(unittest.TestCase):
                 hashes.append(value)
                 dhash = hexed(value) if rng.random() > 0.03 else ""
                 content = "c%d" % rng.randrange(200) if rng.random() < 0.15 else ""
-                items.append((image_id, dhash, content, rng.choice(self.DATES)))
+                items.append((image_id, dhash, content, rng.choice(self.DATES),
+                              rng.choice(self.ASPECTS)))
             if seed == 3:
                 items = [item[:3] for item in items]        # no dates at all
+            elif seed == 2:
+                items = [item[:4] for item in items]        # no shapes
             expected = brute_force_groups(items)
             rng.shuffle(items)
             self.assertEqual(search_index.duplicate_groups(items), expected, seed)
@@ -497,10 +578,12 @@ class DuplicateGroupTest(unittest.TestCase):
                 hashes.append(value)
                 content = "c%d" % rng.randrange(150) if rng.random() < 0.2 else ""
                 taken = rng.choice(self.DATES)
+                aspect = rng.choice(self.ASPECTS)
                 if content:
-                    # Exact copies hold the same EXIF data, so the same date.
-                    taken = copy_dates.setdefault(content, taken)
-                items.append((image_id, hexed(value), content, taken))
+                    # Exact copies hold the same EXIF data and size, so the
+                    # same date and shape.
+                    taken, aspect = copy_dates.setdefault(content, (taken, aspect))
+                items.append((image_id, hexed(value), content, taken, aspect))
             grouper = search_index._Grouper(8, 6)
             start = 0
             for end in (200, 201, 350, 600):
@@ -690,6 +773,100 @@ class DuplicateGroupTest(unittest.TestCase):
         self.assertEqual(search_index.duplicate_groups([]), [])
         with self.assertRaises(ValueError):
             search_index.duplicate_groups([], threshold=9)
+        # A shape that is no positive number counts as unknown.
+        for bad in (0, -1.5, float("nan"), float("inf"), True, "1.5"):
+            self.assertEqual(search_index.duplicate_groups(
+                [(1, hexed(self.BASE), "", DAY, 4 / 3.0), (2, hexed(self.BASE), "", DAY, bad)]),
+                [[1, 2]], bad)
+
+    def test_only_pictures_of_about_the_same_shape_group(self):
+        base, near = hexed(self.BASE), hexed(flip(self.BASE, 3, 40))
+
+        def pair(first, second, copy=False):
+            return search_index.duplicate_groups(
+                [(1, base, "same" if copy else "", DAY, first),
+                 (2, base if copy else near, "same" if copy else "", DAY, second)])
+        # 4:3 and 3:2 (12.5% wider) group; 4:3 and 16:9 do not, nor do a
+        # night shot and a wide panorama, or a landscape and an upright one.
+        self.assertEqual(pair(4 / 3.0, 1.5), [[1, 2]])
+        self.assertEqual(pair(1.5, 4 / 3.0), [[1, 2]])
+        self.assertEqual(pair(4 / 3.0, 16 / 9.0), [])
+        self.assertEqual(pair(4032 / 3024.0, 4000 / 1100.0), [])
+        self.assertEqual(pair(4 / 3.0, 3 / 4.0), [])
+        # At most 15% apart, either way round.
+        self.assertEqual(pair(1.0, 1.15), [[1, 2]])
+        self.assertEqual(pair(1.15, 1.0), [[1, 2]])
+        self.assertEqual(pair(1.0, 1.151), [])
+        # An unknown shape (no size stored) fits any.
+        self.assertEqual(pair(None, 3.5), [[1, 2]])
+        self.assertEqual(pair(3.5, None), [[1, 2]])
+        # Identical files always group.
+        self.assertEqual(pair(4 / 3.0, 3.5, copy=True), [[1, 2]])
+        # Without trusted dates too.
+        self.assertEqual(search_index.duplicate_groups(
+            [(1, base, "", "", 4 / 3.0), (2, base, "", "", 16 / 9.0)]), [])
+        self.assertEqual(search_index.duplicate_groups(
+            [(1, base, "", "", 4 / 3.0), (2, base, "", "", 1.4)]), [[1, 2]])
+
+    def test_every_two_pictures_of_a_group_have_about_the_same_shape(self):
+        base = hexed(self.BASE)
+        # 2 fits 1 (10% wider) and 3 fits 2 (10% wider), but 3 is 21%
+        # wider than 1: it starts a group of its own, which 4 then joins.
+        items = [(1, base, "", DAY, 1.0), (2, base, "", DAY, 1.1),
+                 (3, base, "", DAY, 1.21), (4, base, "", DAY, 1.25)]
+        self.assertEqual(search_index.duplicate_groups(items), [[1, 2], [3, 4]])
+        # The same without dates.
+        undated = [item[:3] + ("", item[4]) for item in items]
+        self.assertEqual(search_index.duplicate_groups(undated), [[1, 2], [3, 4]])
+
+    def test_a_picture_joins_the_nearest_group_of_its_shape(self):
+        a = self.BASE
+        b = flip(a, *range(10))                 # 10 bits from a: its own group
+        c = flip(a, *range(6))                  # 6 from a, 4 from b
+        # c is nearer to b, but only a has its shape.
+        for first, second, third in (("", "", ""),
+                                     ("2020-06-01T10:00:00", "2020-06-01T10:01:00",
+                                      "2020-06-01T10:02:00")):
+            items = [(1, hexed(a), "", first, 1.5), (2, hexed(b), "", second, 0.75),
+                     (3, hexed(c), "", third, 1.5)]
+            self.assertEqual(search_index.duplicate_groups(items), [[1, 3]], first)
+            self.assertEqual(search_index.duplicate_groups(
+                [item[:4] for item in items]), [[2, 3]], first)
+        # Two groups of the very same hash: each picture takes the one of
+        # its shape.
+        d = flip(a, 1, 2)
+        self.assertEqual(search_index.duplicate_groups(
+            [(1, hexed(a), "", "", 1.5), (2, hexed(a), "", "", 0.75),
+             (3, hexed(a), "", "", 0.75), (4, hexed(d), "", "", 1.5),
+             (5, hexed(d), "", "", 0.7)]), [[1, 4], [2, 3, 5]])
+
+    def test_a_copy_that_brings_the_first_shape_cannot_be_added(self):
+        base = hexed(self.BASE)
+        grouper = search_index._Grouper()
+        self.assertTrue(grouper.add([(1, base, "same", DAY, None)]))
+        # Worked out again, the group would have that shape (and refuse
+        # pictures of other shapes).
+        self.assertFalse(grouper.add([(3, base, "same", DAY, 1.5)]))
+        other = search_index._Grouper()
+        other.add([(1, base, "same", DAY, 1.5)])
+        self.assertTrue(other.add([(2, base, "same", DAY, None), (3, base, "same", DAY, 1.5),
+                                   (4, base, "", DAY, 3.5), (5, base, "", DAY, 1.4)]))
+        self.assertEqual(other.groups(), [[1, 2, 3, 5]])
+        # Shapes do not matter for pictures that only group as copies.
+        alone = search_index._Grouper()
+        alone.add([(1, "", "same", DAY, None)])
+        self.assertTrue(alone.add([(3, "", "same", DAY, 1.5)]))
+        self.assertEqual(alone.groups(), [[1, 3]])
+
+    def test_aspect_ratio(self):
+        self.assertEqual(search_index.aspect_ratio(4000, 3000), 4000 / 3000.0)
+        self.assertEqual(search_index.aspect_ratio(3000, 4000), 0.75)
+        for width, height in ((0, 3000), (4000, 0), (None, 10), (10, None), ("x", 10),
+                              (-4, 3), (float("inf"), 3)):
+            self.assertIsNone(search_index.aspect_ratio(width, height), (width, height))
+        self.assertTrue(search_index.same_shape(1.0, 1.15))
+        self.assertFalse(search_index.same_shape(1.0, 1.16))
+        self.assertTrue(search_index.same_shape(None, 9.0))
 
 
 class GroupsInRecordsTest(IndexFixture, unittest.TestCase):
@@ -748,6 +925,34 @@ class GroupsInRecordsTest(IndexFixture, unittest.TestCase):
                            key({"i": 1, "ts": "2019-01-01T09:00:00", "dk": "2019-01-01"}))
         self.assertGreater(key({"i": 9, "dk": "2030-01-01"}), key({"i": 1}))
         self.assertGreater(key({"i": 1}), key({"i": 2}))
+
+    def test_pictures_of_other_shapes_are_not_grouped(self):
+        # A night shot and two wide panoramas of the same evening: alike
+        # dHashes, taken the same day, but other shapes.
+        dhash = hexed(DuplicateGroupTest.BASE)
+        near = hexed(flip(DuplicateGroupTest.BASE, 3, 40))
+
+        def add(path, value, width, height, taken, content):
+            return self.add(path, value, width=width, height=height, taken_at=taken,
+                            taken_source="exif", content_hash=content)
+        night = add("night.jpg", dhash, 4032, 3024, "2019-07-04T21:30:00", "n1")
+        wide = add("pano1.jpg", near, 4000, 1100, "2019-07-04T18:30:00", "p1")
+        wider = add("pano2.jpg", dhash, 4300, 1150, "2019-07-04T18:31:00", "p2")
+        # An upright picture (its size as displayed, after EXIF rotation).
+        upright = add("upright.jpg", dhash, 3024, 4032, "2019-07-04T21:31:00", "u1")
+        # A smaller copy of the night shot, and another copy of its file.
+        small = add("night-small.jpg", near, 1008, 756, "2019-07-04T21:30:00", "n2")
+        same = add("night (1).jpg", dhash, 4032, 3024, "2019-07-04T21:30:00", "n1")
+        records = self.records()
+        self.assertEqual({image_id: records[image_id].get("dg") for image_id in records},
+                         {night: night, wide: wider, wider: wider, upright: None,
+                          small: night, same: night})
+        # The groups follow a new size (a picture scanned again).
+        self.conn.execute("UPDATE images SET width = 4000, height = 3000 WHERE id = ?",
+                          (wider,))
+        self.conn.commit()
+        records = self.records()
+        self.assertEqual((records[wide].get("dg"), records[wider]["dg"]), (None, night))
 
     def test_documents_and_screenshots_group_only_as_copies(self):
         # Different pages of text have nearly the same dHash.

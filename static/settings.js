@@ -200,14 +200,23 @@
     }
 
     function usedByText(endpoint) {
+        var used = endpoint.used_by || [];
+        var refined = endpoint.refined_by || [];
+        var text = used.length ? libraryNames(used) :
+            endpoint.default ? "Libraries without an endpoint of their own" :
+            refined.length ? "" : "No library";
+        if (refined.length) {
+            text += (text ? "; refine" : "Refine") + " pass of " + libraryNames(refined);
+        }
+        return text;
+    }
+
+    // The names of the libraries with these ids, the turned-off ones counted.
+    function libraryNames(used) {
         var names = {};
         (SITE.libraryList || []).forEach(function (item) {
             names[item.id] = item.name;
         });
-        var used = endpoint.used_by || [];
-        if (!used.length) {
-            return endpoint.default ? "Libraries without an endpoint of their own" : "No library";
-        }
         var known = used.filter(function (id) {
             return names[id];
         }).map(function (id) {
@@ -338,9 +347,14 @@
         var used = endpoint.used_by || [];
         var message = [el("p", {text: "Pictures described by it keep their descriptions."})];
         if (used.length) {
-            message.push(el("p", {text: "Used by: " + usedByText(endpoint) + ". Their " +
+            message.push(el("p", {text: "Used by: " + libraryNames(used) + ". Their " +
                 "pictures are not described until you choose another endpoint for them on " +
                 "the Manage page."}));
+        }
+        if ((endpoint.refined_by || []).length) {
+            message.push(el("p", {text: "The refine pass of " +
+                libraryNames(endpoint.refined_by) + " stops until you choose another " +
+                "refine endpoint in its settings on the Manage page."}));
         }
         if (endpoint.stored_key) {
             message.push(el("p", {text: "The API key saved with it is deleted from " +
@@ -1013,6 +1027,13 @@
         }, STATUS_REFRESH);
         document.addEventListener("visibilitychange", function () {
             if (!document.hidden && state) {
+                reload();
+            }
+        });
+        // The Model server panel started or stopped a server.
+        document.addEventListener("model-server-changed", function () {
+            if (state) {
+                statusRetries = 0;
                 reload();
             }
         });

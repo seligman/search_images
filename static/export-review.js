@@ -70,7 +70,9 @@ var EXPORT_REVIEW = (function () {
         folders: {label: "Folder names",
                   hint: "Shown and searchable, such as Holidays/2019 Rome."},
         location: {label: "Location",
-                   hint: "GPS positions (rounded to about 10 m), the map, and the AI " +
+                   hint: "GPS positions (rounded to about 10 m), the town, region and " +
+                         "country of each (when place names were downloaded, with a " +
+                         "GeoNames credit at the foot of the pages), the map, and the AI " +
                          "model's separate landmark and place-guess fields. Shows where " +
                          "pictures were taken, which may include your home. Titles and " +
                          "descriptions can still name a place a picture shows; read them " +
@@ -418,7 +420,7 @@ var EXPORT_REVIEW = (function () {
         var hidden = [];
         (options.file_names ? shown : hidden).push("file name");
         (options.folders ? shown : hidden).push("folder");
-        (options.location ? shown : hidden).push("location");
+        (options.location ? shown : hidden).push("location (GPS position and place names)");
         var text = "Published with each picture: its " + shown.slice(0, -1).join(", ") +
             " and " + shown[shown.length - 1] + ".";
         if (hidden.length) {

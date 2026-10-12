@@ -346,11 +346,12 @@ class StitchingTest(unittest.TestCase):
             self.assertTrue(x < 12 or x > width - 12, x)
             self.assertLess(abs(y - height / 2.0), 8)
 
-    def test_each_cell_comes_from_one_lens(self):
-        # The two halves have different colours; the seams are sharp lines at
-        # longitude -90 and 90 degrees.
+    def test_without_blending_each_cell_comes_from_one_lens(self):
+        # The two halves have different colours; with blend 0 the seams are
+        # sharp lines at longitude -90 and 90 degrees.
         frame = imagegen.dual_fisheye_image(self.SIZE, offsets=self.params()["offsets"])
-        panorama = images.dual_fisheye_to_equirect(frame, 512).convert("RGB")
+        panorama = images.dual_fisheye_to_equirect(frame, 512, dict(self.params(), blend=0),
+                                                   nadir_fill=0, zenith_fill=0)
         pixels = panorama.load()
         for y in (64, 128, 192):
             left_of_seam, right_of_seam = pixels[126, y], pixels[129, y]
@@ -458,6 +459,258 @@ class StitchingTest(unittest.TestCase):
             for colour in set(view.convert("RGB").getdata()):
                 self.assertLessEqual(max(abs(a - b) for a, b in zip(colour, want)), 3,
                                      (pitch, yaw, colour))
+
+
+def flat_lenses_frame(size, front, back, markers=()):
+    """A dual-fisheye frame whose lens circles are plain colours (front: the left half)."""
+    width, height = size
+    frame = Image.new("RGB", size, (0, 0, 0))
+    draw = ImageDraw.Draw(frame)
+    radius = height / 2.0
+    for half, colour in ((0, front), (1, back)):
+        cx = (2 * half + 1) * width / 4.0 + images.INSTA360_PARAMS["offsets"][half][0] * radius
+        draw.ellipse([cx - radius, 0, cx + radius, height], fill=colour)
+    for x, y, r in markers:
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=imagegen.RED)
+    return frame
+
+
+def row_values(image, y, channel=0):
+    pixels = image.convert("RGB").load()
+    return [pixels[x, y][channel] for x in range(image.size[0])]
+
+
+@needs_pillow
+class SeamBlendTest(unittest.TestCase):
+    """The two lenses are evened out and blended across the seams."""
+
+    SIZE = (1024, 512)
+
+    def stitch(self, frame, out_width=512, **params):
+        return images.dual_fisheye_to_equirect(frame, out_width,
+                                               dict(images.INSTA360_PARAMS, **params),
+                                               nadir_fill=0, zenith_fill=0)
+
+    def test_lenses_of_different_brightness_meet_without_a_step(self):
+        frame = flat_lenses_frame(self.SIZE, (100, 110, 90), (130, 120, 140))
+        hard = self.stitch(frame, blend=0)
+        soft = self.stitch(frame)
+        for y in (64, 128, 192):
+            values = row_values(hard, y)
+            self.assertGreaterEqual(max(abs(b - a) for a, b in zip(values, values[1:])), 25)
+            for channel in range(3):
+                values = row_values(soft, y, channel)
+                # Evened out: the whole row is about one colour ...
+                self.assertLessEqual(max(values) - min(values), 4, (y, channel))
+                # ... and no column differs much from the next.
+                self.assertLessEqual(max(abs(b - a) for a, b in zip(values, values[1:])), 2)
+
+    def test_the_seam_fades_across_the_band(self):
+        # Too different to even out fully (SEAM_GAIN_LIMIT): what is left
+        # changes over several columns, not in one step.
+        frame = flat_lenses_frame(self.SIZE, (40, 40, 40), (200, 200, 200))
+        panorama = self.stitch(frame, 1024)
+        values = row_values(panorama, 256)
+        seam = 256
+        jump = abs(values[seam + 20] - values[seam - 20])
+        self.assertGreater(jump, 40)
+        largest = max(abs(values[x + 1] - values[x]) for x in range(seam - 20, seam + 20))
+        self.assertLess(largest, jump / 3.0)
+        # Away from the band each lens shows alone (evened out by the gains).
+        gains = images.SEAM_GAIN_LIMIT
+        self.assertAlmostEqual(values[512], images._gain_table(gains)[40], delta=2)
+        self.assertAlmostEqual(values[5], images._gain_table(1 / gains)[200], delta=2)
+        self.assertAlmostEqual(values[512], 40 * gains, delta=2)
+
+    def test_gains_keep_black_and_white(self):
+        for gain in (1 / images.SEAM_GAIN_LIMIT, 0.9, 1.1, images.SEAM_GAIN_LIMIT):
+            table = images._gain_table(gain)
+            self.assertEqual((table[0], table[255]), (0, 255), gain)
+            self.assertEqual(table, sorted(table), gain)            # never darker
+            self.assertLess(max(table[:255]), 255, gain)            # nothing new clips
+            # Dark and middle levels get about the gain.
+            for level in (40, 100):
+                self.assertAlmostEqual(table[level], level * gain, delta=level * 0.02 + 1)
+        # A clipped sky seen by both lenses stays neutral white when the
+        # lenses are evened out (here the back one looked a little blue).
+        white = Image.new("RGB", (64, 32), (255, 255, 255))
+        self.assertEqual(images._apply_gains(white, (1.0, 1.0, 0.9)).getextrema(),
+                         ((255, 255), (255, 255), (255, 255)))
+        frame = flat_lenses_frame(self.SIZE, (120, 130, 140), (120, 130, 160))
+        draw = ImageDraw.Draw(frame)
+        for longitude in (0, 180):          # the sky round the zenith, in each lens
+            x, y = lens_position(longitude, 89.9, self.SIZE, images.INSTA360_PARAMS)
+            draw.ellipse([x - 70, y - 70, x + 70, y + 70], fill=(255, 255, 255))
+        panorama = self.stitch(frame, 1024)
+        self.assertEqual(panorama.crop((0, 0, 1024, 40)).getextrema(),
+                         ((255, 255), (255, 255), (255, 255)))
+        values = row_values(panorama, 256, channel=2)
+        self.assertLessEqual(max(values) - min(values), 4)          # and evened out below
+
+    def test_gains_come_from_the_overlap(self):
+        width, height = 512, 256
+        front = Image.new("RGB", (width, height), (100, 100, 200))
+        back = Image.new("RGB", (width, height), (121, 100, 160))
+        front_gains, back_gains = images._lens_gains(front, back, math.radians(3))
+        self.assertAlmostEqual(front_gains[0], 1.1, places=2)
+        self.assertAlmostEqual(front_gains[1], 1.0, places=3)
+        self.assertAlmostEqual(front_gains[2], math.sqrt(0.8), places=2)
+        for got_front, got_back in zip(front_gains, back_gains):
+            self.assertAlmostEqual(got_front * got_back, 1.0, places=6)
+        # Clipped or black overlaps tell nothing: no change.
+        white = Image.new("RGB", (width, height), (255, 255, 255))
+        black = Image.new("RGB", (width, height), (0, 0, 0))
+        self.assertEqual(images._lens_gains(white, front, math.radians(3)),
+                         ((1.0, 1.0, 1.0), (1.0, 1.0, 1.0)))
+        self.assertEqual(images._lens_gains(black, black, math.radians(3)),
+                         ((1.0, 1.0, 1.0), (1.0, 1.0, 1.0)))
+
+    def test_seam_mask(self):
+        mask = images._seam_mask(256, 128, math.radians(3))
+        self.assertEqual(mask.size, (256, 128))
+        middle = row_values(mask, 64)
+        self.assertEqual(middle[128], 255)              # the front lens alone
+        self.assertEqual(middle[0], 0)                  # the back lens alone
+        self.assertEqual(middle[255], 0)
+        # The seams lie between columns 63 and 64, and 191 and 192.
+        self.assertAlmostEqual((middle[63] + middle[64]) / 2.0, 128, delta=3)
+        self.assertAlmostEqual((middle[191] + middle[192]) / 2.0, 128, delta=3)
+        ramp = middle[58:71]
+        self.assertEqual(ramp, sorted(ramp))            # rises steadily into the front
+        self.assertLess(ramp[0], 10)
+        self.assertGreater(ramp[-1], 245)
+        # Near the poles both lenses see everything: both are mixed in.
+        top = row_values(mask, 0)
+        for x in range(0, 256, 16):
+            self.assertTrue(64 < top[x] < 192, (x, top[x]))
+        # Kept for the next frame of the size.
+        self.assertIs(images._seam_mask(256, 128, math.radians(3)), mask)
+        self.assertEqual(images._seam_mask(4096, 2048, math.radians(3)).size, (4096, 2048))
+
+    def test_markers_keep_their_place_near_the_seams(self):
+        for longitude, latitude in ((88, 10), (-92, -20), (93, 40)):
+            x, y = lens_position(longitude, latitude, self.SIZE, images.INSTA360_PARAMS)
+            frame = flat_lenses_frame(self.SIZE, (90, 120, 90), (90, 120, 90),
+                                      markers=[(x, y, 5)])
+            panorama = self.stitch(frame, 1024)
+            found = red_centroid(panorama)
+            want = panorama_position(longitude, latitude, panorama.size)
+            self.assertIsNotNone(found, (longitude, latitude))
+            self.assertLessEqual(abs(found[0] - want[0]), 3, (found, want))
+            self.assertLessEqual(abs(found[1] - want[1]), 3, (found, want))
+
+
+@needs_pillow
+class PoleFillTest(unittest.TestCase):
+    """The camera's stick at the nadir (and a tripod at the zenith) under a soft fill."""
+
+    SIZE = (1024, 512)
+
+    def frame_with_marker(self, latitude, longitude=30):
+        x, y = lens_position(longitude, latitude, self.SIZE, images.INSTA360_PARAMS)
+        return flat_lenses_frame(self.SIZE, (90, 120, 90), (90, 120, 90), markers=[(x, y, 6)])
+
+    def test_the_stick_at_the_nadir_is_covered(self):
+        frame = self.frame_with_marker(-86)
+        bare = images.dual_fisheye_to_equirect(frame, 1024, nadir_fill=0, zenith_fill=0)
+        self.assertTrue(red_pixels(bare))
+        filled = images.dual_fisheye_to_equirect(frame, 1024, nadir_fill=12, zenith_fill=0)
+        self.assertEqual(red_pixels(filled), [])
+        # The fill takes the colour round it.
+        pixels = filled.load()
+        for x in range(0, 1024, 64):
+            self.assertLessEqual(max(abs(a - b) for a, b in zip(pixels[x, 510], (90, 120, 90))),
+                                 6)
+        # The zenith is left alone unless asked for.
+        top = self.frame_with_marker(86)
+        self.assertTrue(red_pixels(images.dual_fisheye_to_equirect(
+            top, 1024, nadir_fill=12, zenith_fill=0)))
+        self.assertEqual(red_pixels(images.dual_fisheye_to_equirect(
+            top, 1024, nadir_fill=0, zenith_fill=10)), [])
+
+    def test_fill_size_and_soft_edge(self):
+        width, height = 1024, 512
+        panorama = imagegen.equirect_image((width, height))
+        # A dark stick and its shadow within 10 degrees of the nadir.
+        ImageDraw.Draw(panorama).rectangle([0, height - 28, width - 1, height - 1],
+                                           fill=(10, 10, 10))
+        before = panorama.copy()
+        images._fill_pole(panorama, 12)
+        rows_filled = int(round(height * (12 + images.POLE_FEATHER_DEG) / 180.0))
+        # Rows further out are untouched.
+        self.assertEqual(panorama.crop((0, 0, width, height - rows_filled)).tobytes(),
+                         before.crop((0, 0, width, height - rows_filled)).tobytes())
+        # No dark stick is left, and the fill has no hard edge: the mean
+        # colour of each row changes little from one row to the next.
+        gray = panorama.convert("L")
+        means = [sum(gray.crop((0, y, width, y + 1)).getdata()) / float(width)
+                 for y in range(height - rows_filled - 4, height)]
+        self.assertGreater(min(means[-28:]), 40)
+        self.assertLess(max(abs(b - a) for a, b in zip(means, means[1:])), 12)
+
+    def test_zero_and_tiny_fills_do_nothing(self):
+        panorama = imagegen.equirect_image((256, 128))
+        before = panorama.tobytes()
+        self.assertEqual(images._fill_pole(panorama, 0).tobytes(), before)
+        self.assertEqual(images._fill_pole(panorama, 0.1).tobytes(), before)
+        small = images.dual_fisheye_to_equirect(imagegen.dual_fisheye_image((64, 32)), 16,
+                                                nadir_fill=12, zenith_fill=12)
+        self.assertEqual(small.size, (16, 8))
+
+
+@needs_pillow
+class StitchSettingsTest(support.TempBaseMixin, unittest.TestCase):
+
+    def test_options(self):
+        defaults = {"nadir_fill_deg": images.NADIR_FILL_DEG,
+                    "zenith_fill_deg": images.ZENITH_FILL_DEG}
+        self.assertEqual(images.stitch_options({}), defaults)
+        self.assertEqual(images.stitch_options(None), defaults)
+        for bad in ("10", True, -1, float("nan"), None, [5]):
+            self.assertEqual(images.stitch_options({"nadir_fill_deg": bad}), defaults, bad)
+        self.assertEqual(images.stitch_options({"nadir_fill_deg": 0, "zenith_fill_deg": 8}),
+                         {"nadir_fill_deg": 0.0, "zenith_fill_deg": 8.0})
+        self.assertEqual(images.stitch_options({"nadir_fill_deg": 500})["nadir_fill_deg"],
+                         images.POLE_FILL_MAX)
+
+    def test_settings_follow_config_json(self):
+        self.assertEqual(images.stitch_settings()["nadir_fill_deg"], images.NADIR_FILL_DEG)
+        default_key = images.stitch_key()
+        self.assertTrue(default_key.startswith("%d " % images.STITCH_VERSION), default_key)
+        self.base.write_config([], nadir_fill_deg=5, zenith_fill_deg=7.5)
+        self.assertEqual(images.stitch_settings(),
+                         {"nadir_fill_deg": 5.0, "zenith_fill_deg": 7.5})
+        self.assertNotEqual(images.stitch_key(), default_key)
+        self.assertEqual(images.stitch_key({"nadir_fill_deg": images.NADIR_FILL_DEG,
+                                            "zenith_fill_deg": images.ZENITH_FILL_DEG}),
+                         default_key)
+        # A broken config.json: the defaults, no error.
+        self.base.write_file("config.json", "{not json")
+        self.assertEqual(images.stitch_settings()["nadir_fill_deg"], images.NADIR_FILL_DEG)
+
+    def test_no_fill_by_default(self):
+        # On clean ground a fill only leaves a grey disc: it is off unless
+        # config.json asks for it.
+        self.assertEqual(images.stitch_settings(),
+                         {"nadir_fill_deg": 0.0, "zenith_fill_deg": 0.0})
+        self.assertEqual(images.stitch_key(), "%d n0 z0" % images.STITCH_VERSION)
+        # Photos stitched with the fill the default used to have get
+        # another key, so they are stitched again (see scan._restitch_ids).
+        self.assertNotEqual(images.stitch_key({"nadir_fill_deg": 6.0, "zenith_fill_deg": 0.0}),
+                            images.stitch_key())
+        x, y = lens_position(30, -86, (1024, 512), images.INSTA360_PARAMS)
+        frame = flat_lenses_frame((1024, 512), (90, 120, 90), (90, 120, 90),
+                                  markers=[(x, y, 6)])
+        self.assertTrue(red_pixels(images.dual_fisheye_to_equirect(frame, 1024)))
+
+    def test_stitching_uses_the_settings(self):
+        x, y = lens_position(30, -86, (1024, 512), images.INSTA360_PARAMS)
+        frame = flat_lenses_frame((1024, 512), (90, 120, 90), (90, 120, 90),
+                                  markers=[(x, y, 6)])
+        self.base.write_config([], nadir_fill_deg=0)
+        self.assertTrue(red_pixels(images.dual_fisheye_to_equirect(frame, 1024)))
+        self.base.write_config([], nadir_fill_deg=10)
+        self.assertEqual(red_pixels(images.dual_fisheye_to_equirect(frame, 1024)), [])
 
 
 @needs_pillow

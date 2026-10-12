@@ -37,7 +37,7 @@ var SHELL = (function () {
     var adminOn = Boolean(capabilities.admin) && !capabilities.static;
     var LIBRARY_KEY = "searchImages.library";
     // Pages whose content follows the library switcher (others navigate).
-    var LIBRARY_PAGES = ["search", "map", "detail"];
+    var LIBRARY_PAGES = ["search", "map", "detail", "duplicates"];
     var JOB_POLL_ACTIVE = 5000;
     var JOB_POLL_IDLE = 10000;
 
@@ -322,10 +322,12 @@ var SHELL = (function () {
     var KIND_LABELS = {
         scan: "Scan",
         describe: "Describe",
+        refine: "Refine documents",
         process: "Scan + describe",
         previews: "Build previews",
         delete_library: "Delete indexed data",
-        export: "Export"
+        export: "Export",
+        places: "Add place names"
     };
     var STATE_LABELS = {
         queued: "Waiting",
@@ -341,14 +343,19 @@ var SHELL = (function () {
         scan: "Looking for new and changed pictures",
         previews: "Building previews",
         describe: "Describing pictures",
+        refine: "Describing documents and screenshots again",
         delete: "Deleting indexed data",
         export: "Exporting pictures",
-        zip: "Writing the zip file"
+        zip: "Writing the zip file",
+        download: "Downloading place names",
+        "build places": "Building the place index",
+        places: "Adding place names"
     };
     var STAGE_VERBS = {
         scan: "Scanning",
         previews: "Building previews for",
         describe: "Describing",
+        refine: "Refining the documents of",
         delete: "Deleting the data of",
         export: "Exporting",
         zip: "Zipping the export of"
@@ -357,6 +364,9 @@ var SHELL = (function () {
 
     function jobKind(job) {
         var params = job.params || {};
+        if (job.kind === "places" && params.download) {
+            return "Download place names";
+        }
         if (job.kind === "describe" && params.retry_failed) {
             return "Retry failed";
         }
@@ -379,7 +389,7 @@ var SHELL = (function () {
     // "Scan + describe: Family", "Process all libraries".
     function jobTitle(job) {
         var kind = jobKind(job);
-        if (job.kind === "process" && !job.library_id) {
+        if ((job.kind === "process" || job.kind === "places") && !job.library_id) {
             return kind;
         }
         return kind + ": " + jobLibrary(job);
@@ -448,7 +458,8 @@ var SHELL = (function () {
             }
             add(totals, "previews", item.filled);
         });
-        var described = summary.describe || (job.kind === "describe" ? summary : null);
+        var described = summary.describe ||
+            (job.kind === "describe" || job.kind === "refine" ? summary : null);
         if (job.kind === "delete_library") {
             add(totals, "deleted", summary.deleted);
         }
@@ -472,7 +483,11 @@ var SHELL = (function () {
         }
         if (described) {
             if (typeof described.described === "number") {
-                parts.push(number(described.described) + " described");
+                parts.push(number(described.described) +
+                           (job.kind === "refine" ? " refined" : " described"));
+            }
+            if (described.skipped_hidden) {
+                parts.push(number(described.skipped_hidden) + " hidden not sent");
             }
             if (described.failed) {
                 parts.push(number(described.failed) + " failed");
@@ -491,6 +506,14 @@ var SHELL = (function () {
             }
             if (summary.failed) {
                 parts.push(number(summary.failed) + " could not be read");
+            }
+        }
+        if (job.kind === "places") {
+            if (summary.index && typeof summary.index.cities === "number") {
+                parts.push(plural(summary.index.cities, "town") + " known");
+            }
+            if (summary.places && typeof summary.places.checked === "number") {
+                parts.push(plural(summary.places.checked, "picture") + " given a place");
             }
         }
         if (summary.offline && summary.offline.length) {
@@ -958,11 +981,21 @@ var SHELL = (function () {
                                     text: site.title || "Image Search"}));
         var nav = el("nav", {attrs: {"aria-label": "Pages"}});
         nav.appendChild(link("Search", home, "search"));
+        // Pictures taken on this day in earlier years (on:today).
+        if (site.searchUrl) {
+            var today = link("", site.searchUrl({q: "on:today"}), "today");
+            // (A calendar on a phone, where Manage and Settings leave no room.)
+            today.className = "nav-today" + (adminOn ? " is-short" : "");
+            today.title = "Pictures taken on this day in earlier years";
+            today.appendChild(el("span", {className: "nav-text", text: "On this day"}));
+            nav.appendChild(today);
+        }
         var mapHref = site.mapUrl ? site.mapUrl() : null;
         if (mapHref) {
             nav.appendChild(link("Map", mapHref, "map"));
         }
         if (adminOn) {
+            nav.appendChild(link("Duplicates", "/duplicates", "duplicates"));
             nav.appendChild(link("Manage", "/manage", "manage"));
             nav.appendChild(link("Settings", "/settings", "settings"));
         }

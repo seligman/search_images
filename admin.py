@@ -41,11 +41,17 @@ import urllib.parse
 
 import common
 import db
+import duplicates
 import export
+import image_edits
 import jobs
 import library_ops
 import llm
+import local_server
+import not_duplicates
 import prompts
+import refine
+import search_index
 import settings
 
 URL_PREFIX = "/api/admin"
@@ -65,7 +71,7 @@ KEY_FILE_TIMEOUT = 2.0      # seconds a save waits to look at a key file
 REGISTER_WAIT = 2.0         # seconds a save waits to record library names in index.db
 REGISTER_RETRY = 5.0        # seconds between later tries when that had to wait
 REGISTER_TRIES = 60
-HIDE_LIMIT = 10000          # pictures one hide/unhide (or paths) request may name
+HIDE_LIMIT = 10000          # pictures one hide/unhide (or paths, or tags) request may name
 DESCRIBE_IDS_LIMIT = 1000   # pictures one describe job may name
 ID_CHUNK = 500              # ids per SQL statement (older SQLite allows 999 parameters)
 IMAGE_ID_MAX = 2 ** 63 - 1  # SQLite integers are 64-bit
@@ -73,6 +79,7 @@ IMAGE_ID_MAX = 2 ** 63 - 1  # SQLite integers are 64-bit
 JOB_PARAMS = {
     "scan": ("allow_mass_removal",),
     "describe": ("retry_failed", "redescribe_stale", "limit", "endpoint", "ids", "force"),
+    "refine": ("limit", "retry_failed"),
     "process": ("allow_mass_removal", "retry_failed", "redescribe_stale", "limit", "endpoint"),
     "previews": (),
     "delete_library": ("confirm_name",),
@@ -80,6 +87,8 @@ JOB_PARAMS = {
 }
 BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force", "save_options")
 EXPORT_FOLDER_TIMEOUT = 5.0  # seconds to look at an export's output folder
+MODEL_LIST_SECONDS = 30.0   # how long a listing of the models folder is reused
+MODEL_LIST_WAIT = 1.0       # seconds a request waits for a first listing
 ENDPOINT_TEXT_FIELDS = ("label", "kind", "preset", "base_url", "model", "api_key_env",
                         "api_key_file", "group")
 # number fields: (type, minimum, maximum or None)
@@ -229,6 +238,11 @@ def endpoint_view(config, endpoint, raw=None, status=None, key_info=None):
                  if library.get("id") and any(
                      item["name"] == endpoint["name"]
                      for item in common.endpoints_for_library(config, library))],
+        refined_by=[library["id"] for library in config.get("libraries", [])
+                    if library.get("id") and refine.enabled(library) and any(
+                        item["name"] == endpoint["name"]
+                        for item in common.resolve_endpoints(
+                            config, refine.settings(library)["endpoint"]))],
         status=probe_view(status) if local else None)
     if isinstance(raw, dict):
         view["stored"] = redact_tree(_key_shaped({name: value for name, value in raw.items()
@@ -297,10 +311,12 @@ def library_endpoint_info(config, library, key_info=None, status_of=None):
     """Which endpoints describe a library, whether they can, and where pictures go.
 
     {"name", "endpoints", "ready", "problem", "warning", "cloud",
-    "cloud_hosts"}. ready is False when no endpoint has a model, or the only
-    ones are cloud services without an API key (nothing may be sent
-    without one); problem then says why. cloud and cloud_hosts only count
-    endpoints with a model: one without can send nothing anywhere. warning
+    "cloud_hosts", "local"}. ready is False when no endpoint has a model, or
+    the only ones are cloud services without an API key (nothing may be
+    sent without one); problem then says why. cloud and cloud_hosts only
+    count endpoints with a model: one without can send nothing anywhere;
+    local is True when one with a model is on this computer or network
+    (only those describe hidden pictures). warning
     mentions a local model
     server that is not running (status_of(endpoint) gives its probe_view,
     when the caller knows it): describing works again once it is started.
@@ -313,6 +329,7 @@ def library_endpoint_info(config, library, key_info=None, status_of=None):
              if endpoint["model"] and not common.is_local_endpoint(endpoint)]
     usable, problems, warnings = [], [], []
     for endpoint in endpoints:
+        server = local_server.managed(config, endpoint["name"])
         if not endpoint["model"]:
             problems.append("The endpoint %s has no model set." % endpoint["name"])
             continue
@@ -324,6 +341,8 @@ def library_endpoint_info(config, library, key_info=None, status_of=None):
                 continue
         usable.append(endpoint)
         status = status_of(endpoint) if status_of is not None else None
+        if server is not None and server["auto_start"]:
+            continue        # describing starts its model server (local_server)
         if status and status.get("state") == "not running":
             warnings.append("The model server of %s (%s) is not running."
                             % (endpoint["name"], common.url_host(endpoint["base_url"])))
@@ -335,7 +354,9 @@ def library_endpoint_info(config, library, key_info=None, status_of=None):
             "ready": bool(usable), "problem": "" if usable else " ".join(problems),
             "warning": " ".join(warnings) if usable and len(warnings) == len(usable) else "",
             "cloud": bool(cloud),
-            "cloud_hosts": sorted({common.url_host(endpoint["base_url"]) for endpoint in cloud})}
+            "cloud_hosts": sorted({common.url_host(endpoint["base_url"]) for endpoint in cloud}),
+            "local": any(endpoint["model"] and common.is_local_endpoint(endpoint)
+                         for endpoint in endpoints)}
 
 
 def counts_view(counts):
@@ -351,11 +372,71 @@ def counts_view(counts):
             "pending": max(0, present - counts.get("described", 0) - counts.get("gave_up", 0))}
 
 
-def library_view(config, library, counts, latest, status, endpoint_info=None):
+def refine_endpoints(config, library):
+    """The endpoints (with a model) of a library's refine pass; [] when it has none."""
+    wanted = refine.settings(library)["endpoint"]
+    if not wanted:
+        return []
+    return [endpoint for endpoint in common.resolve_endpoints(config, wanted)
+            if endpoint["model"]]
+
+
+def refine_view(config, library, counted=None, key_info=None):
+    """A library's refine pass for the Manage page.
+
+    {"settings": refine.settings(), "enabled", "ready" (an endpoint of it
+    can be used: it has a model, and a cloud one an API key), "problem",
+    "cloud", "cloud_hosts", "local" (hidden pictures can be refined: an
+    endpoint is on this computer or network), and from counted
+    (refine.counts; None when not counted): "pending" (pictures it would
+    describe again), "hidden" (hidden pictures it leaves alone because
+    they may not be sent to its endpoints) and "failed" (pictures skipped
+    after failing; Retry failed tries them again)}. key_info(endpoint)
+    gives (key, source) (default common.resolve_api_key).
+    """
+    key_info = key_info or common.resolve_api_key
+    wanted = refine.settings(library)
+    endpoints = refine_endpoints(config, library)
+    usable, problems = [], []
+    for endpoint in endpoints:
+        if endpoint["preset"] in common.CLOUD_PRESETS:
+            key, source = key_info(endpoint)
+            if not key and source != "file checking":
+                problems.append("The refine endpoint %s has no API key: %s."
+                                % (endpoint["name"], key_problem(source)))
+                continue
+        usable.append(endpoint)
+    cloud = [endpoint for endpoint in usable if not common.is_local_endpoint(endpoint)]
+    problem = ""
+    if wanted["endpoint"] and not endpoints:
+        problem = ("The refine endpoint %s is missing, turned off or has no model."
+                   % wanted["endpoint"])
+    elif wanted["endpoint"] and not usable:
+        problem = " ".join(problems)
+    counted = counted or {}
+    return {"settings": wanted, "enabled": bool(wanted["endpoint"]), "ready": bool(usable),
+            "problem": problem, "cloud": bool(cloud),
+            "cloud_hosts": sorted({common.url_host(endpoint["base_url"]) for endpoint in cloud}),
+            "local": any(common.is_local_endpoint(endpoint) for endpoint in usable),
+            "pending": counted.get("pending"), "hidden": counted.get("hidden"),
+            "failed": counted.get("failed")}
+
+
+def refine_choices():
+    """The kinds of picture a refine pass can be asked for (for the library dialog)."""
+    return {"photo_types": list(refine.PHOTO_TYPE_CHOICES),
+            "document_types": list(refine.DOCUMENT_TYPE_CHOICES),
+            "defaults": refine.settings({}),
+            "max_output_tokens_range": list(refine.MAX_OUTPUT_TOKENS_RANGE)}
+
+
+def library_view(config, library, counts, latest, status, endpoint_info=None,
+                 refine_info=None):
     """A library as the manage page shows it (settings, counts, status, last job).
 
     latest is JobManager.latest_by_library(); endpoint_info the library's
-    library_endpoint_info() when the caller has worked it out.
+    library_endpoint_info() and refine_info its refine_view() when the
+    caller has worked them out.
     """
     view = {key: copy.deepcopy(library.get(key)) for key in ("id",) + library_ops.LIBRARY_FIELDS}
     view["root"] = common.library_root(library)
@@ -367,7 +448,15 @@ def library_view(config, library, counts, latest, status, endpoint_info=None):
     view["last_job"] = own
     view["endpoint_info"] = (endpoint_info if endpoint_info is not None
                              else library_endpoint_info(config, library))
+    waiting = view["endpoint_info"].get("hidden_waiting")
+    if waiting:
+        # Hidden pictures are never sent to the library's (cloud) endpoints:
+        # they are not "to describe" there, and are counted on their own.
+        view["counts"]["pending"] = max(0, view["counts"]["pending"] - waiting)
+        view["counts"]["pending_hidden"] = waiting
     view["export_info"] = export_view(config, library)
+    view["refine_info"] = (refine_info if refine_info is not None
+                           else refine_view(config, library))
     return view
 
 
@@ -671,14 +760,17 @@ def register_libraries(config):
 # ---------------------------------------------------------------------------
 # The blueprint
 
-def init_app(app, state, manager, allowed_hosts, enabled=True):
+def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=None):
     """Register the admin routes on a Flask app.
 
     state is serve.ServerState (config, helper), manager a jobs.JobManager
     (not started here), allowed_hosts the host names requests may name.
     enabled is False when the server listens on another address than
-    localhost: every admin route then answers 403.
+    localhost: every admin route then answers 403. model_servers is the
+    local_server.ServerManager behind the Model server panel (default: the
+    process's own, which the jobs use too).
     """
+    model_servers = model_servers or local_server.default_manager()
     from flask import Blueprint, g, jsonify, request
     from werkzeug.exceptions import HTTPException
 
@@ -842,7 +934,15 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
         views = []
         for endpoint, raw in zip(common.endpoint_list(config), _raw_endpoints(config)):
             status = probe_status(endpoint) if common.is_local_endpoint(endpoint) else None
-            views.append(endpoint_view(config, endpoint, raw, status, resolve_key(endpoint)))
+            view = endpoint_view(config, endpoint, raw, status, resolve_key(endpoint))
+            server = local_server.managed(config, endpoint["name"])
+            view["managed"] = server is not None
+            if server is not None and view["status"] and \
+                    view["status"]["state"] == "not running":
+                view["status"]["hint"] = (
+                    "Start it under Model server below%s."
+                    % (", or let describing start it" if server["auto_start"] else ""))
+            views.append(view)
         return views
 
     def endpoint_info(config, library):
@@ -851,7 +951,17 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
                 return None
             found = probe_status(endpoint)
             return probe_view(found) if found is not None else None
-        return library_endpoint_info(config, library, resolve_key, status_of)
+        info = library_endpoint_info(config, library, resolve_key, status_of)
+        if info["cloud"] and not info["local"] and library.get("id"):
+            # Hidden pictures still to describe, which these endpoints may not be sent.
+            try:
+                info["hidden_waiting"] = get_conn().execute(
+                    "SELECT COUNT(*) FROM images WHERE library_id = ? AND missing_since IS NULL "
+                    "AND hidden = 1 AND described = 0 AND describe_attempts < ?",
+                    (library["id"], common.MAX_DESCRIBE_FAILURES)).fetchone()[0]
+            except sqlite3.Error:
+                pass
+        return info
 
     def snapshot(config, since=0):
         return manager.snapshot(since, library_names(config))
@@ -862,10 +972,22 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
         except (TypeError, ValueError):
             return 0
 
+    def refine_info(config, library):
+        counted = None
+        if refine.enabled(library) and library.get("id"):
+            # Hidden pictures only count when an endpoint may be sent them.
+            local = any(common.is_local_endpoint(endpoint)
+                        for endpoint in refine_endpoints(config, library))
+            try:
+                counted = refine.counts(get_conn(), library, include_hidden=local)
+            except sqlite3.Error:
+                counted = None
+        return refine_view(config, library, counted, key_info=resolve_key)
+
     def view_of(config, library):
         return library_view(config, library, db.library_counts(get_conn(), prompts.PROMPT_VER),
                             manager.latest_by_library(), folder_status(library),
-                            endpoint_info(config, library))
+                            endpoint_info(config, library), refine_info(config, library))
 
     def clean_job(config, kind, library_id, params):
         """Check a job request; returns the params to store (defaults left out)."""
@@ -915,6 +1037,8 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
         if params.get("ids") is not None:
             cleaned["ids"] = describable_ids(config, library_id,
                                              image_ids(params["ids"], DESCRIBE_IDS_LIMIT))
+        if kind == "refine":
+            check_refine(config, library_id)
         if cleaned.get("force") and "ids" not in cleaned:
             # Describing a whole library again is "Re-describe stale" (or a
             # new prompt version), never a single click.
@@ -1009,6 +1133,18 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
                              {"ids": "No such pictures."})
         return sorted(found)
 
+    def check_refine(config, library_id):
+        """A refine job needs a library with a refine endpoint (any enabled one, for all)."""
+        if library_id is not None:
+            library = find_library(config, library_id)
+            if not refine.enabled(library):
+                raise AdminError(400, "Library %s has no refine endpoint: choose one in its "
+                                      "settings first." % common.library_label(library),
+                                 {"refine": "Choose a refine endpoint."})
+        elif not any(refine.enabled(library) for library in common.enabled_libraries(config)):
+            raise AdminError(400, "No library has a refine endpoint: choose one in a "
+                                  "library's settings first.", {"refine": "None set."})
+
     def check_orphan_delete(config, library_id, confirm):
         conn = get_conn()
         if not library_id or library_id not in db.orphan_library_ids(conn, config):
@@ -1028,7 +1164,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
         counts = db.library_counts(conn, prompts.PROMPT_VER)
         latest = manager.latest_by_library()
         libraries = [library_view(config, library, counts, latest, folder_status(library),
-                                  endpoint_info(config, library))
+                                  endpoint_info(config, library), refine_info(config, library))
                      for library in config.get("libraries", []) if library.get("id")]
         return jsonify({
             "libraries": libraries,
@@ -1039,6 +1175,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
             "jobs": snapshot(config, since_arg()),
             "config_token": config_token(),
             "version": {"schema": db.SCHEMA_VERSION, "prompt": prompts.PROMPT_VER},
+            "refine_choices": refine_choices(),
         })
 
     # -- libraries ------------------------------------------------------------
@@ -1298,6 +1435,50 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
         job, added = manager.enqueue("describe", library_id, params)
         return jsonify({"job": job, "added": added}), 202
 
+    # -- place names (places.py) --------------------------------------------
+
+    def places_view():
+        """places.status() with the places job that is waiting or running ("job") and
+        the last one that finished ("last")."""
+        import places
+        # (From the latest log line on: the jobs without their log. Looked
+        # at before the pictures, so a job that ends in between is not
+        # missed: its counts are then the new ones.)
+        jobs_now = manager.snapshot(manager.buffer.latest)
+        result = places.status(get_conn())
+        waiting = [job for job in [jobs_now["current"]] + jobs_now["queue"]
+                   if job is not None and job["kind"] == "places"]
+        finished = [job for job in jobs_now["recent"] if job["kind"] == "places"]
+        result["job"] = waiting[0] if waiting else None
+        result["last"] = finished[0] if finished else None
+        return result
+
+    @bp.route("/places", methods=["GET"])
+    def places_state():
+        return jsonify(places_view())
+
+    @bp.route("/places/<action>", methods=["POST"])
+    def places_action(action):
+        """download: fetch the place names (GeoNames) and name every located picture's place;
+        label: name the places of the pictures not looked up yet (redo: of all of them)."""
+        data = body()
+        redo = data.get("redo", False)
+        if not isinstance(redo, bool):
+            raise AdminError(400, "redo must be true or false.", {"redo": "Must be true or "
+                                                                       "false."})
+        if action == "download":
+            params = {"download": True}
+        elif action == "label":
+            import places
+            known = places.status()
+            if not known["available"] and not known["rebuild"]:
+                raise AdminError(409, "There are no place names yet: download them first.")
+            params = {"redo": True} if redo else {}
+        else:
+            raise AdminError(404, "Unknown action: %s." % action)
+        job, added = manager.enqueue("places", None, params)
+        return jsonify({"job": job, "added": added, "places": places_view()}), 202
+
     # -- pictures -------------------------------------------------------------
 
     @bp.route("/images/hide", methods=["POST"])
@@ -1324,6 +1505,173 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
             raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
         return jsonify({"hidden": hidden, "changed": changed, "found": found,
                         "unknown": len(ids) - found})
+
+    # -- duplicates (the Duplicates page) -------------------------------------
+
+    def int_arg(name, default, low, high):
+        value = request.args.get(name)
+        if value in (None, ""):
+            return default
+        try:
+            number = int(value)
+        except ValueError:
+            raise AdminError(400, "%s must be a whole number." % name, {name: "A whole number."})
+        if not low <= number <= high:
+            raise AdminError(400, "%s must be from %d to %d." % (name, low, high),
+                             {name: "From %d to %d." % (low, high)})
+        return number
+
+    @bp.route("/duplicates", methods=["GET"])
+    def duplicate_stacks():
+        """?lib=&kind=&min=&page=&stack=: the stacks of alike pictures to review."""
+        config = state.config()
+        library_ids = [library["id"] for library in common.enabled_libraries(config)
+                       if library.get("id")]
+        wanted = request.args.get("lib", "")
+        if wanted not in ("", "all"):
+            if wanted not in library_ids:
+                raise AdminError(404, "There is no enabled library with that id.")
+            library_ids = [wanted]
+        kind = request.args.get("kind") or "all"
+        if kind not in duplicates.KINDS:
+            raise AdminError(400, "kind must be one of %s." % ", ".join(duplicates.KINDS))
+        min_size = int_arg("min", 2, 2, duplicates.MIN_SIZE_LIMIT)
+        page = int_arg("page", 1, 1, IMAGE_ID_MAX)
+        stack = int_arg("stack", None, 1, IMAGE_ID_MAX)
+        try:
+            answer = duplicates.review_page(get_conn(), config, library_ids, kind, min_size,
+                                            page, stack)
+        except sqlite3.OperationalError as error:
+            raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
+        return jsonify(answer)
+
+    @bp.route("/duplicates/not-duplicates", methods=["POST"])
+    def keep_apart():
+        """{ids, apart?, undo?}: say pictures are not duplicates (undo: take that back).
+
+        Every two of the pictures are kept apart, or with apart (one of the
+        ids) only that one from each of the others; see not_duplicates.py.
+        """
+        data = body()
+        apart = data.get("apart")
+        # One picture apart from the others makes a pair with each; all of
+        # them apart make a pair of every two, so they are fewer.
+        limit = HIDE_LIMIT if apart is not None else duplicates.NOT_DUPLICATES_LIMIT
+        if apart is None and isinstance(data.get("ids"), list) and len(data["ids"]) > limit:
+            raise AdminError(400, "At most %d pictures can be kept apart from each other at "
+                                  "once; take single pictures out of the stack instead."
+                             % limit, {"ids": "Too many."})
+        ids = image_ids(data.get("ids"), limit)
+        if apart is not None and (isinstance(apart, bool) or apart not in ids):
+            raise AdminError(400, "apart must be one of the ids.", {"apart": "One of the ids."})
+        undo = data.get("undo", False)
+        if not isinstance(undo, bool):
+            raise AdminError(400, "undo must be true or false.", {"undo": "True or false."})
+        keys = {}
+        conn = get_conn()
+        for chunk in id_chunks(ids):
+            for row in conn.execute("SELECT id, content_hash FROM images "
+                                    "WHERE missing_since IS NULL AND id IN (%s)"
+                                    % ",".join("?" * len(chunk)), chunk):
+                keys[row["id"]] = not_duplicates.unit_key(row["id"], row["content_hash"])
+        if apart is not None and apart not in keys:
+            raise AdminError(404, "That picture is not in the index.")
+        if len(set(keys.values())) < 2:
+            raise AdminError(400, "These are identical files (or pictures that are not in the "
+                                  "index): identical files always stay together.")
+        pairs = not_duplicates.pairs_among(keys.values(),
+                                           keys[apart] if apart is not None else None)
+        try:
+            changed = not_duplicates.change(pairs, add=not undo)
+        except OSError as error:
+            raise AdminError(500, "Could not save %s: %s"
+                             % (not_duplicates.FILE_NAME, export.os_error_text(error)))
+        return jsonify({"pairs": len(pairs), "changed": changed, "undo": undo,
+                        "unknown": len(ids) - len(keys)})
+
+    # -- the owner's titles, descriptions and tags (image_edits) ---------------
+
+    def model_info(conn, image_id):
+        """(present, the model's description dict or None) of a picture."""
+        row = conn.execute("SELECT info FROM images WHERE id = ? AND missing_since IS NULL",
+                           (image_id,)).fetchone() if image_id <= IMAGE_ID_MAX else None
+        if row is None:
+            return False, None
+        try:
+            info = json.loads(row["info"] or "null", parse_constant=lambda _name: None)
+        except ValueError:
+            info = None
+        return True, info if isinstance(info, dict) else None
+
+    def edit_answer(conn, image_id, edit, model):
+        """What the edit routes answer: the edit, the description with it and the record keys."""
+        record = search_index.picture_record(conn, image_id, edit) or {}
+        return {"id": image_id, "edited": not image_edits.is_empty(edit),
+                "edits": image_edits.view(edit), "info": image_edits.apply(model, edit),
+                "model_info": model,
+                # The keys of the search record an edit can change (absent: none).
+                "record": {key: record[key] for key in ("t", "d", "g", "ed") if key in record}}
+
+    def edit_error(error):
+        return AdminError(400, str(error), error.fields)
+
+    @bp.route("/images/<int:image_id>/edits", methods=["GET"])
+    def get_edits(image_id):
+        """The owner's edit of a picture, with the model's description and the one shown."""
+        conn = get_conn()
+        present, model = model_info(conn, image_id)
+        if not present:
+            raise AdminError(404, "There is no picture %d." % image_id)
+        return jsonify(edit_answer(conn, image_id, image_edits.load(conn, image_id), model))
+
+    @bp.route("/images/<int:image_id>/edits", methods=["POST"])
+    def save_edits(image_id):
+        """{title?, description?, tags_add?, tags_remove?}: change a picture's edit.
+
+        Only the fields sent change; null (or "") clears one, so the
+        model's text is used again. An edit left empty is deleted.
+        """
+        changes = body()
+        conn = get_conn()
+        present, model = model_info(conn, image_id)
+        if not present:
+            raise AdminError(404, "There is no picture %d." % image_id)
+        try:
+            with conn:
+                edit = image_edits.save(conn, image_id, changes)
+        except image_edits.EditError as error:
+            raise edit_error(error)
+        except sqlite3.OperationalError as error:
+            raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
+        return jsonify(edit_answer(conn, image_id, edit, model))
+
+    @bp.route("/images/tags", methods=["POST"])
+    def change_tags():
+        """{ids, add, remove}: add and remove tags on many pictures (the owner's edits)."""
+        data = body()
+        ids = image_ids(data.get("ids"), HIDE_LIMIT)
+        try:
+            add = image_edits.clean_tags(data.get("add"), "add")
+            remove = image_edits.clean_tags(data.get("remove"), "remove")
+        except image_edits.EditError as error:
+            raise edit_error(error)
+        if not add and not remove:
+            raise AdminError(400, "Name a tag to add or remove.",
+                             {"add": "Name a tag.", "remove": "Name a tag."})
+        conn = get_conn()
+        try:
+            with conn:
+                result = image_edits.change_tags(conn, ids, add, remove)
+        except image_edits.EditError as error:
+            raise edit_error(error)
+        except sqlite3.OperationalError as error:
+            raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
+        return jsonify({"changed": result["changed"], "found": result["found"],
+                        "unknown": len(ids) - result["found"],
+                        "tags": {str(image_id): search_index.record_tags(tags)
+                                 for image_id, tags in result["tags"].items()},
+                        "edited": {str(image_id): edited
+                                   for image_id, edited in result["edited"].items()}})
 
     def picture_file(config, image_id):
         """The full path of a present picture of a configured library; AdminError 404 otherwise."""
@@ -1628,6 +1976,272 @@ def init_app(app, state, manager, allowed_hosts, enabled=True):
                 total += counts_view(counts.get(library.get("id"), {}))["pending"]
         return total
 
+    # -- the model server -----------------------------------------------------
+
+    # Listing the models folder (which may be on a share) happens in the background.
+    model_lists = library_ops.BackgroundChecks(ttl=MODEL_LIST_SECONDS,
+                                               timeout=library_ops.PATH_CHECK_TIMEOUT)
+
+    def model_choices(settings, wait=MODEL_LIST_WAIT):
+        root = local_server.models_root(settings)
+        found = model_lists.get(("models", root), local_server.model_choices, settings,
+                                timed_out={"models": [], "mmprojs": [], "error": "The models "
+                                           "folder does not answer (an offline share?)."},
+                                wait=wait)
+        if found is None:
+            return {"models": [], "mmprojs": [], "error": "", "checking": True}
+        return found
+
+    def server_of(config, data):
+        name = data.get("endpoint")
+        settings = local_server.find_server(config, name) if isinstance(name, str) else None
+        if settings is None:
+            raise AdminError(404, "No model server is set up for the endpoint %s in "
+                                  "config.json." % name, {"endpoint": "Unknown."})
+        return settings
+
+    # So is looking at its files (the model, the projector, the program).
+    file_checks = library_ops.BackgroundChecks(ttl=MODEL_LIST_SECONDS,
+                                               timeout=library_ops.PATH_CHECK_TIMEOUT)
+
+    def server_facts(settings, wait=MODEL_LIST_WAIT):
+        """local_server.file_facts() of a server, worked out in the background."""
+        key = ("facts", json.dumps(settings, sort_keys=True))
+        found = file_checks.get(key, local_server.file_facts, settings,
+                                timed_out={"problem": "The models folder does not answer (an "
+                                           "offline share?).", "command": None,
+                                           "mmproj_auto": "", "offline": True},
+                                wait=wait)
+        if found is None:
+            return {"problem": "", "command": None, "mmproj_auto": "", "checking": True}
+        return found
+
+    def server_view(config, name, until=None):
+        """A server's status for the panel; until: when to stop waiting for file checks."""
+        settings = local_server.find_server(config, name)
+        if settings is None:
+            return model_servers.status(config, name)
+        until = time.monotonic() + MODEL_LIST_WAIT if until is None else until
+        view = model_servers.status(config, name, facts=server_facts(
+            settings, wait=max(0.0, until - time.monotonic())))
+        view["choices"] = model_choices(settings, wait=max(0.0, until - time.monotonic()))
+        return view
+
+    seen_states = {}
+
+    @bp.route("/model-server", methods=["GET"])
+    def model_server_state():
+        """{"servers": [status], "setup": an example for config.json, "limits", "ui_fields"}."""
+        config = state.config()
+        # (One wait for the file checks of every server, not one each.)
+        until = time.monotonic() + MODEL_LIST_WAIT
+        servers = [server_view(config, settings["endpoint"], until)
+                   for settings in local_server.server_list(config)]
+        states = {server["endpoint"]: server["state"] for server in servers}
+        if states != seen_states:
+            # A server started or stopped: the endpoints' status is looked at again.
+            seen_states.clear()
+            seen_states.update(states)
+            probes.forget()
+        return jsonify({"servers": servers,
+                        "setup": model_server_example(config),
+                        "limits": {name: list(value)
+                                   for name, value in local_server.LIMITS.items()},
+                        "ui_fields": list(local_server.UI_FIELDS),
+                        "config_token": config_token()})
+
+    @bp.route("/model-server/start", methods=["POST"])
+    def model_server_start():
+        config = state.config()
+        settings = server_of(config, body())
+        facts = server_facts(settings)
+        if facts.get("checking") or facts.get("offline"):
+            # (Starting would look at the same files, on the request's thread.)
+            raise AdminError(409, facts.get("problem") or "The model files are still being "
+                                  "looked at; try again in a moment.")
+        ok, message = model_servers.start(config, settings["endpoint"], by="you", wait=False)
+        if not ok:
+            raise AdminError(409, message)
+        return jsonify({"ok": True, "message": message,
+                        "server": server_view(config, settings["endpoint"])}), 202
+
+    @bp.route("/model-server/stop", methods=["POST"])
+    def model_server_stop():
+        config = state.config()
+        settings = server_of(config, body())
+        ok, message = model_servers.stop(config, settings["endpoint"], wait=False,
+                                         reason="you asked")
+        if not ok:
+            raise AdminError(409, message)
+        return jsonify({"ok": True, "message": message,
+                        "server": server_view(config, settings["endpoint"])}), 202
+
+    @bp.route("/model-server/settings", methods=["POST"])
+    def model_server_settings():
+        """{endpoint, settings: {...}}: change the settings the page may change (UI_FIELDS)."""
+        data = body()
+        current = server_of(state.config(), data)
+        fields = data.get("settings")
+        if not isinstance(fields, dict) or not fields:
+            raise AdminError(400, "Send the settings to change as an object.")
+        unknown = sorted(set(fields) - set(local_server.UI_FIELDS))
+        if unknown:
+            raise AdminError(400, "%s can only be changed in config.json." % ", ".join(unknown),
+                             {name: "Only in config.json." for name in unknown})
+        changes, errors = clean_server_fields(current, fields)
+        if errors:
+            raise AdminError(400, "Some model server settings cannot be used.", errors)
+        name = current["endpoint"]
+        if ("port" in changes and changes["port"] != current["port"]
+                and (model_servers.owned(name) or model_servers.busy(name))):
+            raise AdminError(409, "Stop the model server before changing its port.",
+                             {"port": "Stop the server first."})
+        notes = []
+
+        def mutate(config):
+            for entry in local_server.raw_entries(config):
+                if str(entry.get("endpoint") or "").strip().casefold() == name.casefold():
+                    old_port = local_server.server_settings(entry)["port"]
+                    entry.update(changes)
+                    if "port" in changes and changes["port"] != old_port:
+                        moved = move_endpoint_port(config, name, old_port, changes["port"])
+                        if moved:
+                            notes.append("The endpoint %s now uses port %d too."
+                                         % (name, changes["port"]))
+                        if moved == "key removed":
+                            notes.append("Its stored API key was removed, as keys are only "
+                                         "sent to the address they were entered for: enter "
+                                         "it again if the server needs one.")
+                    return config
+            raise AdminError(404, "No model server is set up for the endpoint %s." % name)
+
+        config, token = write_config(mutate, token_of(data))
+        probes.forget()
+        file_checks.forget()
+        if model_servers.owned(name) and set(changes) & {"model", "mmproj", "slots",
+                                                          "ctx_per_slot"}:
+            notes.append("The running server keeps its old settings until it is started again.")
+        return jsonify({"server": server_view(config, name), "notes": notes,
+                        "config_token": token})
+
+    def clean_server_fields(current, fields):
+        """(changes, errors) for the UI_FIELDS sent by the page."""
+        changes, errors = {}, {}
+        choices = None
+        for name in ("model", "mmproj"):
+            if name not in fields:
+                continue
+            value = fields[name] if fields[name] is not None else ""
+            if not isinstance(value, str):
+                errors[name] = "Must be text."
+                continue
+            value = value.strip().replace("\\", "/")
+            if value == current[name] or (name == "mmproj" and not value):
+                changes[name] = value
+                continue
+            if choices is None:
+                try:
+                    choices = library_ops.run_with_timeout(local_server.model_choices,
+                                                           library_ops.PATH_CHECK_TIMEOUT,
+                                                           current)
+                except library_ops.TimedOut:
+                    choices = {"models": [], "mmprojs": [],
+                               "error": "The models folder does not answer."}
+            if value not in choices["models" if name == "model" else "mmprojs"]:
+                errors[name] = ("Choose a file from the models folder."
+                                + (" " + choices["error"] if choices["error"] else ""))
+                continue
+            changes[name] = value
+        for name in ("slots", "ctx_per_slot", "port"):
+            if name not in fields:
+                continue
+            value = fields[name]
+            if isinstance(value, str):
+                try:
+                    value = int(value.strip())
+                except ValueError:
+                    value = None
+            low, high = local_server.LIMITS[name]
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                errors[name] = "Enter a whole number from %d to %d." % (low, high)
+                continue
+            changes[name] = value
+        if "stop_at" in fields:
+            value = fields["stop_at"] if fields["stop_at"] is not None else ""
+            if not isinstance(value, str) or (value.strip()
+                                              and not local_server.parse_stop_at(value)):
+                errors["stop_at"] = "Enter a time such as 03:30 (24-hour clock), or nothing."
+            else:
+                when = local_server.parse_stop_at(value)
+                changes["stop_at"] = "%02d:%02d" % when if when else ""
+        for name in ("auto_start", "auto_stop"):
+            if name in fields:
+                if isinstance(fields[name], bool):
+                    changes[name] = fields[name]
+                else:
+                    errors[name] = "Must be true or false."
+        return changes, errors
+
     app.register_blueprint(bp)
     app.extensions["search_images_jobs"] = manager
+    app.extensions["search_images_model_servers"] = model_servers
     return bp
+
+
+def move_endpoint_port(config, name, old_port, new_port):
+    """Point an endpoint that used 127.0.0.1:old_port at new_port instead.
+
+    Only an endpoint on this computer (localhost, 127.0.0.1, ::1) at the
+    old port is changed, so the endpoint keeps reaching the model server
+    whose port was changed. As for any change of address, a typed API key
+    is removed (settings.forget_key_if_moved): keys are only sent to the
+    address they were entered for. Returns False (not changed), True, or
+    "key removed".
+    """
+    entry = settings.find_endpoint(config, name)
+    if entry is None:
+        return False
+    current = common.endpoint_settings(entry)
+    parts = urllib.parse.urlsplit(current["base_url"])
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    if (parts.hostname or "") not in ("127.0.0.1", "localhost", "::1") or port != old_port:
+        return False
+    host = parts.hostname if ":" not in (parts.hostname or "") else "[%s]" % parts.hostname
+    old_url = current["base_url"]
+    entry["base_url"] = urllib.parse.urlunsplit(
+        (parts.scheme, "%s:%d" % (host, new_port), parts.path, parts.query, parts.fragment))
+    return "key removed" if settings.forget_key_if_moved(entry, old_url) else True
+
+
+def model_server_example(config, windows=None):
+    """What to add to config.json to let the Settings page run a model server.
+
+    {"endpoint": the local llama.cpp endpoint it would serve ('' if none),
+    "port", "snippet": JSON text with placeholder paths (Windows ones on
+    Windows), "windows", "config_path": where config.json is}. windows
+    defaults to this computer's kind.
+    """
+    windows = os.name == "nt" if windows is None else windows
+    endpoint = next((item for item in common.endpoint_list(config)
+                     if item["preset"] in common.LLAMACPP_PRESETS
+                     and common.url_host(item["base_url"]) in ("127.0.0.1", "localhost")), None)
+    port = local_server.DEFAULTS["port"]
+    if endpoint is not None:
+        try:
+            port = urllib.parse.urlsplit(endpoint["base_url"]).port or port
+        except ValueError:
+            pass
+    if windows:
+        binary, models = "C:\\path\\to\\llama-server.exe", "C:\\path\\to\\models"
+    else:
+        binary, models = "/path/to/llama-server", "/path/to/models"
+    example = {"enabled": True, "endpoint": endpoint["name"] if endpoint else "local",
+               "binary": binary, "models_dir": models,
+               "model": "model.gguf", "port": port, "slots": local_server.DEFAULTS["slots"],
+               "ctx_per_slot": local_server.DEFAULTS["ctx_per_slot"], "stop_at": ""}
+    return {"endpoint": endpoint["name"] if endpoint else "", "port": port,
+            "snippet": "\"local_server\": " + json.dumps(example, indent=4),
+            "windows": bool(windows), "config_path": common.config_path()}

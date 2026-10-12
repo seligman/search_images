@@ -46,7 +46,7 @@ test("the address keeps a search and reads it back", function () {
                  filters: {type: ["photo", "doc:receipt"], tags: ["sun & sea", "a=b"],
                            year: ["2019"]},
                  group: false, size: "l", hidden: true, junk: true, sensitive: "show",
-                 ids: "5-2.2", view: "-17.5,179.9,4"};
+                 ids: "5-2.2", view: "-17.5,179.9,4", from: "2019-03", to: "2019-05-14"};
     var query = SITE.searchState.params(state);
     var back = SITE.searchState.read("?" + query);
     assert.deepStrictEqual(back, state);
@@ -272,6 +272,36 @@ test("a full record becomes the compact search record", function () {
                                    info: null});
     assert.deepStrictEqual(bare, {i: 4, l: "lib_x", n: "b.jpg"});
     assert.strictEqual(SITE.compactRecord(null), null);
+    // The place: the town only when one is near, and how far it is.
+    var placed = SITE.compactRecord({id: 5, library_id: "lib_x", name: "c.jpg", path: "c.jpg",
+                                     lat: 20.9, lon: -156.5,
+                                     place: {city: "Kahului", region: "Hawaii",
+                                             country: "United States", cc: "US", km: 2.6}});
+    assert.deepStrictEqual(placed, {i: 5, l: "lib_x", n: "c.jpg", gp: 1, ci: "Kahului",
+                                    rg: "Hawaii", co: "United States", cc: "US", km: 3});
+    var far = SITE.compactRecord({id: 6, library_id: "lib_x", name: "d.jpg", path: "d.jpg",
+                                  place: {city: "", region: "", country: "Fiji", cc: "FJ"}});
+    assert.deepStrictEqual(far, {i: 6, l: "lib_x", n: "d.jpg", co: "Fiji", cc: "FJ"});
+});
+
+test("the timeline's dates and the shuffle seed travel in the address", function () {
+    var state = SITE.searchState.read("?from=2019-03&to=2019-05-31&sort=shuffle");
+    assert.strictEqual(state.from, "2019-03");
+    assert.strictEqual(state.to, "2019-05-31");
+    assert.strictEqual(state.sort, "shuffle");
+    ["2019-13", "2019-02-32", "19", "2019-1", "x", "2019-05-14T10:00"].forEach(function (value) {
+        var read = SITE.searchState.read("?from=" + encodeURIComponent(value) + "&to=" +
+                                         encodeURIComponent(value));
+        assert.strictEqual(read.from, "", value);
+        assert.strictEqual(read.to, "", value);
+        assert.strictEqual(SITE.searchState.params({from: value, to: value}), "", value);
+    });
+    // One seed per page (sessionStorage when there is one), a new one when asked.
+    var seed = SITE.shuffleSeed();
+    assert.strictEqual(SITE.shuffleSeed(), seed);
+    assert.ok(seed >= 0 && seed < 4294967296 && seed % 1 === 0);
+    var renewed = SITE.shuffleSeed(true);
+    assert.strictEqual(SITE.shuffleSeed(), renewed);
 });
 
 /* ---------- Viewer: words and numbers ------------------------------------------ */
@@ -288,6 +318,18 @@ test("dates in words", function () {
         assert.strictEqual(format.monthLabel(value), "");
         assert.strictEqual(format.longDate(value), "");
     });
+});
+
+test("places in words", function () {
+    assert.strictEqual(format.placeText({co: "United States", rg: "Hawaii", ci: "Kahului",
+                                         km: 3}), "Kahului, Hawaii, United States (3 km)");
+    assert.strictEqual(format.placeText({co: "France", rg: "Bretagne", ci: "Brest", km: 0}),
+                       "Brest, Bretagne, France (under 1 km)");
+    assert.strictEqual(format.placeText({co: "Singapore", ci: "Singapore"}),
+                       "Singapore, Singapore");
+    assert.strictEqual(format.placeText({co: "Fiji", rg: "Northern"}), "Northern, Fiji");
+    assert.strictEqual(format.placeText({ci: "Nowhere"}), "");
+    assert.strictEqual(format.placeText(null), "");
 });
 
 test("camera settings in words", function () {
@@ -374,6 +416,36 @@ test("dragging turns the 360 view with the finger, within limits", function () {
     assert.ok(spun.yaw >= -Math.PI && spun.yaw < Math.PI, "yaw wraps: " + spun.yaw);
     near(format.panoZoom(view, 0.01).fov, format.MIN_FOV, "zoom in limit");
     near(format.panoZoom(view, 100).fov, format.MAX_FOV, "zoom out limit");
+});
+
+test("the edit form's tags and what a save sends", function () {
+    assert.deepStrictEqual(format.splitTags(" Rex, grandma's  garden;REX,, "),
+                           ["rex", "grandma's garden"]);
+    assert.deepStrictEqual(format.splitTags(""), []);
+    assert.strictEqual(format.tagKey("  Golden   Retriever "), "golden retriever");
+    // The owner's tags first, then the model's that were not removed.
+    assert.deepStrictEqual(format.editedTags(["Dog", "beach", "sand"], ["rex", "beach"],
+                                             ["SAND"]),
+                           [{tag: "rex", added: true}, {tag: "beach", added: true},
+                            {tag: "dog", added: false}]);
+    assert.deepStrictEqual(format.editedTags(null, null, null), []);
+    assert.deepStrictEqual(format.editedTags(["constructor"], ["__proto__"], []),
+                           [{tag: "__proto__", added: true}, {tag: "constructor", added: false}]);
+    var model = {title: "Dog on a beach", description: "A dog runs."};
+    // Text like the model's (or none) is sent as null: the model's is used.
+    assert.deepStrictEqual(format.editBody(model, {title: " Dog on a beach ", description: "",
+                                                   added: ["rex"], removed: ["sand"]}),
+                           {title: null, description: null, tags_add: ["rex"],
+                            tags_remove: ["sand"]});
+    assert.deepStrictEqual(format.editBody(null, {title: "Rex", description: "Our dog.  "}),
+                           {title: "Rex", description: "Our dog.", tags_add: [],
+                            tags_remove: []});
+    // A tag longer than the server keeps is named before anything is sent.
+    assert.strictEqual(format.tagProblem(["rex", "x".repeat(60)]), "");
+    assert.strictEqual(format.tagProblem([]), "");
+    var problem = format.tagProblem(["rex", "y".repeat(61)]);
+    assert.ok(problem.indexOf("y".repeat(24) + "\u2026") > 0, problem);
+    assert.ok(/at most 60 characters/.test(problem), problem);
 });
 
 test("the viewer loads without a page and only offers its helpers", function () {

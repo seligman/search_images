@@ -269,5 +269,146 @@ class DescribeChosenTest(PictureFixture, unittest.TestCase):
         self.assertEqual((second[1]["ids"], second[1]["force"]), (None, False))
 
 
+MODEL_INFO = {"title": "Dog on a beach", "description": "A brown dog runs on the sand.",
+              "photo_type": "photo", "tags": ["dog", "beach", "sand"], "subjects": ["dog"]}
+
+
+class EditsTest(PictureFixture, unittest.TestCase):
+    """The owner's titles, descriptions and tags (image_edits)."""
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE images SET info = ?, described = 1, prompt_ver = 5 "
+                          "WHERE id IN (?, ?)",
+                          (json.dumps(MODEL_INFO), self.picture, self.second))
+        self.conn.commit()
+        self.path = "/images/%d/edits" % self.picture
+
+    def index_records(self, **kwargs):
+        return {record["i"]: record
+                for record in self.client.get("/api/index", **kwargs).get_json()["records"]}
+
+    def test_read_change_and_clear(self):
+        answer = self.ok(self.get(self.path))
+        self.assertEqual(answer["edited"], False)
+        self.assertEqual(answer["edits"], {"title": None, "description": None, "tags_add": [],
+                                           "tags_remove": [], "updated": None})
+        self.assertEqual(answer["model_info"], MODEL_INFO)
+        self.assertEqual(answer["info"], MODEL_INFO)
+        etag = self.client.get("/api/index").headers["ETag"]
+        answer = self.ok(self.post(self.path, {"title": "Rex at the beach",
+                                               "tags_add": ["Rex"], "tags_remove": ["sand"]}))
+        self.assertTrue(answer["edited"])
+        self.assertEqual(answer["edits"]["title"], "Rex at the beach")
+        self.assertEqual(answer["info"]["title"], "Rex at the beach")
+        self.assertEqual(answer["info"]["tags"], ["rex", "dog", "beach"])
+        self.assertEqual(answer["model_info"], MODEL_INFO)
+        self.assertEqual(answer["record"], {"t": "Rex at the beach",
+                                            "d": "A brown dog runs on the sand.",
+                                            "g": ["rex", "dog", "beach"], "ed": 1})
+        # The search index follows at once.
+        response = self.client.get("/api/index", headers={"If-None-Match": etag})
+        self.assertEqual(response.status_code, 200)
+        record = self.index_records()[self.picture]
+        self.assertEqual((record["t"], record["g"], record["ed"]),
+                         ("Rex at the beach", ["rex", "dog", "beach"], 1))
+        # Only the fields sent change.
+        answer = self.ok(self.post(self.path, {"description": "Rex, our dog."}))
+        self.assertEqual((answer["edits"]["title"], answer["edits"]["description"]),
+                         ("Rex at the beach", "Rex, our dog."))
+        # null puts the model's text back; an empty edit is no edit.
+        answer = self.ok(self.post(self.path, {"title": None, "description": None,
+                                               "tags_add": [], "tags_remove": None}))
+        self.assertFalse(answer["edited"])
+        self.assertEqual(answer["info"], MODEL_INFO)
+        self.assertEqual(answer["record"], {"t": "Dog on a beach",
+                                            "d": "A brown dog runs on the sand.",
+                                            "g": ["dog", "beach", "sand"]})
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM image_edits").fetchone()[0], 0)
+        self.assertNotIn("ed", self.index_records()[self.picture])
+
+    def test_the_picture_record_shows_the_owners_words(self):
+        self.ok(self.post(self.path, {"title": "Rex", "tags_remove": ["beach"]}))
+        detail = self.client.get("/api/image/%d" % self.picture).get_json()
+        self.assertEqual(detail["info"]["title"], "Rex")
+        self.assertEqual(detail["info"]["tags"], ["dog", "sand"])
+        self.assertTrue(detail["edited"])
+        self.assertEqual(detail["model_info"], MODEL_INFO)
+        self.assertEqual(detail["edits"]["tags_remove"], ["beach"])
+        # Others see the words shown, not what the model wrote, the edit,
+        # or even that there is one.
+        remote = self.client.get("/api/image/%d" % self.picture, environ_base=REMOTE)
+        detail = remote.get_json()
+        self.assertEqual(detail["info"]["title"], "Rex")
+        for key in ("model_info", "edits", "edited"):
+            self.assertNotIn(key, detail)
+        self.assertNotIn("Dog on a beach", remote.get_data(as_text=True))
+        records = self.index_records(environ_base=REMOTE)
+        self.assertEqual(records[self.picture]["t"], "Rex")
+        self.assertNotIn("ed", records[self.picture])
+        self.assertEqual(self.index_records()[self.picture]["ed"], 1)
+
+    def test_requests_that_make_no_sense(self):
+        for body in ({"title": 5}, {"tags_add": "rex"}, {"tags_add": [1]},
+                     {"color": "red"}, {"title": "x" * 201},
+                     {"tags_add": ["x" * 61]},
+                     # A lone surrogate (JSON can carry one) cannot be stored.
+                     {"title": "a" + chr(0xD800) + "b"}, {"tags_add": [chr(0xDC00)]}):
+            response = self.post(self.path, body)
+            self.assertEqual(response.status_code, 400, body)
+            self.assertIn("error", response.get_json())
+        self.assertEqual(self.post(self.path, ["title"]).status_code, 400)
+        for image_id in (999999, self.gone, 2 ** 63):
+            self.assertEqual(self.get("/images/%d/edits" % image_id).status_code, 404)
+            self.assertEqual(self.post("/images/%d/edits" % image_id, {"title": "x"})
+                             .status_code, 404)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM image_edits").fetchone()[0], 0)
+
+    def test_only_the_admin_on_this_computer(self):
+        self.refused_from_outside("/images/tags", {"ids": [self.picture], "add": ["rex"]})
+        body = {"title": "Rex"}
+        self.assertEqual(self.post(self.path, body, environ_base=REMOTE).status_code, 403)
+        response = self.client.post(admin.URL_PREFIX + self.path, data=json.dumps(body),
+                                    content_type="application/json")
+        self.assertEqual(response.status_code, 403)                     # no header
+        self.assertEqual(self.post(self.path, body, headers={"Sec-Fetch-Site": "cross-site"})
+                         .status_code, 403)
+        self.assertEqual(self.post(self.path, body, headers={"Origin": "http://attacker.example"})
+                         .status_code, 403)
+        response = self.client.post(admin.URL_PREFIX + self.path, data=json.dumps(body),
+                                    content_type="text/plain", headers={"X-Search-Images": "1"})
+        self.assertEqual(response.status_code, 415)
+        self.assertEqual(self.get(self.path, environ_base=REMOTE).status_code, 403)
+        response = self.client.get(admin.URL_PREFIX + self.path)
+        self.assertEqual(response.status_code, 403)                     # no header
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM image_edits").fetchone()[0], 0)
+
+    def test_tags_of_many_pictures(self):
+        ids = [self.picture, self.second, self.elsewhere, 999999]
+        answer = self.ok(self.post("/images/tags", {"ids": ids, "add": ["Summer trip"]}))
+        self.assertEqual((answer["changed"], answer["found"], answer["unknown"]), (3, 3, 1))
+        self.assertEqual(answer["tags"][str(self.picture)],
+                         ["summer trip", "dog", "beach", "sand"])
+        self.assertEqual(answer["tags"][str(self.elsewhere)], ["summer trip"])
+        self.assertTrue(all(answer["edited"].values()))
+        records = self.index_records()
+        self.assertEqual(records[self.second]["g"][0], "summer trip")
+        answer = self.ok(self.post("/images/tags", {"ids": ids, "remove": ["summer trip",
+                                                                           "beach"]}))
+        self.assertEqual(answer["changed"], 3)
+        self.assertEqual(answer["tags"][str(self.picture)], ["dog", "sand"])
+        self.assertEqual(answer["tags"][str(self.elsewhere)], [])
+        self.assertEqual(answer["edited"][str(self.elsewhere)], False)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM image_edits").fetchone()[0], 2)
+        for body in ({"ids": [self.picture]}, {"ids": [self.picture], "add": [], "remove": []},
+                     {"ids": [self.picture], "add": "rex"}, {"ids": [], "add": ["rex"]},
+                     {"ids": list(range(1, admin.HIDE_LIMIT + 2)), "add": ["rex"]},
+                     {"ids": [self.picture], "remove": ["x" * 61]},
+                     {"ids": [self.picture], "add": ["x" + chr(0xDC00)]}):
+            response = self.post("/images/tags", body)
+            self.assertEqual(response.status_code, 400, str(body)[:60])
+            self.assertIn("error", response.get_json())
+
+
 if __name__ == "__main__":
     unittest.main()

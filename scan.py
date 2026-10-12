@@ -24,7 +24,8 @@ Descriptions are never thrown away by accident:
   count towards that limit.
 - Libraries that are no longer in config.json are never touched.
 - A hidden image stays hidden when it is moved, renamed or copied within its
-  library.
+  library (a new copy is shown when another copy is shown there: the owner
+  kept that one), and a shown image stays shown.
 
 Then the describe step (describe.py) runs for images without a description.
 
@@ -33,8 +34,12 @@ Usage:
                    [--newest-first | --oldest-first] [--retry-failed]
                    [--redescribe-stale] [--limit N] [--endpoint NAME]
                    [--allow-mass-removal] [--verbose]
+    python scan.py --refine [--library NAME_OR_ID ...] [--limit N] [--retry-failed]
     python scan.py --list-endpoints
     python scan.py --test-endpoint NAME [--image PATH]
+
+--refine only runs the refine pass (describe.refine_pending): documents and
+screenshots described again with each library's refine endpoint.
 
 To stop a long run early, create data/abort (or a file named "abort" or
 "abort.txt" in the current directory). Work done so far is kept; run again to
@@ -53,9 +58,12 @@ import cache
 import common
 import db
 import describe
+import image_edits
 import images
 import jobs
 import llm
+import not_duplicates
+import places
 
 COMMIT_ROWS = 100           # commit after this many written rows...
 COMMIT_SECONDS = 3.0        # ...or this many seconds, whichever comes first
@@ -70,6 +78,10 @@ MASS_REMOVAL_MIN = 20
 DAY = 86400.0
 MISSING_LOG_LIMIT = 20      # log at most this many missing paths one by one
 FILE_LOG_LIMIT = 20         # per library, "Added ..." (etc.) lines beyond this are only counted
+# New content at a path within this many dHash bits of the old content is the
+# same picture retouched: the owner's edit stays with it, even when the old
+# content turns up under another name.
+RETOUCHED_BITS = 12
 LIST_LOG_SECONDS = 10.0     # progress line while listing a large library
 
 
@@ -264,6 +276,14 @@ def excluded_by_ignores(path, patterns):
                for depth in range(1, len(parts)))
 
 
+def _looks_alike(first, second):
+    """True when two dHashes (16 hex digits) are within RETOUCHED_BITS of each other."""
+    try:
+        return bin(int(first, 16) ^ int(second, 16)).count("1") <= RETOUCHED_BITS
+    except (TypeError, ValueError):
+        return False
+
+
 def _under_any(path, prefixes):
     """True if path is one of prefixes, or inside one of them ('' covers everything)."""
     if "" in prefixes or path in prefixes:
@@ -441,12 +461,16 @@ class _CommitTimer:
 
 
 def _metadata(result):
-    """Column values for the image facts returned by images.read_image()."""
+    """Column values for the image facts returned by images.read_image().
+
+    With place names (places.py) they include the place of its GPS
+    position; without, the place is left to be looked up later.
+    """
     try:
         exif = json.dumps(result["exif"], ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError):
         exif = "{}"
-    return {
+    values = {
         "width": int(result["width"]), "height": int(result["height"]),
         "content_hash": result["content_hash"], "dhash": result["dhash"],
         "taken_at": result["taken_at"], "taken_source": result["taken_source"],
@@ -454,6 +478,8 @@ def _metadata(result):
         "lat": result["lat"], "lon": result["lon"], "exif": exif,
         "projection": result.get("projection", ""),
     }
+    values.update(places.place_columns(result["lat"], result["lon"]))
+    return values
 
 
 _DESCRIPTION_COLUMNS = ("info", "described", "prompt_ver", "provenance", "hidden",
@@ -470,12 +496,52 @@ _SOURCE_COLUMNS = "id, library_id, path, " + ", ".join(_DESCRIPTION_COLUMNS) + "
 # Rows with the same content: the images_hash index makes this one lookup.
 _SOURCE_BY_HASH_SQL = ("SELECT " + _SOURCE_COLUMNS
                        + " FROM images WHERE content_hash = ? AND id <> ?")
-_HIDDEN_TWIN_SQL = ("SELECT 1 FROM images WHERE content_hash = ? AND library_id = ? "
-                    "AND hidden = 1 LIMIT 1")
+# Whether a library shows a content: 0 when a present row with it is shown,
+# else 1 when a row with it is hidden, else NULL (see LibraryScan._insert).
+_SHOWN_OR_HIDDEN_SQL = ("SELECT MIN(CASE WHEN hidden = 0 AND missing_since IS NULL THEN 0 "
+                        "WHEN hidden = 1 THEN 1 END) FROM images "
+                        "WHERE content_hash = ? AND library_id = ?")
 
 
 # ---------------------------------------------------------------------------
 # Scanning one library
+
+def _path_likeness(first, second):
+    """How many trailing parts (file name, folders) two relative paths share."""
+    first, second = first.lower().split("/"), second.lower().split("/")
+    count = 0
+    while count < min(len(first), len(second)) and first[-1 - count] == second[-1 - count]:
+        count += 1
+    return count
+
+
+def _moved_to(missing, twins_of, new_ids):
+    """{missing row id: the id of the row added in this walk it most likely moved to}.
+
+    missing are rows whose files are gone, twins_of maps each one's id to
+    the rows listed in this walk with its content, new_ids are the rows
+    given that content in this walk. Each new row is the destination of at
+    most one missing row: the pairs with the most alike paths go first
+    (a folder moved or renamed keeps the folders below it and the file
+    names), then the newest rows.
+    """
+    pairs = sorted(((_path_likeness(row["path"], twin["path"]), twin["id"], row["id"])
+                    for row in missing for twin in twins_of.get(row["id"], ())
+                    if twin["id"] in new_ids), reverse=True)
+    result, taken = {}, set()
+    for _likeness, twin_id, row_id in pairs:
+        if row_id not in result and twin_id not in taken:
+            result[row_id] = twin_id
+            taken.add(twin_id)
+    return result
+
+
+def _edit_words(edit):
+    """An edit without its time, to compare two."""
+    words = image_edits.view(edit)
+    words.pop("updated")
+    return words
+
 
 class LibraryScan:
     """The state of one library scan. Use scan_library() rather than this directly."""
@@ -516,6 +582,17 @@ class LibraryScan:
         # content (hash, or (size, dhash) for imported rows), so a file that
         # still holds the old content elsewhere can keep them.
         self.replaced = {}
+        # The owner's edits (image_edits): ids of this library's rows that
+        # have one, the rows given new content in this scan (added or
+        # changed), and {id: (old row, new dHash)} of edited rows whose
+        # content changed -- the edit follows its content to another path.
+        self.edited = set()
+        self.any_edits = False
+        self.new_content = set()
+        self.edit_left = {}
+        # {old key: new key} of rows whose not_duplicates key changed (new
+        # content in place, or a content hash found for an imported row).
+        self.rekeyed = {}
         self.unsupported_logged = set()
         self.logged = collections.Counter()
         self.timer = None
@@ -556,6 +633,11 @@ class LibraryScan:
                 self.legacy_index[(row["size"], row["dhash"])].append(row["id"])
         self.failures = _load_failures(self.conn, self.library_id)
         self.thumb_ids = self.thumbs.ids()
+        self.edited = {row[0] for row in self.conn.execute(
+            "SELECT e.image_id FROM image_edits AS e JOIN images AS i ON i.id = e.image_id "
+            "WHERE i.library_id = ?", (self.library_id,))}
+        self.any_edits = bool(self.edited) or self.conn.execute(
+            "SELECT 1 FROM image_edits LIMIT 1").fetchone() is not None
 
     def delete_rows(self, ids):
         """Delete image rows with their thumbnails and previews (no commit)."""
@@ -622,8 +704,25 @@ class LibraryScan:
             self.commit()
         finally:
             self.summary["errors"] = walk.errors + self.read_errors
+            self._carry_over_pairs()
         ctx.log(self._summary_line())
         return self.summary
+
+    def _carry_over_pairs(self):
+        """Pictures the owner said are not duplicates stay apart when a file
+        changes in place (rotated, or tags written into it): their pairs
+        (not_duplicates.py, kept by content) are copied to the new content."""
+        if not self.rekeyed:
+            return
+        try:
+            count = not_duplicates.carry_over(self.rekeyed)
+        except OSError as error:
+            self.ctx.log("Could not update %s: %s" % (not_duplicates.FILE_NAME,
+                                                      _error_text(error)), "warn")
+            return
+        if count:
+            self.ctx.log("Kept %d pair(s) of pictures apart as not duplicates after their "
+                         "files changed." % count)
 
     def _summary_line(self):
         summary = self.summary
@@ -785,12 +884,19 @@ class LibraryScan:
         else:
             image_id = row["id"]
             values = dict(metadata, size=size, mtime=mtime, ctime=ctime, updated=now)
+            old_key = not_duplicates.unit_key(image_id, row["content_hash"])
+            new_key = not_duplicates.unit_key(image_id, metadata["content_hash"])
+            if old_key != new_key:
+                self.rekeyed[old_key] = new_key
             if self._same_content(row, metadata, size, mtime):
                 self.summary["updated"] += 1
                 self._note("updated", "Updated " + rel
                            + (" (description kept)" if row["described"] else ""))
             else:
                 self._remember_description(row)
+                self.new_content.add(image_id)
+                if image_id in self.edited:
+                    self.edit_left[image_id] = (row, metadata["dhash"])
                 source, _moved = self._find_source(metadata, size, image_id)
                 if source is not None:
                     values.update({key: source[key] for key in _DESCRIPTION_COLUMNS
@@ -839,18 +945,27 @@ class LibraryScan:
         source, moved = self._find_source(metadata, size, -1)
         if source is not None:
             values.update({key: source[key] for key in _DESCRIPTION_COLUMNS})
-        if not values["hidden"] and self.conn.execute(
-                _HIDDEN_TWIN_SQL, (metadata["content_hash"], self.library_id)).fetchone():
-            # A hidden picture stays hidden under a new name or as a copy.
-            values["hidden"] = 1
+        if not moved:
+            # A hidden picture stays hidden as a copy (and under a new name,
+            # see _remove_moved), unless a copy of it is shown here: the owner
+            # kept that one in view and hid the others ("Keep best"). A
+            # moved file keeps its own flag.
+            shown = self.conn.execute(_SHOWN_OR_HIDDEN_SQL,
+                                      (metadata["content_hash"], self.library_id)).fetchone()[0]
+            if shown is not None:
+                values["hidden"] = shown
         columns = sorted(values)
         image_id = self.conn.execute(
             "INSERT INTO images (%s) VALUES (%s)" % (", ".join(columns),
                                                      ", ".join("?" * len(columns))),
             [values[column] for column in columns]).lastrowid
         self.summary["added"] += 1
+        self.new_content.add(image_id)
         if moved:
-            # The old row was the same file at its previous path.
+            # The old row was the same file at its previous path; the
+            # owner's edit (image_edits) moves along with it.
+            if source["id"] in self.edited:
+                image_edits.give(self.conn, source["id"], [image_id])
             self.delete_rows([source["id"]])
             self.summary["moved"] += 1
             self._note("moved", "Moved %s -> %s" % (source["path"], rel))
@@ -859,7 +974,97 @@ class LibraryScan:
             self._note("added", "Added %s (description copied from %s)" % (rel, source["path"]))
         else:
             self._note("added", "Added " + rel)
+        if not moved and self.any_edits:
+            self._adopt_edit(image_id, rel, metadata["content_hash"])
         return image_id
+
+    # -- the owner's edits ---------------------------------------------------
+
+    def _adopt_edit(self, image_id, rel, content_hash):
+        """A new file whose content was last seen as a missing file gets that file's edit.
+
+        The missing file is most likely the same one, moved here from
+        another library; it keeps its edit too (copied), in case it comes
+        back.
+        """
+        if not content_hash:
+            return
+        for row in self.conn.execute(
+                "SELECT i.id, i.library_id, i.path FROM image_edits AS e "
+                "JOIN images AS i ON i.id = e.image_id WHERE i.content_hash = ? "
+                "AND i.missing_since IS NOT NULL AND i.id <> ? "
+                "ORDER BY i.missing_since DESC, i.id DESC", (content_hash, image_id)).fetchall():
+            if row["library_id"] == self.library_id and row["path"] in self.walked:
+                continue        # back at its own path in this walk
+            if image_edits.give(self.conn, row["id"], [image_id], copy=True) is not None:
+                self._note("edits", "Kept your edit of %s for %s" % (row["path"], rel))
+            return
+
+    def _follow_content(self, present):
+        """Edits of files whose content changed go where the old content is now.
+
+        A file moved away and a new one saved under its name (cameras reuse
+        names), or two files that swapped names: the owner's edit belongs to
+        the picture, so it goes to the file added or changed in this scan
+        that now holds the content it was made for. When the new content at
+        the old path looks like the same picture (retouched, with the
+        original kept under another name), both keep the edit. A file whose
+        old content is nowhere else keeps its edit.
+        """
+        plan = {}
+        for image_id, (row, new_dhash) in self.edit_left.items():
+            twins = sorted((twin["id"] for twin in self._twins(row, present)
+                            if twin["id"] in self.new_content), reverse=True)
+            if twins:
+                plan[image_id] = (twins, _looks_alike(row["dhash"], new_dhash))
+        if not plan:
+            return
+        paths = {twin["id"]: twin["path"] for group in present for rows in group.values()
+                 for twin in rows}
+        for source, target in sorted(image_edits.reassign(self.conn, plan).items()):
+            self._note("edits", "Your edit of %s went with its picture to %s"
+                       % (self.edit_left[source][0]["path"], paths.get(target, target)))
+
+    def _share_edit(self, row):
+        """Copy a file's edit, as it goes missing, to the same picture in another library.
+
+        That file most likely moved there (the other library was scanned
+        first); this one keeps its edit too, in case it comes back.
+        """
+        if not row["content_hash"]:
+            return
+        heirs = [other["id"] for other in self.conn.execute(
+            "SELECT id FROM images WHERE content_hash = ? AND library_id <> ? "
+            "AND missing_since IS NULL ORDER BY id DESC", (row["content_hash"], self.library_id))]
+        if heirs and image_edits.give(self.conn, row["id"], heirs, copy=True) is not None:
+            self._note("edits", "Kept your edit of %s for its copy in another library"
+                       % row["path"])
+
+    def _hand_on_edit(self, row, preferred=()):
+        """Before a missing file's row is deleted, give its edit to a present copy.
+
+        preferred (ids) come first, then present rows with the same content
+        in any library, newest first. An edit that no copy can take (each
+        has an edit of its own, and none the same) is logged as it goes.
+        """
+        heirs = list(preferred)
+        if row["content_hash"]:
+            heirs += [other["id"] for other in self.conn.execute(
+                "SELECT id FROM images WHERE content_hash = ? AND missing_since IS NULL "
+                "AND id <> ? ORDER BY id DESC", (row["content_hash"], row["id"]))
+                      if other["id"] not in heirs]
+        if not heirs or image_edits.give(self.conn, row["id"], heirs) is not None:
+            return
+        edit = image_edits.load(self.conn, row["id"])
+        if edit is None:
+            return
+        words = _edit_words(edit)
+        if any(_edit_words(other) == words
+               for other in image_edits.load_many(self.conn, heirs).values()):
+            return              # a copy has the same edit already
+        self._note("edits lost", "Your edit of %s (%s) was removed with it: every copy of the "
+                   "picture has an edit of its own" % (row["path"], words["title"] or ", ".join(
+                       words["tags_add"]) or "a description"))
 
     # -- after a complete walk ----------------------------------------------
 
@@ -924,7 +1129,8 @@ class LibraryScan:
                 self._guard(to_mark, present)
             self.summary["complete"] = True
             return
-        present_walked = self._present_walked() if (to_mark or self._has_missing()) else None
+        present_walked = (self._present_walked()
+                          if (to_mark or self._has_missing() or self.edit_left) else None)
 
         # Files now excluded by ignore patterns were not deleted, but they
         # are no longer part of the library.
@@ -941,6 +1147,9 @@ class LibraryScan:
             self.summary["excluded"] = len(excluded)
             ctx.log("%d file(s) in %s are now excluded by ignore patterns; they were marked "
                     "missing." % (len(excluded), self.label))
+            for row in excluded:
+                if row["id"] in self.edited:
+                    self._share_edit(row)
         if moved:
             self._set_missing([row["id"] for row in moved], self.now)
         trusted = True
@@ -951,11 +1160,16 @@ class LibraryScan:
             else:
                 self._set_missing([row["id"] for row in rest], self.now)
                 self.summary["missing"] = len(rest)
+                for row in rest:
+                    if row["id"] in self.edited:
+                        self._share_edit(row)
                 for row in rest[:MISSING_LOG_LIMIT]:
                     ctx.log("Missing: " + row["path"])
                 if len(rest) > MISSING_LOG_LIMIT:
                     ctx.log("... and %d more missing file(s)" % (len(rest) - MISSING_LOG_LIMIT))
         self.summary["complete"] = True
+        if self.edit_left:
+            self._follow_content(present_walked)
         if present_walked is not None:
             self._remove_moved(present_walked)
         if not trusted:
@@ -985,28 +1199,50 @@ class LibraryScan:
     def _remove_moved(self, present_walked):
         """Delete missing rows whose content was listed at another path in this walk.
 
-        The new row gets the old one's description when it has none yet, and
-        stays hidden if the old one was hidden.
+        The new rows get the old one's description when they have none yet.
+        The file the old one moved to (the row added in this walk with its
+        content and the most alike path, see _moved_to) stays hidden if the
+        old one was hidden, and the owner's edit moves to it. Copies that
+        were there before keep their own flag: a hidden copy deleted from
+        the folder never hides the copy the owner kept. A shown row whose
+        copies here are all hidden, and that moved to no new path, is kept
+        (missing): it moved away, and is shown again when it comes back.
         """
         missing = [row for row in self.conn.execute(
             "SELECT " + _SOURCE_COLUMNS + ", content_hash, size, dhash FROM images "
             "WHERE library_id = ? AND missing_since IS NOT NULL", (self.library_id,))
                    if row["path"] not in self.walked]
+        twins_of = {row["id"]: self._twins(row, present_walked) for row in missing}
+        moved_to = _moved_to(missing, twins_of, self.new_content)
         gone = []
         for row in missing:
-            twins = self._twins(row, present_walked)
+            twins = twins_of[row["id"]]
             if not twins:
                 continue
             ids = [twin["id"] for twin in twins]
             marks = ",".join("?" * len(ids))
+            target = moved_to.get(row["id"])
+            if target is None and not row["hidden"] and self.conn.execute(
+                    "SELECT 1 FROM images WHERE hidden = 0 AND id IN (%s) LIMIT 1" % marks,
+                    ids).fetchone() is None:
+                # Shown, while every copy left is hidden: the owner kept
+                # this one, which went elsewhere. It stays a missing row,
+                # so the file is shown again when a later scan finds it.
+                continue
             if row["described"]:
                 self.conn.execute(
                     "UPDATE images SET info = ?, described = 1, prompt_ver = ?, "
                     "provenance = ?, describe_attempts = 0, describe_error = '' "
                     "WHERE described = 0 AND id IN (%s)" % marks,
                     [row["info"], row["prompt_ver"], row["provenance"]] + ids)
-            if row["hidden"]:
-                self.conn.execute("UPDATE images SET hidden = 1 WHERE id IN (%s)" % marks, ids)
+            if row["hidden"] and target is not None:
+                self.conn.execute("UPDATE images SET hidden = 1 WHERE id = ?", (target,))
+            if row["id"] in self.edited:
+                # The owner's edit goes to the file at the new path: the one
+                # it moved to, else one added in this walk, else the newest
+                # copy without an edit of its own.
+                self._hand_on_edit(row, sorted(ids, key=lambda image_id: (
+                    image_id != target, image_id not in self.new_content, -image_id)))
             gone.append(row)
         if gone:
             self.delete_rows([row["id"] for row in gone])
@@ -1026,10 +1262,14 @@ class LibraryScan:
             return
         cutoff = self.now - days * DAY
         rows = [row for row in self.conn.execute(
-            "SELECT id, path FROM images WHERE library_id = ? AND missing_since IS NOT NULL "
-            "AND missing_since < ?", (self.library_id, cutoff))
+            "SELECT id, path, content_hash FROM images WHERE library_id = ? "
+            "AND missing_since IS NOT NULL AND missing_since < ?", (self.library_id, cutoff))
                 if row["path"] not in self.walked
                 and not _under_any(row["path"], protected_paths)]
+        for row in rows:
+            if row["id"] in self.edited:
+                # A copy of the picture (in any library) keeps the owner's words.
+                self._hand_on_edit(row)
         if rows:
             self.delete_rows([row["id"] for row in rows])
             self.summary["purged"] = len(rows)
@@ -1055,6 +1295,7 @@ def scan_library(conn, library, ctx, helper=None, thumbs=None, previews=None,
     own_thumbs = thumbs is None
     thumbs = thumbs or cache.ThumbStore()
     try:
+        start_stitch_state(conn, library["id"])
         scan = LibraryScan(conn, library, ctx, helper, thumbs, previews or cache.PreviewStore(),
                            threads, allow_mass_removal, purge_after_days, now, verbose)
         return scan.run()
@@ -1065,6 +1306,76 @@ def scan_library(conn, library, ctx, helper=None, thumbs=None, previews=None,
 
 # ---------------------------------------------------------------------------
 # Filling in what older rows lack
+
+# The meta row (this prefix + library id) that says which of a library's
+# unstitched 360 photos still need stitching again, as JSON:
+# {"key": images.stitch_key() they are being stitched for, "pending": [ids]}.
+STITCH_META = "stitch:"
+# The back-fill saves what is still pending after every this many of them.
+STITCH_SAVE_EVERY = 25
+
+
+def stitch_state(conn, library_id):
+    """(stitch key, [pending image ids]) recorded for a library, or (None, [])."""
+    row = conn.execute("SELECT value FROM meta WHERE key = ?",
+                       (STITCH_META + library_id,)).fetchone()
+    try:
+        value = json.loads(row[0]) if row is not None else None
+    except ValueError:
+        value = None
+    if not isinstance(value, dict) or not isinstance(value.get("key"), str):
+        return None, []
+    pending = value.get("pending")
+    if not isinstance(pending, list):
+        pending = []
+    return value["key"], [item for item in pending
+                          if isinstance(item, int) and not isinstance(item, bool)]
+
+
+def save_stitch_state(conn, library_id, key, pending):
+    """Record a library's stitch key and pending ids (no commit)."""
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                 (STITCH_META + library_id,
+                  json.dumps({"key": key, "pending": sorted(pending)}, separators=(",", ":"))))
+
+
+def start_stitch_state(conn, library_id):
+    """Note that a library without any rows yet stitches its 360 photos the current way.
+
+    Called before a scan: a library scanned for the first time gets the
+    current images.stitch_key() with nothing pending, so the back-fill does
+    not stitch its photos twice. A library with rows but no record was
+    stitched by an older version (see _restitch_ids).
+    """
+    if stitch_state(conn, library_id)[0] is not None:
+        return
+    if conn.execute("SELECT 1 FROM images WHERE library_id = ? LIMIT 1",
+                    (library_id,)).fetchone() is None:
+        save_stitch_state(conn, library_id, images.stitch_key(), [])
+        conn.commit()
+
+
+def _restitch_ids(conn, library_id):
+    """(stitch key, ids of a library's dual-fisheye photos to stitch again as a set).
+
+    When the recorded stitch key is not images.stitch_key() (a new version
+    of the stitching, or other pole fill settings), every dual-fisheye row
+    is pending, also those of files missing now (they are stitched again
+    once they are back unchanged); the back-fill reads them again and takes
+    them off the list as it goes, so a stopped run carries on later. Rows
+    that are gone, or no longer dual-fisheye frames, drop off the list. No
+    commit.
+    """
+    key = images.stitch_key()
+    stored, pending = stitch_state(conn, library_id)
+    frames = {row[0] for row in conn.execute(
+        "SELECT id FROM images WHERE library_id = ? AND projection = ?",
+        (library_id, images.PROJECTION_DUAL_FISHEYE))}
+    wanted = frames if stored != key else frames.intersection(pending)
+    if stored != key or len(wanted) != len(pending):
+        save_stitch_state(conn, library_id, key, wanted)
+    return key, wanted
+
 
 _BACKFILL_SQL = """
     SELECT id, path, size, mtime, content_hash, dhash, width, height, has_preview,
@@ -1081,11 +1392,13 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     photos were recognised) are read again the same way, which gives 360
     photos their panorama preview, front-view thumbnail and dHash; so are
     360 photos with a preview but no pano (stored before panos were made;
-    only those larger than their preview get one, see images.has_pano).
+    only those larger than their preview get one, see images.has_pano),
+    and unstitched 360 photos stitched by an older version or with other
+    pole fill settings (see _restitch_ids; their descriptions are kept).
     Rows of files the ignore patterns now exclude are left alone. It runs
     as stage "previews", can be stopped at any point and continues where
-    it left off. Returns a summary dict:
-    {needed, filled, failed, changed, unsupported, aborted, panoramas, panos}.
+    it left off. Returns a summary dict: {needed, filled, failed, changed,
+    unsupported, aborted, panoramas, panos, restitched}.
     """
     own_thumbs = thumbs is None
     thumbs = thumbs or cache.ThumbStore()
@@ -1103,10 +1416,12 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
     patterns = common.ignore_patterns(library)
     want_previews = bool(library.get("previews", True))
     summary = {"needed": 0, "filled": 0, "failed": 0, "changed": 0, "unsupported": 0,
-               "aborted": False, "panoramas": 0, "panos": 0}
+               "aborted": False, "panoramas": 0, "panos": 0, "restitched": 0}
     redescribe = []
     on_disk, panos_on_disk = previews.stored_ids(library_id)
     failures = _load_failures(conn, library_id)
+    stitch_key, restitch = _restitch_ids(conn, library_id)
+    pending_before = len(restitch)
     needed = []
     for row in conn.execute(_BACKFILL_SQL, (library_id,)).fetchall():
         has_preview = bool(row["has_preview"])
@@ -1118,32 +1433,47 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
         if (row["content_hash"] and row["dhash"] and row["width"] > 0 and row["height"] > 0
                 and (has_preview or not want_previews)
                 and row["projection"] != images.PROJECTION_UNKNOWN
+                and row["id"] not in restitch
                 and not (want_previews and has_preview
                          and row["projection"] in images.PROJECTIONS_360
                          and images.has_pano(row["width"], row["height"])
                          and row["id"] not in panos_on_disk)):
             continue
-        if excluded_by_ignores(row["path"], patterns):
-            continue
-        if _failed_before(failures, row["path"], row["size"], row["mtime"]):
+        if (excluded_by_ignores(row["path"], patterns)
+                or _failed_before(failures, row["path"], row["size"], row["mtime"])):
             continue
         needed.append(row)
+    # (Pending rows left alone here -- missing, ignored now, or unreadable
+    # before -- stay pending until they can be read.)
     conn.commit()
     summary["needed"] = len(needed)
     if not needed:
         return summary
+    stitching = sum(1 for row in needed if row["id"] in restitch)
+    if stitching:
+        ctx.log("Stitching %d 360-degree photo(s) in %s again (their descriptions are kept)"
+                % (stitching, common.library_label(library)))
     ctx.stage("previews", total=len(needed))
     ctx.log("Filling in previews and details for %d image(s) in %s"
             % (len(needed), common.library_label(library)))
     read_helper = thread_safe_helper(helper)
     timer = _CommitTimer(conn, thumbs)
     unsupported_logged = set()
+    rekeyed = {}                # not_duplicates keys that change (see LibraryScan)
 
     def read(row):
         return _read_original(root, row["path"], read_helper, want_previews, row["mtime"])
 
     def handle(row, outcome):
         result, error = outcome
+        # A file that could not be read for now (a share that went away)
+        # stays pending; one read, changed since, or bad for good is done.
+        if row["id"] in restitch and not isinstance(error, images.SourceReadError):
+            restitch.discard(row["id"])
+            if error is None and result.get("projection") == images.PROJECTION_DUAL_FISHEYE:
+                summary["restitched"] += 1
+            if not len(restitch) % STITCH_SAVE_EVERY:
+                save_stitch_state(conn, library_id, stitch_key, restitch)
         if error is not None and _missing_decoder(error):
             summary["unsupported"] += 1
             if str(error) not in unsupported_logged:
@@ -1159,6 +1489,8 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
             # Changed since it was scanned; the next scan picks it up.
             summary["changed"] += 1
         else:
+            if not row["content_hash"] and result["content_hash"]:
+                rekeyed[not_duplicates.unit_key(row["id"], "")] = result["content_hash"]
             values = _metadata(result)
             values["updated"] = time.time()
             preview = result["preview"] if want_previews else None
@@ -1190,7 +1522,16 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
         summary["aborted"] = _parallel_reads(threads, needed, read, handle, ctx.should_stop,
                                              ctx, timer.flush)
     finally:
+        if pending_before:
+            save_stitch_state(conn, library_id, stitch_key, restitch)
         timer.commit()
+        if rekeyed:
+            # Imported rows found their content hash: their pairs follow.
+            try:
+                not_duplicates.carry_over(rekeyed)
+            except OSError as error:
+                ctx.log("Could not update %s: %s" % (not_duplicates.FILE_NAME,
+                                                     _error_text(error)), "warn")
     if summary["panoramas"]:
         made = (" (%d with a large panorama for the 360 view)" % summary["panos"]
                 if want_previews else "")
@@ -1253,6 +1594,14 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
                     if result["backfill"]["aborted"]:
                         summary["stopped"] = True
                         break
+                    # Place names for pictures that have a position but no
+                    # place yet (when place names were downloaded).
+                    labelled = places.label_pictures(conn, ctx, [library["id"]])
+                    if labelled is not None:
+                        result["places"] = labelled
+                        if labelled["aborted"]:
+                            summary["stopped"] = True
+                            break
         if describe_images and not summary["stopped"] and not ctx.should_stop():
             summary["describe"] = describe.describe_pending(
                 conn, config, ctx, helper=helper,
@@ -1267,7 +1616,22 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
     finally:
         if own_conn:
             conn.close()
+        # The towns take memory; a later run loads them again.
+        places.release()
     return summary
+
+
+def run_refine(config, ctx, library_ids, helper, args):
+    """scan.py --refine: the refine pass only (describe.refine_pending); returns run()'s shape."""
+    conn = db.connect()
+    try:
+        result = describe.refine_pending(
+            conn, config, ctx, helper=helper, library_ids=library_ids, limit=args.limit,
+            retry_failed=args.retry_failed, newest_first=args.newest_first,
+            only_library=bool(library_ids) and len(library_ids) == 1)
+    finally:
+        conn.close()
+    return {"libraries": [], "describe": result, "stopped": result["stopped"]}
 
 
 def _safe_output():
@@ -1384,6 +1748,10 @@ def main(argv=None):
                              "(after the new ones).")
     parser.add_argument("--limit", type=int, metavar="N",
                         help="Describe at most N images in this run.")
+    parser.add_argument("--refine", action="store_true",
+                        help="Only run the refine pass: describe the documents and screenshots "
+                             "again with each library's refine endpoint (no scan, no regular "
+                             "describing).")
     parser.add_argument("--endpoint", metavar="NAME",
                         help="Describe with this endpoint (or group) instead of each "
                              "library's own.")
@@ -1425,6 +1793,10 @@ def main(argv=None):
     if args.limit is not None and args.limit < 0:
         print("--limit must be 0 or more.")
         return 2
+    if args.refine and (args.endpoint or args.redescribe_stale):
+        print("--refine uses each library's refine endpoint (see SETTINGS.md); --endpoint and "
+              "--redescribe-stale do not go with it.")
+        return 2
     if args.endpoint and not args.no_describe and not common.resolve_endpoints(
             config, args.endpoint):
         names = ", ".join(item["name"] for item in common.endpoint_list(config)) or "none"
@@ -1456,12 +1828,15 @@ def main(argv=None):
                 library_ids.append(library["id"])
         helper = common.load_helper(config.get("helper", ""))
         with ctx.stop_on_ctrl_c():
-            summary = run(config, ctx, library_ids=library_ids, scan_images=not args.no_scan,
-                          describe_images=not args.no_describe,
-                          newest_first=args.newest_first, retry_failed=args.retry_failed,
-                          allow_mass_removal=args.allow_mass_removal, helper=helper,
-                          verbose=args.verbose, redescribe_stale=args.redescribe_stale,
-                          limit=args.limit, endpoint_name=args.endpoint)
+            if args.refine:
+                summary = run_refine(config, ctx, library_ids, helper, args)
+            else:
+                summary = run(config, ctx, library_ids=library_ids, scan_images=not args.no_scan,
+                              describe_images=not args.no_describe,
+                              newest_first=args.newest_first, retry_failed=args.retry_failed,
+                              allow_mass_removal=args.allow_mass_removal, helper=helper,
+                              verbose=args.verbose, redescribe_stale=args.redescribe_stale,
+                              limit=args.limit, endpoint_name=args.endpoint)
     except (db.DatabaseError, common.ConfigError) as error:
         print("Error: %s" % error)
         return 2

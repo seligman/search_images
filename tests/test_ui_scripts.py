@@ -25,6 +25,7 @@ import unittest
 import support
 
 import db
+import image_edits
 import jobs
 import serve
 import test_search_index as fixtures
@@ -38,7 +39,7 @@ STATIC = os.path.join(support.REPO, "static")
 NODE_TESTS = os.path.join(support.REPO, "tests", "js", "ui_test.js")
 MAP_TESTS = os.path.join(support.REPO, "tests", "js", "map_test.js")
 NODE = shutil.which("node")
-SCRIPTS = ("site.js", "viewer.js", "app.js", "detail.js", "map.js")
+SCRIPTS = ("site.js", "viewer.js", "app.js", "detail.js", "map.js", "duplicates.js")
 
 
 def read(*parts):
@@ -104,16 +105,23 @@ class PageScriptSourceTest(unittest.TestCase):
             self.assertIn("var %s = (function () {" % global_name, text)
             self.assertIn("module.exports = %s;" % global_name, text)
 
+    def test_the_pages_know_how_long_a_tag_can_be(self):
+        # The edit form and the bulk dialog check tags before sending them.
+        found = re.findall(r"var TAG_LENGTH = (\d+);", read(STATIC, "viewer.js"))
+        self.assertEqual([int(value) for value in found], [image_edits.TAG_LENGTH])
+
     def test_admin_actions_name_pictures_by_id_only(self):
-        # Copy path, open folder, hide and describe send picture ids; no
-        # path from the page ever goes to the server.
+        # Copy path, open folder, hide, describe and the tags of many
+        # pictures send picture ids (and tags); no path from the page ever
+        # goes to the server.
         bodies = []
         for name in ("viewer.js", "app.js"):
             code = read(STATIC, name)
             for url, body in re.findall(r'SHELL\.admin\(("[^"]*"[^,]*),\s*(\{[^}]*\}?)', code):
                 bodies.append(body)
                 keys = set(re.findall(r"([A-Za-z_]+):", body))
-                self.assertLessEqual(keys, {"ids", "hidden", "kind", "library_id", "params"},
+                self.assertLessEqual(keys, {"ids", "hidden", "kind", "library_id", "params",
+                                            "add", "remove"},
                                      "%s: %s %s" % (name, url, body))
         self.assertGreaterEqual(len(bodies), 5)
         viewer = read(STATIC, "viewer.js")
@@ -131,11 +139,17 @@ class PageScriptSourceTest(unittest.TestCase):
             body = body[:body.index("\n    }\n")]
             self.assertIn("dropStaleView();", body, name)
         self.assertEqual(app.count("keepView();"), 2)       # at the start and on Back
-        for name, text in (("app.js", app), ("detail.js", read(STATIC, "detail.js")),
-                           ("map.js", read(STATIC, "map.js"))):
-            chip = text[text.index("chipUrl"):]
-            chip = chip[:chip.index("return SITE.searchUrl(target);")]
+        page = "return SITE.searchUrl(target);"
+        for name, text, start, end in (
+                ("app.js", app, "chipUrl", page),
+                ("detail.js", read(STATIC, "detail.js"), "chipUrl", page),
+                ("map.js", read(STATIC, "map.js"), "function chipState", "return target;")):
+            chip = text[text.index(start):]
+            chip = chip[:chip.index(end)]
             self.assertRegex(chip, r'target\.view = "";', name)
+            # (Nor the dates chosen on the timeline.)
+            self.assertRegex(chip, r'target\.from = "";', name)
+        self.assertIn("chipState(searchLinkState(), group, value)", read(STATIC, "map.js"))
 
     def test_the_map_takes_the_focus_and_leaves_a_way_back(self):
         code = read(STATIC, "map.js")
@@ -204,21 +218,30 @@ class ServerRecordsTest(fixtures.IndexFixture, unittest.TestCase):
                               info=fixtures.V5_INFO, described=1, prompt_ver=5, provenance=prov,
                               dhash="0f0f0f0f0f0f0f0f", content_hash="aa",
                               taken_at="2019-05-14T10:00:00", camera="Apple iPhone 12",
-                              lat=1.0, lon=2.0)
+                              lat=1.0, lon=2.0, place_city="Kahului", place_region="Hawaii",
+                              place_country="United States", place_cc="US", place_km=2.6)
         fixtures.insert_image(conn, "lib_family1", "2019/Beach/IMG_0002.jpg",
                               info=fixtures.V5_INFO, described=1, prompt_ver=5, provenance=prov,
                               dhash="0f0f0f0f0f0f0f0e", content_hash="bb",
                               taken_at="2019-05-14T10:00:05")
         fixtures.insert_image(conn, "lib_other001", "trip.jpg", info=extended, described=1,
                               prompt_ver=5, provenance=prov, projection="equirectangular",
-                              width=4096, height=2048, hidden=1)
-        fixtures.insert_image(conn, "lib_other001", "cars/old.jpg", described=1, prompt_ver=4,
-                              info={"description": "Old style description of a red car",
-                                    "subjects": ["car"], "text": "", "tags": ["Car", "red"],
-                                    "colors": ["Red"], "sharpness": 0.8,
-                                    "aesthetic_score": 0.9},
-                              taken_at="2015-07-01T12:00:00")
-        fixtures.insert_image(conn, "lib_family1", "new.jpg")
+                              width=4096, height=2048, hidden=1, lat=-16.4, lon=179.99,
+                              place_region="Northern", place_country="Fiji", place_cc="FJ",
+                              place_km=70.2)
+        old = fixtures.insert_image(conn, "lib_other001", "cars/old.jpg", described=1,
+                                    prompt_ver=4,
+                                    info={"description": "Old style description of a red car",
+                                          "subjects": ["car"], "text": "",
+                                          "tags": ["Car", "red"], "colors": ["Red"],
+                                          "sharpness": 0.8, "aesthetic_score": 0.9},
+                                    taken_at="2015-07-01T12:00:00")
+        new = fixtures.insert_image(conn, "lib_family1", "new.jpg")
+        # The owner's edits: of an older description, and of a picture not
+        # described yet.
+        image_edits.save(conn, old, {"title": "Grandpa's red car", "tags_remove": ["red"]})
+        image_edits.save(conn, new, {"title": "Grandma's garden", "tags_add": ["Garden"]})
+        conn.commit()
 
     @unittest.skipIf(NODE is None, "Node.js is not installed")
     def test_site_js_makes_the_records_the_server_sends(self):
@@ -314,7 +337,8 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
 
     def test_pages_name_no_favicon_file(self):
         # An empty data: icon, so browsers do not ask the server for one.
-        for url in ("/", "/detail?id=1", "/map", "/manage", "/settings"):
+        for url in ("/", "/detail?id=1", "/map", "/manage", "/settings",
+                    "/duplicates"):
             self.assertIn('<link rel="icon" href="data:,">', self.page(url))
 
     def test_exported_pages_get_the_new_scripts(self):
