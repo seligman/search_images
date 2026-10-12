@@ -14,6 +14,7 @@ text, and render the pages with the Flask test client in a temporary
 SETTINGS_BASE.
 """
 
+import gzip
 import json
 import os
 import re
@@ -39,7 +40,8 @@ STATIC = os.path.join(support.REPO, "static")
 NODE_TESTS = os.path.join(support.REPO, "tests", "js", "ui_test.js")
 MAP_TESTS = os.path.join(support.REPO, "tests", "js", "map_test.js")
 NODE = shutil.which("node")
-SCRIPTS = ("site.js", "viewer.js", "app.js", "detail.js", "map.js", "duplicates.js")
+SCRIPTS = ("site.js", "viewer.js", "app.js", "detail.js", "map.js", "duplicates.js",
+           "embed-engine.js", "embed-kernel.js")
 
 
 def read(*parts):
@@ -93,6 +95,29 @@ class PageScriptSourceTest(unittest.TestCase):
                             r"createContextualFragment", r"\bsetTimeout\s*\(\s*\"",
                             r"\.setAttribute\(\s*\"on", r"javascript:"):
                 self.assertIsNone(re.search(pattern, code), "%s: %s" % (name, pattern))
+
+    def test_the_meaning_engine_works_from_disk(self):
+        # Exported pages run it from file:// as well: classic scripts only (no
+        # fetch, workers or modules), and its WebAssembly compiled from the
+        # bytes in embed-kernel.js.
+        code = code_only(read(STATIC, "embed-engine.js"))
+        for pattern in (r"\bfetch\s*\(", r"XMLHttpRequest", r"\bWorker\b", r"\bimport\s*\(",
+                        r"WebAssembly\.(instantiateStreaming|compileStreaming)"):
+            self.assertIsNone(re.search(pattern, code), pattern)
+        self.assertIn("new WebAssembly.Module(", code)
+        self.assertIn('"use strict";', read(STATIC, "embed-engine.js"))
+        self.assertIn("var EMBED = (function () {", read(STATIC, "embed-engine.js"))
+        self.assertIn("module.exports = {EMBED: EMBED, SEARCH_EMBED: SEARCH_EMBED};",
+                      read(STATIC, "embed-engine.js"))
+        # The pages of the server never load it.
+        for name in os.listdir(os.path.join(support.REPO, "templates")):
+            self.assertNotIn("embed-", read(support.REPO, "templates", name))
+        # Small next to the model it runs (about 23 MB): its budget, as
+        # visitors download it (gzip) and as it is.
+        engine = read(STATIC, "embed-engine.js").encode("ascii")
+        self.assertLess(len(engine), 32 * 1024)
+        self.assertLess(len(gzip.compress(engine, 6)), 10 * 1024)
+        self.assertLess(len(read(STATIC, "embed-kernel.js")), 3 * 1024)
 
     def test_highlights_are_marks_made_from_text(self):
         viewer = read(STATIC, "viewer.js")
@@ -187,6 +212,15 @@ class PageScriptNodeTest(unittest.TestCase):
         # Projection and the repeating world, pins across the date line and
         # while panning, the wheel, fitting the view.
         code, output = run_node(script=MAP_TESTS)
+        self.assertEqual(code, 0, "\n" + output)
+        self.assertRegex(output, r"(\d+) of \1 passed")
+
+    def test_search_by_meaning_on_an_exported_page(self):
+        # The search page of an export with its query model (a stub engine):
+        # the switch before any download, the vectors then the model with its
+        # progress, Words, failures, the self-check and Save-Data.
+        code, output = run_node(script=os.path.join(support.REPO, "tests", "js",
+                                                    "app_meaning_test.js"))
         self.assertEqual(code, 0, "\n" + output)
         self.assertRegex(output, r"(\d+) of \1 passed")
 

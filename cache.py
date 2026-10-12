@@ -5,7 +5,8 @@ ThumbStore keeps the small (320 px) thumbnails as BLOBs in data/thumbs.db,
 so a reader never sees a half-written thumbnail and nothing is ever
 rewritten in place. PreviewStore keeps the larger (2048 px) previews as plain
 JPEG files under data/previews/<library id>/<bucket>/<image id>.jpg, and next
-to them the 4096 px panoramas of 360-degree photos (<image id>.pano.jpg).
+to them the 4096 px panoramas of 360-degree photos (<image id>.pano.jpg) and
+the contact sheets of videos (<image id>.sheet.jpg).
 
 This module uses only the standard library.
 """
@@ -19,6 +20,8 @@ import db
 
 # The file name ending of a 360 photo's larger panorama (see PreviewStore).
 PANO_SUFFIX = ".pano.jpg"
+# ... and of a video's contact sheet (see videos.py).
+SHEET_SUFFIX = ".sheet.jpg"
 
 
 class ThumbStore:
@@ -118,6 +121,9 @@ class PreviewStore:
     "pano" (images.PANO_EDGE wide, always a JPEG), next to its preview as
     <image id>.pano.jpg. A pano belongs to its preview: it is written with
     it, and whoever deletes a preview deletes the pano too (delete_both).
+    A video's preview is its poster frame; next to it is the contact sheet
+    the describe step sends (<image id>.sheet.jpg), which also belongs to
+    the preview.
     """
 
     def __init__(self, root=None):
@@ -140,6 +146,9 @@ class PreviewStore:
 
     def pano_path_for(self, library_id, image_id):
         return self._path(library_id, image_id, PANO_SUFFIX)
+
+    def sheet_path_for(self, library_id, image_id):
+        return self._path(library_id, image_id, SHEET_SUFFIX)
 
     @staticmethod
     def _write(path, data):
@@ -193,16 +202,29 @@ class PreviewStore:
         """Remove one pano. Returns True if a file was removed."""
         return self._remove(self.pano_path_for(library_id, image_id))
 
-    def delete_both(self, library_id, image_id):
-        """Remove an image's preview and its pano. Returns True if a file was removed.
+    def write_sheet(self, library_id, image_id, data):
+        """Store the contact sheet of a video (atomically, like write()). Returns its path."""
+        return self._write(self.sheet_path_for(library_id, image_id), data)
 
-        Both are tried even when removing the first fails (the first
+    def read_sheet(self, library_id, image_id):
+        """The contact sheet bytes, or None if there is none."""
+        return self._read(self.sheet_path_for(library_id, image_id))
+
+    def delete_sheet(self, library_id, image_id):
+        """Remove one contact sheet. Returns True if a file was removed."""
+        return self._remove(self.sheet_path_for(library_id, image_id))
+
+    def delete_both(self, library_id, image_id):
+        """Remove an image's preview, its pano and its contact sheet. Returns True if a file was removed.
+
+        Each is tried even when removing an earlier one fails (the first
         OSError is raised afterwards).
         """
         removed = False
         failure = None
         for path in (self.path_for(library_id, image_id),
-                     self.pano_path_for(library_id, image_id)):
+                     self.pano_path_for(library_id, image_id),
+                     self.sheet_path_for(library_id, image_id)):
             try:
                 removed = self._remove(path) or removed
             except OSError as error:
@@ -213,25 +235,32 @@ class PreviewStore:
 
     def stored_ids(self, library_id):
         """(ids with a preview, ids with a pano) of a library: one listing per bucket folder."""
-        previews, panos = set(), set()
+        return self.stored_sets(library_id)[:2]
+
+    def stored_sets(self, library_id):
+        """(ids with a preview, ids with a pano, ids with a contact sheet) of a library."""
+        previews, panos, sheets = set(), set(), set()
         try:
             buckets = [entry.path for entry in os.scandir(self.library_dir(library_id))
                        if entry.is_dir()]
         except OSError:
-            return previews, panos
+            return previews, panos, sheets
         for bucket in buckets:
             try:
                 for entry in os.scandir(bucket):
                     name = entry.name
-                    if name.endswith(PANO_SUFFIX):
-                        stem = name[:-len(PANO_SUFFIX)]
-                        if stem.isdigit():
-                            panos.add(int(stem))
-                    elif name.endswith(".jpg") and name[:-4].isdigit():
-                        previews.add(int(name[:-4]))
+                    for suffix, found in ((PANO_SUFFIX, panos), (SHEET_SUFFIX, sheets)):
+                        if name.endswith(suffix):
+                            stem = name[:-len(suffix)]
+                            if stem.isdigit():
+                                found.add(int(stem))
+                            break
+                    else:
+                        if name.endswith(".jpg") and name[:-4].isdigit():
+                            previews.add(int(name[:-4]))
             except OSError:
                 pass
-        return previews, panos
+        return previews, panos, sheets
 
     def delete_library(self, library_id):
         """Remove every preview of a library. Returns True if anything was removed."""

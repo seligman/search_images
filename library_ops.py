@@ -24,8 +24,10 @@ import time
 import cache
 import common
 import db
+import embeddings
 import jobs
 import prompts
+import videos
 
 PATH_CHECK_TIMEOUT = 10.0   # seconds before a folder check gives up
 SAMPLE_SECONDS = 3.0        # time spent counting pictures in a folder check
@@ -37,8 +39,9 @@ EXAMPLE_LIMIT = 10          # example paths in an ignore preview
 NOTES_LIMIT = 2000          # characters of context notes
 METADATA_PROFILES = ("core", "extended")
 LIBRARY_FIELDS = ("name", "path", "enabled", "ignore", "default_ignores", "previews",
-                  "newest_first", "endpoint", "metadata", "context_notes", "export", "refine")
-BOOL_FIELDS = ("enabled", "default_ignores", "previews", "newest_first")
+                  "newest_first", "endpoint", "metadata", "context_notes", "export", "refine",
+                  "videos")
+BOOL_FIELDS = ("enabled", "default_ignores", "previews", "newest_first", "videos")
 # Folder names the folder picker does not offer (system and NAS folders).
 HIDDEN_FOLDERS = {"system volume information", "@eadir", "#recycle", "#snapshot",
                   ".@__thumb", "lost+found"}
@@ -778,9 +781,10 @@ def reattach_orphan(conn, orphan_id, library_id, config, previews=None):
 
     Refused (LibraryError) when orphan_id is not an orphan, library_id is
     not in the settings, or any of the orphan's files is already indexed
-    under that library (same relative path). Descriptions, thumbnails and
-    previews move along; the orphan's name is forgotten. Run it only while
-    no job is running. Returns {"moved" (rows), "previews_moved"}.
+    under that library (same relative path). Descriptions, thumbnails,
+    previews and the playable copies of videos move along; the orphan's
+    name is forgotten. Run it only while no job is running. Returns
+    {"moved" (rows), "previews_moved"}.
     """
     configured = {library.get("id") for library in config.get("libraries", [])}
     if library_id not in configured:
@@ -814,11 +818,15 @@ def reattach_orphan(conn, orphan_id, library_id, config, previews=None):
     # After the commit: a preview that did not move is rebuilt by the next
     # scan (the scanner checks that the files exist).
     previews_moved = _move_previews(previews or cache.PreviewStore(), orphan_id, library_id)
+    videos.move_library_proxies(orphan_id, library_id)
     return {"moved": moved, "previews_moved": previews_moved}
 
 
 def delete_library_data(conn, library_id, ctx=None, chunk=500):
-    """Delete every row, thumbnail and preview of a library id (and its read failures).
+    """Delete every row, thumbnail, preview and meaning vector of a library id (and its
+    read failures), and the looks (looks.py) no other row needs.
+
+    The playable copies of its videos (videos.py) go too.
 
     Works in chunks and stops early when ctx asks to (running it again
     finishes the work). Returns {"deleted", "previews_removed", "stopped"}.
@@ -840,10 +848,14 @@ def delete_library_data(conn, library_id, ctx=None, chunk=500):
                 conn.execute("DELETE FROM images WHERE id IN (%s)" % ",".join("?" * len(part)),
                              part)
             thumbs.delete(part)
+            embeddings.forget(part)         # (their meaning vectors: search by meaning)
             result["deleted"] += len(part)
             if ctx is not None:
                 ctx.step(len(part))
+    import looks
+    looks.forget_unreferenced(conn)     # (the looks of pictures no row has any more)
     result["previews_removed"] = cache.PreviewStore().delete_library(library_id)
+    videos.delete_library_proxies(library_id)
     with conn:
         conn.execute("DELETE FROM read_failures WHERE library_id = ?", (library_id,))
         conn.execute("DELETE FROM libraries WHERE id = ?", (library_id,))

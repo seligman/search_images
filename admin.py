@@ -42,17 +42,20 @@ import urllib.parse
 import common
 import db
 import duplicates
+import embeddings
 import export
 import image_edits
 import jobs
 import library_ops
 import llm
 import local_server
+import looks
 import not_duplicates
 import prompts
 import refine
 import search_index
 import settings
+import videos
 
 URL_PREFIX = "/api/admin"
 HEADER = "X-Search-Images"
@@ -80,12 +83,16 @@ JOB_PARAMS = {
     "scan": ("allow_mass_removal",),
     "describe": ("retry_failed", "redescribe_stale", "limit", "endpoint", "ids", "force"),
     "refine": ("limit", "retry_failed"),
+    "embed": ("limit",),
+    "image_embed": ("limit", "rebuild"),
     "process": ("allow_mass_removal", "retry_failed", "redescribe_stale", "limit", "endpoint"),
     "previews": (),
     "delete_library": ("confirm_name",),
     "export": ("options", "save_options", "out_dir"),
+    "proxies": (),
 }
-BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force", "save_options")
+BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force", "save_options",
+               "rebuild")
 EXPORT_FOLDER_TIMEOUT = 5.0  # seconds to look at an export's output folder
 MODEL_LIST_SECONDS = 30.0   # how long a listing of the models folder is reused
 MODEL_LIST_WAIT = 1.0       # seconds a request waits for a first listing
@@ -244,6 +251,11 @@ def endpoint_view(config, endpoint, raw=None, status=None, key_info=None):
                         for item in common.resolve_endpoints(
                             config, refine.settings(library)["endpoint"]))],
         status=probe_view(status) if local else None)
+    wanted = embeddings.settings(config)["endpoint"]
+    # The endpoint of search by meaning: an embedding model, which sees no images.
+    view["embedding"] = bool(wanted) and wanted.casefold() == endpoint["name"].casefold()
+    if view["embedding"] and view["status"] and view["status"]["vision"] is False:
+        view["status"]["hint"] = ""
     if isinstance(raw, dict):
         view["stored"] = redact_tree(_key_shaped({name: value for name, value in raw.items()
                                                   if name != "api_key"}), secrets)
@@ -431,12 +443,13 @@ def refine_choices():
 
 
 def library_view(config, library, counts, latest, status, endpoint_info=None,
-                 refine_info=None):
+                 refine_info=None, meaning=None):
     """A library as the manage page shows it (settings, counts, status, last job).
 
     latest is JobManager.latest_by_library(); endpoint_info the library's
     library_endpoint_info() and refine_info its refine_view() when the
-    caller has worked them out.
+    caller has worked them out. meaning is the library's
+    embeddings.counts() entry (search by meaning), when counted.
     """
     view = {key: copy.deepcopy(library.get(key)) for key in ("id",) + library_ops.LIBRARY_FIELDS}
     view["root"] = common.library_root(library)
@@ -457,7 +470,62 @@ def library_view(config, library, counts, latest, status, endpoint_info=None,
     view["export_info"] = export_view(config, library)
     view["refine_info"] = (refine_info if refine_info is not None
                            else refine_view(config, library))
+    if meaning is not None:
+        view["meaning"] = dict(meaning, pending=meaning["stale"] + meaning["missing"])
     return view
+
+
+def video_counts(conn):
+    """{library id: how many present videos it has}."""
+    return {row[0]: row[1] for row in conn.execute(
+        "SELECT library_id, COUNT(*) FROM images WHERE media = 'video' "
+        "AND missing_since IS NULL GROUP BY library_id")}
+
+
+def videos_view(config):
+    """Videos for the Manage page: {"available", "problem", "ffmpeg", "proxies"}.
+
+    available: ffmpeg and ffprobe were found (problem says what to do
+    otherwise); proxies: the "video_proxies" settings (videos.proxy_settings).
+    """
+    status = videos.tools_status(config)
+    return {"available": status["available"], "problem": status["problem"],
+            "ffmpeg": status["ffmpeg"], "proxies": videos.proxy_settings(config)}
+
+
+def library_video_view(conn, config, library, counts, usage):
+    """A library's videos for the Manage page: {"on", "count", "proxies": {count, bytes, pending}}.
+
+    counts is video_counts(); usage videos.proxy_usage(). pending (the
+    videos that would get a playable copy) is only counted while playable
+    copies are turned on.
+    """
+    library_id = library.get("id")
+    view = {"on": common.library_videos(library), "count": counts.get(library_id, 0),
+            "proxies": dict(usage.get(library_id) or {"count": 0, "bytes": 0}, pending=None)}
+    if view["count"] and videos.proxy_settings(config)["enabled"]:
+        try:
+            view["proxies"]["pending"] = sum(
+                1 for row in videos.proxy_candidates(conn, library_id)
+                if not videos.existing_proxy(library_id, row["id"], row["content_hash"]))
+        except sqlite3.Error:
+            pass
+    return view
+
+
+def meaning_view(config):
+    """Search by meaning for the Manage page: {"configured", "ready", "problem" (why it
+    cannot be used, or how to turn it on), "endpoint"}."""
+    options = embeddings.settings(config)
+    endpoint, problem = embeddings.endpoint_for(config, options)
+    if endpoint is not None:
+        # (A model file that cannot be read now: nothing is embedded, and the
+        # vectors stay as they are until it can.)
+        problem = embeddings.recipe_problem(config, options)
+        if problem:
+            endpoint = None
+    return {"configured": bool(options["endpoint"]), "ready": endpoint is not None,
+            "problem": problem, "endpoint": options["endpoint"]}
 
 
 def export_view(config, library):
@@ -465,11 +533,17 @@ def export_view(config, library):
 
     {"options": its saved export options with every default filled in,
     "default_output": the folder an export goes to unless another one is
-    chosen, "last": export.last_export() (None before the first export)}.
+    chosen, "last": export.last_export() (None before the first export),
+    "meaning": {"available", "reason"}: whether search by meaning in the
+    browser can go with it (export.meaning_status; the review step says it
+    for the pictures chosen)}.
     """
-    return {"options": export.library_options(library),
+    options = export.library_options(library)
+    status = export.meaning_status(config, options)
+    return {"options": options,
             "default_output": export.default_output_dir(config, library),
-            "last": export.last_export(library.get("id")) if library.get("id") else None}
+            "last": export.last_export(library.get("id")) if library.get("id") else None,
+            "meaning": {"available": status["available"], "reason": status["reason"]}}
 
 
 def options_error(error):
@@ -985,9 +1059,75 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         return refine_view(config, library, counted, key_info=resolve_key)
 
     def view_of(config, library):
-        return library_view(config, library, db.library_counts(get_conn(), prompts.PROMPT_VER),
+        view = library_view(config, library, db.library_counts(get_conn(), prompts.PROMPT_VER),
                             manager.latest_by_library(), folder_status(library),
-                            endpoint_info(config, library), refine_info(config, library))
+                            endpoint_info(config, library), refine_info(config, library),
+                            meaning_counts(config).get(library.get("id")))
+        view["video_info"] = library_video_view(get_conn(), config, library,
+                                                video_counts(get_conn()), videos.proxy_usage())
+        found = looks_counts(config).get(library.get("id"))
+        if found is not None:
+            view["looks"] = found
+        return view
+
+    looks_memo = {"key": None, "value": {}}
+
+    def looks_counts(config):
+        """looks.counts() of every library ({} when looks are off and none are kept),
+        worked out again only when index.db, the looks or their settings changed."""
+        current = looks.read_meta()
+        if not looks.configured(config) and not (current and current["count"]):
+            return {}
+        ids = [library["id"] for library in config.get("libraries", []) if library.get("id")]
+        conn = get_conn()
+        try:
+            key = json.dumps([ids, search_index.data_state(conn, ids), current,
+                              looks.settings(config), looks.recipe_problem(config)],
+                             sort_keys=True)
+            with meaning_lock:
+                if looks_memo["key"] == key:
+                    return looks_memo["value"]
+            value = looks.counts(conn, config, ids)
+        except sqlite3.Error:
+            return {}
+        with meaning_lock:
+            looks_memo.update(key=key, value=value)
+        return value
+
+    meaning_memo = {"key": None, "value": {}}
+    meaning_lock = threading.Lock()
+    # (The search text hashes /api/vectors keeps up to date, else our own.)
+    text_hashes = getattr(getattr(state, "vectors", None), "hashes", None) or \
+        embeddings.TextHashes()
+
+    def meaning_counts(config):
+        """embeddings.counts() of every library (or {} when search by meaning is off),
+        worked out again only when index.db, vectors.db or the settings changed (and
+        then only for the pictures that changed: text_hashes)."""
+        if not embeddings.configured(config):
+            return {}
+        ids = [library["id"] for library in config.get("libraries", []) if library.get("id")]
+        conn = get_conn()
+        try:
+            store = embeddings.connect(create=False)
+        except sqlite3.Error:
+            store = None
+        try:
+            stored_meta = embeddings.meta(store) if store is not None else None
+            key = json.dumps([ids, search_index.data_state(conn, ids), stored_meta,
+                              meaning_view(config)], sort_keys=True)
+            with meaning_lock:
+                if meaning_memo["key"] == key:
+                    return meaning_memo["value"]
+            value = embeddings.counts(conn, config, ids, store=store, hashes=text_hashes)
+        except sqlite3.Error:
+            return {}
+        finally:
+            if store is not None:
+                store.close()
+        with meaning_lock:
+            meaning_memo.update(key=key, value=value)
+        return value
 
     def clean_job(config, kind, library_id, params):
         """Check a job request; returns the params to store (defaults left out)."""
@@ -1039,6 +1179,17 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                              image_ids(params["ids"], DESCRIBE_IDS_LIMIT))
         if kind == "refine":
             check_refine(config, library_id)
+        if kind == "proxies" and not videos.proxy_settings(config)["enabled"]:
+            raise AdminError(400, "Playable copies of videos are turned off: set "
+                                  "\"video_proxies\": {\"enabled\": true} in config.json first.")
+        if kind == "embed":
+            endpoint, problem = embeddings.endpoint_for(config)
+            if endpoint is None:
+                raise AdminError(400, problem, {"embedding": problem})
+        if kind == "image_embed":
+            endpoint, problem = looks.endpoint_for(config)
+            if endpoint is None:
+                raise AdminError(400, problem, {"image_embedding": problem})
         if cleaned.get("force") and "ids" not in cleaned:
             # Describing a whole library again is "Re-describe stale" (or a
             # new prompt version), never a single click.
@@ -1163,11 +1314,23 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         conn = get_conn()
         counts = db.library_counts(conn, prompts.PROMPT_VER)
         latest = manager.latest_by_library()
+        meaning = meaning_counts(config)
         libraries = [library_view(config, library, counts, latest, folder_status(library),
-                                  endpoint_info(config, library), refine_info(config, library))
+                                  endpoint_info(config, library), refine_info(config, library),
+                                  meaning.get(library["id"]))
                      for library in config.get("libraries", []) if library.get("id")]
+        with_videos, usage = video_counts(conn), videos.proxy_usage()
+        looked = looks_counts(config)
+        for view, library in zip(libraries, [library for library in config.get("libraries", [])
+                                             if library.get("id")]):
+            view["video_info"] = library_video_view(conn, config, library, with_videos, usage)
+            if library["id"] in looked:
+                view["looks"] = looked[library["id"]]
         return jsonify({
             "libraries": libraries,
+            "videos": videos_view(config),
+            "meaning": meaning_view(config),
+            "looks": looks.status(config),
             "orphans": library_ops.orphans(conn, config, counts),
             "endpoints": endpoint_views(config),
             "default_endpoint": common.default_endpoint_name(config),
@@ -2136,7 +2299,16 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                 errors[name] = "Must be text."
                 continue
             value = value.strip().replace("\\", "/")
-            if value == current[name] or (name == "mmproj" and not value):
+            if value == current[name]:
+                changes[name] = value
+                continue
+            if name == "mmproj" and local_server.embeddings_server(current):
+                # (A projector makes an embeddings server an image model for looks:
+                # set in config.json only, see SETTINGS.md.)
+                errors[name] = ("The image projector of an embeddings server is set in "
+                                "config.json only.")
+                continue
+            if name == "mmproj" and not value:
                 changes[name] = value
                 continue
             if choices is None:
@@ -2152,7 +2324,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                 + (" " + choices["error"] if choices["error"] else ""))
                 continue
             changes[name] = value
-        for name in ("slots", "ctx_per_slot", "port"):
+        for name in ("slots", "ctx_per_slot", "port", "idle_stop_minutes"):
             if name not in fields:
                 continue
             value = fields[name]

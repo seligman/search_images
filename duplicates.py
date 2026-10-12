@@ -66,6 +66,10 @@ FORMATS = {
     ".jpg": "JPEG", ".jpeg": "JPEG", ".jpe": "JPEG", ".png": "PNG", ".gif": "GIF",
     ".heic": "HEIC", ".heif": "HEIF", ".hif": "HEIF", ".webp": "WebP", ".tif": "TIFF",
     ".tiff": "TIFF", ".avif": "AVIF", ".bmp": "BMP", ".insp": "Insta360",
+    # Videos (they only stack with copies of the same file).
+    ".mov": "MOV", ".mp4": "MP4", ".m4v": "M4V", ".3gp": "3GP", ".3g2": "3G2",
+    ".avi": "AVI", ".mkv": "MKV", ".webm": "WebM", ".wmv": "WMV", ".mts": "MTS",
+    ".m2ts": "M2TS", ".mpg": "MPEG", ".mpeg": "MPEG",
 }
 # How likely a format is the camera's own, higher first: phones save HEIC
 # and convert it to JPEG to share it; editors, chat apps and web pages turn
@@ -76,7 +80,8 @@ ORIGINAL_FORMATS = {"HEIC": 3, "HEIF": 3, "Insta360": 3, "JPEG": 2, "TIFF": 2}
 # them at the same second and their dHashes are at most this many bits apart.
 CONVERSION_BITS = 1
 # Where a date taken comes from (images.taken_source), in words.
-DATE_SOURCES = {"exif": "camera", "filename": "file name", "mtime": "file date"}
+DATE_SOURCES = {"exif": "camera", "filename": "file name", "mtime": "file date",
+                "video": "video"}
 
 _FACT_COLUMNS = "id, size, content_hash, taken_source, dhash"
 # What rank_members compares, in this order (the places in its key).

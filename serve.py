@@ -13,21 +13,27 @@ import errno
 import hashlib
 import io
 import json
+import logging
 import math
 import mimetypes
 import os
+import re
 import socket
 import sys
 import threading
+import urllib.parse
 
 import admin
 import cache
 import common
 import db
+import embeddings
 import image_edits
 import imageinfo
 import jobs
+import looks
 import search_index
+import videos
 import world_map
 
 TEMPLATE_DIR = os.path.join(common.BASE_DIR, "templates")
@@ -254,6 +260,16 @@ def detail_record(row, library_name, edit=None, for_admin=False):
         "exif": exif if isinstance(exif, dict) else {},
         "provenance": provenance_record(row["provenance"]),
     }
+    if "media" in row.keys() and row["media"] == videos.MEDIA_VIDEO:
+        # A video: its length and what ffprobe said (codec, frame rate, ...);
+        # its kind is "video" whatever the description says.
+        record["media"] = videos.MEDIA_VIDEO
+        record["duration"] = finite(row["duration"])
+        facts = record["exif"].get("video")
+        record["video"] = facts if isinstance(facts, dict) else {}
+        record["info"] = videos.effective_info(record["info"], row["media"])
+    else:
+        record["media"] = "image"
     if for_admin:
         record["edited"] = not image_edits.is_empty(edit)
         record["model_info"] = model_info
@@ -400,7 +416,10 @@ class ServerState:
     The config is re-read when config.json changes, so library renames and
     enable/disable show up without a restart. The thumbnail store keeps one
     connection that all request threads share. index answers /api/index
-    (search_index.IndexService). helper is what requests read originals
+    (search_index.IndexService), vectors /api/vectors and embedder /api/embed
+    (embeddings.VectorService, embeddings.QueryEmbedder), looks /api/looks and
+    examples /api/looks/query (looks.LooksService, looks.ExampleEmbedder).
+    helper is what requests read originals
     through: its load_image and stat hooks take turns with each other and
     with the jobs' (common.thread_safe_helper), as the helper module was
     promised; module is the helper module itself.
@@ -411,6 +430,10 @@ class ServerState:
         self.helper = common.thread_safe_helper(helper)
         self.previews = cache.PreviewStore()
         self.index = search_index.IndexService()
+        self.vectors = embeddings.VectorService()
+        self.embedder = embeddings.QueryEmbedder(config_loader=self.config, log=print)
+        self.looks = looks.LooksService()
+        self.examples = looks.ExampleEmbedder(config_loader=self.config)
         self._lock = threading.Lock()
         self._config = None
         self._config_key = None
@@ -688,6 +711,107 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             etag_matches=request.if_none_match.contains_weak)
         return Response(body, status=status, headers=headers, mimetype="application/json")
 
+    @app.route("/api/vectors")
+    def api_vectors():
+        # ?lib=<library id> or all: the meaning vectors of the pictures /api/index lists.
+        config = state.config()
+        names = visible_libraries(config)
+        wanted = request.args.get("lib", "all")
+        if wanted not in ("", "all"):
+            if wanted not in names:
+                return jsonify({"error": "There is no enabled library with that id."}), 404
+            names = {wanted: names[wanted]}
+        conn = get_conn()
+        status, body, headers = state.vectors.respond(
+            conn, config, names, include_hidden=is_admin(),
+            accept_gzip=request.accept_encodings.quality("gzip") > 0,
+            etag_matches=request.if_none_match.contains_weak,
+            index_state=state.index.state(conn, list(names)))
+        return Response(body, status=status, headers=headers, mimetype="application/json")
+
+    @app.route("/api/looks")
+    def api_looks():
+        # ?lib=<library id> or all: the image vectors ("Looks like this") of the
+        # pictures /api/index lists.
+        config = state.config()
+        names = visible_libraries(config)
+        wanted = request.args.get("lib", "all")
+        if wanted not in ("", "all"):
+            if wanted not in names:
+                return jsonify({"error": "There is no enabled library with that id."}), 404
+            names = {wanted: names[wanted]}
+        conn = get_conn()
+        status, body, headers = state.looks.respond(
+            conn, config, names, include_hidden=is_admin(),
+            accept_gzip=request.accept_encodings.quality("gzip") > 0,
+            etag_matches=request.if_none_match.contains_weak,
+            index_state=state.index.state(conn, list(names)))
+        return Response(body, status=status, headers=headers, mimetype="application/json")
+
+    @app.route("/api/looks/query", methods=["POST"])
+    def api_looks_query():
+        # The body is a picture (JPEG, PNG, WebP, HEIC...): its look vector, so
+        # the page can find the pictures that look like it (looks.ExampleEmbedder).
+        # The admin's only, with the admin routes' checks: it may wake a model.
+        problem = ""
+        if not is_admin():
+            problem = "Search by an example picture only works on this computer."
+        elif request.headers.get(admin.HEADER) != "1":
+            problem = "This request needs the %s header." % admin.HEADER
+        elif not same_origin():
+            problem = "Requests from other sites are not allowed."
+        if problem:
+            response = jsonify({"error": problem})
+            response.status_code = 403
+        elif (request.content_length or 0) > looks.QUERY_MAX_BYTES:
+            response = jsonify({"error": "The picture is larger than %d MB."
+                                % (looks.QUERY_MAX_BYTES // (1024 * 1024))})
+            response.status_code = 413
+        else:
+            data = request.stream.read(looks.QUERY_MAX_BYTES + 1)
+            status, payload = state.examples.answer(state.config(), data,
+                                                    client=request.remote_addr or "")
+            response = jsonify(payload)
+            response.status_code = status
+            if status == 429:
+                response.headers["Retry-After"] = "2"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    def same_origin():
+        """False for a request another site's page made (it may start a model server)."""
+        site = request.headers.get("Sec-Fetch-Site")
+        if site is not None and site not in ("same-origin", "none"):
+            return False
+        origin = request.headers.get("Origin")
+        if origin is None:
+            return True
+        try:
+            parts = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        return (parts.scheme in ("http", "https")
+                and parts.netloc.lower() == request.host.lower())
+
+    @app.route("/api/embed")
+    def api_embed():
+        # ?q=<what was typed>: its meaning vector (see embeddings.QueryEmbedder).
+        # Only for this server's own pages: it may wake a model.
+        if not same_origin():
+            response = jsonify({"error": "Requests from other sites are not allowed."})
+            response.status_code = 403
+        else:
+            status, payload = state.embedder.answer(state.config(), request.args.get("q", ""),
+                                                    client=request.remote_addr or "",
+                                                    admin=is_admin())
+            response = jsonify(payload)
+            response.status_code = status
+            if status == 429:
+                response.headers["Retry-After"] = "2"
+        # (What was typed is kept by the page itself, never by the browser's cache.)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.route("/api/image/<int:image_id>")
     def api_image(image_id):
         row = visible_row(image_id, "*")
@@ -695,7 +819,12 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             return jsonify({"error": "not found"}), 404
         names = visible_libraries(state.config())
         edit = image_edits.load(get_conn(), image_id)
-        return jsonify(detail_record(row, names[row["library_id"]], edit, for_admin=is_admin()))
+        record = detail_record(row, names[row["library_id"]], edit, for_admin=is_admin())
+        if record["media"] == videos.MEDIA_VIDEO:
+            # /video/<id> sends a playable (H.264) copy when there is one.
+            record["playable_copy"] = bool(videos.existing_proxy(
+                row["library_id"], row["id"], row["content_hash"]))
+        return jsonify(record)
 
     @app.route("/thumb/<int:image_id>")
     def thumb(image_id):
@@ -707,7 +836,7 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
 
     @app.route("/preview/<int:image_id>")
     def preview(image_id):
-        row = visible_row(image_id, "id, path, name, has_preview, projection")
+        row = visible_row(image_id, "id, path, name, has_preview, projection, media")
         if row is None:
             return not_found()
         path = None
@@ -732,6 +861,14 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             return not_modified(etag)
         if images is None:
             return not_found()
+        if row["media"] == videos.MEDIA_VIDEO:
+            # A video's preview is its poster frame (ffmpeg).
+            try:
+                data = videos.poster_jpeg(videos.find_tools(state.config()), full)
+            except (videos.VideoReadError, images.ImageReadError) as error:
+                print("Could not make a poster of video %d: %s" % (row["id"], error))
+                return not_found()
+            return send_bytes(data, "image/jpeg", etag)
         try:
             data = images.read_image(full, state.helper, mtime=stat.st_mtime)["preview"]
         except images.ImageReadError as error:
@@ -806,6 +943,35 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
                               % (row["id"], error))
         return send_bytes(data, "image/jpeg", etag)
 
+    @app.route("/video/<int:image_id>")
+    def video(image_id):
+        # A video, for the viewer's player: its playable copy (see
+        # videos.make_proxies) when there is one, else the original. Byte
+        # ranges (206, 416), ETags and 304 come from send_file, which
+        # streams the file from disk.
+        row = visible_row(image_id, "id, path, name, media, content_hash")
+        if row is None or row["media"] != videos.MEDIA_VIDEO:
+            return not_found()
+        proxy = videos.existing_proxy(row["library_id"], row["id"], row["content_hash"])
+        if proxy is not None:
+            try:
+                path, stat, kind, mime = proxy, os.stat(proxy), "video-proxy", "video/mp4"
+            except OSError:
+                proxy = None
+        if proxy is None:
+            path, stat = original_path(row)
+            if path is None:
+                return not_found()
+            kind, mime = "video", videos.mime_type(row["name"])
+        try:
+            response = send_file(path, mimetype=mime, conditional=True,
+                                 etag=_source_etag(kind, row["id"], stat),
+                                 max_age=CACHE_SECONDS)
+        except OSError:
+            return not_found()
+        response.headers["Accept-Ranges"] = "bytes"
+        return private_cache(response)
+
     @app.route("/image/<int:image_id>")
     def image(image_id):
         row = visible_row(image_id, "id, path, name")
@@ -814,6 +980,17 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         full, stat = original_path(row)
         if full is None:
             return not_found()
+        if common.is_video_file(row["name"]):
+            # A video's original, as it is: a download (the viewer's link),
+            # since a browser tab that cannot decode it would play only its
+            # sound over a black page.
+            try:
+                return private_cache(send_file(
+                    full, mimetype=videos.mime_type(row["name"]), conditional=True,
+                    etag=_source_etag("image", row["id"], stat), max_age=CACHE_SECONDS,
+                    as_attachment=True, download_name=row["name"]))
+            except OSError:
+                return not_found()
         try:
             head, data = _read_head(state.helper, full)
         except OSError:
@@ -995,6 +1172,7 @@ def main(argv=None):
 
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 5000)
+    quiet_query_log()
     problem = port_problem(host, port)
     if problem:
         raise SystemExit("Error: " + problem)
@@ -1024,11 +1202,40 @@ def main(argv=None):
     finally:
         # A running job stops at its next safe point and can be resumed.
         manager.stop(timeout=5)
-        # A model server a job started (with auto_stop) is stopped too.
-        model_servers.shutdown()
+        # A model server a job (or a search) started (with auto_stop) is stopped too.
+        try:
+            server_config = app.extensions["search_images"].config()
+        except common.ConfigError:
+            server_config = None
+        model_servers.shutdown(config=server_config)
         # Closing the shared thumbnail connection lets SQLite tidy up its
         # -wal/-shm files when the server stops (Ctrl+C).
         app.extensions["search_images"].close()
+
+
+_EMBED_QUERY_RE = re.compile(r"(/api/embed)\?[^\s\"]*")
+
+
+class QueryLogFilter(logging.Filter):
+    """Keeps what people type out of the request log: /api/embed?q=... (search by
+    meaning sends the words to the server) is logged as /api/embed?q=..."""
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:       # (a record that cannot be formatted is left alone)
+            return True
+        if "/api/embed?" in message:
+            record.msg = _EMBED_QUERY_RE.sub(r"\1?q=...", message)
+            record.args = ()
+        return True
+
+
+def quiet_query_log():
+    """Put QueryLogFilter on the web server's request log (once)."""
+    logger = logging.getLogger("werkzeug")
+    if not any(isinstance(item, QueryLogFilter) for item in logger.filters):
+        logger.addFilter(QueryLogFilter())
 
 
 if __name__ == "__main__":

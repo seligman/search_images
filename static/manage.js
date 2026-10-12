@@ -252,11 +252,40 @@
 
     /* ---------- Notices -------------------------------------------------- */
 
+    // How many videos the last scans found but could not read (no ffmpeg).
+    function videosSkipped() {
+        var count = 0;
+        (state ? state.libraries : []).forEach(function (lib) {
+            var job = lib.last_job;
+            ((job && job.summary && job.summary.libraries) || []).forEach(function (item) {
+                if (item.library_id === lib.id && typeof item.videos_skipped === "number") {
+                    count += item.videos_skipped;
+                }
+            });
+        });
+        return count;
+    }
+
     function renderNotices() {
         var holder = byId("manage-notices");
         var old = byId("no-endpoint-notice");
         if (old) {
             holder.removeChild(old);
+        }
+        var oldVideo = byId("no-ffmpeg-notice");
+        if (oldVideo) {
+            holder.removeChild(oldVideo);
+        }
+        var videos = state && state.videos;
+        var skipped = videosSkipped();
+        if (videos && !videos.available && skipped) {
+            // Said once here, not in every scan's log line.
+            var videoBox = notice("warn", fmt.plural(skipped, "video") + " " +
+                (skipped === 1 ? "was" : "were") + " found but not indexed. " +
+                (videos.problem || "Videos need ffmpeg and ffprobe.") +
+                " Once that is fixed, scan again (see Videos in SETTINGS.md).");
+            videoBox.id = "no-ffmpeg-notice";
+            holder.appendChild(videoBox);
         }
         // An endpoint needs at least a model name before it can describe.
         var usable = state && state.endpoints.some(function (endpoint) {
@@ -270,6 +299,25 @@
             ]);
             box.id = "no-endpoint-notice";
             holder.insertBefore(box, holder.firstChild);
+        }
+        var oldMeaning = byId("meaning-notice");
+        if (oldMeaning) {
+            holder.removeChild(oldMeaning);
+        }
+        var meaning = state ? state.meaning : null;
+        var described = state && state.libraries.some(function (lib) {
+            return (lib.counts || {}).described > 0;
+        });
+        if (meaning && described && (!meaning.configured || !meaning.ready)) {
+            var note = notice(meaning.configured ? "warn" : "info", meaning.configured
+                ? "Search by meaning cannot be used: " + meaning.problem
+                : "Search by meaning is off. It finds pictures by what a search means, not " +
+                  "only by its words (\u201ckids playing in the snow\u201d finds a sledding " +
+                  "picture), and makes \u201cMore like this\u201d smarter. To turn it on, " +
+                  "set \"embedding\": {\"endpoint\": \"NAME\"} in config.json to an " +
+                  "endpoint that serves an embedding model (see SETTINGS.md).");
+            note.id = "meaning-notice";
+            holder.appendChild(note);
         }
     }
 
@@ -461,6 +509,12 @@
             if (counts.hidden) {
                 stats.appendChild(stat("hidden", counts.hidden, "Pictures hidden from search"));
             }
+            var videoInfo = lib.video_info || {};
+            if (videoInfo.count) {
+                stats.appendChild(stat(videoInfo.count === 1 ? "video" : "videos",
+                                       videoInfo.count, "Videos among the pictures: each is " +
+                                       "shown and described from a few of its frames"));
+            }
             if (counts.pending_hidden) {
                 stats.appendChild(stat("hidden, kept here", counts.pending_hidden, "Hidden " +
                     "pictures are never sent to " + (info.cloud_hosts || []).join(", ") +
@@ -487,6 +541,48 @@
         if (info.ready && info.warning) {
             card.appendChild(el("p", {className: "card-note card-problem", text: info.warning +
                 " Start it before describing; scanning works without it."}));
+        }
+        var proxyInfo = (lib.video_info || {}).proxies || {};
+        var proxiesOn = state.videos && state.videos.proxies && state.videos.proxies.enabled;
+        if (proxiesOn && (lib.video_info || {}).count) {
+            card.appendChild(el("p", {className: "card-note", text: "Playable copies of " +
+                "videos (H.264 copies of the videos browsers may not play, in the data " +
+                "folder): " + (proxyInfo.count ? fmt.plural(proxyInfo.count, "video") + ", " +
+                R.bytes(proxyInfo.bytes || 0) : "none yet") + (proxyInfo.pending ? "; " +
+                fmt.plural(proxyInfo.pending, "video") + " still " +
+                (proxyInfo.pending === 1 ? "needs" : "need") + " one" : "") + "."}));
+        }
+        var meaningInfo = lib.meaning;
+        var meaningSetup = (state && state.meaning) || {};
+        if (meaningInfo && meaningSetup.configured && meaningInfo.pictures) {
+            card.appendChild(el("p", {className: "card-note meaning-line"}, [
+                "Search by meaning: ",
+                el("strong", {text: fmt.number(meaningInfo.embedded)}),
+                " of " + fmt.plural(meaningInfo.pictures, "picture") +
+                    (meaningInfo.pending ? " (" + fmt.number(meaningInfo.pending) +
+                     " to update)" : "") + "." +
+                    (meaningInfo.held_back ? " " + fmt.plural(meaningInfo.held_back,
+                                                              "hidden picture") +
+                     " " + (meaningInfo.held_back === 1 ? "is" : "are") + " never sent to " +
+                     "the cloud embedding endpoint." : "")
+            ]));
+        }
+        var looksInfo = lib.looks;
+        var looksSetup = (state && state.looks) || {};
+        if (looksInfo && looksInfo.pictures && (looksSetup.configured || looksInfo.embedded)) {
+            // (mismatch: the last update stopped at the probe check, see looks.py.)
+            card.appendChild(el("p", {className: "card-note looks-line" +
+                                      (looksSetup.mismatch ? " card-problem" : ""),
+                                      title: looksSetup.mismatch || ""}, [
+                "Looks: ",
+                el("strong", {text: fmt.number(looksInfo.embedded)}),
+                " of " + fmt.plural(looksInfo.pictures, "picture") +
+                    (looksSetup.changed ? " (made with other settings: rebuild them to search " +
+                        "by an example picture)" : looksSetup.mismatch ? " (the last update " +
+                        "stopped: the image model makes other vectors than the reference; see " +
+                        "the job's log)" : looksInfo.pending ? " (" +
+                        fmt.number(looksInfo.pending) + " to make: a GPU job)" : "") + "."
+            ]));
         }
         var refining = lib.refine_info || {};
         if (refining.enabled) {
@@ -558,10 +654,40 @@
                 "", "describe", {retry_failed: true}, lib.id + ":retry", off || noModel,
                 modelTitle || "Try again to describe the pictures that failed"));
         }
+        if (meaningInfo && meaningSetup.configured && meaningInfo.pending) {
+            actions.appendChild(jobButton("Update meaning search (" +
+                fmt.number(meaningInfo.pending) + ")", "", "embed", {}, lib.id + ":embed",
+                off || !meaningSetup.ready, !meaningSetup.ready ? meaningSetup.problem :
+                    "Make the meaning vectors of the " + fmt.plural(meaningInfo.pending,
+                    "picture") + " whose description is new or changed, so search by " +
+                    "meaning and More like this find them (" + meaningSetup.endpoint + ")"));
+        }
+        if (looksInfo && looksSetup.configured && (looksInfo.pending || looksSetup.mismatch)) {
+            var rebuild = Boolean(looksSetup.changed || looksSetup.mismatch);
+            actions.appendChild(jobButton((rebuild ? "Rebuild looks (" : "Update looks (") +
+                fmt.number(rebuild ? looksInfo.pictures : looksInfo.pending) + ")", "",
+                "image_embed", rebuild ? {rebuild: true} : {}, lib.id + ":looks",
+                off || !looksSetup.ready, !looksSetup.ready ? looksSetup.problem :
+                    looksSetup.mismatch ? "The image model makes other vectors of the probe " +
+                    "pictures than the reference. If its server is set up right (flash " +
+                    "attention off), throw away the reference and the kept looks and make " +
+                    "them again" : rebuild ?
+                    "The looks were made with other settings (another model, dims or picture " +
+                    "size): throw them all away and make them again" :
+                    "Make the image vectors of the " + fmt.plural(looksInfo.pending, "picture") +
+                    " that have none, so Looks like this and search by an example picture " +
+                    "find them (" + looksSetup.endpoint + "; best on a GPU)"));
+        }
         if (lib.previews !== false) {
             actions.appendChild(jobButton("Build previews", "", "previews", {},
                 lib.id + ":previews", off,
                 "Make the screen-sized previews that are still missing"));
+        }
+        if (proxiesOn && proxyInfo.pending) {
+            actions.appendChild(jobButton("Make playable copies (" +
+                fmt.number(proxyInfo.pending) + ")", "", "proxies", {}, lib.id + ":proxies", off,
+                "Make H.264 copies of the videos most browsers cannot play (HEVC and " +
+                "others), so they play in the viewer; this takes a while"));
         }
         var exporting = exportJobOf(lib);
         actions.appendChild(button(exporting ? "Export... (" + (exporting.state === "queued" ?
@@ -848,10 +974,41 @@
         });
     }
 
+    // Rebuild looks: every kept image vector goes (of every library), and making
+    // them again is a long run of the image model.
+    function confirmRebuildLooks() {
+        var setup = (state && state.looks) || {};
+        var kept = fmt.plural(setup.stored || 0, "image vector");
+        return SHELL.confirm({
+            title: "Rebuild the looks?",
+            message: [
+                el("p", {text: setup.mismatch && !setup.changed
+                    ? "The image model now makes other vectors of three test pictures than " +
+                      "the reference ones the looks are checked against. That happens when " +
+                      "its server runs with flash attention on (or in float16): if so, fix " +
+                      "the server and choose Update looks instead. If the server is right, " +
+                      "the reference was not: rebuilding throws it away with the " + kept +
+                      " kept, for every library, and makes them again."
+                    : "The " + kept + " kept were made with other settings (another image " +
+                      "model or projector, dims or picture size). Rebuilding throws them all " +
+                      "away, for every library, and makes them again with the current " +
+                      "settings."}),
+                el("p", {className: "muted", text: "This is a long job for the image model: " +
+                    "hours on a CPU, much less on a GPU. Until it is done, Looks like this " +
+                    "finds only the pictures made again." + (setup.reference ? "" :
+                    " Its first pictures make the new reference: run the first few on a CPU " +
+                    "server (or with flash attention off) so it can be trusted, for instance " +
+                    "with scan.py --embed-images --rebuild-looks --limit 8.")})
+            ],
+            confirmText: "Rebuild looks"
+        });
+    }
+
     function queueJob(kind, lib, params, found) {
         params = params || {};
         var libraries = lib ? [lib] : enabledLibraries();
         var ask = kind === "refine" ? confirmRefine(lib, params) :
+            kind === "image_embed" && params.rebuild ? confirmRebuildLooks() :
             confirmCloud(kind, libraries, params, found);
         return ask.then(function (ok) {
             if (!ok) {
@@ -1647,10 +1804,14 @@
                              "kept in the data folder.");
         var enabled = check("Turned on", lib ? lib.enabled !== false : true,
                             "Turned-off libraries are not searched and Process all skips them.");
+        var videos = check("Index videos", lib ? lib.videos !== false : true,
+                           "Videos are shown with a poster frame, play in the viewer and are " +
+                           "described from a few of their frames. Needs ffmpeg.");
         fields.previews = {node: previews.node, error: el("span"), control: previews.input};
         fields.enabled = {node: enabled.node, error: el("span"), control: enabled.input};
+        fields.videos = {node: videos.node, error: el("span"), control: videos.input};
         var other = el("fieldset", {className: "group"}, [
-            el("legend", {text: "Other"}), previews.node, enabled.node
+            el("legend", {text: "Other"}), previews.node, videos.node, enabled.node
         ]);
         var scanNow = null;
         if (adding) {
@@ -1818,6 +1979,7 @@
                 metadata: metadata.value,
                 context_notes: notes.value.trim(),
                 previews: previews.input.checked,
+                videos: videos.input.checked,
                 enabled: enabled.input.checked
             };
             var refineValue = refineBox.value();
@@ -1837,7 +1999,7 @@
                 newest_first: lib.newest_first !== false, endpoint: lib.endpoint || "",
                 metadata: lib.metadata === "extended" ? "extended" : "core",
                 context_notes: lib.context_notes || "", previews: lib.previews !== false,
-                enabled: lib.enabled !== false
+                videos: lib.videos !== false, enabled: lib.enabled !== false
             };
             Object.keys(original).forEach(function (key) {
                 if (data[key] === original[key]) {
@@ -2286,18 +2448,33 @@
             });
             fields.images = {error: el("span", {className: "field-error", hidden: true}),
                              control: modes.web};
+            // Videos: their poster frame always; the videos themselves when chosen.
+            var withVideos = null;
+            var hasVideos = Boolean((lib.video_info || {}).count) || opts.videos === "include" ||
+                (opts.exclude_types || []).indexOf("video") >= 0;
+            if (hasVideos) {
+                withVideos = check(R.OPTIONS.videos.label, opts.videos === "include",
+                                   R.OPTIONS.videos.hint.replace("{mb}",
+                                                                 String(opts.max_video_mb)));
+                withVideos.input.addEventListener("change", changed);
+            }
+            fields.videos = {error: el("span", {className: "field-error", hidden: true}),
+                             control: withVideos ? withVideos.input : modes.web};
             body.appendChild(el("fieldset", {className: "group"}, [
-                el("legend", {text: "Pictures"}), modeList, fields.images.error
+                el("legend", {text: "Pictures"}), modeList,
+                withVideos ? withVideos.node : null, fields.images.error, fields.videos.error
             ]));
 
             // What is left out
             var leave = {};
             var leaveList = el("div", {className: "export-choices two"});
-            [["exclude_private", R.OPTIONS.exclude_private],
-             ["exclude_sensitive", R.OPTIONS.exclude_sensitive],
-             ["document", R.TYPES.document], ["screenshot", R.TYPES.screenshot],
-             ["scan", R.TYPES.scan],
-             ["exclude_undescribed", R.OPTIONS.exclude_undescribed]].forEach(function (item) {
+            var leaveItems = [["exclude_private", R.OPTIONS.exclude_private],
+                              ["exclude_sensitive", R.OPTIONS.exclude_sensitive],
+                              ["document", R.TYPES.document],
+                              ["screenshot", R.TYPES.screenshot], ["scan", R.TYPES.scan],
+                              hasVideos ? ["video", R.TYPES.video] : null,
+                              ["exclude_undescribed", R.OPTIONS.exclude_undescribed]];
+            leaveItems.filter(Boolean).forEach(function (item) {
                 var key = item[0];
                 var on = R.TYPES[key] ? (opts.exclude_types || []).indexOf(key) >= 0 : opts[key];
                 leave[key] = check(item[1].label, on, item[1].hint);
@@ -2319,11 +2496,26 @@
             // What each picture carries
             var details = {};
             var detailList = el("div", {className: "export-choices two"});
-            ["file_names", "folders", "location"].forEach(function (key) {
+            ["file_names", "folders", "location", "similar", "meaning",
+             "looks"].forEach(function (key) {
                 details[key] = check(R.OPTIONS[key].label, opts[key], R.OPTIONS[key].hint);
                 details[key].input.addEventListener("change", changed);
                 detailList.appendChild(details[key].node);
             });
+            // Search by meaning in the browser: on (as saved) only when it can
+            // go; otherwise off, with the reason (the saved choice is kept).
+            var meaningReason = el("span", {className: "field-hint field-reason", hidden: true});
+            details.meaning.node.lastChild.appendChild(meaningReason);
+            function meaningAvailability(meaning) {
+                var input = details.meaning.input;
+                var available = !meaning || meaning.available !== false;
+                input.disabled = !available;
+                input.checked = available && Boolean(opts.meaning);
+                meaningReason.textContent = available ? "" : "Not available: " +
+                    (meaning.reason || "search by meaning is not set up.");
+                meaningReason.hidden = available;
+            }
+            meaningAvailability((lib.export_info || {}).meaning);
             var detailsLine = el("p", {className: "field-hint"});
             body.appendChild(el("fieldset", {className: "group"}, [
                 el("legend", {text: "Also publish"}),
@@ -2384,7 +2576,9 @@
                     return !R.TYPES[type];
                 });
                 Object.keys(R.TYPES).forEach(function (type) {
-                    if (leave[type].input.checked) {
+                    // (A kind not offered here stays as saved.)
+                    if (leave[type] ? leave[type].input.checked
+                        : (opts.exclude_types || []).indexOf(type) >= 0) {
                         types.push(type);
                     }
                 });
@@ -2394,12 +2588,17 @@
                         result[key] = leave[key].input.checked;
                     });
                 Object.keys(details).forEach(function (key) {
-                    result[key] = details[key].input.checked;
+                    // (A choice that cannot be made now keeps its saved value.)
+                    result[key] = details[key].input.disabled ? Boolean(opts[key])
+                        : details[key].input.checked;
                 });
                 result.title = title.value.trim();
                 result.credits = credits.value.trim();
                 result.zip = zip.input.checked;
                 result.allow_indexing = indexing.input.checked;
+                if (withVideos) {
+                    result.videos = withVideos.input.checked ? "include" : "skip";
+                }
                 return result;
             }
 
@@ -2410,7 +2609,10 @@
             }
 
             refreshCount = function () {
-                scheduleCount(countLine);
+                scheduleCount(function (reply) {
+                    meaningAvailability((reply.counts || {}).meaning);
+                    countLine(reply);
+                });
             };
             detailsLine.textContent = R.detailsText(opts);
             footNote.textContent = "Counting the pictures...";
@@ -2523,7 +2725,23 @@
             }
             holder.appendChild(el("p", {className: "export-details",
                                         text: R.detailsText(opts)}));
+            var similarLine = R.similarText(reply.counts, opts);
+            if (similarLine) {
+                holder.appendChild(el("p", {className: "export-details", text: similarLine}));
+            }
+            var looksLine = R.looksText(reply.counts, opts, reply.size_parts);
+            if (looksLine) {
+                holder.appendChild(el("p", {className: "export-details", text: looksLine}));
+            }
+            var meaningLine = R.meaningText(reply.counts, opts);
+            if (meaningLine) {
+                holder.appendChild(el("p", {className: "export-details", text: meaningLine}));
+            }
             var counts = reply.counts || {};
+            var videoNote = R.videoText(counts.videos, opts);
+            if (videoNote) {
+                holder.appendChild(el("p", {className: "muted", text: videoNote}));
+            }
             if (counts.unavailable) {
                 holder.appendChild(notice("error", "The folder of " + lib.name + " cannot be " +
                     "read right now (offline?), and " + fmt.plural(counts.unavailable,

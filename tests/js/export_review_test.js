@@ -27,7 +27,8 @@ function defaults() {
     return {title: "", images: "web", location: false, file_names: false, folders: false,
             exclude_types: ["screenshot", "document"], exclude_private: true,
             exclude_sensitive: true, exclude_undescribed: true, include_ids: [],
-            exclude_ids: [], credits: "", zip: false, allow_indexing: false};
+            exclude_ids: [], credits: "", zip: false, allow_indexing: false, similar: true,
+            meaning: true};
 }
 
 var SHOT = {id: 4, reason: "private", reasons: ["private", "screenshot"], title: "Chat"};
@@ -252,6 +253,96 @@ test("counts, size and details in words", function () {
     assert.strictEqual(R.serveCommand("C:\\Photos\\Family"),
                        "python -m http.server --bind 127.0.0.1 --directory " +
                        "\"C:\\Photos\\Family\"");
+});
+
+test("search by meaning in the browser: its size, or why it cannot go", function () {
+    var options = defaults();
+    var counts = {total: 10, exported: 4, meaning: {available: true, reason: "",
+                                                    bytes: 34603008, gzip: 25690112}};
+    assert.strictEqual(R.meaningText(counts, options), "Search by meaning in the browser: " +
+        "33 MB of model files; visitors download about 25 MB once, the first time they " +
+        "search (works offline and from disk).");
+    counts.meaning = {available: false, reason: "Set embedding.license_file in config.json."};
+    assert.strictEqual(R.meaningText(counts, options), "Search by meaning in the browser is " +
+        "not included: Set embedding.license_file in config.json.");
+    options.meaning = false;
+    assert.strictEqual(R.meaningText(counts, options), "");
+    assert.strictEqual(R.meaningText({total: 1, exported: 1}, defaults()), "");
+    assert.ok(/search by meaning 33 MB/.test(R.sizeText({size_estimate: 34700000, size_parts: {
+        thumbs: 96992, meaning: 34603008}})));
+    assert.ok(/once, the first time they search/.test(R.OPTIONS.meaning.hint));
+});
+
+test("More like this in words, and its vectors in the counts", function () {
+    var options = defaults();
+    assert.strictEqual(options.similar, true);
+    var counts = {total: 10, exported: 4, similar: {vectors: 4, stale: 0, missing: 0}};
+    assert.strictEqual(R.similarText(counts, options),
+                       "More like this goes by meaning for every published picture.");
+    counts.similar = {vectors: 3, stale: 1, missing: 0};
+    assert.ok(/for 3 of 4 pictures; 1 has no up-to-date meaning vector/.test(
+        R.similarText(counts, options)), R.similarText(counts, options));
+    counts.similar = {vectors: 0, stale: 0, missing: 4};
+    assert.ok(/No published picture has a meaning vector yet/.test(
+        R.similarText(counts, options)));
+    options.similar = false;
+    assert.strictEqual(R.similarText(counts, options), "");
+    assert.strictEqual(R.similarText({total: 1, exported: 1}, defaults()), "");
+    assert.ok(/meaning vectors 3\.4 KB/.test(R.sizeText({size_estimate: 5000, size_parts: {
+        thumbs: 1500, vectors: 3500}})));
+    // A picture chosen in the review takes its vector along.
+    var reply = {options: defaults(), counts: {total: 3, exported: 1, by_reason: {"private": 1},
+                                                 similar: {vectors: 1, stale: 0, missing: 0}},
+                 size_estimate: 100, size_parts: {thumbs: 50, vectors: 50},
+                 flagged: [{id: 2, reasons: ["private"], excluded: true, bytes: 80,
+                            parts: {thumbs: 30, vectors: 50}}]};
+    var after = R.recount(reply, R.choose(reply.options, reply.flagged[0], true));
+    assert.deepStrictEqual(after.counts.similar, {vectors: 2, stale: 0, missing: 0});
+    assert.strictEqual(after.size_parts.vectors, 100);
+    assert.deepStrictEqual(reply.counts.similar, {vectors: 1, stale: 0, missing: 0});
+});
+
+test("a video chosen in the review counts in the video sentence", function () {
+    var options = defaults();
+    options.videos = "include";
+    var reply = {options: options,
+                 counts: {total: 4, exported: 2, by_reason: {sensitive: 2},
+                          videos: {total: 2, included: 1, not_playable: 1, too_large: 0}},
+                 size_estimate: 100, size_parts: {thumbs: 50, videos: 50},
+                 flagged: [{id: 20, reasons: ["sensitive"], excluded: true, bytes: 900,
+                            parts: {thumbs: 20, videos: 880}, video: "included"},
+                           {id: 21, reasons: ["sensitive"], excluded: true, bytes: 20,
+                            parts: {thumbs: 20}, video: "too_large"}]};
+    assert.ok(/^1 of 2 videos are published as a video;/.test(
+        R.videoText(reply.counts.videos, options)));
+    var chosen = R.choose(options, reply.flagged[0], true);
+    var after = R.recount(reply, chosen);
+    assert.deepStrictEqual(after.counts.videos,
+                           {total: 3, included: 2, not_playable: 1, too_large: 0});
+    assert.ok(/^2 of 3 videos are published as videos;/.test(
+        R.videoText(after.counts.videos, options)), R.videoText(after.counts.videos, options));
+    assert.strictEqual(after.size_parts.videos, 930);
+    after = R.recount(reply, R.choose(chosen, reply.flagged[1], true));
+    assert.deepStrictEqual(after.counts.videos,
+                           {total: 4, included: 2, not_playable: 1, too_large: 1});
+    // Left out again: back to the server's numbers.
+    after = R.recount(reply, R.choose(chosen, reply.flagged[0], false));
+    assert.deepStrictEqual(after.counts.videos, reply.counts.videos);
+    // Videos not included: a poster, counted in the total only.
+    var posters = {options: defaults(), counts: {total: 2, exported: 1, by_reason: {sensitive: 1},
+                                                 videos: {total: 0, included: 0,
+                                                          not_playable: 0, too_large: 0}},
+                   size_estimate: 10, size_parts: {thumbs: 10},
+                   flagged: [{id: 5, reasons: ["sensitive"], excluded: true, bytes: 20,
+                              parts: {thumbs: 20}, video: "poster"}]};
+    after = R.recount(posters, R.choose(posters.options, posters.flagged[0], true));
+    assert.deepStrictEqual(after.counts.videos,
+                           {total: 1, included: 0, not_playable: 0, too_large: 0});
+    assert.ok(/^The video to publish is published as its poster frame/.test(
+        R.videoText(after.counts.videos, posters.options)));
+    // The reply itself is not changed.
+    assert.deepStrictEqual(reply.counts.videos,
+                           {total: 2, included: 1, not_playable: 1, too_large: 0});
 });
 
 /* ---------- Run ------------------------------------------------------------------ */

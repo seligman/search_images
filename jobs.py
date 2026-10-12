@@ -504,6 +504,7 @@ STAGE_LABELS = {
     "previews": "Building previews",
     "describe": "Describing pictures",
     "refine": "Describing documents and screenshots again",
+    "embed": "Updating search by meaning",
     "delete": "Deleting indexed data",
     "export": "Exporting pictures",
     "zip": "Writing the zip file",
@@ -511,6 +512,8 @@ STAGE_LABELS = {
     "download": "Downloading place names",
     "build places": "Building the place index",
     "places": "Adding place names",
+    "proxies": "Making playable copies of videos",
+    "looks": "Making the looks of pictures",
 }
 # The job queue lives in data/jobs.db, a database of its own: a running scan
 # keeps index.db's write lock almost all the time, and adding, pausing or
@@ -1521,7 +1524,7 @@ def job_libraries(config, params):
 _SCAN_FIELDS = ("library_id", "name", "files", "added", "updated", "changed", "moved",
                 "copied", "unchanged", "restored", "failed", "unsupported", "missing",
                 "excluded", "guarded", "removed_moved", "purged", "offline", "aborted",
-                "complete")
+                "complete", "videos_skipped")
 
 
 def _scan_summary(result, params, offline_fails):
@@ -1546,6 +1549,10 @@ def _scan_summary(result, params, offline_fails):
         summary["describe"] = described
         if described.get("error"):
             summary["error"] = described["error"]
+    if isinstance(result.get("embed"), dict):
+        summary["embed"] = result["embed"]
+    if isinstance(result.get("looks_pending"), int):
+        summary["looks_pending"] = result["looks_pending"]
     return summary
 
 
@@ -1579,10 +1586,23 @@ def run_describe(ctx, conn, config, params, helper=None):
     ids = params.get("ids")
     ids = [image_id for image_id in ids if isinstance(image_id, int)] if isinstance(
         ids, list) else None
-    return describe.describe_pending(conn, config, ctx, helper=helper,
-                                     library_ids=[library["id"] for library in libraries],
-                                     ids=ids, force=bool(params.get("force")),
-                                     **_describe_options(params))
+    library_ids = [library["id"] for library in libraries]
+    summary = describe.describe_pending(conn, config, ctx, helper=helper,
+                                        library_ids=library_ids,
+                                        ids=ids, force=bool(params.get("force")),
+                                        **_describe_options(params))
+    return _with_embed(summary, conn, config, ctx, library_ids)
+
+
+def _with_embed(summary, conn, config, ctx, library_ids):
+    """A describe or refine summary with the embed step that follows it (search by
+    meaning, when it is set up and the run was not stopped) as its "embed"."""
+    import embeddings
+    if not summary.get("stopped"):
+        embedded = embeddings.after_run(conn, config, ctx, library_ids=library_ids)
+        if embedded is not None:
+            summary["embed"] = embedded
+    return summary
 
 
 def run_refine(ctx, conn, config, params, helper=None):
@@ -1591,11 +1611,50 @@ def run_refine(ctx, conn, config, params, helper=None):
     import describe
     libraries = job_libraries(config, params)
     limit = params.get("limit")
-    return describe.refine_pending(
-        conn, config, ctx, helper=helper, library_ids=[library["id"] for library in libraries],
+    library_ids = [library["id"] for library in libraries]
+    summary = describe.refine_pending(
+        conn, config, ctx, helper=helper, library_ids=library_ids,
         limit=limit if isinstance(limit, int) and not isinstance(limit, bool) else None,
         retry_failed=bool(params.get("retry_failed")),
         only_library=bool(params.get("library_id")))
+    return _with_embed(summary, conn, config, ctx, library_ids)
+
+
+def run_embed(ctx, conn, config, params, helper=None):
+    """Update search by meaning for a library (or every enabled one): embed the pictures
+    whose vector is missing or stale (embeddings.update). params "limit": at most
+    that many. Raises JobError when search by meaning is not set up."""
+    import embeddings
+    libraries = job_libraries(config, params)
+    if not embeddings.configured(config):
+        raise JobError(embeddings.NOT_CONFIGURED)
+    limit = params.get("limit")
+    summary = embeddings.update(
+        conn, config, ctx, library_ids=[library["id"] for library in libraries],
+        limit=limit if isinstance(limit, int) and not isinstance(limit, bool) else None)
+    if not summary["error"] and not summary["pending"] and not summary["stopped"]:
+        ctx.log("Search by meaning is up to date (%d picture(s))." % summary["up_to_date"])
+    return summary
+
+
+def run_image_embed(ctx, conn, config, params, helper=None):
+    """Make the looks (image vectors) of a library's pictures (or every enabled
+    library's) that have none yet (looks.update). params "limit": at most that many;
+    "rebuild": first throw away the kept ones made with other settings (or, after a
+    failed probe check, all of them and the reference); run again, it goes on where
+    it was. Raises JobError when looks are not set up."""
+    import looks
+    libraries = job_libraries(config, params)
+    if not looks.configured(config):
+        raise JobError(looks.NOT_CONFIGURED)
+    limit = params.get("limit")
+    summary = looks.update(
+        conn, config, ctx, library_ids=[library["id"] for library in libraries],
+        limit=limit if isinstance(limit, int) and not isinstance(limit, bool) else None,
+        rebuild=bool(params.get("rebuild")), helper=helper)
+    if not summary["error"] and not summary["pending"] and not summary["stopped"]:
+        ctx.log("Looks are up to date (%d picture(s))." % summary["up_to_date"])
+    return summary
 
 
 def run_process(ctx, conn, config, params, helper=None):
@@ -1613,8 +1672,10 @@ def run_previews(ctx, conn, config, params, helper=None):
     """Build missing previews (and other details older rows lack); no scan, no describing."""
     import cache
     import scan
+    import videos
     libraries = job_libraries(config, params)
     threads = scan.reader_threads(config)
+    video = videos.setup(config)
     walker = getattr(helper, "walk_library", None) if helper is not None else None
     results = []
     with cache.ThumbStore() as thumbs:
@@ -1629,7 +1690,8 @@ def run_previews(ctx, conn, config, params, helper=None):
                         % (label, root or "(none)"), "warn")
                 results.append({"library_id": library["id"], "name": label, "offline": True})
                 continue
-            result = scan.backfill(conn, library, ctx, helper, thumbs, previews, threads)
+            result = scan.backfill(conn, library, ctx, helper, thumbs, previews, threads,
+                                   video)
             result.update(library_id=library["id"], name=label)
             results.append(result)
             if result.get("aborted"):
@@ -1710,13 +1772,33 @@ def run_places(ctx, conn, config, params, helper=None):
     return summary
 
 
+def run_proxies(ctx, conn, config, params, helper=None):
+    """Make playable (H.264) copies of the videos browsers may not play (videos.make_proxies).
+
+    Only when "video_proxies" is enabled in config.json; raises JobError
+    otherwise, and when ffmpeg is missing.
+    """
+    import videos
+    if not videos.proxy_settings(config)["enabled"]:
+        raise JobError("Playable copies of videos are turned off: set \"video_proxies\": "
+                       "{\"enabled\": true} in config.json first.")
+    libraries = job_libraries(config, params)
+    try:
+        return videos.make_proxies(conn, config, ctx, [library["id"] for library in libraries])
+    except videos.ToolsMissing as error:
+        raise JobError(str(error))
+
+
 RUNNERS = {
     "scan": run_scan,
     "describe": run_describe,
     "refine": run_refine,
+    "embed": run_embed,
+    "image_embed": run_image_embed,
     "process": run_process,
     "previews": run_previews,
     "delete_library": run_delete_library,
     "export": run_export,
     "places": run_places,
+    "proxies": run_proxies,
 }

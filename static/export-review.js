@@ -24,12 +24,21 @@
      EXPORT_REVIEW.leftOut(counts)     ["1,204 pictures not described yet", ...]
      EXPORT_REVIEW.headline(counts)    "312 of 1,699 pictures will be published."
      EXPORT_REVIEW.sizeText(preview)   "About 162 MB: thumbnails 12 MB, ..."
+     EXPORT_REVIEW.similarText(counts, options)  what "More like this" will
+                                       have to go by, or ""
+     EXPORT_REVIEW.meaningText(counts, options)  what search by meaning in
+                                       the browser costs, or why it cannot
+                                       go, or ""
+     EXPORT_REVIEW.looksText(counts, options, parts)  how many pictures
+                                       "Looks like this" works for and what
+                                       it adds, or ""
      EXPORT_REVIEW.detailsText(options)  what is published with each picture
      EXPORT_REVIEW.serveCommand(folder)  the command that tries a site locally
      EXPORT_REVIEW.bytes(n)            "162 MB"
 
    An item is one entry of the flagged list of /export/preview: {id,
-   reason, reasons, title, excluded, bytes, parts, new_flags}. A picture
+   reason, reasons, title, excluded, bytes, parts, new_flags, video (a
+   video: "included", "not_playable", "too_large" or "poster")}. A picture
    published despite its flags is [id, [those flags]] in include_ids, and
    is left out again when it gets another flag that leaves it out (as
    export.py decides).
@@ -87,7 +96,30 @@ var EXPORT_REVIEW = (function () {
         allow_indexing: {label: "Let search engines index the site",
                          hint: "Off: the pages ask search engines (Google, Bing, ...) not " +
                                "to list them or their pictures. Either way, anyone who has " +
-                               "the address can open the site and every picture in it."}
+                               "the address can open the site and every picture in it."},
+        videos: {label: "Include videos",
+                 hint: "Videos browsers play (H.264, or a playable copy) up to {mb} MB each, " +
+                       "copied without the details hidden in them (place, time, device). " +
+                       "Off, or for other videos (HEVC): the poster frame only. The AI " +
+                       "model saw only a few still frames of each video and never heard " +
+                       "its sound: watch the videos you publish."},
+        max_video_mb: {label: "Largest video",
+                       hint: "Videos larger than this many megabytes are published as their " +
+                             "poster frame only (the review step counts them)."},
+        similar: {label: "More like this by meaning",
+                  hint: "Each picture's meaning vector (about 350 bytes), made from its " +
+                        "description, so \u201cMore like this\u201d finds pictures that mean " +
+                        "much the same. It holds nothing the description does not show."},
+        meaning: {label: "Search by meaning in the browser",
+                  hint: "The small embedding model goes along, with its license, so what " +
+                        "visitors type is found by meaning too, offline and from disk. " +
+                        "Visitors download it once, the first time they search (the " +
+                        "review says how much); choosing Words never loads it."},
+        looks: {label: "Looks like this",
+                hint: "Each picture's look vector (about 350 bytes), made by the image " +
+                      "model from the picture itself, so \u201cLooks like this\u201d finds " +
+                      "pictures that look alike. Searching by an example picture needs " +
+                      "the server's image model: published sites do not have it."}
     };
 
     // The picture types the dialog offers to leave out (others stay as saved).
@@ -98,7 +130,8 @@ var EXPORT_REVIEW = (function () {
         document: {label: "Documents",
                    hint: "Letters, receipts, forms, tickets and other papers, also " +
                          "photographed."},
-        scan: {label: "Scans", hint: "Scanned paper and photos of pages."}
+        scan: {label: "Scans", hint: "Scanned paper and photos of pages."},
+        video: {label: "Videos", hint: "Every video, its poster frame too."}
     };
 
     // Groups of the review grid, in order, and the words for each reason.
@@ -126,6 +159,8 @@ var EXPORT_REVIEW = (function () {
         diagram: {title: "Diagrams", one: "diagram", many: "diagrams", word: "diagram"},
         other: {title: "Other pictures", one: "other picture", many: "other pictures",
                 word: "other"},
+        video: {title: "Videos", one: "video", many: "videos", word: "video",
+                hint: "Left out with every other video (Videos under Leave out)."},
         photo: {title: "Photos", one: "photo", many: "photos", word: "photo"},
         unchecked: {title: "Described by an older version",
                     one: "picture described by an older version (not checked)",
@@ -146,7 +181,7 @@ var EXPORT_REVIEW = (function () {
                  hint: "Pictures you published or left out one by one."}
     };
     var GROUP_ORDER = ["private", "sensitive", "document", "screenshot", "scan", "writing",
-                       "artwork", "meme", "diagram", "other", "photo", "unchecked",
+                       "artwork", "meme", "diagram", "other", "video", "photo", "unchecked",
                        "undescribed"];
     var LEFT_OUT_ORDER = GROUP_ORDER.concat(["excluded", "hidden"]);
 
@@ -314,6 +349,22 @@ var EXPORT_REVIEW = (function () {
                 Object.keys(item.parts || {}).forEach(function (key) {
                     parts[key] = (parts[key] || 0) + delta * item.parts[key];
                 });
+                if (counts.similar) {
+                    var kind = item.parts && item.parts.vectors ? "vectors" : "missing";
+                    counts.similar[kind] = Math.max(0, (counts.similar[kind] || 0) + delta);
+                }
+                if (counts.looks) {
+                    var lookKind = item.parts && item.parts.looks ? "vectors" : "missing";
+                    counts.looks[lookKind] = Math.max(0, (counts.looks[lookKind] || 0) + delta);
+                }
+                if (item.video && counts.videos) {
+                    var videos = counts.videos;
+                    videos.total = Math.max(0, (videos.total || 0) + delta);
+                    // (A poster only, as videos are not included: no key.)
+                    if (item.video !== "poster") {
+                        videos[item.video] = Math.max(0, (videos[item.video] || 0) + delta);
+                    }
+                }
                 if (item.needs_folder && typeof counts.needs_folder === "number") {
                     counts.needs_folder += delta;
                     if (counts.unavailable) {
@@ -402,7 +453,9 @@ var EXPORT_REVIEW = (function () {
         }
         var parts = preview.size_parts || {};
         var named = [["thumbnails", parts.thumbs], ["pictures", parts.images],
-                     ["360-degree panoramas", parts.panos], ["pages and data", parts.data]];
+                     ["360-degree panoramas", parts.panos], ["videos", parts.videos],
+                     ["pages and data", parts.data], ["meaning vectors", parts.vectors],
+                     ["look vectors", parts.looks], ["search by meaning", parts.meaning]];
         var list = named.filter(function (item) {
             return item[1] > 0;
         }).map(function (item) {
@@ -410,6 +463,105 @@ var EXPORT_REVIEW = (function () {
         });
         return "About " + bytes(preview.size_estimate) + (list.length > 1 ? ": " +
             list.join(", ") : "") + ".";
+    }
+
+    /* What happens to the videos among the pictures to publish (counts:
+       preview_export's counts.videos {total, included, not_playable,
+       too_large}), in a sentence; "" when there are none. */
+    function videoText(counts, options) {
+        if (!counts || !counts.total) {
+            return "";
+        }
+        var total = Number(counts.total) || 0;
+        var some = total === 1 ? "The video" : "The " + number(total) + " videos";
+        if (!options || options.videos !== "include") {
+            return some + " to publish " + (total === 1 ? "is" : "are") + " published as " +
+                (total === 1 ? "its poster frame" : "their poster frames") +
+                " (Include videos publishes the videos themselves).";
+        }
+        var parts = [number(counts.included || 0) + " of " + number(total) +
+                     (total === 1 ? " video is" : " videos are") + " published as " +
+                     ((counts.included || 0) === 1 ? "a video" : "videos")];
+        if (counts.not_playable) {
+            parts.push(number(counts.not_playable) + " only as a poster frame: most browsers " +
+                       "cannot play " + (counts.not_playable === 1 ? "it" : "them") +
+                       " (HEVC), and there is no playable copy");
+        }
+        if (counts.too_large) {
+            parts.push(number(counts.too_large) + " only as a poster frame: larger than " +
+                       number(options.max_video_mb) + " MB");
+        }
+        return parts.join("; ") + "." + (counts.included ? " The AI model saw only a few " +
+            "still frames of each video and never heard its sound: watch the videos you " +
+            "publish." : "");
+    }
+
+    // "More like this" in the export: how many pictures it can go by meaning
+    // for (counts.similar of the preview), or "" when the option is off.
+    function similarText(counts, options) {
+        var similar = counts && counts.similar;
+        if (!options || !options.similar || !similar) {
+            return "";
+        }
+        var without = (similar.stale || 0) + (similar.missing || 0);
+        var exported = Number(counts.exported) || 0;
+        if (!exported) {
+            return "";
+        }
+        if (!without) {
+            return "More like this goes by meaning for every published picture.";
+        }
+        if (!similar.vectors) {
+            return "No published picture has a meaning vector yet, so More like this goes by " +
+                "tags and dates (set up search by meaning and update it on the Manage page).";
+        }
+        return "More like this goes by meaning for " + number(similar.vectors) + " of " +
+            number(exported) + (exported === 1 ? " picture" : " pictures") + "; " +
+            number(without) + (without === 1 ? " has" : " have") + " no up-to-date meaning " +
+            "vector (Update meaning search on the Manage page first).";
+    }
+
+    /* Search by meaning in the browser (counts.meaning of the preview:
+       {available, reason, bytes, gzip}): its size and download when it
+       goes, the reason when the option is on but it cannot go, else "". */
+    function meaningText(counts, options) {
+        var meaning = counts && counts.meaning;
+        if (!meaning || !options || !options.meaning) {
+            return "";
+        }
+        if (!meaning.available) {
+            return meaning.reason ? "Search by meaning in the browser is not included: " +
+                meaning.reason : "";
+        }
+        if (!Number(counts.exported)) {
+            return "";
+        }
+        return "Search by meaning in the browser: " + bytes(meaning.bytes) + " of model " +
+            "files; visitors download about " + bytes(meaning.gzip) + " once, the first " +
+            "time they search (works offline and from disk).";
+    }
+
+    /* "Looks like this" in the export (counts.looks of the preview: {vectors,
+       missing}; parts: its size_parts): for how many pictures, and its size;
+       "" when the option is off or nothing would go. */
+    function looksText(counts, options, parts) {
+        var looked = counts && counts.looks;
+        var exported = Number(counts && counts.exported) || 0;
+        if (!options || !options.looks || !looked || !exported) {
+            return "";
+        }
+        if (!looked.vectors) {
+            return "No published picture has a look vector yet, so Looks like this is not " +
+                "included (Update looks on the Manage page first).";
+        }
+        var bytesEach = parts && parts.looks ? Math.round(parts.looks / looked.vectors) : 0;
+        return "Looks like this works for " + (looked.missing ? number(looked.vectors) +
+            " of " + number(exported) + (exported === 1 ? " picture" : " pictures")
+            : looked.vectors === 1 ? "the published picture" : "every published picture") +
+            (bytesEach ? " (about " + number(bytesEach) + " bytes a picture, " +
+             bytes(parts.looks) + " in all)" : "") + (looked.missing ? "; " +
+            number(looked.missing) + (looked.missing === 1 ? " has" : " have") + " no look " +
+            "vector yet (Update looks on the Manage page first)" : "") + ".";
     }
 
     // What each picture carries into the export, in a sentence or two.
@@ -450,6 +602,10 @@ var EXPORT_REVIEW = (function () {
         leftOut: leftOut,
         headline: headline,
         sizeText: sizeText,
+        videoText: videoText,
+        similarText: similarText,
+        meaningText: meaningText,
+        looksText: looksText,
         detailsText: detailsText,
         serveCommand: serveCommand,
         bytes: bytes

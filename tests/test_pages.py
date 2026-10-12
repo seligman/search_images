@@ -32,7 +32,8 @@ PAGES = (("/", "page.html", "app.js"), ("/detail", "detail.html", "detail.js"),
          ("/duplicates", "duplicates.html", "duplicates.js"))
 # Element ids the scripts create themselves (not in a template).
 CREATED_IDS = {"shell-header", "shell-toasts", "shell-library", "shell-job",
-               "no-endpoint-notice", "server-gone"}
+               "no-endpoint-notice", "no-ffmpeg-notice", "meaning-notice",
+               "server-gone"}
 
 
 quiet = support.quiet

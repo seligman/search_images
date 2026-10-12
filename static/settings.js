@@ -204,9 +204,12 @@
         var refined = endpoint.refined_by || [];
         var text = used.length ? libraryNames(used) :
             endpoint.default ? "Libraries without an endpoint of their own" :
-            refined.length ? "" : "No library";
+            refined.length || endpoint.embedding ? "" : "No library";
         if (refined.length) {
             text += (text ? "; refine" : "Refine") + " pass of " + libraryNames(refined);
+        }
+        if (endpoint.embedding) {
+            text += (text ? "; search" : "Search") + " by meaning (embedding model)";
         }
         return text;
     }
@@ -303,7 +306,9 @@
                 (stored.concurrency ? "" : !endpoint.local ? "" :
                     endpoint.status && endpoint.status.slots ? " (from the server)"
                     : " until the server reports its slots")})
-        ] : [el("span", {className: "pill bad plain", text: "Not set"})]);
+        ] : endpoint.embedding ? [el("div", {className: "cell-sub",
+                                             text: "The model the server loaded"})]
+            : [el("span", {className: "pill bad plain", text: "Not set"})]);
         var keyCell = el("td", null, [
             el("div", {text: keyText(endpoint), className: keyProblem(endpoint) ? "result-line bad"
                 : ""})
@@ -316,7 +321,8 @@
             button("Edit", "small", function () {
                 openDialog("edit", endpoint.name);
             }),
-            !endpoint.default && endpoint.enabled !== false ? button("Make default", "small",
+            !endpoint.default && endpoint.enabled !== false && !endpoint.embedding ?
+                button("Make default", "small",
                 function () {
                     makeDefault(endpoint);
                 }, "Libraries without an endpoint of their own use the default") : null,

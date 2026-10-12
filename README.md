@@ -11,6 +11,8 @@ Anthropic's Claude). A library can also be published as a static website.
 Supported image types are JPG/JPEG, PNG, GIF, WebP, TIFF, BMP, HEIC/HEIF,
 AVIF (HEIC needs `pillow-heif`; AVIF needs a Pillow built with AVIF support)
 and Insta360 `.insp` photos. RAW files (`.dng`, `.arw`, ...) are not indexed.
+Videos (MOV, MP4, M4V, 3GP, AVI, MKV, WebM, WMV, MTS, MPEG) are indexed too
+when ffmpeg is installed: see [Videos](#videos).
 
 360-degree photos are recognised: stitched panoramas (2:1 images tagged as
 equirectangular, or from a known 360 camera) and unstitched Insta360 frames
@@ -37,6 +39,10 @@ You need Python 3.9 or newer and a few packages:
 `pillow-heif` is only needed to scan libraries that contain HEIC images.
 Without it the scanner still runs and skips HEIC files with a warning. Each
 script also prints an install command if a package is missing.
+
+Videos need the `ffmpeg` and `ffprobe` programs (from
+https://ffmpeg.org/download.html or your system's package manager), on the
+PATH or set with `"ffmpeg"` in `config.json` (see [Videos](#videos)).
 
 Run the commands in this README from the program folder (the folder that
 holds `serve.py` and the other scripts).
@@ -80,7 +86,7 @@ or, on Windows (in PowerShell, `$env:SETTINGS_BASE = "c:\path\to\data"`):
    every library again after you add pictures.
 5. Open **Search** in the page header and type what you are looking for.
 
-To try it on the 18 bundled sample pictures first, see
+To try it on the 19 bundled sample pictures first, see
 [sample/README.md](sample/README.md).
 
 The same from the command line: `python settings.py` adds endpoints and
@@ -218,8 +224,10 @@ finds new and changed images and reads each of them once: it stores their
 metadata, EXIF data, capture date, camera and GPS position in a SQLite
 database (`data/index.db`), builds a thumbnail and a 2048 px preview (about
 0.5 MB per picture in `data/previews/`; see `previews` in SETTINGS.md), and
-then the LLM describes anything without a description. Run it again
-whenever your folders change; unchanged files are not read again.
+then the LLM describes anything without a description. With [search by
+meaning](#search-by-meaning) set up, the pictures whose description is new
+or changed then get their meaning vectors. Run it again whenever your
+folders change; unchanged files are not read again.
 
 Descriptions follow the pictures: a file that is touched, renamed or moved
 keeps its description, and an exact copy of a described picture gets the same
@@ -257,6 +265,19 @@ Options:
   screenshots](#refining-documents-and-screenshots)): no scan, no regular
   describing. `--library`, `--limit`, `--retry-failed` and the order options
   work with it.
+- `--embed` runs only the embed step of [search by
+  meaning](#search-by-meaning): the pictures whose meaning vector is
+  missing or out of date (`--library` and `--limit` work with it). It
+  exits with 1 when search by meaning is not set up or its endpoint
+  cannot be used.
+- `--embed-images` only makes the [looks](#looks-like-this-and-search-by-a-picture)
+  of the pictures that have none (`--library` and `--limit` work with it;
+  `--rebuild-looks` first throws away looks made with other settings, or
+  after a failed check of the image model, the looks and the reference
+  they are checked against; looks of the current settings stay, so a
+  stopped rebuild goes on where it was).
+  No other run makes them: they need the image model, best on a graphics
+  card. It exits with 1 when looks are not set up or cannot be made.
 - `--list-endpoints` lists the configured endpoints and where their keys come
   from; `--test-endpoint NAME [--image PATH]` describes one picture (a
   sample by default) and prints the result. Neither ever shows a key.
@@ -278,6 +299,77 @@ directory you ran `scan.py` from. It finishes the images in progress, saves
 its progress, and exits (a second Ctrl+C stops it at once; what was saved
 so far is kept). Delete the `abort` file and run `scan.py` again to pick up
 where it stopped.
+
+## Videos
+
+Videos are indexed like photos, when the programs `ffmpeg` and `ffprobe`
+can be found: on the PATH, or where `"ffmpeg"` in `config.json` says (see
+SETTINGS.md, "Videos"). Without them a scan lists the videos but does not
+read them, and the Manage page says once how many were found and what to
+do; videos indexed before stay as they are. A library's `videos` setting
+(**Index videos** in its settings on the Manage page) turns them off. 360
+videos (`.insv`) are not indexed.
+
+A scan reads each new or changed video once (frames are decoded on the
+processor, never the graphics card):
+
+- What ffprobe says: the length, the size as shown (a phone video filmed
+  upright is upright), the codecs, frame rate and bit rate, the camera,
+  the GPS position, and when it was taken. That is the QuickTime creation
+  date with its time zone (iPhones and many other phones write it);
+  otherwise the creation time in the file, which is in UTC, shown in this
+  computer's time zone (as a photo's file time is) -- except when it is
+  more than 15 minutes later than the file itself: apps that convert or
+  export a video write the time they did that there. Then a date and time
+  in the file name (`VID_20190514_142301.mp4`, `DJI_20190305_093012.MP4`;
+  a name within 15 minutes of the creation time is used instead of it,
+  as cameras that write when the recording ended name the file when it
+  started); otherwise the file's time, as for a photo without a date (not
+  shown on the timeline or in On this day). A video that cannot be read
+  because its file cannot (a share that went away for a moment) is tried
+  again by the next scan, not marked as unreadable.
+- A poster: the frame at 1 second (10 % into a shorter video), or a later
+  one when that frame is black. It is the video's thumbnail and 2048 px
+  preview, and finds look-alikes as a photo's picture does.
+- A contact sheet for describing: four frames spread over the video, in a
+  2 x 2 grid (`video_frames` in SETTINGS.md), kept next to the previews
+  (`<id>.sheet.jpg`). A very short video's sheet may hold fewer frames;
+  the model is told how many. HDR (HLG) videos are tone mapped to ordinary
+  colours when ffmpeg has the zscale filter (the common builds do).
+- A content hash made from the size and the first and last 4 MB, so that
+  moved, renamed and copied videos keep their descriptions without reading
+  every byte of large videos (on a share). A video changed only in the
+  middle without changing its size would count as the same video.
+
+Videos never stack with photos, and with other videos only when they are
+the same file. The AI model gets the contact sheet with a note saying it
+holds four frames, in order, of a video of so many seconds, and describes
+what happens; the kind of picture is always "video" (the refine pass never
+picks videos), though what the model saw (a screen recording looks like a
+screenshot) is still searched and still counts for an export's **Leave
+out** choices. The model never hears a video's sound. Hidden videos are
+never sent to a cloud service, as with photos.
+
+In the search page, videos have a play sign and their length on the
+thumbnail (`▶ 0:24`), `is:video` (or `type:video`, or **Videos** in the
+Type filter) finds them, as do the words video, movie and clip, and they
+are on the map and the timeline like photos. The viewer plays them
+(`Space` plays and pauses; `←` and `→` still change pictures, unless the
+player has the keyboard focus, where they go 5 seconds back or ahead),
+with the length and codec in the information pane. Browsers play H.264
+videos; HEVC (most phones' videos of recent years) plays in Safari, and
+in Edge or Chrome only where the computer can decode it. When a browser
+cannot play a video, the viewer shows the poster and says so (on this
+computer with **Download the original**). For those videos
+`"video_proxies"` in `config.json` (off by default; see SETTINGS.md) adds
+**Make playable copies** to the Manage page: H.264 copies in
+`data/proxies/`, which the viewer then plays. A copy follows its video
+when the file is moved or renamed, and goes when the video or the
+library's indexed data is deleted.
+
+To see what is read from one video, without changing anything:
+
+    python videos.py path/to/video.mov
 
 ## Searching
 
@@ -342,7 +434,9 @@ the page header or the filters.
   the wheel, a pinch or a double click, and the information pane (`i`):
   date, place, camera settings, the description and text in the picture
   with your search words marked, clickable tags and other facts (each
-  starts a search, the place too), quality, and "More like this".
+  starts a search, the place too), quality, and "More like this": a strip
+  of the closest pictures, and a **More like this** button (or `M`) that
+  searches for all of them (see [Search by meaning](#search-by-meaning)).
   360-degree photos can be looked around in by dragging (the flat
   panorama when the browser cannot show that).
   "Details page" opens the same on a page of its own, to link to.
@@ -457,7 +551,160 @@ about it.
 - `is:360`, `is:duplicate`, `is:undescribed`, `is:edited` - 360-degree
   photos, pictures with near-duplicates in the same library, pictures not
   described yet, pictures whose title, description or tags you edited
+- `is:video` (or `type:video`) - videos; `is:photo` - photos (not videos,
+  screenshots or documents)
 - `lib:name` - only the pictures of one library
+- `similar:1234` - the pictures most like picture 1234, closest first (what
+  **More like this** searches; see below)
+- `look:1234` - the pictures that look most like picture 1234, closest
+  first (what **Looks like this** searches; see below)
+
+### Search by meaning
+
+Words find the pictures that have them (or a synonym). With an embedding
+model set up, the search also finds pictures that mean what you typed:
+`kids playing in the snow` finds a picture described as two children on a
+sled, `papers about a car repair` an invoice from a garage. Each described
+picture (and video: its vector says it is a video) gets a meaning vector,
+made from its title, description, tags and the other things its
+description says (never its file or folder name, dates, places or
+camera), by a small embedding model on this computer, run by llama.cpp's
+`llama-server --embeddings` (or Ollama, LM Studio, ...). The recommended
+model is MongoDB's mdbr-leaf-ir: small enough for a CPU (the whole
+library in a few minutes, a few milliseconds a search, no graphics card)
+and for a published site, where it lets typed searches find pictures by
+meaning too (see [Publishing a library](#publishing-a-library)). It
+comes as three files: the model (a Q8_0 GGUF file), its Dense head (a
+last layer llama.cpp leaves out, applied by these tools) and its license
+text. Add an endpoint for it and name it in `config.json`:
+
+    "endpoints": [ ..., {"name": "embed", "preset": "llamacpp",
+                         "base_url": "http://127.0.0.1:8099/v1"} ],
+    "embedding": {"endpoint": "embed",
+                  "model_file": "C:\\path\\to\\models\\model.gguf",
+                  "dense_file": "C:\\path\\to\\models\\model.dense.safetensors",
+                  "license_file": "C:\\path\\to\\models\\model.LICENSE.txt",
+                  "credit": "mdbr-leaf-ir by MongoDB (Apache-2.0)"}
+
+start the server (for example `llama-server -m model.gguf --embeddings
+--host 127.0.0.1 --port 8099 -c 512 -ub 512 -b 512 --device none -t 4
+--cache-ram 0` (an older llama.cpp that does not know `--cache-ram` works
+without it), or let a `local_server` entry with `"kind": "embeddings"`
+start it when needed; see [SETTINGS.md](SETTINGS.md), which also says
+how to use a larger model such as Qwen3-Embedding), and press **Update
+meaning search** on Manage (or run `python scan.py --embed`). From then on scans,
+describe and refine jobs keep the vectors up to date: only pictures whose
+description changed (a new description, the refine pass, your own edits)
+are embedded again. Until a picture has its vector it is found by its
+words only; so is a picture you edit, from the moment the edit is saved
+until the next scan, describe or refine job (or **Update meaning
+search**) embeds it again, so no search by meaning finds it by words you
+took out. When that embed step at the end of a job finds the embedding
+server not running, it says so once and leaves the work for later.
+
+A switch next to the sort order chooses how a search goes:
+
+- **Words + meaning** (the default): the pictures with your words come
+  first, ranked by how well both their words and their meaning match;
+  after them come up to 40 pictures without the words that mean much the
+  same, marked with a small "≈" ("Found by meaning"). The count above the
+  results says how many were found by meaning; when none has your words
+  (a typo, say) a line says so and offers a spelling that has matches.
+  Names, places, years, file names and words read in a picture mean
+  little to the model: when the pictures with such a word are not what
+  the model makes of it, the search goes by the words alone.
+- **Meaning**: by meaning alone, closest first, words or not; a line
+  above the results says how many pictures have the words.
+
+Close in meaning means much closer than the other pictures are; in a
+small set of pictures (a small published library, say), where none can
+stand out much, the closest few still show when they are a little closer
+than the rest.
+- **Words**: the words alone, as without an embedding model. The page
+  remembers this choice; the other two last until you leave the page.
+
+Filters, the timeline, quoted phrases, field words (`tag:dog`) and
+`-words` stay strict in every mode: they apply to the pictures found by
+meaning too. The meaning of what you type is asked of the embedding model
+a moment after you stop typing (the same search again is remembered), so
+the meaning matches join the word matches a moment later. While the model
+is starting, or when it cannot be reached, the search goes by the words
+and says so above the results. The switch only shows when the pictures
+have vectors and the server can embed searches (and does nothing for a
+search of filters or quoted phrases only).
+
+**More like this** (in the viewer, `M`, and on the details page) searches
+`similar:<picture>`: the pictures closest in meaning to that one, best
+first, after the picture itself. Close means much closer than the other
+pictures are; when few stand out like that (a small published library,
+say), the closest few still show if they are close enough. It needs no
+model, only the vectors, so
+it also works in a published site (see [Publishing a
+library](#publishing-a-library)). The viewer's strip shows the closest
+few, one per stack of duplicates. A picture without a vector (not
+described yet) finds pictures sharing its tags, scene or time instead.
+
+The page downloads the vectors once (about 256 bytes a picture, and again
+only when they change) and compares them in the browser, as it does the
+words. Unlike the rest of a search, what you type then goes to the
+server (`/api/embed`), and from there to the embedding endpoint: one on
+this computer or network unless `allow_cloud` is set (see SETTINGS.md).
+The server's request log leaves the words out, the browser does not
+cache the answers, and each computer only ever gets back its own
+searches. Vectors are kept in `data/vectors.db`; deleting it is harmless
+(**Update meaning search** makes it again). Deleting a library's indexed
+data deletes its vectors too.
+
+### Looks like this and search by a picture
+
+With an image embedding model set up (`image_embedding` in
+[SETTINGS.md](SETTINGS.md); for example EmbeddingGemma 2 with its image
+projector, run by llama.cpp's `llama-server`), every picture also gets a
+look vector: what the picture itself looks like, made from its preview
+(a 360-degree photo from the front view its thumbnail shows, a video from
+its poster frame), not from its description. **Looks like this** in the
+viewer (`L`, next to **More like this**) and on the details page searches
+`look:<picture>`: the pictures that look most like that one, best first,
+after the picture itself, with a strip of them under **More like this**.
+It finds what descriptions miss (the same kind of light, the same view,
+the same pattern) and only partly overlaps **More like this**, which goes
+by meaning. Words, filters and the timeline still choose among them
+(`look:123 year:2019`). It needs no model at search time, so it works in a
+published site too (the export's `looks` option).
+
+On your server's search page (on this computer), you can also drop a
+picture anywhere on the page, paste one (outside text fields), or choose
+one with the picture button in the search box: the server's image model
+makes its look vector and the pictures that look like it are shown, with
+a "Looks like: [picture]" chip above them that takes it away again. JPEG,
+PNG, WebP, HEIC, AVIF, GIF, BMP and TIFF pictures can be used (up to 20 MB;
+a 360-degree photo is compared by its front view, as the library's are).
+Until the server has compared a new picture, the results stay as they
+were, under a "Comparing: [picture]" chip; then the words in the search
+box go (the filters stay), and words typed afterwards choose among the
+pictures that look like it. A picture that cannot be compared leaves the
+results as they were, with a message. The picture is sent to your own
+server only and is never kept (not on disk, not in a log, not in the
+address); while the image model starts, a line above the results says so
+and the picture is compared a moment later.
+
+Making the look vectors is slow on a CPU (a few seconds a picture, so
+hours for a large library) and quick on a graphics card: no scan does it.
+The Manage page says how many pictures have their looks and offers
+**Update looks (N)** (or run `python scan.py --embed-images`); a scan's
+log and its line on the Manage page say how many wait. Copies of a
+picture share one look vector, and a moved or renamed picture keeps its
+own; deleting a library's indexed data deletes the look vectors no other
+picture shares. The vectors live in `data/image_vectors.db`: deleting it is
+harmless but costly, as making them again is another long run. Changing
+the image model, its `dims` or `max_edge` keeps the old looks working for
+**Looks like this**, but pictures dropped on the page can no longer be
+compared with them until you choose **Rebuild looks** on the Manage page
+(it asks first, as it makes them all again). Every run first checks the
+image model against vectors it made before (see `probe_check` in
+[SETTINGS.md](SETTINGS.md)); when they differ, nothing is made, the run
+says why, and the Manage page offers **Rebuild looks** for when the
+earlier vectors were the wrong ones.
 
 ### Place names
 
@@ -518,7 +765,11 @@ library that is turned on, see file and folder names, dates, GPS positions,
 place names and the map, camera EXIF data and the model that described each
 picture, download the original files with all their metadata, and turn off
 "Hide sensitive pictures". Hidden pictures and turned-off libraries stay
-out. In this mode Manage, Settings and jobs are off, on this computer too;
+out. With search by meaning set up, their searches are embedded by this
+computer's embedding model too (and may start it; each computer can ask
+a few times a second; only this server's own pages can ask, and other
+computers are not told why it is unavailable when it is). In this mode
+Manage, Settings and jobs are off, on this computer too;
 to manage the libraries at the same time, run a second server without
 `--host` on another port (`python serve.py serve --port 5001`). To share
 pictures beyond your household, publish a library instead (see [Publishing
@@ -535,7 +786,12 @@ The header of every page links to **Duplicates**, **Manage** and
   and the last job. Its buttons scan a library, describe it, do both, retry
   failed pictures, re-describe pictures described with an older prompt,
   refine documents and screenshots (when the library names a refine
-  endpoint), and build missing previews. **Process all libraries** does a scan and describe
+  endpoint), update search by meaning (**Update meaning search**, when it
+  is set up: the card says how many pictures have a meaning vector, and
+  a note at the top says how to set it up when it is not), make the
+  pictures' looks (**Update looks**, or **Rebuild looks** after their
+  settings changed; see [Looks like this](#looks-like-this-and-search-by-a-picture)),
+  and build missing previews. **Process all libraries** does a scan and describe
   of every library that is turned on. **Export...** publishes a library as
   a static website (see "Publishing a library").
 - **Add library** asks for the folder (type it, or use **Browse...**; a
@@ -571,7 +827,9 @@ The header of every page links to **Duplicates**, **Manage** and
   buttons off. With a `local_server` section in `config.json`, the
   **Model server** panel starts and stops the local model server and
   shows its state, settings and log (see [On your own computer
-  (llama.cpp)](#on-your-own-computer-llamacpp)).
+  (llama.cpp)](#on-your-own-computer-llamacpp)); an embeddings server for
+  [search by meaning](#search-by-meaning) is marked "Embeddings", and so
+  is its endpoint in the list.
 - **Duplicates** goes through the stacks that **Group similar** makes on
   the search page (identical files, and nearly the same shot taken at about
   the same time), the largest first, 20 to a page, for the library picked
@@ -634,11 +892,13 @@ On the Manage page, **Export...** on a library opens a dialog:
 
 1. **Options**, in plain words: web-size pictures, originals (with their
    hidden details removed) or thumbnails only; what to leave out
-   (screenshots, documents, scans, pictures flagged as private or sensitive,
-   pictures not checked yet); whether to also publish file names, folder
-   names or locations; and the site's title, a footer line, the output
-   folder, a zip file and search-engine indexing. The line at the bottom
-   counts the pictures that would be published.
+   (screenshots, documents, scans, videos, pictures flagged as private or
+   sensitive, pictures not checked yet); whether to also publish file
+   names, folder names or locations, and whether "More like this" goes
+   by meaning and "Looks like this" goes along (both on by default); and
+   the site's title, a footer line, the
+   output folder, a zip file and search-engine indexing. The line at the
+   bottom counts the pictures that would be published.
 2. **Review what will be published**: how many pictures, the estimated
    size (and a warning when the folder's disk has less room, or when the
    library's folder is offline and pictures need it), how many are left
@@ -723,6 +983,59 @@ options.
   its colours but loses its texts), and their ids do not reveal the
   database's. Each picture shows its title, description, tags, the text
   read in it, the day it was taken and the camera model and settings.
+- Videos are published as their poster frame. With **Include videos** in
+  the dialog (`--videos include`, or `"videos": "include"` in the saved
+  options) the videos browsers can play (H.264, or a playable copy made
+  with `video_proxies`) are published too, up to `max_video_mb` (200 MB)
+  each: copied into an MP4 without their metadata (no place, date or
+  device; the picture and sound are not re-encoded). HEVC videos without
+  a playable copy keep their poster only; the review step says how many.
+  The AI model checked only a few still frames of each video for private
+  or sensitive content and never heard its sound: watch the videos you
+  publish. **Videos** under **Leave out** leaves every video out.
+- With `similar` (on by default) the meaning vectors of the published
+  pictures go along (about 350 bytes each), so **More like this** and
+  `similar:` go by meaning in the site. Only vectors made from a
+  picture's current description are published, and a vector holds
+  nothing its description does not show; the review says how many
+  pictures have one (update search by meaning first, see [Search by
+  meaning](#search-by-meaning)). The pages load the vectors only when a
+  search first needs them.
+- With `looks` (on by default) the look vectors of the published pictures
+  go along (about 350 bytes each), so **Looks like this** and `look:` work
+  in the site; the review says how many pictures have one (see [Looks like
+  this](#looks-like-this-and-search-by-a-picture)). A look vector is made
+  from the picture itself, which the site shows anyway. Searching by a
+  dropped picture needs the image model of your server: published sites
+  do not have it.
+- With **Search by meaning in the browser** (`meaning`, on by default when
+  it can be used) the embedding model goes along too, so typed searches
+  in the site find pictures by meaning as they do on your server, with the
+  same **Words / Words + meaning / Meaning** switch. It needs a small
+  model that can run in a browser (mdbr-leaf-ir, see [Search by
+  meaning](#search-by-meaning); not Qwen3-Embedding), its license file and
+  up-to-date vectors; the Export dialog says what is missing, and the
+  review step how large it is: about 31 MB of files, of which a visitor
+  downloads about 23 MB (web hosts send them compressed) once, at their
+  first search by meaning, never before. Visitors who choose **Words**
+  never download it, and with their browser's data saver on a **Search by
+  meaning (23 MB)** button asks first. Until it has loaded the site shows
+  the word matches, with the download's progress above them; the
+  pictures found by meaning join them a moment later. It then works
+  offline and when the site is opened from disk. It runs in the page
+  (WebAssembly when the browser allows it, plain JavaScript otherwise,
+  with the same results, about five times slower) and checks itself when
+  it loads: a damaged download, a browser that cannot run it, or one that
+  makes other vectors than your server did, searches by the words, with a
+  note above the results. Nothing is asked of any other site. A web host
+  that sends a `Content-Security-Policy` header must allow
+  `'wasm-unsafe-eval'` in its `script-src` for the WebAssembly part
+  (GitHub Pages sends none); without it the model runs in plain
+  JavaScript. The search and details pages credit the model at their foot
+  and link to its license (`data/meaning/LICENSE.txt`; the map page,
+  which does not use the model, has no foot); the model files hold only
+  the model (its weights and vocabulary), two made-up test sentences and
+  their vectors.
 - `--zip` also writes `<folder>.zip` next to the folder. A file of that
   name is only replaced when an earlier export made it and it was not
   changed since; otherwise the export stops before writing anything. The
@@ -807,14 +1120,20 @@ private:
 - `index.db` - the database: file names, folders, dates, camera, EXIF and
   GPS data, the descriptions, and your own titles, descriptions and tags
   (kept apart from the model's).
-- `thumbs.db` and `previews/` - thumbnails, and 2048 px previews and 360
-  panoramas (about 0.5 MB per picture).
+- `thumbs.db` and `previews/` - thumbnails, and 2048 px previews, 360
+  panoramas and the contact sheets of videos (about 0.5 MB per picture).
+- `proxies/` - playable copies of videos (only with `video_proxies`).
 - `jobs.db` and `logs/` - the Manage page's jobs and their logs, which name
   files. With the `LOG_ERRORS` environment variable set, the LLM's replies
   to failed requests are saved in `logs/` too. `logs/model-server.log` is
   the output of the model server the Settings page starts, and
   `model-server.json` (changed under `model-server.lock`) records it (its
   process id and start time) while it runs.
+- `vectors.db` - the meaning vectors of the pictures (see [Search by
+  meaning](#search-by-meaning)); made again when deleted.
+- `image_vectors.db` - the look vectors of the pictures (see [Looks like
+  this](#looks-like-this-and-search-by-a-picture)); safe to delete, but
+  making them again takes a long run of the image model.
 - `exports/` - static sites (`exports/<library name>/`) and the list of
   files each export wrote (`exports/state/`).
 - `reports/` - model comparison reports.
@@ -868,12 +1187,23 @@ writes the missing or damaged ones.
 - `scan.py` - scan libraries, then request descriptions
 - `describe.py`, `prompts.py` - the describe step and the prompt it sends
 - `refine.py` - which pictures the refine pass describes again
-- `local_server.py` - starts and stops the local model server (Settings
-  page, describe jobs, the daily stop time)
+- `local_server.py` - starts and stops the local model servers (Settings
+  page, describe and embed jobs, searches by meaning, the daily stop time)
+- `browser_model.py` - the embedding model of search by meaning made
+  ready for a published site (and the WebAssembly kernel of
+  `static/embed-engine.js`, which runs it there)
+- `embeddings.py` - search by meaning: the meaning vectors of the
+  pictures (`data/vectors.db`), the embed step, and the server's answers
+  to `/api/vectors` and `/api/embed`
+- `looks.py` - looks: the look vectors of the pictures
+  (`data/image_vectors.db`), the job that makes them, and the server's
+  answers to `/api/looks` and `/api/looks/query`
 - `export.py` - publish one library as a static website
 - `compare_models.py` - compare how endpoints describe the same images
 - `progress.py`, `world_map.py`, `make_tiles.py`, `make_places.py` - see
   [Other tools](#other-tools)
+- `videos.py` - videos: what ffprobe says, posters, contact sheets,
+  copies without metadata and playable copies (ffmpeg)
 - `places.py` - place names: the GeoNames download, the place index and
   the nearest town of a GPS position (`static/place-names.js` is their
   part of the Manage page)
@@ -890,6 +1220,8 @@ writes the missing or damaged ones.
   by every page; `site.js` is where the pages get their data, from the
   server or from a static export; `search-core.js` is the search engine and
   `viewer.js` the picture viewer, both shared with a static export;
+  `embed-engine.js` and `embed-kernel.js` run the embedding model in a
+  published site (only there, and only once a search needs it);
   `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
   `duplicates.js` the Duplicates page; `manage.js` and `settings.js` run
   Manage and Settings, `model-server.js` the Settings page's Model server
@@ -949,6 +1281,19 @@ Other changes to be aware of:
   change and saves a copy of the database as it was first
   (`data/index.db.bak-v<old version>`); delete the copy once all is well.
   An older checkout cannot open the changed database.
+- Videos are indexed now (with ffmpeg installed; see [Videos](#videos)):
+  the first scan after upgrading reads the videos in your libraries. The
+  database gets two columns for them (`media`, `duration`), with the usual
+  copy of the database as it was (`data/index.db.bak-v4`).
+- Search by meaning now recommends a small model, mdbr-leaf-ir, which also
+  runs in published sites, and its `query_prefix` is the new default.
+  With Qwen3-Embedding set `query_prefix` to its instruction (see
+  [SETTINGS.md](SETTINGS.md#embedding)), as the default changed; a model
+  of its size cannot go with a published site. Switching models makes
+  every meaning vector again (**Update meaning search**: a few minutes
+  with the small model on a CPU), and so does the first embed run after
+  upgrading when the model file is known (`model_file`, or a `local_server`
+  entry): the vectors are tied to that file now.
 - Unstitched 360-degree photos (Insta360 `.insp`) are stitched again by the
   first scan after upgrading, now with the seams blended: only their
   previews, panoramas and thumbnails change. The soft fill over a tripod or
@@ -977,7 +1322,17 @@ Other changes to be aware of:
     python -m unittest discover -s tests
 
 The page scripts' own tests (`tests/js/`) run as part of this when Node.js
-is installed, and are skipped when it is not.
+is installed, and are skipped when it is not. No test needs a model or
+ffmpeg: `tests/fake_llm.py`, `tests/fake_model_server.py` and
+`tests/fake_embed_server.py` stand in for the models on 127.0.0.1, and
+`tests/fake_ffmpeg.py` for ffmpeg and ffprobe. A few video tests also use
+a real ffmpeg when there is one on the PATH (or named by the
+`SEARCH_IMAGES_TEST_FFMPEG` environment variable), and are skipped
+otherwise. The browser's embedding engine is tested on tiny made-up
+models (`tests/fake_gguf.py`) against what llama.cpp makes of them,
+kept in `tests/fixtures/fake_bert_llamacpp.json`; after a change to the
+made-up models, `SEARCH_IMAGES_LLAMA_SERVER=/path/to/llama-server python
+tests/make_embed_fixture.py` makes that file again.
 
 `tests/test_repo_hygiene.py` checks every file git would commit for
 personal details (absolute paths, host names, model files). To add your own

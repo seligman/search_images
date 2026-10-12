@@ -257,7 +257,7 @@ def system_prompt(profile=DEFAULT_PROFILE):
     return _SYSTEM_PROMPTS[check_profile(profile)]
 
 
-def user_text(library, taken_at=None, projection=""):
+def user_text(library, taken_at=None, projection="", video=None):
     """The text sent after the image: "Describe this image." plus the library's notes.
 
     library is a library dict (or None); its optional "context_notes" (at
@@ -266,12 +266,15 @@ def user_text(library, taken_at=None, projection=""):
     ('YYYY-MM-DD...') adds the month and year the picture was taken; the
     describe step does not pass it (no EXIF data leaves the machine), but
     callers that want to may. projection ("equirectangular" or
-    "dual_fisheye") adds projection_note() for a 360-degree photo.
+    "dual_fisheye") adds projection_note() for a 360-degree photo. video
+    ((frames, seconds)) adds video_note() for a video's contact sheet.
     """
     parts = [USER_TEXT]
     note = projection_note(projection)
     if note:
         parts.append(note)
+    if video:
+        parts.append(video_note(*video))
     notes = library.get("context_notes") if isinstance(library, dict) else None
     if isinstance(notes, str) and notes.strip():
         notes = notes.strip()[:NOTES_LENGTH]
@@ -415,6 +418,22 @@ def search_terms(info, name="", path="", taken_at="", projection=""):
         if 1 <= month <= 12:
             parts.append(_MONTHS[month - 1])
     return " ".join(part.strip() for part in parts if part and part.strip()).lower()
+
+
+def video_note(frames, seconds=None):
+    """A sentence to add to the prompt for a video's contact sheet (see videos.py).
+
+    A video is sent as one picture holding frames frames from it, in a grid
+    (one frame when its length is not known). The JSON asked for is the
+    same; the description should say what happens.
+    """
+    whole = int(round(seconds)) if isinstance(seconds, (int, float)) and seconds > 0 else 0
+    length = ("a video of %d second%s" % (whole, "" if whole == 1 else "s")
+              if whole else "a video")
+    if not frames or frames <= 1:
+        return "This picture is a frame from %s: describe what the video shows." % length
+    return ("This picture holds %d frames, in order (left to right, top to bottom), from %s: "
+            "describe what happens in the video, not the grid of frames." % (frames, length))
 
 
 def projection_note(projection):

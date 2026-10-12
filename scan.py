@@ -27,7 +27,15 @@ Descriptions are never thrown away by accident:
   library (a new copy is shown when another copy is shown there: the owner
   kept that one), and a shown image stays shown.
 
-Then the describe step (describe.py) runs for images without a description.
+Videos are indexed too when ffmpeg and ffprobe are there and the library's
+"videos" setting is on (see videos.py): their poster frame takes the place
+of a photo's picture (thumbnail, preview, dHash) and a contact sheet of a
+few frames is kept for describing. Without ffmpeg, videos are listed but
+not read (those already indexed are kept as they are).
+
+Then the describe step (describe.py) runs for images without a description,
+and, when search by meaning is set up (config.json "embedding"), the embed
+step (embeddings.py) for pictures whose meaning vector is missing or stale.
 
 Usage:
     python scan.py [--library NAME_OR_ID ...] [--no-scan] [--no-describe]
@@ -35,11 +43,16 @@ Usage:
                    [--redescribe-stale] [--limit N] [--endpoint NAME]
                    [--allow-mass-removal] [--verbose]
     python scan.py --refine [--library NAME_OR_ID ...] [--limit N] [--retry-failed]
+    python scan.py --embed [--library NAME_OR_ID ...] [--limit N]
+    python scan.py --embed-images [--library NAME_OR_ID ...] [--limit N] [--rebuild-looks]
     python scan.py --list-endpoints
     python scan.py --test-endpoint NAME [--image PATH]
 
 --refine only runs the refine pass (describe.refine_pending): documents and
-screenshots described again with each library's refine endpoint.
+screenshots described again with each library's refine endpoint. --embed
+only runs the embed step (search by meaning). --embed-images only makes the
+looks (looks.py: image vectors for "Looks like this"), which no other run
+makes: they need the image model (best on a GPU).
 
 To stop a long run early, create data/abort (or a file named "abort" or
 "abort.txt" in the current directory). Work done so far is kept; run again to
@@ -51,6 +64,7 @@ import collections
 import concurrent.futures
 import json
 import os
+import sqlite3
 import sys
 import time
 
@@ -58,12 +72,15 @@ import cache
 import common
 import db
 import describe
+import embeddings
 import image_edits
 import images
 import jobs
 import llm
+import looks
 import not_duplicates
 import places
+import videos
 
 COMMIT_ROWS = 100           # commit after this many written rows...
 COMMIT_SECONDS = 3.0        # ...or this many seconds, whichever comes first
@@ -94,7 +111,7 @@ def _error_text(error):
 
 
 class LibraryWalk:
-    """The image files below a library root.
+    """The image files (and with videos, the video files) below a library root.
 
     Iterate to get (rel_path, size, mtime, ctime) for each image file that no
     ignore pattern excludes; rel_path is relative to the root and uses "/".
@@ -116,9 +133,10 @@ class LibraryWalk:
         complete    True when every folder was listed
     """
 
-    def __init__(self, root, patterns, helper=None, ctx=None, label=""):
+    def __init__(self, root, patterns, helper=None, ctx=None, label="", videos=False):
         self.root = root
         self.patterns = list(patterns or [])
+        self.videos = bool(videos)
         self.helper = helper
         self.ctx = ctx
         self.label = label or root
@@ -198,7 +216,7 @@ class LibraryWalk:
                     is_dir = entry.is_dir(follow_symlinks=not link)
                     if is_dir and common.should_prune_dir(rel, self.patterns):
                         continue
-                    if not is_dir and (not common.is_image_file(entry.name)
+                    if not is_dir and (not common.is_media_file(entry.name, self.videos)
                                        or common.matches_ignore(rel, self.patterns)):
                         continue
                     if link:
@@ -246,7 +264,7 @@ class LibraryWalk:
                                if not common.should_prune_dir(prefix + name, self.patterns)]
                 for filename in sorted(filenames):
                     rel = prefix + filename
-                    if not common.is_image_file(filename) or common.matches_ignore(
+                    if not common.is_media_file(filename, self.videos) or common.matches_ignore(
                             rel, self.patterns):
                         continue
                     stat = common.stat_path(self.helper, os.path.join(dirpath, filename))
@@ -262,9 +280,9 @@ class LibraryWalk:
             self._error("", error)
 
 
-def walk_library(root, patterns, helper=None, ctx=None, label=""):
-    """Return a LibraryWalk over a library root (see LibraryWalk)."""
-    return LibraryWalk(root, patterns, helper, ctx, label)
+def walk_library(root, patterns, helper=None, ctx=None, label="", videos=False):
+    """Return a LibraryWalk over a library root (see LibraryWalk); videos: list videos too."""
+    return LibraryWalk(root, patterns, helper, ctx, label, videos)
 
 
 def excluded_by_ignores(path, patterns):
@@ -352,18 +370,36 @@ def _parallel_reads(threads, items, read, handle, should_stop, ctx, flush=None):
 
 
 def _missing_decoder(error):
-    """True when a read failed only because an optional decoder is not installed."""
+    """True when a read failed only because an optional decoder (or ffmpeg) is not installed."""
+    if isinstance(error, videos.ToolsMissing):
+        return True
     text = str(error)
     return images.HEIF_MISSING in text or images.AVIF_MISSING in text
 
 
-def _read_original(root, rel, helper, want_previews, mtime):
+def video_options(video, library):
+    """What _read_original needs to read a library's videos: {tools, sheet_edge, frames}."""
+    return {"tools": video.tools, "sheet_edge": video.sheet_edge(library),
+            "frames": video.frames}
+
+
+def _read_original(root, rel, helper, want_previews, mtime, video=None):
     """Worker thread: images.read_image() for one file. Returns (result, error); never raises.
 
     With previews, a 360-degree photo also gets its pano (see cache.PreviewStore).
+    A video is read by videos.read_video() with video (video_options): its
+    poster is the preview and, with previews, it gets a contact sheet.
+    Videos are read from the file itself (the helper's hooks are for
+    pictures).
     """
     full = os.path.join(root, *rel.split("/"))
     try:
+        if common.is_video_file(rel):
+            video = video or {}
+            return videos.read_video(full, video.get("tools"), want_preview=want_previews,
+                                     mtime=mtime, sheet_edge=video.get("sheet_edge")
+                                     or common.DEFAULT_MAX_IMAGE_EDGE,
+                                     frames=video.get("frames") or videos.DEFAULT_FRAMES), None
         return images.read_image(full, helper, want_preview=want_previews, mtime=mtime,
                                  want_pano=want_previews), None
     except Exception as error:
@@ -401,12 +437,14 @@ def _update_row(conn, image_id, values, extra=""):
 
 
 def _delete_preview(previews, library_id, image_id, ctx):
-    """Remove a preview file and its pano (best effort; a failure is only logged)."""
+    """Remove a preview file, its pano or contact sheet, and a video's playable copy
+    (best effort; a failure is only logged)."""
     try:
         previews.delete_both(library_id, image_id)
     except OSError as error:
         ctx.log("Could not delete the preview of image %d: %s"
                 % (image_id, _error_text(error)), "warn")
+    videos.delete_proxies(library_id, [image_id])
 
 
 def _store_pano(previews, library_id, image_id, pano, ctx, rel):
@@ -429,6 +467,28 @@ def _store_pano(previews, library_id, image_id, pano, ctx, rel):
             pass
         ctx.log("Could not save the 360-degree panorama of %s: %s"
                 % (rel, _error_text(error)), "warn")
+    return False
+
+
+def _store_sheet(previews, library_id, image_id, sheet, ctx, rel):
+    """After a new preview was written: write a video's contact sheet, or remove an older one.
+
+    sheet is the read result's sheet (None for a picture). A sheet that
+    cannot be written is removed (the describe step makes one when it needs
+    it).
+    """
+    try:
+        if sheet:
+            previews.write_sheet(library_id, image_id, sheet)
+            return True
+        previews.delete_sheet(library_id, image_id)
+    except OSError as error:
+        try:
+            previews.delete_sheet(library_id, image_id)
+        except OSError:
+            pass
+        ctx.log("Could not save the contact sheet of %s: %s" % (rel, _error_text(error)),
+                "warn")
     return False
 
 
@@ -477,6 +537,7 @@ def _metadata(result):
         "tz_offset": result["tz_offset"], "camera": result["camera"],
         "lat": result["lat"], "lon": result["lon"], "exif": exif,
         "projection": result.get("projection", ""),
+        "media": result.get("media") or "image", "duration": result.get("duration"),
     }
     values.update(places.place_columns(result["lat"], result["lon"]))
     return values
@@ -489,7 +550,7 @@ _EMPTY_DESCRIPTION = {"info": "", "described": 0, "prompt_ver": 0, "provenance":
 
 _ROW_SQL = """
     SELECT id, path, size, mtime, content_hash, dhash, width, height, described,
-           hidden, has_preview, missing_since
+           hidden, has_preview, missing_since, media
     FROM images WHERE library_id = ?"""
 
 _SOURCE_COLUMNS = "id, library_id, path, " + ", ".join(_DESCRIPTION_COLUMNS) + ", missing_since"
@@ -548,7 +609,7 @@ class LibraryScan:
 
     def __init__(self, conn, library, ctx, helper=None, thumbs=None, previews=None,
                  threads=6, allow_mass_removal=False, purge_after_days=30, now=None,
-                 verbose=False):
+                 verbose=False, video=None):
         self.conn = conn
         self.library = library
         self.library_id = library["id"]
@@ -563,6 +624,11 @@ class LibraryScan:
         self.previews = previews
         self.threads = max(1, int(threads or 1))
         self.want_previews = bool(library.get("previews", True))
+        # Videos (videos.py): listed when the library has them on, read only
+        # when ffmpeg and ffprobe are there.
+        self.videos_on = common.library_videos(library)
+        self.video = video if video is not None else videos.setup()
+        self.video_read = video_options(self.video, library)
         self.allow_mass_removal = allow_mass_removal
         self.purge_after_days = purge_after_days
         self.now = time.time() if now is None else now
@@ -602,7 +668,7 @@ class LibraryScan:
             "changed": 0, "moved": 0, "copied": 0, "unchanged": 0, "restored": 0,
             "failed": 0, "skipped_failed": 0, "unsupported": 0, "read_errors": 0,
             "missing": 0, "protected": 0, "links": 0, "excluded": 0, "guarded": 0,
-            "removed_moved": 0, "purged": 0, "errors": [],
+            "removed_moved": 0, "purged": 0, "errors": [], "videos_skipped": 0,
         }
 
     # -- bookkeeping --------------------------------------------------------
@@ -640,13 +706,14 @@ class LibraryScan:
             "SELECT 1 FROM image_edits LIMIT 1").fetchone() is not None
 
     def delete_rows(self, ids):
-        """Delete image rows with their thumbnails and previews (no commit)."""
+        """Delete image rows with their thumbnails, previews and meaning vectors (no commit)."""
         ids = list(ids)
         for start in range(0, len(ids), 500):
             chunk = ids[start:start + 500]
             self.conn.execute("DELETE FROM images WHERE id IN (%s)"
                               % ",".join("?" * len(chunk)), chunk)
         self.thumbs.delete(ids, commit=False)
+        embeddings.forget(ids)
         for image_id in ids:
             _delete_preview(self.previews, self.library_id, image_id, self.ctx)
 
@@ -665,7 +732,8 @@ class LibraryScan:
         ctx.log("Scanning library %s (%s)" % (self.label, self.root or "no folder set"))
         self.timer = _CommitTimer(self.conn, self.thumbs)
         self._load()
-        walk = walk_library(self.root, self.patterns, self.helper, ctx, self.label)
+        walk = walk_library(self.root, self.patterns, self.helper, ctx, self.label,
+                            videos=self.videos_on)
         ctx.stage("scan")
         entries = list(walk)
         self.walked = {entry[0] for entry in entries}
@@ -705,6 +773,11 @@ class LibraryScan:
         finally:
             self.summary["errors"] = walk.errors + self.read_errors
             self._carry_over_pairs()
+        if self.summary["videos_skipped"]:
+            # (Not a warning: the Manage page says it once, and nothing is
+            # wrong with the videos.)
+            ctx.log("%d video(s) in %s were not read. %s" % (
+                self.summary["videos_skipped"], self.label, self.video.problem()))
         ctx.log(self._summary_line())
         return self.summary
 
@@ -742,9 +815,21 @@ class LibraryScan:
         for entry in entries:
             rel, size, mtime, _ctime = entry
             row = self.rows.get(rel)
-            if (row is not None and row["size"] == size
-                    and abs(row["mtime"] - mtime) < MTIME_TOLERANCE
-                    and row["id"] in self.thumb_ids):
+            unreadable_video = self.video.tools is None and common.is_video_file(rel)
+            if unreadable_video and row is None:
+                # Without ffmpeg a new video cannot be read: it is counted
+                # (unless it is known to be unreadable anyway), and read by
+                # a scan once ffmpeg is there.
+                if _failed_before(self.failures, rel, size, mtime):
+                    self.summary["skipped_failed"] += 1
+                else:
+                    self.summary["videos_skipped"] += 1
+                self.ctx.step(item=rel, quick=True)
+                continue
+            if row is not None and (unreadable_video or (
+                    row["size"] == size and abs(row["mtime"] - mtime) < MTIME_TOLERANCE
+                    and row["id"] in self.thumb_ids)):
+                # (An indexed video stays as it is while ffmpeg is missing.)
                 self.summary["unchanged"] += 1
                 if row["missing_since"] is not None:
                     self.conn.execute("UPDATE images SET missing_since = NULL WHERE id = ?",
@@ -764,7 +849,8 @@ class LibraryScan:
     def _read(self, entry):
         """Worker thread: read one file. Returns (result, error); never raises."""
         rel, _size, mtime, _ctime = entry
-        return _read_original(self.root, rel, self.read_helper, self.want_previews, mtime)
+        return _read_original(self.root, rel, self.read_helper, self.want_previews, mtime,
+                              self.video_read)
 
     def _handle(self, entry, outcome):
         rel, size, mtime, ctime = entry
@@ -933,6 +1019,9 @@ class LibraryScan:
             else:
                 _store_pano(self.previews, self.library_id, image_id, result.get("pano"),
                             self.ctx, rel)
+                if result.get("media") == videos.MEDIA_VIDEO or row is not None:
+                    _store_sheet(self.previews, self.library_id, image_id,
+                                 result.get("sheet"), self.ctx, rel)
         self._wrote()
 
     def _insert(self, rel, size, mtime, ctime, metadata, has_preview, now):
@@ -963,9 +1052,12 @@ class LibraryScan:
         self.new_content.add(image_id)
         if moved:
             # The old row was the same file at its previous path; the
-            # owner's edit (image_edits) moves along with it.
+            # owner's edit (image_edits) moves along with it, and so does a
+            # video's playable copy.
             if source["id"] in self.edited:
                 image_edits.give(self.conn, source["id"], [image_id])
+            if metadata.get("media") == videos.MEDIA_VIDEO:
+                videos.move_proxy(self.library_id, source["id"], image_id)
             self.delete_rows([source["id"]])
             self.summary["moved"] += 1
             self._note("moved", "Moved %s -> %s" % (source["path"], rel))
@@ -1133,8 +1225,10 @@ class LibraryScan:
                           if (to_mark or self._has_missing() or self.edit_left) else None)
 
         # Files now excluded by ignore patterns were not deleted, but they
-        # are no longer part of the library.
-        excluded = [row for row in to_mark if excluded_by_ignores(row["path"], self.patterns)]
+        # are no longer part of the library; nor are its videos once they
+        # were turned off.
+        excluded = [row for row in to_mark if excluded_by_ignores(row["path"], self.patterns)
+                    or (not self.videos_on and row["media"] == videos.MEDIA_VIDEO)]
         # Files whose content was listed at another path in this walk moved.
         excluded_ids = {row["id"] for row in excluded}
         moved = [row for row in to_mark if row["id"] not in excluded_ids
@@ -1145,8 +1239,14 @@ class LibraryScan:
         if excluded:
             self._set_missing([row["id"] for row in excluded], self.now)
             self.summary["excluded"] = len(excluded)
-            ctx.log("%d file(s) in %s are now excluded by ignore patterns; they were marked "
-                    "missing." % (len(excluded), self.label))
+            turned_off = sum(1 for row in excluded
+                             if not excluded_by_ignores(row["path"], self.patterns))
+            if turned_off:
+                ctx.log("%d video(s) in %s are no longer indexed (videos are off for this "
+                        "library); they were marked missing." % (turned_off, self.label))
+            if len(excluded) > turned_off:
+                ctx.log("%d file(s) in %s are now excluded by ignore patterns; they were "
+                        "marked missing." % (len(excluded) - turned_off, self.label))
             for row in excluded:
                 if row["id"] in self.edited:
                     self._share_edit(row)
@@ -1209,7 +1309,7 @@ class LibraryScan:
         (missing): it moved away, and is shown again when it comes back.
         """
         missing = [row for row in self.conn.execute(
-            "SELECT " + _SOURCE_COLUMNS + ", content_hash, size, dhash FROM images "
+            "SELECT " + _SOURCE_COLUMNS + ", content_hash, size, dhash, media FROM images "
             "WHERE library_id = ? AND missing_since IS NOT NULL", (self.library_id,))
                    if row["path"] not in self.walked]
         twins_of = {row["id"]: self._twins(row, present_walked) for row in missing}
@@ -1237,6 +1337,9 @@ class LibraryScan:
                     [row["info"], row["prompt_ver"], row["provenance"]] + ids)
             if row["hidden"] and target is not None:
                 self.conn.execute("UPDATE images SET hidden = 1 WHERE id = ?", (target,))
+            if target is not None and row["media"] == videos.MEDIA_VIDEO:
+                # (The same content: its playable copy fits the new row.)
+                videos.move_proxy(self.library_id, row["id"], target)
             if row["id"] in self.edited:
                 # The owner's edit goes to the file at the new path: the one
                 # it moved to, else one added in this walk, else the newest
@@ -1272,6 +1375,7 @@ class LibraryScan:
                 self._hand_on_edit(row)
         if rows:
             self.delete_rows([row["id"] for row in rows])
+            looks.forget_unreferenced(self.conn)    # (looks no row needs any more)
             self.summary["purged"] = len(rows)
             self.ctx.log("Removed %d file(s) that have been missing for more than %g days."
                          % (len(rows), days))
@@ -1279,25 +1383,27 @@ class LibraryScan:
 
 def scan_library(conn, library, ctx, helper=None, thumbs=None, previews=None,
                  threads=6, allow_mass_removal=False, purge_after_days=30, now=None,
-                 verbose=False):
+                 verbose=False, video=None):
     """Bring the index of one library up to date with its folder.
 
     conn is an index.db connection, ctx a jobs.JobContext; thumbs and
     previews default to cache.ThumbStore() and cache.PreviewStore(). now
     (seconds) is the time used for missing_since and purging. verbose logs
-    every added or changed file instead of the first FILE_LOG_LIMIT. Returns
+    every added or changed file instead of the first FILE_LOG_LIMIT. video
+    is a videos.Setup (default: one for config.json). Returns
     a summary dict with counts (files, added, updated, changed, moved,
     copied, unchanged, restored, failed, skipped_failed, unsupported,
     read_errors, missing, protected, links, excluded, guarded,
-    removed_moved, purged), flags (offline, aborted, complete) and errors
-    [(rel_path, message)].
+    removed_moved, purged, videos_skipped: new videos that were not read
+    because ffmpeg is missing), flags (offline, aborted, complete) and
+    errors [(rel_path, message)].
     """
     own_thumbs = thumbs is None
     thumbs = thumbs or cache.ThumbStore()
     try:
         start_stitch_state(conn, library["id"])
         scan = LibraryScan(conn, library, ctx, helper, thumbs, previews or cache.PreviewStore(),
-                           threads, allow_mass_removal, purge_after_days, now, verbose)
+                           threads, allow_mass_removal, purge_after_days, now, verbose, video)
         return scan.run()
     finally:
         if own_thumbs:
@@ -1379,11 +1485,22 @@ def _restitch_ids(conn, library_id):
 
 _BACKFILL_SQL = """
     SELECT id, path, size, mtime, content_hash, dhash, width, height, has_preview,
-           projection, described
+           projection, described, media,
+           CASE WHEN media = 'video' THEN exif ELSE '' END AS video_exif
     FROM images WHERE library_id = ? AND missing_since IS NULL ORDER BY id"""
 
 
-def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, threads=6):
+def _sheet_outdated(row, frames):
+    """True for a video row whose stored contact sheet was made for another frame count.
+
+    Also for a sheet whose frames were not recorded (made by an earlier
+    version): the describe step tells the model how many frames it holds.
+    """
+    return videos.sheet_frames(row["video_exif"])[1] != frames
+
+
+def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, threads=6,
+             video=None):
     """Read rows that lack a content hash, dHash, size or (wanted) preview.
 
     Rows imported from the old database have no content hash or preview;
@@ -1395,6 +1512,10 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     only those larger than their preview get one, see images.has_pano),
     and unstitched 360 photos stitched by an older version or with other
     pole fill settings (see _restitch_ids; their descriptions are kept).
+    Videos with a preview but no contact sheet, or one made for another
+    "video_frames" setting, are read again for one (video is a
+    videos.Setup, default: one for config.json; without ffmpeg videos are
+    left alone).
     Rows of files the ignore patterns now exclude are left alone. It runs
     as stage "previews", can be stopped at any point and continues where
     it left off. Returns a summary dict: {needed, filled, failed, changed,
@@ -1404,13 +1525,14 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     thumbs = thumbs or cache.ThumbStore()
     previews = previews or cache.PreviewStore()
     try:
-        return _backfill(conn, library, ctx, helper, thumbs, previews, threads)
+        return _backfill(conn, library, ctx, helper, thumbs, previews, threads,
+                         video if video is not None else videos.setup())
     finally:
         if own_thumbs:
             thumbs.close()
 
 
-def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
+def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
     library_id = library["id"]
     root = common.library_root(library)
     patterns = common.ignore_patterns(library)
@@ -1418,7 +1540,9 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
     summary = {"needed": 0, "filled": 0, "failed": 0, "changed": 0, "unsupported": 0,
                "aborted": False, "panoramas": 0, "panos": 0, "restitched": 0}
     redescribe = []
-    on_disk, panos_on_disk = previews.stored_ids(library_id)
+    on_disk, panos_on_disk, sheets_on_disk = previews.stored_sets(library_id)
+    read_videos = video.tools is not None and common.library_videos(library)
+    video_read = video_options(video, library)
     failures = _load_failures(conn, library_id)
     stitch_key, restitch = _restitch_ids(conn, library_id)
     pending_before = len(restitch)
@@ -1430,6 +1554,9 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
             # is never trusted; it may hold an older picture.)
             conn.execute("UPDATE images SET has_preview = 0 WHERE id = ?", (row["id"],))
             has_preview = False
+        is_video = row["media"] == videos.MEDIA_VIDEO
+        if is_video and not read_videos:
+            continue
         if (row["content_hash"] and row["dhash"] and row["width"] > 0 and row["height"] > 0
                 and (has_preview or not want_previews)
                 and row["projection"] != images.PROJECTION_UNKNOWN
@@ -1437,7 +1564,10 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
                 and not (want_previews and has_preview
                          and row["projection"] in images.PROJECTIONS_360
                          and images.has_pano(row["width"], row["height"])
-                         and row["id"] not in panos_on_disk)):
+                         and row["id"] not in panos_on_disk)
+                and not (is_video and want_previews and has_preview
+                         and (row["id"] not in sheets_on_disk
+                              or _sheet_outdated(row, video.frames)))):
             continue
         if (excluded_by_ignores(row["path"], patterns)
                 or _failed_before(failures, row["path"], row["size"], row["mtime"])):
@@ -1462,7 +1592,8 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
     rekeyed = {}                # not_duplicates keys that change (see LibraryScan)
 
     def read(row):
-        return _read_original(root, row["path"], read_helper, want_previews, row["mtime"])
+        return _read_original(root, row["path"], read_helper, want_previews, row["mtime"],
+                              video_read)
 
     def handle(row, outcome):
         result, error = outcome
@@ -1507,6 +1638,9 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
                     if _store_pano(previews, library_id, row["id"], result.get("pano"), ctx,
                                    row["path"]):
                         summary["panos"] += 1
+                    if result.get("media") == videos.MEDIA_VIDEO:
+                        _store_sheet(previews, library_id, row["id"], result.get("sheet"),
+                                     ctx, row["path"])
             _update_row(conn, row["id"], values)
             thumbs.put(row["id"], result["thumb"], commit=False)
             summary["filled"] += 1
@@ -1553,19 +1687,26 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads):
 def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
         newest_first=None, retry_failed=False, allow_mass_removal=False, helper=None,
         now=None, verbose=False, redescribe_stale=False, limit=None, endpoint_name=None,
-        conn=None):
+        conn=None, embed_vectors=True):
     """Scan (and back-fill) the selected libraries, then describe what needs it.
 
     library_ids limits the run to those library ids (default: every enabled
     library). db.init() must have run in this process. redescribe_stale,
     limit and endpoint_name are passed on to describe.describe_pending.
     conn is an index.db connection to use (default: one opened and closed
-    here). Returns {"libraries": [scan summaries], "describe": describe
-    summary or None, "stopped": bool}.
+    here). Unless the run stopped (or embed_vectors is False), the embed
+    step (embeddings.after_run) follows when search by meaning is set up.
+    Looks (looks.py) are not made here (a job for the image model of its
+    own): when they are set up, the log says how many pictures wait.
+    Returns {"libraries": [scan summaries], "describe": describe summary
+    or None, "embed": embed summary or None, "looks_pending": pictures
+    without looks (None when looks are off), "stopped": bool}.
     """
     libraries = describe.selected_libraries(config, library_ids)
-    summary = {"libraries": [], "describe": None, "stopped": False}
+    summary = {"libraries": [], "describe": None, "embed": None, "looks_pending": None,
+               "stopped": False}
     threads = reader_threads(config)
+    video = videos.setup(config)
     own_conn = conn is None
     if own_conn:
         conn = db.connect()
@@ -1582,7 +1723,8 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
                         continue
                     result = scan_library(conn, library, ctx, helper, thumbs, previews, threads,
                                           allow_mass_removal,
-                                          config.get("purge_after_days", 30), now, verbose)
+                                          config.get("purge_after_days", 30), now, verbose,
+                                          video)
                     summary["libraries"].append(result)
                     if result["aborted"]:
                         summary["stopped"] = True
@@ -1590,7 +1732,7 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
                     if result["offline"]:
                         continue
                     result["backfill"] = backfill(conn, library, ctx, helper, thumbs,
-                                                  previews, threads)
+                                                  previews, threads, video)
                     if result["backfill"]["aborted"]:
                         summary["stopped"] = True
                         break
@@ -1613,12 +1755,55 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
             summary["stopped"] = summary["describe"]["stopped"]
         elif ctx.should_stop():
             summary["stopped"] = True
+        if embed_vectors and not summary["stopped"]:
+            summary["embed"] = embeddings.after_run(
+                conn, config, ctx, library_ids=[library["id"] for library in libraries
+                                                if not jobs.library_removed(ctx, library["id"])])
+            if summary["embed"] is not None and summary["embed"]["stopped"]:
+                summary["stopped"] = True
+        if scan_images and not summary["stopped"]:
+            summary["looks_pending"] = looks_pending(conn, config, ctx, [
+                library["id"] for library in libraries])
     finally:
         if own_conn:
             conn.close()
         # The towns take memory; a later run loads them again.
         places.release()
     return summary
+
+
+def looks_pending(conn, config, ctx, library_ids):
+    """How many pictures of these libraries have no looks yet (logged when some do),
+    or None when looks are not set up."""
+    if not looks.configured(config):
+        return None
+    try:
+        counted = looks.counts(conn, config, library_ids)
+    except (sqlite3.Error, OSError):
+        return None
+    pending = sum(entry["pending"] for entry in counted.values())
+    if pending:
+        ctx.log("Looks: %d picture(s) have none yet: Update looks on the Manage page (or run "
+                "scan.py --embed-images) when the image model can run." % pending)
+    return pending
+
+
+def run_looks(config, ctx, library_ids, limit=None, rebuild=False, helper=None):
+    """scan.py --embed-images: make the looks only (looks.update); returns run()'s shape
+    with the summary as "looks"."""
+    conn = db.connect()
+    try:
+        result = looks.update(conn, config, ctx, library_ids=library_ids, limit=limit,
+                              rebuild=rebuild, helper=helper)
+    finally:
+        conn.close()
+    if not result["configured"]:
+        result["error"] = looks.NOT_CONFIGURED
+        ctx.log(result["error"], "error")
+    elif not result["error"] and not result["pending"] and not result["stopped"]:
+        ctx.log("Looks are up to date (%d picture(s))." % result["up_to_date"])
+    return {"libraries": [], "describe": None, "embed": None, "looks": result,
+            "stopped": result["stopped"]}
 
 
 def run_refine(config, ctx, library_ids, helper, args):
@@ -1629,9 +1814,32 @@ def run_refine(config, ctx, library_ids, helper, args):
             conn, config, ctx, helper=helper, library_ids=library_ids, limit=args.limit,
             retry_failed=args.retry_failed, newest_first=args.newest_first,
             only_library=bool(library_ids) and len(library_ids) == 1)
+        embedded = None
+        if not result["stopped"]:
+            embedded = embeddings.after_run(conn, config, ctx, library_ids=library_ids)
     finally:
         conn.close()
-    return {"libraries": [], "describe": result, "stopped": result["stopped"]}
+    return {"libraries": [], "describe": result, "embed": embedded,
+            "stopped": result["stopped"] or bool(embedded and embedded["stopped"])}
+
+
+def run_embed(config, ctx, library_ids, limit=None):
+    """scan.py --embed: the embed step only (embeddings.update); returns run()'s shape.
+
+    Its "describe" is None; "embed" holds the summary, with an "error" when
+    search by meaning is not set up.
+    """
+    conn = db.connect()
+    try:
+        result = embeddings.update(conn, config, ctx, library_ids=library_ids, limit=limit)
+    finally:
+        conn.close()
+    if not result["configured"]:
+        result["error"] = embeddings.NOT_CONFIGURED
+        ctx.log(result["error"], "error")
+    elif not result["error"] and not result["pending"] and not result["stopped"]:
+        ctx.log("Search by meaning is up to date (%d picture(s))." % result["up_to_date"])
+    return {"libraries": [], "describe": None, "embed": result, "stopped": result["stopped"]}
 
 
 def _safe_output():
@@ -1747,11 +1955,25 @@ def main(argv=None):
                         help="Also describe again images described with an older prompt "
                              "(after the new ones).")
     parser.add_argument("--limit", type=int, metavar="N",
-                        help="Describe at most N images in this run.")
+                        help="Describe (with --embed or --embed-images: embed) at most N images "
+                             "in this run.")
     parser.add_argument("--refine", action="store_true",
                         help="Only run the refine pass: describe the documents and screenshots "
                              "again with each library's refine endpoint (no scan, no regular "
                              "describing).")
+    parser.add_argument("--embed", action="store_true",
+                        help="Only run the embed step for search by meaning: embed the "
+                             "pictures whose meaning vector is missing or out of date (no scan, "
+                             "no describing).")
+    parser.add_argument("--embed-images", action="store_true",
+                        help="Only make the looks (image vectors) of the pictures that have "
+                             "none, for Looks like this and search by an example picture (no "
+                             "scan, no describing); see \"image_embedding\" in SETTINGS.md.")
+    parser.add_argument("--rebuild-looks", action="store_true",
+                        help="With --embed-images: first throw away the looks made with other "
+                             "settings (another image model, dims or picture size), or after a "
+                             "failed check of the image model the looks and the reference they "
+                             "are checked against. Looks of the current settings stay.")
     parser.add_argument("--endpoint", metavar="NAME",
                         help="Describe with this endpoint (or group) instead of each "
                              "library's own.")
@@ -1797,6 +2019,21 @@ def main(argv=None):
         print("--refine uses each library's refine endpoint (see SETTINGS.md); --endpoint and "
               "--redescribe-stale do not go with it.")
         return 2
+    if args.embed and (args.refine or args.endpoint or args.redescribe_stale
+                       or args.no_scan or args.no_describe):
+        print("--embed only runs the embed step (the \"embedding\" settings in config.json); "
+              "--refine, --endpoint, --redescribe-stale, --no-scan and --no-describe do not go "
+              "with it.")
+        return 2
+    if args.embed_images and (args.embed or args.refine or args.endpoint
+                              or args.redescribe_stale or args.no_scan or args.no_describe):
+        print("--embed-images only makes the looks (the \"image_embedding\" settings in "
+              "config.json); --embed, --refine, --endpoint, --redescribe-stale, --no-scan and "
+              "--no-describe do not go with it.")
+        return 2
+    if args.rebuild_looks and not args.embed_images:
+        print("--rebuild-looks goes with --embed-images.")
+        return 2
     if args.endpoint and not args.no_describe and not common.resolve_endpoints(
             config, args.endpoint):
         names = ", ".join(item["name"] for item in common.endpoint_list(config)) or "none"
@@ -1828,7 +2065,12 @@ def main(argv=None):
                 library_ids.append(library["id"])
         helper = common.load_helper(config.get("helper", ""))
         with ctx.stop_on_ctrl_c():
-            if args.refine:
+            if args.embed_images:
+                summary = run_looks(config, ctx, library_ids, args.limit, args.rebuild_looks,
+                                    helper)
+            elif args.embed:
+                summary = run_embed(config, ctx, library_ids, args.limit)
+            elif args.refine:
                 summary = run_refine(config, ctx, library_ids, helper, args)
             else:
                 summary = run(config, ctx, library_ids=library_ids, scan_images=not args.no_scan,
@@ -1847,11 +2089,16 @@ def main(argv=None):
     finally:
         lock.release()
     described = summary.get("describe") or {}
+    embedded = summary.get("embed") or {}
     if summary["stopped"]:
         ctx.log("Stopped as asked. Progress saved; run scan.py again to continue.")
     elif described.get("fatal") or described.get("error"):
         # Unattended runs (a scheduled task) can tell this from success.
         ctx.log("Stopped early: %s" % described["error"], "error")
+        return 1
+    elif args.embed and embedded.get("error"):
+        return 1
+    elif args.embed_images and (summary.get("looks") or {}).get("error"):
         return 1
     else:
         ctx.log("Done.")

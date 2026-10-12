@@ -303,8 +303,12 @@ def _source_mtime(path, helper):
         return None
 
 
-def _open_image(data):
-    """Open image bytes with Pillow, registering HEIF support when needed."""
+def _open_image(data, formats=None):
+    """Open image bytes with Pillow, registering HEIF support when needed.
+
+    formats: the only Pillow formats tried (those of them Pillow has), or
+    None for any it can read.
+    """
     if not data:
         raise ImageReadError("file is empty")
     major, _ = imageinfo.ftyp_brands(data)
@@ -312,6 +316,10 @@ def _open_image(data):
     if heif:
         ensure_heif(warn=False)
     try:
+        if formats is not None:
+            Image.init()
+            return Image.open(io.BytesIO(data), formats=[name for name in formats
+                                                         if name in Image.OPEN])
         return Image.open(io.BytesIO(data))
     except Image.DecompressionBombError as error:
         raise ImageReadError("image is too large to decode safely (%s)"
@@ -1589,6 +1597,130 @@ def prepare_for_llm(jpeg_bytes, max_edge=1536, min_short=768, max_pixels=3200000
         if stitched is not None:
             return _encode_jpeg(stitched[0], quality, stitched[1])
     return _render_jpeg(jpeg_bytes, quality, size_for)
+
+
+LOOKS_QUALITY = 90
+
+
+def front_view_width(panorama_width, max_edge):
+    """How wide the front view of an equirectangular panorama panorama_width pixels wide
+    is made for the image embedding model: as many pixels as the panorama holds in
+    the middle of the view (more would only be upscaled), at most max_edge."""
+    natural = panorama_width * math.tan(math.radians(FRONT_VIEW_FOV) / 2.0) / math.pi
+    return max(THUMB_SIZE, min(int(max_edge), int(round(natural))))
+
+
+def prepare_for_looks(data, max_edge=1024, panorama=False, quality=LOOKS_QUALITY):
+    """JPEG bytes of a picture as the image embedding model sees it (looks.py).
+
+    data is a stored preview, a video's poster frame or any picture Pillow
+    can read (an example picture dropped on the search page). The result
+    is upright, flattened to RGB, its long edge at most max_edge (never
+    upscaled), with no EXIF. panorama=True: data is the equirectangular
+    panorama of a 360-degree photo (its preview), and the result is its
+    front view (front_view(): what its thumbnail shows), front_view_width()
+    wide. Raises ImageReadError if the bytes cannot be decoded.
+    """
+    edge = max(THUMB_SIZE, int(max_edge))
+    if not panorama:
+        return _render_jpeg(data, quality, lambda w, h: _fit_size((w, h), edge))
+    image = _open_image(data)
+    try:
+        with image:
+            with _decoded(image, lambda w, h: (w, h), resize=False) as (rgb, _, icc):
+                view = front_view(rgb, front_view_width(rgb.size[0], edge))
+                return _encode_jpeg(view, quality, icc)
+    except ImageReadError:
+        raise
+    except Image.DecompressionBombError as error:
+        raise ImageReadError("image is too large to decode safely (%s)"
+                             % _error_text(error)) from error
+    except Exception as error:
+        raise ImageReadError("cannot decode image (%s)" % _error_text(error)) from error
+
+
+# Example pictures (a picture dropped on the search page, see
+# prepare_example_for_looks): the kinds read, by the type their first bytes
+# show (imageinfo.sniff_mime, before Pillow sees them), with the only Pillow
+# formats then tried; and the most pixels one may have unless it is a JPEG
+# (which is decoded at a fraction of its size).
+EXAMPLE_TYPES = {
+    "image/jpeg": ("JPEG", "MPO"), "image/png": ("PNG",), "image/webp": ("WEBP",),
+    "image/heic": ("HEIF",), "image/heif": ("HEIF",), "image/avif": ("AVIF", "HEIF"),
+    "image/gif": ("GIF",), "image/bmp": ("BMP",), "image/tiff": ("TIFF",),
+}
+EXAMPLE_MAX_PIXELS = 64000000
+# The picture a page shows for an example picture: at most this many pixels a side.
+EXAMPLE_CHIP_EDGE = 96
+
+
+class PictureNotAllowed(ImageReadError):
+    """An example picture of a kind that is not read (not one of EXAMPLE_TYPES)."""
+
+
+class PictureTooLarge(ImageReadError):
+    """An example picture with more pixels than may be decoded for it."""
+
+
+def prepare_example_for_looks(data, max_edge=1024, max_pixels=None):
+    """prepare_for_looks() for an example picture a page sent (looks.ExampleEmbedder).
+
+    Only the kinds of EXAMPLE_TYPES are read (PictureNotAllowed: a PostScript
+    file named .jpg never reaches Pillow's EPS reader), with at most
+    max_pixels (default EXAMPLE_MAX_PIXELS) unless it is a JPEG
+    (PictureTooLarge). A 360-degree photo (a 2:1 picture whose XMP or camera
+    says so, as the scanner finds them: detect_projection) is seen as its
+    front view, made from the panorama at the size of a stored preview, as
+    the library's 360 photos are (picture_jpeg in looks.py). Raises
+    ImageReadError when the bytes cannot be decoded.
+    """
+    formats = EXAMPLE_TYPES.get(imageinfo.sniff_mime(data or b""))
+    if not formats:
+        raise PictureNotAllowed("only JPEG, PNG, WebP, HEIC, AVIF, GIF, BMP and TIFF pictures "
+                                "can be compared")
+    edge = max(THUMB_SIZE, int(max_edge))
+    max_pixels = EXAMPLE_MAX_PIXELS if max_pixels is None else max_pixels
+    image = _open_image(data, formats)
+    try:
+        with image:
+            width, height = image.size
+            if image.format not in ("JPEG", "MPO") and width * height > max_pixels:
+                raise PictureTooLarge("it has %.0f million pixels; at most %.0f million can "
+                                      "be compared" % (width * height / 1e6, max_pixels / 1e6))
+            exif = extract_exif(image)
+            xmp = _image_xmp(image, data)
+            if not _may_be_360(image, exif, xmp, ""):
+                with _decoded(image, lambda w, h: _fit_size((w, h), edge)) as (rgb, _, icc):
+                    return _encode_jpeg(rgb, LOOKS_QUALITY, icc)
+            source = _fisheye_source_edge(PREVIEW_EDGE)
+            with _decoded(image, lambda w, h: _fit_size((w, h), source), resize=False) as (
+                    rgb, _, icc):
+                projection = detect_projection(rgb, exif, xmp, "")
+                if projection == PROJECTION_DUAL_FISHEYE:
+                    rgb = dual_fisheye_to_equirect(rgb, min(PREVIEW_EDGE, rgb.size[0]))
+                if projection:
+                    preview = _fit_size(rgb.size, PREVIEW_EDGE)
+                    if rgb.size != preview:
+                        rgb = rgb.resize(preview, _LANCZOS, reducing_gap=2.0)
+                    view = front_view(rgb, front_view_width(rgb.size[0], edge))
+                    return _encode_jpeg(view, LOOKS_QUALITY, icc)
+                target = _fit_size(rgb.size, edge)
+                if rgb.size != target:
+                    rgb = rgb.resize(target, _LANCZOS, reducing_gap=2.0)
+                return _encode_jpeg(rgb, LOOKS_QUALITY, icc)
+    except ImageReadError:
+        raise
+    except Image.DecompressionBombError as error:
+        raise ImageReadError("image is too large to decode safely (%s)"
+                             % _error_text(error)) from error
+    except Exception as error:
+        raise ImageReadError("cannot decode image (%s)" % _error_text(error)) from error
+
+
+def example_chip_jpeg(jpeg_bytes, edge=EXAMPLE_CHIP_EDGE):
+    """A small JPEG of a prepared example picture, for the page to show it by (a
+    browser cannot show every kind of picture it can send, such as HEIC)."""
+    return _render_jpeg(jpeg_bytes, THUMB_QUALITY, lambda w, h: _fit_size((w, h), edge))
 
 
 def to_browser_jpeg(path, helper=None, quality=BROWSER_QUALITY):

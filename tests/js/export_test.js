@@ -10,7 +10,10 @@
    how many, or "ordered": [titles, in this order]}],
    "details": {title: {key: value, ...}}, "count": records,
    "fail_once": a data file (such as "index-000.js") whose first load fails:
-   the page must load the index on its second try}.
+   the page must load the index on its second try, "vectors": how many
+   pictures have a meaning vector (the similar option), "meaning": {query,
+   id, dims} (the export ships its query model: the page embeds the query
+   with it) or {query, state: "off"} (the page's self-check fails)}.
    Prints one line per test and exits with status 1 when any test fails.
 */
 "use strict";
@@ -79,9 +82,16 @@ function fakePage(htmlFile) {
                     }
                     loaded.push(parts[0]);
                     versions[parts[0]] = parts.length > 1 ? parts[1] : null;
-                    var run = vm.runInThisContext("(function (window, SEARCH_DATA) {\n" + code +
-                                                  "\n})", {filename: file});
-                    run(win, win.SEARCH_DATA);
+                    if (/^(assets\/embed-|data\/meaning\/)/.test(parts[0])) {
+                        // (The engine's scripts define page globals: EMBED,
+                        // SEARCH_EMBED, EMBED_KERNEL.)
+                        vm.runInThisContext(code, {filename: file});
+                    } else {
+                        var run = vm.runInThisContext("(function (window, SEARCH_DATA, " +
+                                                      "SEARCH_VECTORS) {\n" + code + "\n})",
+                                                      {filename: file});
+                        run(win, win.SEARCH_DATA, win.SEARCH_VECTORS);
+                    }
                     if (node.onload) {
                         node.onload();
                     }
@@ -292,6 +302,99 @@ test("locations only with the map", function () {
         assert.strictEqual(points.length, (expected.locations || points.length));
     });
 });
+
+test("meaning vectors only with the similar option", function () {
+    global.SearchCore = SearchCore;
+    return promised(SITE.loadVectors).then(function (vectors) {
+        delete global.SearchCore;
+        var manifest = page.window.SEARCH_DATA_MANIFEST;
+        if (!manifest.vectors) {
+            assert.strictEqual(vectors, null);
+            assert.ok(!fs.readdirSync(path.join(folder, "data")).some(function (name) {
+                return /^vectors-/.test(name);
+            }));
+            assert.ok(!expected.vectors, "the export has no vectors");
+            return;
+        }
+        assert.ok(vectors, "the vectors load");
+        if (manifest.meaning) {
+            // Its own model embeds queries; the vectors carry the model's id.
+            assert.strictEqual(vectors.query, true);
+            assert.strictEqual(vectors.model, manifest.meaning.id);
+        } else {
+            assert.strictEqual(vectors.query, false, "an export without its model cannot " +
+                               "embed queries");
+            assert.strictEqual(vectors.model, "", "the model's name is not published");
+        }
+        assert.strictEqual(vectors.ids.length, expected.vectors);
+        manifest.vectors.forEach(function (name) {
+            assert.strictEqual(manifest.versions[name], sha1("data/" + name), name);
+            assert.strictEqual(versions["data/" + name], manifest.versions[name], name);
+        });
+        var known = {};
+        data.records.forEach(function (rec) {
+            known[rec.i] = true;
+        });
+        vectors.ids.forEach(function (id) {
+            assert.ok(XID.test(id) && known[id], id);
+        });
+        // More like this works from the files alone.
+        var index = SearchCore.prepare(data.records);
+        assert.strictEqual(index.setVectors(vectors), vectors.ids.length);
+        var result = index.search("similar:" + vectors.ids[0]);
+        assert.strictEqual(result.items[0], vectors.ids[0]);
+        assert.strictEqual(result.meaning.mode, "similar");
+    }, function (error) {
+        delete global.SearchCore;
+        throw error;
+    });
+});
+
+if (expected.meaning) {
+    test("nothing of the model loads before a search by meaning", function () {
+        assert.ok(SITE.meaningInBrowser());
+        assert.deepStrictEqual(loaded.filter(function (name) {
+            return /^(assets\/embed-|data\/meaning\/)/.test(name);
+        }), []);
+    });
+
+    test("search by meaning runs in the page", function () {
+        var manifest = page.window.SEARCH_DATA_MANIFEST;
+        var progress = [];
+        return promised(function (resolve) {
+            SITE.queryVector(expected.meaning.query, resolve, function (step) {
+                progress.push(step);
+            });
+        }).then(function (answer) {
+            var state = expected.meaning.state || "ready";
+            assert.strictEqual(answer.state, state, JSON.stringify(answer));
+            ["assets/embed-kernel.js", "assets/embed-engine.js", "data/meaning/model.js"]
+                .forEach(function (name) {
+                    assert.ok(loaded.indexOf(name) >= 0, name);
+                    assert.ok(versions[name], name + " is asked for with its hash");
+                });
+            assert.ok(progress.length >= 2);
+            assert.strictEqual(progress[progress.length - 1].loaded,
+                               progress[progress.length - 1].total);
+            assert.strictEqual(progress[0].total, manifest.meaning.gzip);
+            if (state === "off") {
+                assert.strictEqual(SITE.meaningInBrowser(), false);
+                return null;
+            }
+            assert.strictEqual(answer.model, expected.meaning.id);
+            assert.strictEqual(answer.dims, expected.meaning.dims);
+            assert.strictEqual(Buffer.from(answer.vec, "base64").length, expected.meaning.dims);
+            // Asked again: from the engine at once, nothing more loaded.
+            var count = loaded.length;
+            return promised(function (resolve) {
+                SITE.queryVector(expected.meaning.query, resolve);
+            }).then(function (again) {
+                assert.deepStrictEqual(again, answer);
+                assert.strictEqual(loaded.length, count);
+            });
+        });
+    });
+}
 
 test("a picture's id that is not in the export has no details", function () {
     return promised(function (resolve) {

@@ -82,6 +82,7 @@ import images
 import jobs
 import llm
 import prompts
+import videos
 from prompts import PROMPT_VER
 
 # Unusable replies (cut off, refused, not valid JSON, no description) are
@@ -677,7 +678,8 @@ def capture_sort_key(row):
 
 _PENDING_SQL = """
     SELECT id, library_id, path, name, content_hash, taken_at, mtime, described,
-           prompt_ver, describe_attempts, has_preview, projection, hidden
+           prompt_ver, describe_attempts, has_preview, projection, hidden, media, duration,
+           CASE WHEN media = 'video' THEN exif ELSE '' END AS video_exif
     FROM images
     WHERE library_id = ? AND missing_since IS NULL AND (described = 0 OR %s)
     ORDER BY id"""
@@ -847,16 +849,76 @@ def _projection(row):
     return row["projection"] if "projection" in row.keys() else ""
 
 
-def image_for_llm(row, root, previews, helper=None, max_edge=common.DEFAULT_MAX_IMAGE_EDGE):
+def _is_video(row):
+    """True for a video's row (see videos.py; False for older databases)."""
+    return "media" in row.keys() and row["media"] == videos.MEDIA_VIDEO
+
+
+def _stored_frames(row):
+    """The frames on a video row's stored contact sheet (recorded when it was made), or None."""
+    if row["has_preview"] != 1 or "video_exif" not in row.keys():
+        return None
+    return videos.sheet_frames(row["video_exif"])[0]
+
+
+def _video(row, frames):
+    """(frames on its contact sheet, seconds) of a video row, for prompts.user_text; else None.
+
+    The stored sheet's own count when it is known (a short video's sheet
+    can hold fewer frames than asked for), else frames (the setting).
+    """
+    if not _is_video(row):
+        return None
+    duration = row["duration"] if "duration" in row.keys() else None
+    if not duration:
+        return (1, duration)
+    return (_stored_frames(row) or frames, duration)
+
+
+def video_for_llm(row, root, previews, max_edge=common.DEFAULT_MAX_IMAGE_EDGE,
+                  frames=videos.DEFAULT_FRAMES):
+    """(JPEG bytes, frames on it or None when not known) of a video row's contact sheet.
+
+    The sheet kept with the previews, else one made now with frames
+    frames (see image_for_llm).
+    """
+    data = (previews.read_sheet(row["library_id"], row["id"])
+            if row["has_preview"] == 1 else None)
+    count = _stored_frames(row) if data is not None else None
+    if data is None:
+        full = os.path.join(root, *row["path"].split("/"))
+        data, count = videos.sheet_jpeg(videos.find_tools(), full, edge=max_edge,
+                                        frames=frames)
+    return images.prepare_for_llm(data, max_edge=max_edge), count
+
+
+def video_text(user_text, row, planned_frames, count):
+    """user_text with the video note saying count frames instead of planned_frames' count.
+
+    planned_frames is what _video(row, ...) was given when the text was
+    made; count what the sheet sent really holds (None: as planned).
+    """
+    planned = _video(row, planned_frames)
+    if planned is None or not count or count == planned[0]:
+        return user_text
+    return user_text.replace(prompts.video_note(*planned), prompts.video_note(count, planned[1]))
+
+
+def image_for_llm(row, root, previews, helper=None, max_edge=common.DEFAULT_MAX_IMAGE_EDGE,
+                  frames=videos.DEFAULT_FRAMES):
     """The JPEG bytes to send for an image row.
 
     Uses the cached preview when there is one, else the original (read
     through the helper's load_image when it has one). Either way the image is
     upright, flattened and shrunk by images.prepare_for_llm() to a long edge
-    of max_edge (the endpoint's max_image_edge). Raises
+    of max_edge (the endpoint's max_image_edge). A video sends its contact
+    sheet (kept with the previews, or made now with frames frames). Raises
     images.SourceReadError when the original cannot be read and
-    images.ImageReadError when it cannot be decoded.
+    images.ImageReadError (videos.VideoReadError for a video;
+    videos.ToolsMissing without ffmpeg) when it cannot be decoded.
     """
+    if _is_video(row):
+        return video_for_llm(row, root, previews, max_edge, frames)[0]
     if row["has_preview"] == 1:
         data = previews.read(row["library_id"], row["id"])
         if data is not None:
@@ -1362,16 +1424,20 @@ def _execute(conn, config, ctx, summary, assigned, by_library, helper, previews,
     run.redescribe_stale = redescribe_stale
     run.force_ids = force_ids
     run.tier = tier
+    run.video_frames = videos.frame_count(config)
 
     def profile_of(library):
         return "core" if tier == "refine" else library_profile(library)
 
     # Exact copies only share a description within libraries that ask for
-    # the same thing (metadata profile and context notes).
+    # the same thing (metadata profile and context notes). This is the
+    # library's own prompt: a picture's adds notes that follow from its
+    # content (360-degree projection, video frames), the same for its copies.
     for library in config.get("libraries", []):
         if isinstance(library, dict) and library.get("id"):
             signature = (profile_of(library), prompts.user_text(library))
             run.share_ids.setdefault(signature, []).append(library["id"])
+            run.share_key[library["id"]] = signature
     used = collections.OrderedDict()
     for _row, route in assigned:
         for endpoint in route:
@@ -1386,7 +1452,8 @@ def _execute(conn, config, ctx, summary, assigned, by_library, helper, previews,
         library = by_library[row["library_id"]]
         run.add_task(Task(position, row, tuple(endpoint["name"] for endpoint in route),
                           roots.get(row["library_id"], ""), profile_of(library),
-                          prompts.user_text(library, projection=_projection(row))))
+                          prompts.user_text(library, projection=_projection(row),
+                                            video=_video(row, run.video_frames))))
     clean_tmp()
     ctx.stage(stage, total=len(assigned))
     ctx.log("%s %d image(s)..." % (verb, len(assigned)))
@@ -1551,6 +1618,7 @@ class _DescribeRun:
         self.tier = ""                             # "refine" for the refine pass
         self.server_problem = ""                   # why a model server could not be used
         self.share_ids = {}                        # (profile, user text) -> library ids
+        self.share_key = {}                        # library id -> its key in share_ids
         self.endpoints = []
         self.by_name = {}
         self.queues = collections.OrderedDict()    # route -> deque of Tasks
@@ -1568,6 +1636,7 @@ class _DescribeRun:
         self.started = time.monotonic()
         self.last_progress = self.started
         self.hashes = {}
+        self.video_frames = videos.DEFAULT_FRAMES   # frames on a contact sheet made now
 
     # -- setting up -------------------------------------------------------------
 
@@ -1747,19 +1816,29 @@ class _DescribeRun:
         """Worker thread: prepare and describe one image. Never raises."""
         row = task.row
         source_path = os.path.join(task.root, *row["path"].split("/"))
+        user_text = task.user_text
         try:
-            jpeg = image_for_llm(row, task.root, self.previews, self.read_helper,
-                                 max_edge=state.settings["max_image_edge"])
+            if _is_video(row):
+                # (The note says how many frames the sheet really holds.)
+                jpeg, count = video_for_llm(row, task.root, self.previews,
+                                            max_edge=state.settings["max_image_edge"],
+                                            frames=self.video_frames)
+                user_text = video_text(user_text, row, self.video_frames, count)
+            else:
+                jpeg = image_for_llm(row, task.root, self.previews, self.read_helper,
+                                     max_edge=state.settings["max_image_edge"],
+                                     frames=self.video_frames)
         except images.SourceReadError as error:
             return {"status": "skipped", "error": _error_text(error, state.secrets)}
         except Exception as error:
             text = _error_text(error, state.secrets)
-            if images.HEIF_MISSING in text or images.AVIF_MISSING in text:
+            if (images.HEIF_MISSING in text or images.AVIF_MISSING in text
+                    or isinstance(error, videos.ToolsMissing)):
                 # Not the image's fault: it works once the decoder is installed.
                 return {"status": "skipped", "error": text}
             return {"status": "error", "kind": "local", "error": text, "exception": None}
         return describe_jpeg(state.settings, jpeg, profile=task.profile,
-                             user_text=task.user_text, helper=self.helper,
+                             user_text=user_text, helper=self.helper,
                              helper_lock=self.helper_lock, image_id=row["id"],
                              source_path=source_path, should_stop=self.should_stop,
                              sleep=self.sleep, read_helper=self.read_helper)
@@ -2008,7 +2087,8 @@ class _DescribeRun:
                 provenance["previous"] = previous
         signature = (task.profile, task.user_text)
         stored, shared = store_description(self.conn, row, info, provenance,
-                                           library_ids=self.share_ids.get(signature, []),
+                                           library_ids=self.share_ids.get(
+                                               self.share_key.get(row["library_id"]), []),
                                            include_stale=self.redescribe_stale,
                                            also_ids=self.force_ids)
         if stored:

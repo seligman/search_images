@@ -551,6 +551,7 @@ var MAP = (function () {
         var indexById = {};
         var indexLibraries = [];
         var searchIndex = null;
+        var vectorsWanted = false;
         var allLocations = null;
         var locations = [];
         var matchCount = 0;
@@ -1245,6 +1246,12 @@ var MAP = (function () {
                 query: search.q,
                 libraryName: libraryName,
                 similar: searchIndex ? function (id) {
+                    // ("More like this" goes by meaning once the vectors are
+                    // there: loaded when first wanted.)
+                    if (!vectorsWanted) {
+                        vectorsWanted = true;
+                        SITE.attachVectors(searchIndex);
+                    }
                     return SearchCore.similar(searchIndex, id, 8, visibility());
                 } : null,
                 chipUrl: chipUrl,

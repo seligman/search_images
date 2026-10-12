@@ -34,6 +34,12 @@ IMAGE_EXTENSIONS = (
 # Formats Pillow can only read through an optional plugin (pillow-heif, or a
 # Pillow build with AVIF support), and that browsers may not display.
 HEIC_EXTENSIONS = (".heic", ".heif", ".hif", ".avif")
+# Videos, indexed when ffmpeg and ffprobe are there (see videos.py) and the
+# library's "videos" setting is on. 360-degree videos (.insv) are not.
+VIDEO_EXTENSIONS = (
+    ".mov", ".mp4", ".m4v", ".3gp", ".3g2", ".avi", ".mkv", ".webm", ".wmv", ".mts",
+    ".m2ts", ".mpg", ".mpeg",
+)
 
 # The folder holding the scripts (and the templates/static folders).
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -100,6 +106,11 @@ def reports_dir():
 
 def tiles_dir():
     return os.path.join(data_dir(), "tiles")
+
+
+def proxies_dir():
+    """Browser-playable copies of videos (see videos.py): <library id>/<image id>.mp4."""
+    return os.path.join(data_dir(), "proxies")
 
 
 def abort_path():
@@ -170,6 +181,7 @@ DEFAULT_CONFIG = {
     "helper": "",
     "reader_threads": 6,
     "purge_after_days": 30,
+    "ffmpeg": "",               # videos.py: the ffmpeg program ("" = look on PATH)
     "libraries": [],
 }
 
@@ -187,6 +199,7 @@ LIBRARY_DEFAULTS = {
     "metadata": "core",
     "context_notes": "",
     "export": {},
+    "videos": True,             # index the library's videos (when ffmpeg is there)
 }
 
 LIBRARY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -1122,6 +1135,22 @@ def resolve_api_key(endpoint):
 
 def is_image_file(name):
     return name.lower().endswith(IMAGE_EXTENSIONS)
+
+
+def is_video_file(name):
+    """True for a file name with a video extension (VIDEO_EXTENSIONS)."""
+    return name.lower().endswith(VIDEO_EXTENSIONS)
+
+
+def is_media_file(name, videos=False):
+    """True for a picture, or (with videos) a picture or a video."""
+    lowered = name.lower()
+    return lowered.endswith(IMAGE_EXTENSIONS) or (videos and lowered.endswith(VIDEO_EXTENSIONS))
+
+
+def library_videos(library):
+    """True when a library's videos are indexed (its "videos" setting, on by default)."""
+    return not isinstance(library, dict) or library.get("videos", True) is not False
 
 
 # Windows reparse tag of a directory junction (stat.IO_REPARSE_TAG_MOUNT_POINT).

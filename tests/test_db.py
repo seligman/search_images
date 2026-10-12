@@ -23,6 +23,7 @@ IMAGE_COLUMNS = [
     "lon", "exif", "info", "described", "prompt_ver", "provenance", "describe_attempts",
     "describe_error", "hidden", "has_preview", "missing_since", "added", "updated",
     "projection", "place_city", "place_region", "place_country", "place_cc", "place_km",
+    "media", "duration",
 ]
 
 

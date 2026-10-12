@@ -93,8 +93,10 @@ def candidate_rows(conn, library_ids):
     """Present images of these libraries, by id."""
     if not library_ids:
         return []
-    return conn.execute(_ROW_SQL + "AND library_id IN (%s) ORDER BY id"
+    rows = conn.execute(_ROW_SQL + "AND library_id IN (%s) ORDER BY id"
                         % ",".join("?" * len(library_ids)), list(library_ids)).fetchall()
+    # Videos are described from a contact sheet; a model comparison is about pictures.
+    return [row for row in rows if not common.is_video_file(row["name"])]
 
 
 def stratified_order(rows, library_ids, seed):

@@ -18,6 +18,12 @@
 <button id="facets-button" type="button" class="button tool-button" aria-controls="facets" aria-expanded="false">Filters <span id="facets-count" class="count-badge" hidden></span></button>
 </div>
 <div id="search-tools">
+<div id="meaning-switch" class="tool tool-by" hidden><span class="tool-label" id="by-label">Search by</span>
+<span class="segmented" role="group" aria-labelledby="by-label">
+<button type="button" data-by="words" aria-pressed="false" title="Only pictures that have the words">Words</button>
+<button type="button" data-by="" aria-pressed="true" title="Pictures with the words first, then pictures that mean much the same (marked &#8776;)">Words + meaning</button>
+<button type="button" data-by="meaning" aria-pressed="false" title="Pictures ranked by what they mean, words or not">Meaning</button>
+</span></div>
 <label class="tool"><span class="tool-label">Sort</span>
 <select id="sort">
 <option value="relevance">Best match</option>
@@ -53,6 +59,7 @@
 <a id="map-link" class="button subtle small" hidden></a>
 </div>
 <p id="query-notes" hidden></p>
+<p id="meaning-notes" hidden></p>
 <div id="active-filters" hidden></div>
 <div id="selection-bar" hidden></div>
 <section id="timeline" aria-label="Timeline" hidden></section>

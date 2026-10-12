@@ -533,7 +533,7 @@ class DialogTest(ExportFixture, unittest.TestCase):
         reasons = list(export.FLAGS) + ["hidden", "excluded"]
         with open(path, "w", encoding="utf-8", newline="\n") as handle:
             json.dump({"options": sorted(export.DEFAULT_OPTIONS),
-                       "photo_types": list(prompts.PHOTO_TYPES), "reasons": reasons}, handle)
+                       "photo_types": list(export.EXPORT_KINDS), "reasons": reasons}, handle)
         result = subprocess.run([NODE, NODE_TESTS, path], cwd=support.REPO,
                                 capture_output=True, timeout=120)
         output = (result.stdout + result.stderr).decode("utf-8", "replace")

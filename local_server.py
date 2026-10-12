@@ -9,6 +9,18 @@ run whose endpoint it serves starts it when it is not running
 (auto_start) and stops it again afterwards (auto_stop), and with a
 stop_at time the web server stops it every day at that time.
 
+An entry with "kind": "embeddings" runs an embedding model for search by
+meaning (embeddings.py): its command has --embeddings (the pooling the
+model file says), a context no larger than the model's own, and no
+slots, and it is ready once it answers /health. The
+embed step starts it like a describe run does; the web server starts it
+for the queries typed on the search page (start_for_queries) and, with
+idle_stop_minutes, stops it again when no query has used it that long.
+Such an entry may also name an image projector ("mmproj", never found by
+itself): it then runs an image embedding model for looks (looks.py),
+with --mmproj and flash attention off (-fa off: on a GPU it changes the
+vectors of pictures).
+
 The server runs as its own process group, with its output in
 data/logs/model-server.log. Only a process this module started is ever
 stopped: its PID and creation time are kept in data/model-server.json
@@ -35,6 +47,7 @@ This module uses only the standard library.
 import collections
 import contextlib
 import copy
+import itertools
 import json
 import os
 import re
@@ -62,6 +75,7 @@ except ImportError:
 
 DEFAULTS = {
     "enabled": False,
+    "kind": "describe",
     "endpoint": "",
     "models_dir": "",
     "model": "",
@@ -76,11 +90,14 @@ DEFAULTS = {
     "auto_stop": True,
     "stop_at": "",
     "start_timeout": 900,
+    "idle_stop_minutes": 0,
 }
+# What a server runs: a describing (vision) model, or an embedding model.
+KINDS = ("describe", "embeddings")
 # Settings the Settings page may change; the others only in config.json.
 UI_FIELDS = ("model", "mmproj", "slots", "ctx_per_slot", "port", "stop_at", "auto_start",
-             "auto_stop")
-FILE_ONLY_FIELDS = ("enabled", "endpoint", "binary", "models_dir", "launch_command",
+             "auto_stop", "idle_stop_minutes")
+FILE_ONLY_FIELDS = ("enabled", "kind", "endpoint", "binary", "models_dir", "launch_command",
                     "extra_args", "start_timeout")
 # (minimum, maximum) of the number settings.
 LIMITS = {
@@ -88,6 +105,7 @@ LIMITS = {
     "slots": (1, 64),
     "ctx_per_slot": (512, 1048576),
     "start_timeout": (10, 86400),
+    "idle_stop_minutes": (0, 10080),
 }
 # Words in a launch_command (or its first argument) replaced when it runs.
 PLACEHOLDERS = ("{model_path}", "{mmproj_path}", "{port}", "{slots}", "{ctx}",
@@ -103,6 +121,7 @@ START_POLL = 1.0            # seconds between /health checks while starting
 PRE_STOP_MINUTES = 10       # jobs using the server stop this long before stop_at
 NO_START_MINUTES = 60       # and do not start it again until this long after
 SCHEDULE_SECONDS = 30.0     # how often the web server looks at the stop times
+QUERY_RETRY_SECONDS = 300.0  # a server that failed to start is not started for searches this soon
 LOG_TAIL_LINES = 50
 LOG_TAIL_BYTES = 64 * 1024
 MAX_LOG_BYTES = 5 * 1024 * 1024     # a bigger log is renamed to .1 when the server starts
@@ -170,9 +189,11 @@ def server_settings(entry):
     result["enabled"] = entry.get("enabled") is True
     for key in ("endpoint", "models_dir", "model", "mmproj", "binary"):
         result[key] = _text(entry.get(key))
-    for key in ("port", "slots", "ctx_per_slot", "start_timeout"):
+    for key in ("port", "slots", "ctx_per_slot", "start_timeout", "idle_stop_minutes"):
         if key in entry:
             result[key] = _int(entry[key], key)
+    kind = _text(entry.get("kind")).lower()
+    result["kind"] = kind if kind in KINDS else DEFAULTS["kind"]
     for key in ("extra_args", "launch_command"):
         result[key] = _string_list(entry.get(key))
     for key in ("auto_start", "auto_stop"):
@@ -336,17 +357,22 @@ def model_path(settings):
     return full
 
 
+def embeddings_server(settings):
+    """True for a server that runs an embedding model ("kind": "embeddings")."""
+    return settings.get("kind") == "embeddings"
+
+
 def auto_mmproj(settings):
     """The vision projector found for the model (a path relative to models_dir), or ''.
 
     Next to the model: its name with MMPROJ_SUFFIX in place of the
     extension (model.mmproj.gguf for model.gguf); for a model in a sub-folder of
     models_dir also the (first, by name) file there with "mmproj" in its
-    name.
+    name. An embeddings server has none (its "mmproj" is only used when set).
     """
     root = models_root(settings)
     model = settings["model"]
-    if not root or not model:
+    if not root or not model or embeddings_server(settings):
         return ""
     folder, _, name = model.rpartition("/")
     stem = name[:-len(MODEL_EXTENSION)] if name.lower().endswith(MODEL_EXTENSION) else name
@@ -367,8 +393,13 @@ def auto_mmproj(settings):
 
 
 def mmproj_path(settings):
-    """The full path of the vision projector ('' for none); raises ServerError for a bad one."""
-    chosen = settings["mmproj"] or auto_mmproj(settings)
+    """The full path of the vision projector ('' for none); raises ServerError for a bad one.
+
+    An embeddings server has one only when its "mmproj" names it (an image
+    embedding model, see looks.py).
+    """
+    chosen = settings["mmproj"] if embeddings_server(settings) else (
+        settings["mmproj"] or auto_mmproj(settings))
     if not chosen:
         return ""
     full = _inside(models_root(settings), chosen)
@@ -392,6 +423,20 @@ def binary_path(settings):
     return binary       # a program name found on the PATH
 
 
+def model_context(path):
+    """The context length a GGUF model file was trained with (<arch>.context_length), or
+    None when the file does not say (or cannot be read)."""
+    import browser_model     # stdlib only
+    try:
+        meta = browser_model.read_gguf(path)["meta"]
+    except browser_model.ModelError:
+        return None
+    value = meta.get("%s.context_length" % meta.get("general.architecture"))
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
 def build_command(settings):
     """The command line that starts the server (a list); raises ServerError.
 
@@ -400,10 +445,21 @@ def build_command(settings):
     {ctx_per_slot}, {stop_at} ('' when there is none), {python});
     otherwise binary is started with the model, its projector,
     127.0.0.1:port, slots, slots * ctx_per_slot of context and extra_args.
+    An embeddings server gets --embeddings (llama-server then pools as the
+    model file says: mean for mdbr-leaf-ir, CLS for snowflake-arctic-embed,
+    last for Qwen3-Embedding) and ctx_per_slot of context, or the model's own
+    context when that is smaller (512 for small BERT models), also as its
+    batch sizes so a long text fits in one batch; no slots, and a projector
+    only when its mmproj is set (an image embedding model): then also
+    -fa off, as flash attention changes the vectors of pictures on a GPU.
+    {ctx} is that context for it.
     """
     model = model_path(settings)
     mmproj = mmproj_path(settings)
-    ctx = settings["slots"] * settings["ctx_per_slot"]
+    embedding = embeddings_server(settings)
+    ctx = settings["ctx_per_slot"] if embedding else settings["slots"] * settings["ctx_per_slot"]
+    if embedding:
+        ctx = min(ctx, model_context(model) or ctx)
     if settings["launch_command"]:
         values = {"{model_path}": model, "{mmproj_path}": mmproj,
                   "{port}": str(settings["port"]), "{slots}": str(settings["slots"]),
@@ -420,6 +476,13 @@ def build_command(settings):
         raise ServerError("No program is set: add \"binary\" (the path of llama-server) or "
                           "\"launch_command\" to local_server in config.json.")
     command = [binary, "-m", model]
+    if embedding:
+        command += ["--embeddings", "--host", "127.0.0.1",
+                    "--port", str(settings["port"]), "-c", str(ctx), "-ub", str(ctx),
+                    "-b", str(ctx), "--no-webui"]
+        if mmproj:
+            command += ["--mmproj", mmproj, "-fa", "off"]
+        return command + list(settings["extra_args"])
     if mmproj:
         command += ["--mmproj", mmproj]
     command += ["--host", "127.0.0.1", "--port", str(settings["port"]),
@@ -1132,6 +1195,11 @@ class ServerManager:
         self._notes = {}            # key -> (state, message) after the last start or stop
         self._stopping = set()      # keys whose start was cut short by a stop
         self._leases = collections.defaultdict(set)
+        self._query_started = set()  # keys of servers started here for search queries
+        self._last_used = {}        # key -> time.monotonic() of the last query that used it
+        self._failed = {}           # key -> (time.monotonic(), message) of the last failed start
+        self._identity = None       # process_identity() of this process (see _mark_user)
+        self._user = "%d.%d" % (os.getpid(), next(_MANAGER_NUMBERS))    # (see _mark_user)
         self._clock = clock or datetime.now
         self._scheduler = None
         self._scheduler_stop = threading.Event()
@@ -1261,6 +1329,10 @@ class ServerManager:
         with self._lock:
             op = self._ops.pop(key, None)
             self._notes[key] = (state, message)
+            if ok:
+                self._failed.pop(key, None)
+            elif state == "error":
+                self._failed[key] = (time.monotonic(), message)
         if op is not None:
             op.update(ok=ok, message=message)
             op["done"].set()
@@ -1345,8 +1417,10 @@ class ServerManager:
             view.update(state="external", served=props(settings["port"]) if code == 200 else None,
                         external={"status": code},
                         message="Port %d already answers, but that server was not started "
-                                "here, so it cannot be stopped here either. Describing uses "
-                                "it as it is." % settings["port"])
+                                "here, so it cannot be stopped here either. %s uses it as it "
+                                "is." % (settings["port"], ("Looks" if settings["mmproj"]
+                                                             else "Search by meaning")
+                                         if embeddings_server(settings) else "Describing"))
             return view
         with self._lock:
             note = self._notes.get(key)
@@ -1540,7 +1614,7 @@ class ServerManager:
             wants_vision = bool(mmproj_path(settings))
         except ServerError:
             wants_vision = False
-        if wants_vision and served["vision"] is False:
+        if wants_vision and served["vision"] is False and not embeddings_server(settings):
             return self._give_up(key, settings, "The model server started but cannot see "
                                  "images (its projector was not loaded); it was stopped again. "
                                  "Check the mmproj setting and its log.", "error",
@@ -1710,15 +1784,142 @@ class ServerManager:
     def _drop_lease(self, key, lease):
         with self._lock:
             group = self._leases.get(key)
+            last = False
             if group is not None:
                 group.discard(lease)
                 if not group:
                     self._leases.pop(key, None)
+                    last = True
+        if last:
+            self._mark_user(key, False)
+
+    def _mark_user(self, key, using):
+        """Note in data/model-server.json that this manager (of this process) uses the
+        server of key, or no longer does, so another one's idle stop (check_idle)
+        leaves it running. Users whose process no longer runs are dropped on the way.
+        A user is "<pid>.<number>": its process, and which manager of it."""
+        if self._identity is None:
+            self._identity = process_identity(os.getpid()) or ""
+
+        def change(servers):
+            entry = servers.get(key)
+            if entry is None:
+                return False
+            users = entry.get("users") if isinstance(entry.get("users"), dict) else {}
+            kept = {user: identity for user, identity in users.items()
+                    if user != self._user and _user_running(user, identity)}
+            if using:
+                kept[self._user] = self._identity
+            if kept == users:
+                return False
+            entry["users"] = kept
+            return True
+        try:
+            update_state(change)
+        except OSError:
+            pass
+
+    def _other_users(self, key):
+        """The other managers (of running processes) that use the server of key now."""
+        entry = load_state().get(key) or {}
+        users = entry.get("users") if isinstance(entry.get("users"), dict) else {}
+        return [user for user, identity in users.items()
+                if user != self._user and _user_running(user, identity)]
 
     def leases(self, name):
         """The leases (runs) that use the server of this endpoint now."""
         with self._lock:
             return list(self._leases.get(self._key(name), ()))
+
+    # -- servers started for the search page's queries ---------------------------
+
+    def touch(self, name):
+        """Note that a search query used the server of this endpoint just now."""
+        with self._lock:
+            self._last_used[self._key(name)] = time.monotonic()
+
+    def start_for_queries(self, config, name):
+        """Make sure the managed server of an endpoint runs for the search page's queries.
+
+        Returns (state, message): "ready" (it answers), "starting" (it is
+        starting or loading its model: ask again soon) or "off" (it does
+        not run and is not started: auto_start is off, its stop_at window
+        is on, or it cannot be started; message says why). An endpoint
+        without a managed server is "ready" (whatever answers there is
+        used as it is). A server started here for queries is stopped by
+        check_idle after idle_stop_minutes without a query.
+        """
+        settings = managed(config, name)
+        if settings is None:
+            return "ready", ""
+        key = self._key(settings["endpoint"])
+        self.touch(name)
+        op = self._current_op(key)
+        if op is not None:
+            if op["state"] == "stopping":
+                return "off", "The model server is stopping."
+            return "starting", op["message"]
+        code = health(settings["port"])
+        if code == 503:
+            return "starting", "The model server is loading its model."
+        if code is not None:
+            return "ready", ""
+        if not embeddings_server(settings):
+            return "off", ("The model server for %s is not an embeddings server (\"kind\": "
+                           "\"embeddings\" in config.json's local_server), so a search does not "
+                           "start it." % settings["endpoint"])
+        if not settings["auto_start"]:
+            return "off", ("The model server for %s is not running and auto start is off: start "
+                           "it on the Settings page." % settings["endpoint"])
+        stop = stop_window(settings, self._clock())
+        if stop is not None:
+            return "off", window_message(settings, stop)
+        with self._lock:
+            failed = self._failed.get(key)
+        if failed is not None and time.monotonic() - failed[0] < QUERY_RETRY_SECONDS:
+            # (Not loaded again and again for every search; Start on the Settings
+            # page, or a job, still tries at once.)
+            return "unavailable", ("The model server could not be started a moment ago: %s "
+                                   "Searches try again in a few minutes." % failed[1])
+        ok, message = self.start(config, settings["endpoint"], by="search", wait=False)
+        if not ok:
+            return "off", message
+        with self._lock:
+            self._query_started.add(key)
+        return "starting", message
+
+    def check_idle(self, config, log=None):
+        """Stop the servers started for queries that no query has used for their
+        idle_stop_minutes (0: never), unless a run uses them. Returns the endpoint
+        names whose server was stopped."""
+        log = log or _no_log
+        stopped = []
+        with self._lock:
+            keys = list(self._query_started)
+        for key in keys:
+            settings = find_server(config, key)
+            if settings is None or (self._record(key) is None and self._current_op(key) is None):
+                with self._lock:
+                    self._query_started.discard(key)
+                continue
+            minutes = settings["idle_stop_minutes"]
+            if not minutes or self.leases(key) or self._current_op(key) is not None:
+                continue
+            if self._other_users(key):
+                continue        # (scan.py, say, embeds with it now)
+            with self._lock:
+                last = self._last_used.get(key, 0.0)
+            if time.monotonic() - last < minutes * 60:
+                continue
+            ok, message = self.stop(config, settings["endpoint"], wait=True,
+                                    reason="no search used it for %d minute%s"
+                                    % (minutes, "" if minutes == 1 else "s"))
+            log(message, "info" if ok else "error")
+            if ok:
+                with self._lock:
+                    self._query_started.discard(key)
+                stopped.append(settings["endpoint"])
+        return stopped
 
     # -- the daily stop time ----------------------------------------------------
 
@@ -1775,7 +1976,9 @@ class ServerManager:
             def loop():
                 while not self._scheduler_stop.wait(interval):
                     try:
-                        self.check_schedule(config_loader(), log=log)
+                        config = config_loader()
+                        self.check_schedule(config, log=log)
+                        self.check_idle(config, log=log)
                     except Exception as error:
                         log("Checking the model server's stop time failed: %s"
                             % common.redact(str(error)), "warn")
@@ -1784,13 +1987,30 @@ class ServerManager:
                                                daemon=True)
             self._scheduler.start()
 
-    def shutdown(self, grace=10.0):
-        """When the program stops: stop the scheduler, and the servers runs started (auto_stop)."""
+    def shutdown(self, grace=10.0, config=None):
+        """When the program stops: stop the scheduler, and the servers runs started
+        (auto_stop); with config, also those started for search queries whose
+        auto_stop is on."""
         self._scheduler_stop.set()
         with self._lock:
             leases = {lease for group in self._leases.values() for lease in group}
+            queried = list(self._query_started)
         for lease in leases:
             lease.release(grace=grace)
+        for key in queried if config is not None else ():
+            settings = find_server(config, key)
+            if settings is not None and settings["auto_stop"] and not self.leases(key):
+                self.stop(config, settings["endpoint"], wait=True, grace=grace,
+                          reason="the web server stopped")
+
+
+_MANAGER_NUMBERS = itertools.count(1)
+
+
+def _user_running(user, identity):
+    """True when the process of a recorded user ("<pid>.<number>") still runs."""
+    pid = str(user).split(".")[0]
+    return pid.isdigit() and is_running(int(pid), identity)
 
 
 def _no_log(message, level="info"):
@@ -1879,8 +2099,10 @@ class Lease:
             if not ok:
                 problems[name] = message
                 self._let_go(key)
-            elif not owned and self.manager.owned(name):
+                continue
+            if not owned and self.manager.owned(name):
                 self.started.append(name)
+            self.manager._mark_user(key, True)
         return problems
 
     def _let_go(self, key):

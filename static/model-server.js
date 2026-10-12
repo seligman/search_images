@@ -5,7 +5,9 @@
    projector (only files found in its models folder), slots, context per
    slot, port, the daily stop time and the auto start/stop switches. The
    program and its command line can only be set in config.json; they are
-   shown read-only.
+   shown read-only. A server of "kind": "embeddings" (search by meaning)
+   is marked so, has no projector or slots, and has the minutes after
+   which a server started for searches stops when idle.
 
    Fires a "model-server-changed" event on the document when a server
    starts or stops, so the endpoint list can look at its status again.
@@ -173,9 +175,20 @@
     }
 
     function serverCard(server) {
+        var embedding = server.kind === "embeddings";
+        // (An embeddings server with a projector embeds pictures: looks.)
+        var pictures = embedding && Boolean(server.mmproj);
         var pill = el("span", {className: "pill"});
         var head = el("div", {className: "card-head"}, [
-            el("h2", {text: server.endpoint}), pill
+            el("h2", {text: server.endpoint}),
+            embedding ? el("span", {className: "pill plain kind-pill",
+                                    text: pictures ? "Image embeddings" : "Embeddings",
+                                    title: pictures ? "Runs an image embedding model for " +
+                                        "Looks like this (with its projector, flash " +
+                                        "attention off)" : "Runs an embedding model for " +
+                                        "search by meaning"})
+                : null,
+            pill
         ]);
         var message = el("p", {className: "card-note"});
         var facts = el("dl", {className: "server-facts"});
@@ -208,8 +221,21 @@
                                                             "time."});
         inputs.ctx_per_slot = el("input", {type: "number", className: "input", min: 512,
                                            step: 512, inputMode: "numeric"});
-        fields.ctx_per_slot = field("Context per slot (tokens)", inputs.ctx_per_slot,
-                                    {hint: "About 8192 suits most pictures."});
+        fields.ctx_per_slot = field(embedding ? "Context (tokens)" : "Context per slot (tokens)",
+                                    inputs.ctx_per_slot,
+                                    {hint: embedding ? "The longest text it embeds at once; " +
+                                        "8192 is plenty." : "About 8192 suits most pictures."});
+        inputs.idle_stop_minutes = el("input", {type: "number", className: "input", min: 0,
+                                                step: 1, inputMode: "numeric"});
+        fields.idle_stop_minutes = field("Stop when searches leave it idle (minutes)",
+            inputs.idle_stop_minutes, {hint: "Only a server a search started; 0 keeps it " +
+                                               "running."});
+        if (embedding) {
+            fields.mmproj.node.hidden = true;
+            fields.slots.node.hidden = true;
+        } else {
+            fields.idle_stop_minutes.node.hidden = true;
+        }
         inputs.port = el("input", {type: "number", className: "input", min: 1024, max: 65535,
                                    step: 1, inputMode: "numeric"});
         fields.port = field("Port", inputs.port, {hint: "On this computer (127.0.0.1); the " +
@@ -222,8 +248,14 @@
         inputs.auto_stop = el("input", {type: "checkbox"});
         var checks = el("div", {className: "server-checks"}, [
             el("label", {className: "check"}, [inputs.auto_start, el("span", null, [
-                "Start it when describing needs it",
-                el("span", {className: "field-hint", text: "Describe and refine jobs that " +
+                pictures ? "Start it when looks need it" :
+                    embedding ? "Start it when search by meaning needs it"
+                    : "Start it when describing needs it",
+                el("span", {className: "field-hint", text: pictures ? "Update looks jobs, " +
+                    "and a picture dropped on the search page, start the server." :
+                    embedding ? "Searches and the " +
+                    "jobs that update search by meaning start the server; searches go by " +
+                    "the words while it loads." : "Describe and refine jobs that " +
                     "use this endpoint start the server, and wait for it to load."})])]),
             el("label", {className: "check"}, [inputs.auto_stop, el("span", null, [
                 "Stop it when such a job has finished",
@@ -233,7 +265,8 @@
         var form = el("div", {className: "server-form"}, [
             el("div", {className: "field-grid"}, [fields.model.node, fields.mmproj.node]),
             el("div", {className: "field-grid"}, [fields.slots.node, fields.ctx_per_slot.node,
-                                                  fields.port.node, fields.stop_at.node]),
+                                                  fields.port.node, fields.stop_at.node,
+                                                  fields.idle_stop_minutes.node]),
             checks, formErrors
         ]);
 
@@ -265,7 +298,8 @@
                 port: inputs.port.value.trim(),
                 stop_at: inputs.stop_at.value,
                 auto_start: inputs.auto_start.checked,
-                auto_stop: inputs.auto_stop.checked
+                auto_stop: inputs.auto_stop.checked,
+                idle_stop_minutes: inputs.idle_stop_minutes.value.trim()
             };
         }
 
@@ -278,7 +312,8 @@
                 port: String(server.port),
                 stop_at: server.stop_at || "",
                 auto_start: Boolean(server.auto_start),
-                auto_stop: Boolean(server.auto_stop)
+                auto_stop: Boolean(server.auto_stop),
+                idle_stop_minutes: String(server.idle_stop_minutes || 0)
             };
         }
 
@@ -336,6 +371,7 @@
             inputs.stop_at.value = current.stop_at;
             inputs.auto_start.checked = current.auto_start;
             inputs.auto_stop.checked = current.auto_stop;
+            inputs.idle_stop_minutes.value = current.idle_stop_minutes;
             dirty = false;
             saveButton.disabled = true;
         }
@@ -370,7 +406,7 @@
             }
             if (served.vision === true) {
                 loaded.push("sees pictures");
-            } else if (served.vision === false) {
+            } else if (served.vision === false && !embedding) {
                 loaded.push("cannot see pictures");
             }
             factRow(facts, "Loaded", loaded.join(" \u00b7 "));

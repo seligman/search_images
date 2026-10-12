@@ -1,12 +1,24 @@
 # Sample Image Credits
 
-These 18 images are provided for demonstrating the image database.
+These 19 images are provided for demonstrating the image database.
 Every image is under a Creative Commons license that permits free
 reuse and redistribution. Images under CC BY require attribution; the
 table below provides it. CC0 images are released into the public domain.
 
-Images were collected through the Openverse API (https://openverse.org)
-and resized for the demo. Resizing is permitted by all licenses listed.
+Images 01 to 18 were collected through the Openverse API
+(https://openverse.org) and resized for the demo. Image 19, a 360-degree
+panorama, comes from Wikimedia Commons (https://commons.wikimedia.org);
+it was resized from 5760x2880 to 4096x2048 pixels and is otherwise
+unchanged. Resizing is permitted by all licenses listed.
+
+The capture dates stored in images 01 to 18 were added for the demo's
+timeline and are not when those photos were taken; image 19's date is
+the photographer's own.
+
+The license texts:
+- CC BY 2.0: https://creativecommons.org/licenses/by/2.0/
+- CC BY 4.0: https://creativecommons.org/licenses/by/4.0/
+- CC0 1.0: https://creativecommons.org/publicdomain/zero/1.0/
 
 | File | Title | Creator | License | Source |
 |------|-------|---------|---------|--------|
@@ -28,4 +40,5 @@ and resized for the demo. Resizing is permitted by all licenses listed.
 | 16-penguin.jpg | Emperor Penguin, Antarctica, 1947 | Archives Branch, USMC History Division | CC BY 2.0 | https://www.flickr.com/photos/60868061@N04/11714663896 |
 | 17-stop-sign.jpg | Stop Sign | Kt Ann | CC BY 2.0 | https://www.flickr.com/photos/54409200@N04/5070012761 |
 | 18-chalkboard-menu.jpg | Gere-a-Deli | Ruth and Dave | CC BY 2.0 | https://www.flickr.com/photos/95142644@N00/8785153125 |
+| 19-roys-motel-360.jpg | Roy's Motel, Amboy, California (360-degree panorama) | G. Edward Johnson | CC BY 4.0 | https://commons.wikimedia.org/wiki/File:360_degree_panorama_Roys_Motel_Amboy_CA_2026-04-05_12-43-59_1.jpg |
 

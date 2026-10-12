@@ -10,6 +10,9 @@ presets built on them):
     claude   Anthropic's Messages API
     ollama   Ollama's own /api/chat
 
+embed() turns texts into vectors for search by meaning (embeddings.py),
+through an OpenAI-compatible /embeddings API or Ollama's /api/embed.
+
 describe() makes one request and returns the reply. Failures raise
 ProviderError, whose kind says what to do about them:
 
@@ -36,6 +39,7 @@ import email.utils
 import http.client
 import itertools
 import json
+import math
 import mimetypes
 import os
 import random
@@ -535,6 +539,11 @@ def _has(text, markers):
     return any(marker in text for marker in markers)
 
 
+# What llama.cpp's server says (with a 500) about an input too long to embed or
+# describe in one batch: the input's problem, not a passing one.
+_TOO_LARGE_MARKERS = ("is too large to process",)
+
+
 def classify_http(status, body="", headers=None):
     """How to treat an HTTP error reply: returns (kind, retry_after).
 
@@ -542,7 +551,8 @@ def classify_http(status, body="", headers=None):
     (seconds) or None. In order: a content-policy block (moderation) is the
     image's problem; a rejected key (401, or a key error in a 400), a
     billing code or 402/403 are fatal; a daily quota (429) sets the endpoint
-    aside; 408, 409, 425, 429, 499 and 5xx (but 501 and 505) are worth
+    aside; an input too long for llama.cpp (a 500 saying so) is the image's
+    (or text's); 408, 409, 425, 429, 499 and 5xx (but 501 and 505) are worth
     retrying; 413 and 400/422 blaming the image are the image's; the rest
     (wrong model, URL, parameters, schema, no image support) the endpoint's.
     """
@@ -558,6 +568,9 @@ def classify_http(status, body="", headers=None):
         return "fatal", retry_after
     if status == 429 and _has(text, _DAILY_MARKERS):
         return "endpoint", retry_after
+    if status >= 500 and _has(text, _TOO_LARGE_MARKERS):
+        # (llama.cpp: an input longer than its batch; asking again cannot help.)
+        return "image", retry_after
     if status in RETRYABLE_STATUSES or (
             status >= 500 and status not in NOT_RETRYABLE_SERVER_STATUSES):
         return "retryable", retry_after
@@ -1126,6 +1139,128 @@ def describe_with_retries(endpoint, system, user_text, jpeg, schema, should_stop
                 if timeouts >= max_timeout_retries:
                     raise
                 timeouts += 1
+            if error.retry_after is not None and error.retry_after > MAX_RETRY_AFTER:
+                raise
+            if should_stop is not None and should_stop():
+                raise
+            delay = max(error.retry_after or 0.0,
+                        random.uniform(0, min(MAX_BACKOFF, 2 ** retries)))
+            if on_retry is not None:
+                on_retry(error, delay)
+            if not _pause(delay, sleep, should_stop):
+                raise
+            retries += 1
+
+
+# ---------------------------------------------------------------------------
+# Embeddings (search by meaning, see embeddings.py)
+
+def _embedding_list(items, count, secrets):
+    """The vectors of an embeddings reply, checked: count lists of finite numbers, one length."""
+    if not isinstance(items, list) or len(items) != count:
+        raise ProviderError("content", "the reply has %s vectors for %d texts"
+                            % (len(items) if isinstance(items, list) else "no", count),
+                            secrets=secrets)
+    length = None
+    for vector in items:
+        if (not isinstance(vector, list) or not vector
+                or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                           and math.isfinite(value) for value in vector)):
+            raise ProviderError("content", "the reply holds a vector that is not a list of "
+                                "numbers", secrets=secrets)
+        if length is not None and len(vector) != length:
+            raise ProviderError("content", "the reply's vectors differ in length",
+                                secrets=secrets)
+        length = len(vector)
+    return items
+
+
+def embed(endpoint, texts, model=None, timeout=None, extra=None):
+    """Turn texts into embedding vectors: a single request, no retries.
+
+    endpoint is an endpoint dict (see common.endpoint_settings); texts a
+    list of strings; model the model name to ask for (None: the endpoint's
+    own; '' sends none, which llama.cpp accepts). OpenAI-compatible
+    endpoints get POST {base}/embeddings (llama.cpp with --embeddings,
+    Ollama's /v1, LM Studio, vLLM, OpenAI), Ollama's own kind POST
+    /api/embed. Anthropic's API has no embeddings. extra is merged into the
+    request body (merge_body), such as {"embd_normalize": -1}: llama.cpp's
+    raw pooled vectors. An item of texts may also be a dict: a multimodal
+    input as llama.cpp's server takes it ({"content": [parts]}, see
+    looks.image_input), which only OpenAI-compatible endpoints are sent.
+
+    Returns {"vectors": [[float, ...] per text, in order], "model" (as the
+    server names it; '' if it does not), "tokens" (input tokens, or None),
+    "seconds"}. Raises ProviderError (kind "content" for a reply that is
+    not a list of vectors).
+    """
+    settings = common.endpoint_settings(endpoint)
+    key, _source = common.resolve_api_key(settings)
+    secrets = [key] if key else []
+    if not settings["base_url"]:
+        raise ProviderError("endpoint", "no base URL is set (the %s preset needs one)"
+                            % settings["preset"])
+    if settings["kind"] == "claude":
+        raise ProviderError("endpoint", "Anthropic's API cannot make embeddings: choose an "
+                            "OpenAI-compatible or Ollama endpoint")
+    texts = [text if isinstance(text, (str, dict)) else "" for text in texts]
+    if settings["kind"] == "ollama" and any(isinstance(text, dict) for text in texts):
+        raise ProviderError("endpoint", "Ollama's own API cannot embed pictures: use a llama.cpp "
+                            "server (its OpenAI-compatible API)")
+    model = settings["model"] if model is None else model
+    timeout = timeout or settings["timeout"]
+    headers = _headers(settings, key)
+    started = time.monotonic()
+    if settings["kind"] == "ollama":
+        url = _root_url(settings["base_url"], ollama=True) + "/api/embed"
+        payload = {"model": model, "input": texts}
+    else:
+        url = settings["base_url"] + "/embeddings"
+        payload = {"input": texts, "encoding_format": "float"}
+        if model:
+            payload["model"] = model
+    if extra:
+        payload = merge_body(payload, extra)
+    with _send(url, headers, payload, timeout, secrets) as response:
+        body = _read_reply_body(response, timeout, secrets)
+    data = _parse_reply_json(body, secrets)
+    if settings["kind"] == "ollama":
+        vectors = data.get("embeddings")
+        tokens = data.get("prompt_eval_count")
+    else:
+        items = data.get("data")
+        if isinstance(items, list) and all(isinstance(item, dict) for item in items):
+            # (The API may answer out of order: each item says which text it is.)
+            if all(isinstance(item.get("index"), int) for item in items):
+                items = sorted(items, key=lambda item: item["index"])
+            vectors = [item.get("embedding") for item in items]
+        else:
+            vectors = None
+        usage = data.get("usage")
+        tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    vectors = _embedding_list(vectors, len(texts), secrets)
+    served = data.get("model")
+    return {"vectors": vectors,
+            "model": served.replace("\\", "/").split("/")[-1] if isinstance(served, str) else "",
+            "tokens": tokens if isinstance(tokens, int) and not isinstance(tokens, bool)
+            else None,
+            "seconds": round(time.monotonic() - started, 3)}
+
+
+def embed_with_retries(endpoint, texts, model=None, should_stop=None, max_retries=6,
+                       sleep=time.sleep, timeout=None, on_retry=None, extra=None):
+    """embed(), asked again after retryable failures (a server still loading its
+    model answers 503), with the pauses of describe_with_retries. Other
+    failures, and the last retryable one, are raised."""
+    retries = 0
+    while True:
+        try:
+            reply = embed(endpoint, texts, model=model, timeout=timeout, extra=extra)
+            reply["retries"] = retries
+            return reply
+        except ProviderError as error:
+            if error.kind != "retryable" or retries >= max_retries:
+                raise
             if error.retry_after is not None and error.retry_after > MAX_RETRY_AFTER:
                 raise
             if should_stop is not None and should_stop():

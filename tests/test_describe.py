@@ -360,6 +360,25 @@ class DescribeTest(DescribeTestCase):
         rows = self.rows()
         self.assertEqual(rows["photo0.jpg"]["info"], rows["Copy/photo0.jpg"]["info"])
 
+    def test_exact_copies_of_a_360_photo_or_video_are_described_once(self):
+        # Their prompt carries a note of its own (the projection, the video's
+        # frames); the copy still gets the description it was skipped for.
+        self.small_images(1)
+        os.makedirs(os.path.join(self.folder, "Copy"))
+        with open(os.path.join(self.folder, "photo0.jpg"), "rb") as handle:
+            data = handle.read()
+        with open(os.path.join(self.folder, "Copy", "photo0.jpg"), "wb") as handle:
+            handle.write(data)
+        self.configure()
+        self.index()
+        with mock.patch.object(describe, "_projection", return_value="equirectangular"):
+            summary = self.describe()
+        self.assertEqual((summary["described"], summary["shared"]), (1, 1))
+        self.assertEqual(len(self.server.describe_requests()), 1)
+        rows = self.rows()
+        self.assertTrue(rows["Copy/photo0.jpg"]["described"])
+        self.assertEqual(rows["photo0.jpg"]["info"], rows["Copy/photo0.jpg"]["info"])
+
     def library_rows(self, library_id):
         conn = db.connect()
         try:

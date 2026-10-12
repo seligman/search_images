@@ -38,8 +38,13 @@ The same variable is honored by every script.
     "reader_threads": 6,
     "purge_after_days": 30,
     "local_server": { ... },
+    "embedding": { ... },
+    "image_embedding": { ... },
     "nadir_fill_deg": 0,
     "zenith_fill_deg": 0,
+    "ffmpeg": "",
+    "video_frames": 4,
+    "video_proxies": { "enabled": false, "height": 720, "crf": 26 },
     "libraries": [ { ... }, { ... } ]
 }
 ```
@@ -297,7 +302,8 @@ it, start the server yourself.
   before the extension (`model.mmproj.gguf` for `model.gguf`), or, for a
   model in a sub-folder, the file there with `mmproj` in its name. After
   starting, the server must report that it can see images, or it is
-  stopped again.
+  stopped again. An embeddings server (below) has one only when it is set:
+  then it runs an image embedding model for looks.
 - `binary` - the `llama-server` program (a full path, a path relative to
   `config.json`, or a name found on the PATH).
 - `port` (default 8091), `slots` (requests at the same time, `-np`; default
@@ -332,6 +338,40 @@ it, start the server yourself.
   when. **Start** on the Settings page still works in that hour.
 - `start_timeout` - seconds to wait for the server to load its model
   (default 900); after that it is stopped again.
+- `kind` - `"describe"` (the default: a vision model that describes
+  pictures) or `"embeddings"`: an embedding model for search by meaning
+  (see [embedding](#embedding)). An embeddings server is started with
+  `--embeddings` (it pools as the model file says: mean for mdbr-leaf-ir,
+  CLS for snowflake-arctic-embed, the last token for Qwen3-Embedding) and
+  `ctx_per_slot` as its context and batch sizes (`-c`, `-ub`, `-b`: the
+  longest text it can take at once), or the model's own context when that
+  is smaller (512 for small BERT models), without a projector or slots,
+  and counts as ready once it answers `/health`. A small model needs no
+  graphics card: `"extra_args": ["--device", "none", "-t", "4"]` keeps it
+  on the CPU (four threads), with CPU and CUDA builds of llama.cpp alike.
+  **Update meaning search** and the embed step after scans, describe and
+  refine jobs start it as describe jobs do (`auto_start`, `auto_stop`);
+  the search page starts it too when a typed search needs it (with
+  `auto_start` on; while it loads, searches go by the words alone). When
+  such a start fails, searches do not try again for five minutes
+  (**Start** on the Settings page, or a job, still does). Searches never
+  start a server of the other kind.
+  An embeddings server with `mmproj` set runs an image embedding model
+  for looks (see [image_embedding](#image_embedding)): its command also
+  gets `--mmproj <projector> -fa off`. Its `mmproj` is set in
+  `config.json` only (the Settings page does not change it). Flash attention changes the vectors
+  of pictures on a graphics card, so it stays off for image embeddings
+  (a `launch_command` must pass `-fa off` too). **Update looks** starts it
+  like describe jobs do, and the search page when a picture is dropped on
+  it (`auto_start`; `idle_stop_minutes` stops it again).
+- `idle_stop_minutes` - for a server the search page started for its
+  searches: stop it when no search has used it for this many minutes
+  (default 0: keep it running; it is also stopped when the web server
+  stops, with `auto_stop` on, and at `stop_at`). A job using it keeps it
+  running, and so does a `scan.py` run that is embedding with it. A small
+  embedding model on the CPU takes about 50 MB of memory and a few
+  milliseconds a search, so 0 suits it; a larger model, or one on the
+  graphics card, can be stopped after, say, 30 idle minutes.
 
 The server starts in its own process group, listening on `127.0.0.1` only,
 with `-fa on --reasoning off --no-webui`; its output goes to
@@ -350,10 +390,12 @@ stop, the panel says so instead of "stopped". The web server, its jobs and
 hold `data/model-server.lock`.
 
 The Settings page may change `model`, `mmproj`, `slots`, `ctx_per_slot`,
-`port`, `stop_at`, `auto_start` and `auto_stop`. The other settings
-(`enabled`, `endpoint`, `binary`, `models_dir`, `extra_args`,
-`launch_command`, `start_timeout`) are only changed here, in
-`config.json`: a web page can never choose which program runs.
+`port`, `stop_at`, `auto_start`, `auto_stop` and `idle_stop_minutes`. The
+other settings (`enabled`, `kind`, `endpoint`, `binary`, `models_dir`,
+`extra_args`, `launch_command`, `start_timeout`) are only changed here, in
+`config.json`: a web page can never choose which program runs. Its Model
+server panel marks an embeddings server "Embeddings" and offers no
+projector or slots for it.
 
 `local_server` may also be a list of such objects, one per endpoint (for
 example a small model for describing and a larger one for the refine
@@ -361,6 +403,221 @@ pass); each then logs to `data/logs/model-server-<endpoint>.log`. Most
 graphics cards hold one model at a time: a job that needs the other
 server waits for it to start, so stop the first one (auto_stop does this
 after each job).
+
+## embedding
+
+Optional: search by meaning (see "Search by meaning" in the README). An
+embedding model turns the description of every described picture into a
+meaning vector, and the search page turns what is typed into one too, to
+find pictures that mean the same without sharing its words. "More like
+this" ranks pictures by how close their vectors are.
+
+```
+"embedding": {
+    "endpoint": "embed",
+    "model": "",
+    "dims": 256,
+    "query_prefix": "Represent this sentence for searching relevant passages: ",
+    "batch": 32,
+    "allow_cloud": false,
+    "model_file": "",
+    "dense_file": "C:\\path\\to\\models\\model.dense.safetensors",
+    "license_file": "C:\\path\\to\\models\\model.LICENSE.txt",
+    "credit": "mdbr-leaf-ir by MongoDB (Apache-2.0)"
+}
+```
+
+The recommended model is MongoDB's mdbr-leaf-ir (23 million parameters,
+Apache-2.0): it runs on a CPU (the whole library in a few minutes, a few
+milliseconds a search), keeps its meaning when cut to 256 numbers, finds
+the pictures you mean at least as well as much larger models, and is small
+enough to go along with a published site, so that typed searches find
+pictures by meaning there too (the export's `meaning` option, see
+[libraries](#libraries)). Download three files and keep them together:
+the model as a Q8_0 GGUF file (a conversion of `MongoDB/mdbr-leaf-ir`; F16
+and F32 ones work too, but take longer to convert for a published site),
+its Dense head (the `2_Dense/model.safetensors` file of the model's
+repository; llama.cpp leaves this last layer out, so these tools apply it
+themselves, see `dense_file`), and its license text (Apache-2.0, with a
+line saying where the model comes from). snowflake-arctic-embed-xs is
+the other small model that works in a browser (it has no Dense head, but
+cannot be cut below its 384 numbers: set `"dims": 0`).
+
+- `endpoint` - the name of an endpoint (in `endpoints`) that serves an
+  embedding model through an OpenAI-compatible `/v1/embeddings` API
+  (llama.cpp's `llama-server --embeddings`, Ollama, LM Studio, vLLM,
+  OpenAI) or Ollama's own `/api/embed` (the `ollama` preset); `""` (the
+  default) turns search by meaning off. Claude endpoints cannot make
+  embeddings. For llama.cpp:
+
+      {"name": "embed", "preset": "llamacpp", "base_url": "http://127.0.0.1:8099/v1"}
+
+  started for example as `llama-server -m model.gguf --embeddings --host
+  127.0.0.1 --port 8099 -c 512 -ub 512 -b 512 --device none -t 4
+  --cache-ram 0` (a BERT model such as mdbr-leaf-ir takes 512 tokens at
+  most; Qwen3-Embedding 0.6B takes 8192), or by a `local_server` entry
+  with `"kind": "embeddings"`. `--device none` keeps it on the CPU, which
+  a small model is fast enough on. `--cache-ram 0` turns off the prompt
+  cache of recent llama.cpp builds (up to 8 GB of memory by default),
+  which embedding never reuses: every text is different. An older build
+  that does not know the flag works without it; for a `local_server`
+  entry, add `"extra_args": ["--cache-ram", "0"]`.
+- `model` - the model name sent with each request; `""` sends the
+  endpoint's `model` (llama.cpp needs none). The vectors are tied to this
+  name (or, without one, to the endpoint's model or name), and to the
+  model's name and vector length as its server reports them: when
+  another model is loaded behind the same endpoint, the next embed run
+  notices and makes every vector again (until then, typed searches go by
+  the words).
+- `dims` - keep this many numbers of each vector (the first ones) and
+  scale them back to unit length: 256 by default, 0 for all. Models
+  trained for this (Matryoshka models, such as Qwen3-Embedding or
+  nomic-embed-text) lose little meaning; smaller vectors download and
+  compare faster. More than the model gives is an error that the
+  embed job reports (with the number to use).
+- `query_prefix` - put in front of every query, not of the descriptions.
+  The default suits mdbr-leaf-ir, snowflake-arctic-embed and bge models.
+  Qwen3-Embedding wants an instruction instead, such as `"Instruct: Given
+  a description of a photo someone is looking for, find photo descriptions
+  that match it\nQuery: "`; set `""` for models that want none, or the
+  prefix your model's card asks for (`"search_query: "` for
+  nomic-embed-text).
+- `batch` - descriptions sent in one request (1 to 256, default 32; a
+  batch of a small model takes a fraction of a second on a CPU). A
+  search typed while an embed job runs waits for the batch in progress:
+  with a large model on a CPU, a smaller batch (8) keeps that wait short.
+- `allow_cloud` - an endpoint that is not on this computer or the local
+  network is only used when this is `true` (default `false`): the
+  descriptions, and every typed query, then go to that service. Hidden
+  pictures are never sent to one.
+- `model_file` - the GGUF file the endpoint runs (a relative path is next
+  to `config.json`); `""` (the default) means the model of the
+  `local_server` entry with `"kind": "embeddings"` that serves the
+  endpoint, if there is one. The vectors are tied to this file (another
+  file makes every vector again), a llama.cpp server that says it runs a
+  model file of another name is refused, and a published site can only
+  ship the model with it.
+- `dense_file` - the model's Dense head (sentence-transformers'
+  `2_Dense/model.safetensors`, F32), when it has one: mdbr-leaf-ir ends in
+  a layer that turns its 384 numbers into 768, which llama.cpp leaves out.
+  With it, every request asks for the model's raw vectors (the request
+  field `"embd_normalize": -1`) and the layer is applied here, to pictures
+  and searches alike (only its first `dims` rows). Only a llama.cpp
+  server gives raw vectors: one that answers with unit-length vectors
+  anyway (an Ollama endpoint, or a llama.cpp build too old for the field)
+  is refused with a message that says so, and nothing is stored.
+- `license_file` - the model's license text (with a line saying where the
+  model comes from). A published site ships the model only with it: it
+  goes along as `data/meaning/LICENSE.txt`.
+- `credit` - one line the pages of a published site show at their foot
+  next to the license link, such as `"mdbr-leaf-ir by MongoDB
+  (Apache-2.0)"`.
+
+Every embed run that embeds anything also embeds two fixed, made-up
+sentences and keeps their vectors (a "probe"): when they come out
+differently later, another model answers the endpoint, and every picture
+is embedded again. A published site checks itself with them too. (Vectors
+made before there was a probe get one from the next **Update meaning
+search**, or the next run that embeds something.) A text too long for the
+model (rare: a picture with a lot of text in it) is cut and tried again,
+the text read in the picture first; the job's summary counts the pictures
+cut.
+
+Changing `endpoint`'s model, `model`, `dims`, `model_file` or
+`dense_file` makes every vector again (the next **Update meaning
+search**, scan, describe or refine job does it; until then the search
+goes by the words, and "More like this" uses the older vectors). When
+the model file or the Dense head cannot be read (a renamed folder, a
+drive that is not there), nothing is embedded and the vectors stay as
+they are; the Manage page says why, and the search goes by the words
+until the file is back. A picture whose title, description or tags you
+edit is left out of search by meaning until it is embedded again. The
+vectors live in `data/vectors.db`, which is safe to delete: it is made
+again.
+
+## image_embedding
+
+Optional: looks ("Looks like this", and finding pictures by a picture
+dropped on the search page; see "Looks like this and search by a picture"
+in the README). An image embedding model turns what each picture looks
+like into a look vector, kept in `data/image_vectors.db`.
+
+```
+"image_embedding": {
+    "endpoint": "looks",
+    "dims": 256,
+    "max_edge": 1024,
+    "batch": 8,
+    "model_file": "",
+    "mmproj_file": "",
+    "probe_check": true
+}
+```
+
+The model must embed pictures through llama.cpp's server: for example
+Google's EmbeddingGemma 2 (Apache-2.0: a model file and an image projector
+file, both GGUF; llama.cpp release b11452 or later). Run it with the
+projector and flash attention off:
+
+    llama-server -m model.gguf --mmproj model.mmproj.gguf --embeddings -fa off --host 127.0.0.1 --port 8097 -c 8192 -ub 8192 -b 8192
+
+or with a `local_server` entry of `"kind": "embeddings"` that names the
+projector in `mmproj` (it passes `-fa off` itself). On a CPU a picture
+takes a few seconds (hours for a large library); a graphics card makes
+them much faster, so **Update looks** is a job of its own, never part of a
+scan. A search by a dropped picture embeds that one picture, on whichever
+server the endpoint reaches (a CPU server takes a few seconds; a stopped
+server is started for it with its `auto_start`).
+
+- `endpoint` - the name of an endpoint (in `endpoints`, an
+  OpenAI-compatible one) that serves the image model; `""` (the default)
+  turns looks off. It must be on this computer or the local network:
+  pictures (hidden ones too) are never sent to a cloud service for this.
+- `dims` - keep this many numbers of each vector (the first ones, scaled
+  back to unit length): 256 by default (about 350 bytes a picture in a
+  published site), 0 for all. EmbeddingGemma 2 gives 768 and keeps what
+  pictures look like when cut to 256.
+- `max_edge` - the long edge, in pixels, of the picture the model is sent
+  (320 to 2048, default 1024; never larger than the picture). A larger
+  picture costs the model much more time; 768 halves it.
+- `batch` - pictures sent in one request (1 to 64, default 8).
+- `model_file`, `mmproj_file` - the model and projector files the
+  endpoint runs (relative paths are next to `config.json`); `""` (the
+  default) means those of the `local_server` entry that serves the
+  endpoint, if there is one. The looks are tied to them (see below), and a
+  llama.cpp server that says it runs a model file of another name is
+  refused.
+- `probe_check` - `true` (the default): before the first batch of every
+  run, three probe pictures drawn by the program (a gradient, a disc,
+  stripes) are embedded and compared with the vectors the first run made
+  of them; when they differ (cosine below 0.99) the run stops with a
+  message, as a graphics card running the model with flash attention on,
+  or in float16, makes different vectors. Make the first run (a few
+  pictures: `scan.py --embed-images --limit 8`) on a CPU server, or with
+  flash attention off, to have a trusted reference. The reference belongs
+  to the model and projector files: a rebuild for other `dims` or
+  `max_edge` keeps it. When the check fails, fix the server (flash
+  attention off, not float16) and update the looks again; if the server
+  was right and the reference was not (made on a server that was not), the
+  Manage page offers **Rebuild looks**, which throws away the reference
+  and the kept looks and makes them again. `false` skips the check.
+
+The looks are tied to a recipe: the model and projector files, `dims`,
+`max_edge` and the way pictures are prepared. When it changes, the kept
+looks still work for **Looks like this** (they match each other), but
+pictures dropped on the search page cannot be compared with them, and no
+new ones are made until you choose **Rebuild looks** on the Manage page
+(or run `scan.py --embed-images --rebuild-looks`): that throws them all
+away and makes them again. A rebuild never throws away looks of the
+current recipe, so one that was stopped (or is run again, for another
+library) goes on where it was; to make looks of the same recipe again,
+delete `data/image_vectors.db`. Copies of a picture share one look vector
+(it belongs to the picture's content); vectors of pictures no longer in
+the index are dropped by the next run, or at once when a library's
+indexed data is deleted or the scanner removes pictures missing too long.
+A `data/image_vectors.db` written by a newer version of the program is
+never changed: there are no looks until that version is used again (or the
+file is deleted).
 
 ## reader_threads
 
@@ -395,6 +652,43 @@ something). At most 30. Panoramas the camera stitched itself, and other
 
 After a change, the next scan stitches the 360-degree photos in the index
 again (their previews, panoramas and thumbnails; descriptions are kept).
+
+## Videos: ffmpeg, video_frames, video_proxies
+
+Videos (`.mov`, `.mp4`, `.m4v`, `.3gp`, `.3g2`, `.avi`, `.mkv`, `.webm`,
+`.wmv`, `.mts`, `.m2ts`, `.mpg`, `.mpeg`) are indexed when the programs
+`ffmpeg` and `ffprobe` (which come together in every ffmpeg download) can be
+found, and the library's `videos` setting is on (see README, "Videos").
+
+- `ffmpeg` - the ffmpeg program, or the folder holding it, such as
+  `C:\path\to\ffmpeg\bin\ffmpeg.exe` or `/usr/local/bin/ffmpeg` (a
+  relative path is relative to the folder of config.json); `ffprobe` is
+  looked for next to it, then on the PATH. `""` (the default) looks for
+  both on the PATH. Without them, scans list videos but do not read them
+  (videos indexed before stay as they are), and the Manage page says so
+  once. Frames are always decoded on the processor (no graphics card).
+- `video_frames` - how many frames a video's contact sheet holds for
+  describing (1 to 9, default 4: a 2 x 2 grid of frames at 12.5 %, 37.5 %,
+  62.5 % and 87.5 % of the video). The sheet is as large as the library's
+  endpoint's `max_image_edge` when it is made (a later change of the
+  endpoint keeps the sheets as they are; the describe step shrinks a
+  larger one). After a change of `video_frames`, the next scan (or **Build
+  previews**) makes the sheets of the videos already indexed again, which
+  reads each video once more. A very short video's sheet may hold fewer
+  frames; the model is told how many it holds.
+- `video_proxies` - playable copies, off by default. Browsers play H.264
+  videos, but many cannot play HEVC (most phones' format in recent years)
+  or older formats (AVI, WMV, MPEG-4 Part 2). With `"enabled": true`, the
+  Manage page offers **Make playable copies (N)** for a library: a job
+  that writes an H.264 / AAC copy of each such video into
+  `data/proxies/<library id>/`, at most `height` pixels on its short side
+  (default 720) with quality `crf` (14 to 40, default 26: lower is better
+  and larger). The viewer then plays the copy, and an export with videos
+  can publish it. Copies of videos that changed or are gone are removed by
+  the next run (a moved or renamed video keeps its copy; deleting a
+  library's indexed data deletes its copies); the Manage page shows how
+  much space they take. Encoding takes about as long as the video plays,
+  or longer.
 
 ## libraries
 
@@ -444,6 +738,10 @@ A list of folders to scan. Each library is one object:
   letters". It can help the descriptions, but it is sent to the endpoint's
   service, so do not put anything private here. Names of people in the
   notes are not used to identify anyone.
+- `videos` - `true` (the default) indexes the library's videos when ffmpeg
+  is there (see "Videos" above); `false` leaves them out (videos indexed
+  before are then treated like files excluded by an ignore pattern: marked
+  missing, and removed after `purge_after_days`).
 - `refine` - optional: a second endpoint that describes the library's
   documents and screenshots again (the refine pass; see README, "Refining
   documents and screenshots"). `{}` or no `endpoint` turns it off (the
@@ -489,10 +787,11 @@ A list of folders to scan. Each library is one object:
     (searchable); default `false`.
   - `exclude_types` - picture types left out; default
     `["screenshot", "document"]` (the others are `scan`, `artwork`, `meme`,
-    `diagram`, `photo` and `other`). A picture whose document type is a
-    receipt, letter, form, ticket or handwriting also counts as a
-    `document`, and one showing a chat, web page or app as a `screenshot`,
-    whatever its photo type.
+    `diagram`, `photo`, `other` and `video`: every video). A picture whose
+    document type is a receipt, letter, form, ticket or handwriting also
+    counts as a `document`, and one showing a chat, web page or app as a
+    `screenshot`, whatever its photo type; a video counts as the kind the
+    AI model saw in its frames too (a screen recording as a `screenshot`).
   - `exclude_private`, `exclude_sensitive`, `exclude_undescribed` - leave
     out pictures flagged as showing private information (or an ID card),
     as suggestive, explicit or graphic, or not checked yet (not described,
@@ -514,6 +813,49 @@ A list of folders to scan. Each library is one object:
     (default `false`: the pages and a `robots.txt` ask them not to list
     the pages or their pictures; anyone with the address can still open
     them).
+  - `videos` - `"skip"` (the default) publishes each video as its poster
+    frame; `"include"` also publishes the videos browsers play (H.264, or
+    a playable copy made by `video_proxies`), copied into an MP4 without
+    their metadata (no place, date, device, data tracks or chapters; the
+    picture and sound are not re-encoded). Other videos (HEVC without a
+    playable copy) keep their poster only; the review step counts them.
+    The AI model checked only a few still frames of each video for
+    private or sensitive content and never heard its sound: watch the
+    videos you publish.
+  - `max_video_mb` - videos larger than this many megabytes (default 200)
+    are published as their poster only.
+  - `looks` - `true` (the default) publishes the look vectors of the
+    published pictures (about 350 bytes each, in `data/looks-NNN.js`), so
+    "Looks like this" works in the site too; nothing goes when no
+    published picture has one (see `image_embedding`).
+  - `similar` - `true` (the default) publishes the meaning vectors of the
+    published pictures (about 350 bytes each, in `data/vectors-NNN.js`),
+    so "More like this" goes by meaning in the site too. Only vectors made
+    from a picture's current description go: a vector holds nothing its
+    description does not show (no names, dates or places), and the
+    model's name is not published. Pictures without one (search by
+    meaning not set up, or not updated since the description changed)
+    fall back to tags and dates there.
+  - `meaning` - `true` (the default) also publishes the query model of
+    search by meaning, when it can run in a browser, so that typed searches
+    in the site find pictures by meaning as on the server: the model's files
+    (`data/meaning/`, converted from `model_file` with its Dense head: about
+    31 MB, of which visitors download about 23 MB with gzip, once, at their
+    first search by meaning), the engine that runs it
+    (`assets/embed-engine.js`, `embed-kernel.js`), the model's license and
+    the credit line at the foot of the search and details pages. It works
+    from disk and offline too. A web host that sends a
+    `Content-Security-Policy` header must allow `'wasm-unsafe-eval'` in
+    `script-src` for its WebAssembly part (else it runs in plain JavaScript:
+    the same results, about five times slower). It needs `similar`, a
+    `model_file` that can run in a browser (a small BERT-family model:
+    mdbr-leaf-ir, snowflake-arctic-embed-xs; not Qwen3-Embedding or
+    EmbeddingGemma), a `license_file`, and vectors made with that model
+    (**Update meaning search**); the Export dialog says which is missing.
+    The model files hold only public model data, the two probe sentences and
+    their vectors, and the query prefix. Visitors who choose **Words** never
+    download the model; with their browser's data saver on, a button asks
+    first.
 
 A library removed from the file is not deleted from the database: its images
 stay there, unused, until you delete them or attach them to a library again
@@ -626,9 +968,12 @@ count towards the "most of the library vanished" safety check.
 }
 ```
 
-With a model server the Settings page starts and stops, and a stronger
-model for the documents of the Family library (`local_server` and
-`refine`, both optional):
+With a model server the Settings page starts and stops, a stronger
+model for the documents of the Family library, and search by meaning with
+a small embedding model on the CPU (with its Dense head, license and
+credit, so published sites can search by meaning too) that starts when
+needed and stops after half an hour without searches (`local_server`,
+`refine` and `embedding`, all optional):
 
 ```
 {
@@ -644,9 +989,20 @@ model for the documents of the Family library (`local_server` and
             "preset": "llamacpp",
             "base_url": "http://127.0.0.1:8081/v1",
             "model": "your-larger-model"
+        },
+        {
+            "name": "embed",
+            "preset": "llamacpp",
+            "base_url": "http://127.0.0.1:8099/v1"
         }
     ],
     "default_endpoint": "local",
+    "embedding": {
+        "endpoint": "embed",
+        "dense_file": "C:\\path\\to\\models\\model.dense.safetensors",
+        "license_file": "C:\\path\\to\\models\\model.LICENSE.txt",
+        "credit": "mdbr-leaf-ir by MongoDB (Apache-2.0)"
+    },
     "local_server": [
         {
             "enabled": true,
@@ -666,6 +1022,17 @@ model for the documents of the Family library (`local_server` and
             "port": 8081,
             "slots": 2,
             "ctx_per_slot": 16384
+        },
+        {
+            "enabled": true,
+            "kind": "embeddings",
+            "endpoint": "embed",
+            "binary": "C:\\path\\to\\llama-server.exe",
+            "models_dir": "C:\\path\\to\\models",
+            "model": "model.gguf",
+            "port": 8099,
+            "extra_args": ["--device", "none", "-t", "4"],
+            "idle_stop_minutes": 30
         }
     ],
     "libraries": [

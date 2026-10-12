@@ -1226,6 +1226,30 @@ test("one word only in the text of a picture ranks below pictures about it", fun
     assert.deepStrictEqual(items(records, "dog food"), [1]);
 });
 
+test("videos are a kind of picture: is:video, type:video and the Type facet", function () {
+    var records = [
+        {i: 1, t: "Fireworks over the bay", ty: "video", mv: 1, dr: 24, vc: "hevc", ds: 1},
+        {i: 2, t: "Fireworks", ty: "photo", ds: 1},
+        {i: 3, n: "IMG_0003.MOV", ty: "video", mv: 1, dr: 4},
+        {i: 4, t: "A chat", ty: "screenshot", ds: 1}
+    ];
+    assert.deepStrictEqual(items(records, "is:video").sort(), [1, 3]);
+    assert.deepStrictEqual(items(records, "type:video").sort(), [1, 3]);
+    assert.deepStrictEqual(items(records, "type:videos").sort(), [1, 3]);
+    assert.deepStrictEqual(items(records, "is:movie").sort(), [1, 3]);
+    assert.deepStrictEqual(items(records, "-is:video").sort(), [2, 4]);
+    // is:photo stays the photo type: no videos, no screenshots.
+    assert.deepStrictEqual(items(records, "is:photo"), [2]);
+    assert.deepStrictEqual(items(records, "fireworks video"), [1]);
+    var result = search(records, "");
+    assert.strictEqual(counts(result, "type").video, 2);
+    assert.strictEqual(SearchCore.facetLabel("type", "video"), "Videos");
+    assert.deepStrictEqual(items(records, "", {filters: {type: ["video"]}}).sort(), [1, 3]);
+    assert.ok(SearchCore.SYNTAX.some(function (row) {
+        return row.meaning.indexOf("is:video") >= 0;
+    }));
+});
+
 test("is:edited finds the pictures the owner edited", function () {
     var records = [{i: 1, t: "Rex", ed: 1}, {i: 2, t: "Beach"}];
     assert.deepStrictEqual(items(records, "is:edited"), [1]);
@@ -1777,6 +1801,503 @@ test("10k records: every query under 50 ms", function () {
     assert.strictEqual(all.total, records.filter(function (rec) {
         return !rec.h;
     }).length);
+});
+
+/* ---------- Search by meaning ---------------------------------------------- */
+
+var MEANING_DIMS = 8;
+
+// A signed-byte vector (unit length times 127) from numbers.
+function byteVector(values) {
+    var norm = Math.sqrt(values.reduce(function (sum, value) {
+        return sum + value * value;
+    }, 0));
+    var out = new Int8Array(MEANING_DIMS);
+    values.forEach(function (value, k) {
+        out[k] = Math.round(value / norm * 127);
+    });
+    return out;
+}
+
+// A vector whose cosine with the query (axis 0) is cos, leaning towards axis.
+function closeTo(cos, axis) {
+    var values = [];
+    for (var k = 0; k < MEANING_DIMS; k++) {
+        values.push(0);
+    }
+    values[0] = cos;
+    values[axis || 1] = Math.sqrt(Math.max(0, 1 - cos * cos));
+    return byteVector(values);
+}
+
+var QUERY = closeTo(1);
+
+// An index of records with vectors ({id: Int8Array}), among 200 (or
+// fillers) pictures that are not what is looked for: their cosines with
+// the query (axis 0) spread from 0.05 to 0.45, as most of a real index's
+// are. (Cosines are judged against those of the whole index.)
+function meaningIndex(records, vectors, fillers) {
+    fillers = fillers || 200;
+    for (var k = 0; k < fillers; k++) {
+        var id = 10000 + k;
+        records.push({i: id, t: "Filler picture " + k, dk: "2010-01-01", ds: 1});
+        vectors[id] = closeTo(0.05 + 0.4 * (k / (fillers - 1)), 6 + (k % 2));
+    }
+    var ids = Object.keys(vectors).map(Number);
+    var data = new Int8Array(ids.length * MEANING_DIMS);
+    ids.forEach(function (id, k) {
+        data.set(vectors[id], k * MEANING_DIMS);
+    });
+    var index = SearchCore.prepare(records);
+    var known = {};
+    records.forEach(function (rec) {
+        known[rec.i] = true;
+    });
+    assert.strictEqual(index.setVectors({dims: MEANING_DIMS, ids: ids, data: data}),
+                       ids.filter(function (id) {
+                           return known[id];
+                       }).length);
+    return index;
+}
+
+test("meaning vectors are decoded, joined and checked", function () {
+    var bytes = new Int8Array([1, -2, 3, -4, 5, -6]);
+    var text = Buffer.from(bytes.buffer).toString("base64");
+    var decoded = SearchCore.decodeVectors({model: "m", dims: 3, query: true, ids: [7, 8],
+                                            data: text});
+    assert.deepStrictEqual(Array.from(decoded.data), [1, -2, 3, -4, 5, -6]);
+    assert.deepStrictEqual([decoded.model, decoded.dims, decoded.query, decoded.ids],
+                           ["m", 3, true, [7, 8]]);
+    // The wrong length, no ids, a bad size: nothing.
+    assert.strictEqual(SearchCore.decodeVectors({dims: 4, ids: [7, 8], data: text}), null);
+    assert.strictEqual(SearchCore.decodeVectors({dims: 3, ids: [], data: ""}), null);
+    assert.strictEqual(SearchCore.decodeVectors({dims: 0, ids: [7], data: text}), null);
+    assert.strictEqual(SearchCore.decodeVectors(null), null);
+    var other = SearchCore.decodeVectors({dims: 3, ids: [9], data: new Int8Array([9, 9, 9])});
+    var joined = SearchCore.joinVectors([decoded, null, other,
+                                         SearchCore.decodeVectors({dims: 2, ids: [1],
+                                                                   data: new Int8Array(2)})]);
+    assert.deepStrictEqual(joined.ids, [7, 8, 9]);
+    assert.deepStrictEqual(Array.from(joined.data), [1, -2, 3, -4, 5, -6, 9, 9, 9]);
+    assert.strictEqual(SearchCore.joinVectors([]), null);
+    assert.deepStrictEqual(Array.from(SearchCore.queryVector(
+        Buffer.from(new Int8Array([5, -5]).buffer).toString("base64"), 2)), [5, -5]);
+    assert.strictEqual(SearchCore.queryVector("AAAA", 2), null);
+});
+
+test("the text whose meaning a query looks for", function () {
+    assert.strictEqual(SearchCore.meaningText("kids playing in the snow"),
+                       "kids playing in the snow");
+    assert.strictEqual(SearchCore.meaningText("year:2019 -cat tag:dog \"red car\" beach"),
+                       "red car beach");
+    assert.strictEqual(SearchCore.meaningText("beach no people"), "beach");
+    assert.strictEqual(SearchCore.meaningText("year:2019 type:photo"), "");
+    assert.strictEqual(SearchCore.meaningText("\"red car\""), "");
+    assert.strictEqual(SearchCore.meaningText("similar:5 beach"), "");
+    assert.strictEqual(SearchCore.meaningText(""), "");
+});
+
+test("words and meaning: word matches first, then pictures that mean the same", function () {
+    // (Words with no synonyms, so only meaning links them.)
+    var records = [
+        {i: 1, t: "Zebra on a quilt", g: ["zebra", "quilt"], dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Striped animal resting on a bedspread", g: ["bedspread"], dk: "2021-01-01",
+         ds: 1},
+        {i: 3, t: "Zebra in the savanna", g: ["zebra", "savanna"], dk: "2020-01-03", ds: 1},
+        {i: 4, t: "Birthday cake", g: ["cake"], dk: "2020-01-04", ds: 1},
+        {i: 5, t: "A quilt and a zebra mug", g: ["quilt", "mug"], dk: "2020-01-05", ds: 1},
+        {i: 6, t: "Stripes on a bedspread", g: ["bedspread"], dk: "2020-01-06", ds: 1},
+        {i: 7, t: "Old bedspread", dk: "2020-01-07", ds: 1}
+    ];
+    var index = meaningIndex(records, {1: closeTo(0.9), 2: closeTo(0.85, 2), 3: closeTo(0.55),
+                                       4: closeTo(0.2, 3), 5: closeTo(0.4, 4),
+                                       6: closeTo(0.65, 5)});
+    var result = index.search("zebra quilt", {vector: QUERY});
+    // Both word matches (the closer one first), then the striped animal by
+    // meaning; the zebra in the savanna lacks a word and is too far below
+    // the best cosine, and so is the other bedspread.
+    assert.deepStrictEqual(result.items, [1, 5, 2]);
+    assert.deepStrictEqual(result.byMeaning, [2]);
+    assert.strictEqual(result.meaning.mode, "hybrid");
+    assert.ok(Math.abs(result.meaning.best - 0.9) < 0.02, result.meaning.best);
+    assert.strictEqual(result.sort, "relevance");
+    assert.strictEqual(result.total, 3);
+    // Words only: as without a vector.
+    assert.deepStrictEqual(index.search("zebra quilt", {vector: QUERY, meaning: "words"}).items,
+                           [1, 5]);
+    var plain = index.search("zebra quilt");
+    assert.deepStrictEqual(plain.items, [1, 5]);
+    assert.deepStrictEqual(plain.byMeaning, []);
+    assert.strictEqual(plain.meaning, null);
+    // A vector of another size is not used.
+    assert.deepStrictEqual(index.search("zebra quilt", {vector: new Int8Array(3)}).items, [1, 5]);
+    // Meaning only: the closest, words or not (a wider net: three standard
+    // deviations of the index's cosines below the best).
+    assert.deepStrictEqual(index.search("zebra quilt", {vector: QUERY, meaning: "meaning"})
+                           .items, [1, 2, 6]);
+    // Sorted by date, the same pictures.
+    assert.deepStrictEqual(index.search("zebra quilt", {vector: QUERY, sort: "newest"}).items,
+                           [2, 5, 1]);
+    // Filters only: nothing for meaning to rank.
+    assert.strictEqual(index.search("year:2020", {vector: QUERY}).meaning, null);
+});
+
+test("a word match about something else ranks below the word matches that mean it", function () {
+    var records = [
+        {i: 1, t: "Zebra on a quilt", g: ["zebra", "quilt"], dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Striped animal resting on a bedspread", g: ["bedspread"], dk: "2020-01-02",
+         ds: 1},
+        {i: 3, t: "Zebra quilt sale flyer", g: ["zebra", "quilt"], dk: "2020-01-03", ds: 1},
+        {i: 4, t: "Zebra quilt", dk: "2020-01-04"},
+        {i: 5, t: "Shop window", d: "A sign in the window mentions a zebra quilt.",
+         dk: "2020-01-05", ds: 1},
+        {i: 6, t: "Zebra pattern on a quilt", g: ["zebra", "quilt"], dk: "2020-01-06", ds: 1}
+    ];
+    // (Picture 4 has no vector yet: its words alone count.)
+    var index = meaningIndex(records, {1: closeTo(0.9), 2: closeTo(0.88, 2),
+                                       3: closeTo(-0.3, 3), 5: closeTo(-0.3, 4),
+                                       6: closeTo(0.8, 5)});
+    var result = index.search("zebra quilt", {vector: QUERY, sort: "relevance"});
+    var at = function (id) {
+        return result.items.indexOf(id);
+    };
+    assert.deepStrictEqual(result.items.slice(0, 3), [1, 6, 4]);
+    // Strong words stay above what only means the same; weak words about
+    // something else drop below it.
+    assert.ok(at(3) < at(2) && at(2) < at(5), result.items.join(" "));
+    assert.strictEqual(result.total, 6);
+    assert.deepStrictEqual(result.byMeaning, [2]);
+    // (Sorting and stacks take the scores as they are: none below zero.)
+    assert.deepStrictEqual(index.search("zebra quilt", {vector: QUERY, group: true}).items,
+                           result.items);
+});
+
+test("pictures found by meaning alone come after the word matches that mean it", function () {
+    var records = [
+        {i: 1, t: "Snowman in the yard", g: ["snowman"], dk: "2020-01-01", ds: 1},
+        {i: 2, d: "A snowman, just the words in a corner.", dk: "2020-01-02", ds: 1},
+        {i: 3, t: "Children building a snow figure", g: ["snow"], dk: "2020-01-03", ds: 1}
+    ];
+    // The weak word match (2) is still about the query (z about 3); the
+    // picture without the word is the closest of all.
+    var index = meaningIndex(records, {1: closeTo(0.85), 2: closeTo(0.6, 2),
+                                       3: closeTo(0.95, 3)});
+    var result = index.search("snowman", {vector: QUERY});
+    assert.deepStrictEqual(result.items, [1, 2, 3]);
+    assert.deepStrictEqual(result.byMeaning, [3]);
+});
+
+test("names: when the words found pictures unlike the query, meaning adds nothing", function () {
+    // A place name: the word is in the pictures' text, but the model makes
+    // something else of it (their cosines are those of any picture).
+    var records = [
+        {i: 1, t: "Mortgage statement", x: "Maplebrook branch", dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Fence along a pond", pl: "Maplebrook", dk: "2020-01-02", ds: 1},
+        {i: 3, t: "Maplebrook Maplebrook Maplebrook", dk: "2020-01-03", ds: 1},
+        {i: 4, t: "Maple leaf brooch carving", g: ["carving"], dk: "2020-01-04", ds: 1}
+    ];
+    var index = meaningIndex(records, {1: closeTo(0.2, 2), 2: closeTo(0.28, 3),
+                                       3: closeTo(0.24, 4), 4: closeTo(0.9, 5)});
+    var words = index.search("Maplebrook");
+    var result = index.search("Maplebrook", {vector: QUERY});
+    assert.deepStrictEqual(result.items, words.items);
+    assert.deepStrictEqual(result.byMeaning, []);
+    assert.strictEqual(result.meaning, null);
+    assert.ok(result.items.indexOf(4) < 0);
+    // By meaning only, the model's view decides (the switch asked for it).
+    assert.deepStrictEqual(index.search("Maplebrook", {vector: QUERY, meaning: "meaning"}).items,
+                           [4]);
+});
+
+test("at most 40 pictures are added by meaning alone: the closest", function () {
+    var records = [];
+    var vectors = {};
+    for (var k = 0; k < 60; k++) {
+        records.push({i: k + 1, t: "Picture " + k, dk: "2020-01-01", ds: 1});
+        vectors[k + 1] = closeTo(0.9 - 0.11 * (k / 59), 1 + (k % 5));
+    }
+    var index = meaningIndex(records, vectors, 2000);
+    var result = index.search("snowmen", {vector: QUERY});
+    assert.strictEqual(result.total, 40);
+    // (The closest by their stored, rounded, vectors.)
+    var cos = index.cosineStats(QUERY).values;
+    var closest = records.slice(0, 60).map(function (rec, row) {
+        return {id: rec.i, cos: cos[row], row: row};
+    }).sort(function (a, b) {
+        return b.cos - a.cos || a.row - b.row;
+    }).slice(0, 40).map(function (entry) {
+        return entry.id;
+    });
+    assert.deepStrictEqual(result.byMeaning, closest);
+    assert.deepStrictEqual(result.items.slice().sort(function (a, b) {
+        return a - b;
+    }), closest.slice().sort(function (a, b) {
+        return a - b;
+    }));
+    assert.ok(closest.indexOf(60) < 0 && closest.indexOf(1) >= 0);
+});
+
+test("filters, phrases, field words and -words stay strict with meaning", function () {
+    var records = [
+        {i: 1, t: "Zebra asleep on a quilt", g: ["zebra", "quilt"], dk: "2020-01-01", ds: 1,
+         ty: "photo"},
+        {i: 2, t: "Striped animal resting on a bedspread", g: ["bedspread"], dk: "2021-01-01",
+         ds: 1, ty: "photo"},
+        {i: 3, t: "Drawing of a striped animal on a bedspread", g: ["drawing"],
+         dk: "2021-01-02", ds: 1, ty: "artwork"}
+    ];
+    var index = meaningIndex(records, {1: closeTo(0.9), 2: closeTo(0.85, 2), 3: closeTo(0.84, 3)});
+    assert.deepStrictEqual(index.search("zebra quilt", {vector: QUERY}).items, [1, 2, 3]);
+    assert.deepStrictEqual(index.search("zebra quilt year:2021", {vector: QUERY}).items, [2, 3]);
+    assert.deepStrictEqual(index.search("zebra quilt type:photo", {vector: QUERY}).items, [1, 2]);
+    assert.deepStrictEqual(index.search("zebra quilt -bedspread", {vector: QUERY}).items, [1]);
+    assert.deepStrictEqual(index.search("tag:zebra quilt", {vector: QUERY}).items, [1]);
+    assert.deepStrictEqual(index.search("\"asleep on\"", {vector: QUERY}).items, [1]);
+    assert.deepStrictEqual(index.search("zebra quilt", {vector: QUERY,
+                                                        filters: {type: ["artwork"]}}).items,
+                           [3]);
+    // The facets count the pictures found by meaning too.
+    var result = index.search("zebra quilt", {vector: QUERY});
+    assert.deepStrictEqual(counts(result, "type"), {photo: 2, artwork: 1});
+    // Hidden pictures stay hidden.
+    records[1].h = 1;
+    assert.deepStrictEqual(index.search("zebra quilt", {vector: QUERY}).items, [1, 3]);
+});
+
+test("similar: pictures closest in meaning to one picture, that one first", function () {
+    var records = [
+        {i: 1, t: "Sunset over the sea", g: ["sunset", "sea"], dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Evening at the beach", g: ["beach"], dk: "2020-01-02", ds: 1},
+        {i: 3, t: "Waves at dusk", g: ["waves"], dk: "2019-01-03", ds: 1},
+        {i: 4, t: "Birthday cake", g: ["cake"], dk: "2020-01-04", ds: 1},
+        {i: 5, t: "Undescribed", dk: "2020-01-05"},
+        {i: 6, t: "Sea at sunset, hidden", g: ["sea", "sunset"], dk: "2020-01-06", ds: 1, h: 1}
+    ];
+    var index = meaningIndex(records, {1: closeTo(1), 2: closeTo(0.8, 2), 3: closeTo(0.7, 3),
+                                       4: closeTo(0.2, 4), 6: closeTo(0.95, 5)});
+    var result = index.search("similar:1");
+    assert.deepStrictEqual(result.items, [1, 2, 3]);
+    assert.strictEqual(result.sort, "relevance");
+    assert.strictEqual(result.meaning.mode, "similar");
+    assert.deepStrictEqual(result.byMeaning, []);
+    assert.deepStrictEqual(index.search("similar:1", {hidden: true}).items, [1, 6, 2, 3]);
+    assert.deepStrictEqual(index.search("similar:1 year:2020").items, [1, 2]);
+    assert.deepStrictEqual(index.search("similar:1 waves").items, [3]);
+    assert.deepStrictEqual(index.search("similar:1", {sort: "oldest"}).items, [3, 1, 2]);
+    assert.deepStrictEqual(index.search("like:2").items.slice(0, 2), [2, 1]);
+    var unknown = index.search("similar:999");
+    assert.deepStrictEqual(unknown.items, []);
+    assert.ok(/no picture 999/.test(unknown.warnings.join(" ")), unknown.warnings);
+    assert.ok(/not understood/.test(index.search("similar:a b").warnings.join(" ")) ||
+              index.search("similar:a b").items.length === 0);
+    // The strip in the viewer: the closest by meaning, without the picture itself.
+    assert.deepStrictEqual(index.similar(1, 8), [2, 3]);
+    assert.deepStrictEqual(index.similar(1, 1), [2]);
+});
+
+test("similar: in a small set, the closest pictures (z 3 is out of reach)", function () {
+    // Nine pictures, as in a small export: with eight others no picture can
+    // be three deviations above them, however close it is. So few pictures
+    // cannot tell the typical cosine of two pictures either: it is taken to
+    // be 0.4, give or take 0.1, so close means at least 0.6, within 0.1 of
+    // the closest.
+    function smallIndex(cosines) {
+        var records = [];
+        var data = new Int8Array(cosines.length * MEANING_DIMS);
+        var ids = [];
+        cosines.forEach(function (cos, k) {
+            records.push({i: k + 1, t: "Picture " + (k + 1), dk: "2020-01-0" + (k + 1), ds: 1});
+            ids.push(k + 1);
+            data.set(closeTo(cos, 1 + k), k * MEANING_DIMS);
+        });
+        var index = SearchCore.prepare(records);
+        assert.strictEqual(index.setVectors({dims: MEANING_DIMS, ids: ids, data: data}),
+                           cosines.length);
+        return index;
+    }
+    // A set of one theme, all of it close: the closest four.
+    var index = smallIndex([1, 0.9, 0.88, 0.86, 0.84, 0.82, 0.65, 0.3, 0.2]);
+    assert.deepStrictEqual(index.search("similar:1").items, [1, 2, 3, 4, 5]);
+    assert.deepStrictEqual(index.similar(1, 8), [2, 3, 4, 5]);
+    assert.deepStrictEqual(index.similar(1, 2), [2, 3]);
+    // (Of the pictures the rest of the search allows.)
+    assert.deepStrictEqual(index.search("similar:1 year:2020").items, [1, 2, 3, 4, 5]);
+    // Only those within SIMILAR_MARGIN of the closest...
+    index = smallIndex([1, 0.93, 0.88, 0.7, 0.5, 0.45, 0.4, 0.35, 0.3]);
+    assert.deepStrictEqual(index.search("similar:1").items, [1, 2, 3]);
+    assert.deepStrictEqual(index.similar(1, 8), [2, 3]);
+    // ...and at least SIMILAR_NEAR close.
+    index = smallIndex([1, 0.66, 0.57, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25]);
+    assert.deepStrictEqual(index.similar(1, 8), [2]);
+    // Two pictures: the other one, when it is close.
+    assert.deepStrictEqual(smallIndex([1, 0.7]).similar(1, 8), [2]);
+    assert.deepStrictEqual(smallIndex([1, 0.4]).similar(1, 8), []);
+    assert.deepStrictEqual(smallIndex([1]).search("similar:1").items, [1]);
+});
+
+test("similar: a set of one theme still has pictures that stand out", function () {
+    // Sixty pictures that are all rather alike (two taken at random: a
+    // cosine of 0.75), as a library of one theme or only documents is; three
+    // of them are closer still to the first. Judged by the set's own typical
+    // cosine, none would be close; it counts as at most 0.4 (give or take
+    // 0.1), as in a varied set.
+    var dims = 64;
+    function vector(values) {
+        var norm = Math.sqrt(values.reduce(function (sum, value) {
+            return sum + value * value;
+        }, 0));
+        var out = new Int8Array(dims);
+        values.forEach(function (value, k) {
+            out[k] = Math.round(value / norm * 127);
+        });
+        return out;
+    }
+    var records = [];
+    var ids = [];
+    var data = new Int8Array(60 * dims);
+    var near = [0.8, 0.79, 0.78];
+    for (var k = 0; k < 60; k++) {
+        var values = [];
+        for (var d = 0; d < dims; d++) {
+            values.push(0);
+        }
+        if (k === 0) {
+            values[0] = 1;
+        } else {
+            var cos = k <= near.length ? near[k - 1] : 0.55 + 0.15 * (k % 7) / 6;
+            values[0] = cos;
+            values[1] = 0.6;
+            values[2 + k] = Math.sqrt(Math.max(0, 1 - cos * cos - 0.36));
+        }
+        records.push({i: k + 1, t: "Picture " + (k + 1), dk: "2020-01-01", ds: 1});
+        ids.push(k + 1);
+        data.set(vector(values), k * dims);
+    }
+    var index = SearchCore.prepare(records);
+    index.setVectors({dims: dims, ids: ids, data: data});
+    assert.strictEqual(index.pairSpread().mean, 0.4);
+    assert.ok(index.pairSpread().std <= 0.1);
+    assert.deepStrictEqual(index.similar(1, 8), [2, 3, 4]);
+    assert.deepStrictEqual(index.search("similar:1").items, [1, 2, 3, 4]);
+});
+
+test("a typed search in a small set: the closest few when none stands out", function () {
+    // Eighteen pictures, as an export of a small library has: with seventeen
+    // others no picture is far above them, and a query that means two of
+    // them puts both a little above the rest (z 2.3 and 2.2): they are found,
+    // by words and meaning and by meaning only. An unrelated query (z 2.0 at
+    // best) finds nothing, and neither does the same in a set of 62 pictures.
+    function set(cosines) {
+        var records = [];
+        var ids = [];
+        var data = new Int8Array(cosines.length * MEANING_DIMS);
+        cosines.forEach(function (cos, k) {
+            records.push({i: k + 1, t: "Picture " + (k + 1), dk: "2020-01-01", ds: 1});
+            ids.push(k + 1);
+            data.set(closeTo(cos, 1 + (k % 5)), k * MEANING_DIMS);
+        });
+        var index = SearchCore.prepare(records);
+        index.setVectors({dims: MEANING_DIMS, ids: ids, data: data});
+        return index;
+    }
+    function found(cosines) {
+        var index = set(cosines);
+        var hybrid = index.search("zebra", {vector: QUERY});
+        return [hybrid.items, hybrid.byMeaning,
+                index.search("zebra", {vector: QUERY, meaning: "meaning"}).items];
+    }
+    var rest = [];
+    var wide = [];
+    for (var k = 0; k < 60; k++) {
+        if (k < 16) {
+            rest.push(0.1 + 0.2 * k / 15);
+        }
+        wide.push(0.05 + 0.3 * (k % 30) / 29);
+    }
+    assert.deepStrictEqual(found([0.45, 0.43].concat(rest)), [[1, 2], [1, 2], [1, 2]]);
+    assert.deepStrictEqual(found([0.36, 0.33].concat(rest)), [[], [], []]);
+    assert.deepStrictEqual(found([0.45, 0.43].concat(wide)), [[], [], []]);
+    // Only those near the closest one (z 2.7 and 1.5 here).
+    assert.deepStrictEqual(found([0.47, 0.36].concat(rest)), [[1], [1], [1]]);
+    // Five as close as each other do not stand out (z 1.6).
+    assert.deepStrictEqual(found([0.45, 0.45, 0.45, 0.45, 0.45].concat(rest))[0], []);
+});
+
+test("the typical cosine of two pictures: worked out, or a default", function () {
+    var records = [];
+    var vectors = {};
+    for (var k = 0; k < 60; k++) {
+        records.push({i: k + 1, t: "Picture " + (k + 1), dk: "2020-01-01", ds: 1});
+        vectors[k + 1] = closeTo(0.2 + 0.6 * (k % 7) / 6, 1 + (k % 5));
+    }
+    var ids = Object.keys(vectors).map(Number);
+    var data = new Int8Array(ids.length * MEANING_DIMS);
+    ids.forEach(function (id, k) {
+        data.set(vectors[id], k * MEANING_DIMS);
+    });
+    var index = SearchCore.prepare(records);
+    index.setVectors(SearchCore.decodeVectors({dims: MEANING_DIMS, ids: ids, data: data}));
+    var worked = index.pairSpread();
+    assert.ok(worked.mean > 0.05 && worked.mean < 0.6, JSON.stringify(worked));
+    assert.ok(worked.std > 0.02, JSON.stringify(worked));
+    // The same pairs every time; never more than a varied set's (mean 0.4,
+    // deviation 0.1).
+    index.setVectors(SearchCore.decodeVectors({dims: MEANING_DIMS, ids: ids, data: data}));
+    assert.deepStrictEqual(index.pairSpread(), worked);
+    assert.ok(worked.mean <= 0.4 && worked.std <= 0.1, JSON.stringify(worked));
+    // Too few pictures to say: the default.
+    var small = SearchCore.prepare(records.slice(0, 3));
+    small.setVectors(SearchCore.decodeVectors({dims: MEANING_DIMS, ids: ids.slice(0, 3),
+                                               data: data.subarray(0, 3 * MEANING_DIMS)}));
+    assert.deepStrictEqual(small.pairSpread(), {mean: 0.4, std: 0.1});
+});
+
+test("similar: without a vector, the pictures sharing tags", function () {
+    var records = [
+        {i: 1, g: ["beach", "sea"], sc: "beach", dk: "2020-01-01", ds: 1},
+        {i: 2, g: ["beach", "sea", "sand"], sc: "beach", dk: "2021-05-05", ds: 1},
+        {i: 3, g: ["cake"], dk: "2015-03-03", ds: 1}
+    ];
+    // Vectors for other pictures only (picture 1 has none).
+    var index = meaningIndex(records, {2: closeTo(0.9), 3: closeTo(0.1, 2)});
+    assert.deepStrictEqual(index.search("similar:1").items, [1, 2]);
+    // An index without vectors at all (an export without them).
+    assert.deepStrictEqual(SearchCore.search(records.slice(), "similar:2").items, [2, 1]);
+});
+
+test("10k pictures by meaning: 256-number vectors compared under 15 ms", function () {
+    var dims = 256;
+    var count = 10000;
+    var random = randomSource(7);
+    var records = [];
+    var data = new Int8Array(count * dims);
+    var ids = [];
+    for (var r = 0; r < count; r++) {
+        records.push({i: r + 1, t: "picture " + r, ds: 1, dk: "2020-01-01"});
+        ids.push(r + 1);
+        for (var d = 0; d < dims; d++) {
+            data[r * dims + d] = Math.round((random() - 0.5) * 30);
+        }
+    }
+    var index = SearchCore.prepare(records);
+    index.setVectors({dims: dims, ids: ids, data: data});
+    var times = [];
+    for (var t = 0; t < 7; t++) {
+        var query = new Int8Array(dims);
+        for (var q = 0; q < dims; q++) {
+            query[q] = Math.round((random() - 0.5) * 30);
+        }
+        var start = now();
+        index.cosineStats(query);
+        times.push(now() - start);
+    }
+    var start2 = now();
+    var result = index.search("picture", {vector: index.vectorAt(5)});
+    var whole = now() - start2;
+    console.log("    cosines of 10k vectors: median " + median(times).toFixed(1) + " ms; a " +
+                "search by words and meaning " + whole.toFixed(1) + " ms");
+    assert.ok(median(times) < 15, "comparing took " + median(times).toFixed(1) + " ms");
+    assert.ok(result.total > 0);
 });
 
 /* ---------- Run ------------------------------------------------------------ */

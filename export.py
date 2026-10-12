@@ -9,12 +9,16 @@ disk by double-clicking index.html.
 
     index.html  detail.html  [map.html]
     assets/     style.css shell.js site.js search-core.js viewer.js app.js
-                detail.js [map.js]
+                detail.js [map.js] [embed-engine.js embed-kernel.js]
     data/       manifest.js  window.SEARCH_DATA_MANIFEST = {...}
                 index-NNN.js  SEARCH_DATA.push([records])
                 detail-NNN.js SEARCH_DATA.detail({picture id: details})
                 [locations.js SEARCH_DATA.locations([{id, lat, lon}])]
+                [vectors-NNN.js SEARCH_VECTORS.push({dims, ids, data, model})]
+                [looks-NNN.js SEARCH_LOOKS.push({dims, ids, data, model})]
+                [meaning/model.js meaning/w-NNN.js meaning/LICENSE.txt]
     thumbs/<id>.jpg   images/<id>.<ext>   [panos/<id>.jpg]   [tiles/z/x/y.jpg]
+    [videos/<id>.mp4] (with the videos option "include")
     [robots.txt]      (unless search engines may index the site)
     .search-images-export   {"format": 1, "export_id": "<random>"}
 
@@ -33,11 +37,42 @@ and the extended profile's landmark and place-guess fields) only go out
 when switched on. The descriptions themselves go out as written. Paths,
 hashes, file times (also as a picture's date), the describing model and
 its costs, other libraries and endpoint settings never do.
+With the "similar" option (on by default) the meaning vectors of the
+exported pictures go along (embeddings.py), so "More like this" and
+similar: work in the published site without a model; only vectors made
+from the picture's current description are shipped, and a vector holds
+nothing the description does not show. The model's name does not go.
+With the "meaning" option too (on by default, when it can be used: see
+meaning_status) the query model goes along (browser_model.py converts the
+GGUF file the embedding server runs; data/meaning/), with the engine that
+runs it (assets/embed-engine.js, embed-kernel.js; loaded only by the first
+search that needs it), so typed searches find pictures by meaning in the
+published site as well, from disk too. The model files hold only public
+model data, the two made-up probe sentences with their vectors and the
+query prefix; the model's license (embedding.license_file) goes along as
+data/meaning/LICENSE.txt, and the foot of the pages links to it with the
+owner's credit line (embedding.credit). The vector files then carry the
+model's id (an opaque hash).
+With the "looks" option (on by default; nothing goes when no exported
+picture has a look vector) the look vectors of the exported pictures go
+along too (looks.py, data/looks-NNN.js), so "Looks like this" and look:
+work in the published site without a model. A look vector is made from
+the picture itself, which the export shows anyway; its recipe goes as an
+opaque id. Search by an example picture needs the server's image model:
+exports do not have it.
 Pictures are named by an id made from a secret kept in the data root
 (make_xid), so neither the database ids nor their count can be worked out
 from the export. Every picture written is cleaned of its metadata (EXIF,
 XMP, IPTC, comments, text chunks, data after the image); a colour profile
 and, for an original JPEG, the orientation are kept.
+
+A video is published as its poster frame (its thumbnail and web-size
+picture), and with the videos option "include" also as a video: the
+playable copy (videos.make_proxies) when there is one, else the original
+when browsers play it (H.264), up to max_video_mb, copied into an MP4
+without its metadata (videos.strip_copy: no tags, data streams, subtitles
+or chapters, so no place, date or device). Other videos (HEVC without a
+playable copy) keep their poster only; the review step counts them.
 
 Exports are incremental and deterministic: a file is only written when its
 bytes change, a second export with nothing changed writes no files, and
@@ -83,15 +118,19 @@ import unicodedata
 import zipfile
 import zlib
 
+import browser_model
 import cache
 import common
 import db
+import embeddings
 import imageinfo
 import jobs
 import library_ops
+import looks
 import places
 import prompts
 import search_index
+import videos
 import world_map
 
 # The marker file of an export folder, and its format.
@@ -116,6 +155,8 @@ _SECRET_RE = re.compile(r"^[0-9a-f]{32,128}$")
 # Positions are rounded to this many decimals (about 11 m).
 LOCATION_DECIMALS = 4
 IMAGE_MODES = ("web", "original", "none")
+VIDEO_MODES = ("skip", "include")
+MAX_VIDEO_MB = (1, 100000)
 MAX_TITLE = 200
 MAX_CREDITS = 2000
 # The credit an export with place names carries (CC BY 4.0, see places.py).
@@ -141,13 +182,13 @@ RESERVED_SLUGS = frozenset(["state", "con", "prn", "aux", "nul"]
                            + ["com%d" % n for n in range(1, 10)]
                            + ["lpt%d" % n for n in range(1, 10)])
 # The folders of an export this tool manages (and may clean up).
-MANAGED_FOLDERS = ("assets", "data", "thumbs", "images", "panos", "tiles")
+MANAGED_FOLDERS = ("assets", "data", "thumbs", "images", "panos", "tiles", "videos")
 # The extensions of exported originals (see original_picture).
 ORIGINAL_EXTENSIONS = ("jpg", "png", "gif", "webp")
 # Free space an export leaves on the disk it writes to, at least.
 SPACE_MARGIN = 32 * 1024 * 1024
 # Zip entries with these extensions are stored, the rest deflated.
-STORED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+STORED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4")
 # EXIF details of a picture an export may show (camera settings only: no
 # dates and times, places, serial numbers, software, owner or copyright).
 DETAIL_EXIF_NUMBERS = ("ExposureTime", "FNumber", "ISOSpeedRatings", "PhotographicSensitivity",
@@ -155,7 +196,7 @@ DETAIL_EXIF_NUMBERS = ("ExposureTime", "FNumber", "ISOSpeedRatings", "Photograph
 DETAIL_EXIF_TEXT = ("LensModel",)
 # Where an exported date may come from (search_index never exports a date
 # from the file's time).
-TAKEN_SOURCES = ("exif", "filename")
+TAKEN_SOURCES = ("exif", "filename", "video")
 # Rough sizes for the estimate, when the real file is not there to measure.
 ESTIMATE_WEB_BYTES = 450000
 ESTIMATE_PANO_BYTES = 2000000
@@ -178,8 +219,12 @@ WRITING_FLAG = "writing"
 # did not ask about private information, sensitive content or the kind of
 # picture: it is left out with the pictures not described yet.
 UNCHECKED_FLAG = "unchecked"
+# The kinds of picture exclude_types can name: the describe step's photo
+# types, and "video" (every video, whatever the model saw in its frames).
+VIDEO_KIND = "video"
+EXPORT_KINDS = prompts.PHOTO_TYPES + (VIDEO_KIND,)
 # Every flag a picture can have (see _reasons), most serious first.
-FLAGS = (("private", "sensitive") + prompts.PHOTO_TYPES
+FLAGS = (("private", "sensitive") + EXPORT_KINDS
          + (WRITING_FLAG, UNCHECKED_FLAG, "undescribed"))
 # Pictures that cannot be read are named in the log up to this many times
 # (then only counted), so an unreachable library does not flood the log.
@@ -204,9 +249,21 @@ DEFAULT_OPTIONS = {
     "credits": "",                  # a line of plain text at the foot of the pages
     "zip": False,                   # also write <folder>.zip next to the folder
     "allow_indexing": False,        # False: the pages ask search engines not to index them
+    "videos": "skip",               # "skip" (posters only) | "include" (playable videos too)
+    "max_video_mb": 200,            # larger videos keep their poster only
+    "similar": True,                # meaning vectors, so "More like this" works (no model needed)
+    "meaning": True,                # the query model too: typed searches by meaning (when it
+                                    # can be used, see meaning_status)
+    "looks": True,                  # look vectors, so "Looks like this" works (no model needed)
 }
 _BOOLEAN_OPTIONS = ("location", "file_names", "folders", "exclude_private", "exclude_sensitive",
-                    "exclude_undescribed", "zip", "allow_indexing")
+                    "exclude_undescribed", "zip", "allow_indexing", "similar", "meaning",
+                    "looks")
+# Where the query model goes (in data/), and the scripts that run it (in assets/).
+MEANING_FOLDER = "meaning"
+MEANING_ASSETS = ("embed-kernel.js", "embed-engine.js")
+MEANING_LICENSE = "meaning/LICENSE.txt"
+MAX_LICENSE_BYTES = 1024 * 1024
 
 
 class ExportError(Exception):
@@ -374,6 +431,17 @@ def validate_options(options, base=None):
                 errors[key] = "must be one of %s" % ", ".join(IMAGE_MODES)
             else:
                 result[key] = value
+        elif key == "videos":
+            if value not in VIDEO_MODES:
+                errors[key] = "must be one of %s" % ", ".join(VIDEO_MODES)
+            else:
+                result[key] = value
+        elif key == "max_video_mb":
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or not MAX_VIDEO_MB[0] <= value <= MAX_VIDEO_MB[1]):
+                errors[key] = "must be a whole number of megabytes from %d to %d" % MAX_VIDEO_MB
+            else:
+                result[key] = value
         elif key == "title":
             result[key] = _plain_text(value, key, MAX_TITLE, errors)
         elif key == "credits":
@@ -382,12 +450,12 @@ def validate_options(options, base=None):
             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 errors[key] = "must be a list of picture types"
             else:
-                unknown = sorted(set(value) - set(prompts.PHOTO_TYPES))
+                unknown = sorted(set(value) - set(EXPORT_KINDS))
                 if unknown:
                     errors[key] = "unknown picture type(s): %s (known: %s)" % (
-                        ", ".join(unknown), ", ".join(prompts.PHOTO_TYPES))
+                        ", ".join(unknown), ", ".join(EXPORT_KINDS))
                 else:
-                    result[key] = [kind for kind in prompts.PHOTO_TYPES if kind in value]
+                    result[key] = [kind for kind in EXPORT_KINDS if kind in value]
         elif key == "include_ids":
             result[key] = _include_list(value, errors)
         elif key == "exclude_ids":
@@ -428,8 +496,12 @@ def options_to_save(options):
 
 def options_summary(options):
     """The options an export may publish about itself (no ids, no text)."""
-    return {"images": options["images"], "location": options["location"],
-            "file_names": options["file_names"], "folders": options["folders"]}
+    summary = {"images": options["images"], "location": options["location"],
+               "file_names": options["file_names"], "folders": options["folders"]}
+    if options["videos"] == "include":
+        # (Only then: an export without videos stays as it was.)
+        summary["videos"] = options["videos"]
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1269,7 +1341,41 @@ def clean_jpeg(data):
 # What goes out
 
 _ROW_COLUMNS = ("id, path, name, size, mtime, width, height, content_hash, has_preview, "
-                "projection, exif, taken_at, taken_source, lat, lon")
+                "projection, exif, taken_at, taken_source, lat, lon, media, duration")
+
+
+def _is_video(row):
+    return row["media"] == videos.MEDIA_VIDEO
+
+
+def video_plan(row, options, library_id):
+    """What an export does with a video row: (kind, source path or None, size, reason).
+
+    kind is "skip" (the videos option is "skip", or the row is no video),
+    "video" (the file at source, size bytes, is copied: its playable copy,
+    or the original when browsers play it) or "poster" (only the poster is
+    published; reason "not_playable" -- HEVC and others, without a
+    playable copy -- or "too_large", over max_video_mb). source None with
+    kind "video": the original, read from the library's folder.
+    """
+    if options.get("videos") != "include" or not _is_video(row):
+        return "skip", None, 0, ""
+    proxy = videos.existing_proxy(library_id, row["id"], row["content_hash"])
+    size = _file_size(proxy) if proxy else None
+    if proxy and size is not None:
+        source = proxy
+    else:
+        try:
+            exif = json.loads(row["exif"] or "{}")
+        except (TypeError, ValueError):
+            exif = {}
+        facts = exif.get("video") if isinstance(exif, dict) else None
+        if videos.playable(facts) != "yes":
+            return "poster", None, 0, "not_playable"
+        source, size = None, row["size"] or 0
+    if size > options["max_video_mb"] * 1024 * 1024:
+        return "poster", None, 0, "too_large"
+    return "video", source, size, ""
 
 
 def _load_rows(conn, library_id):
@@ -1290,14 +1396,20 @@ def picture_kinds(record):
 
     Its photo type, and the kind its document type stands for (see
     DOCUMENT_KINDS): a receipt is a document even when the AI model typed
-    the picture a photo or a scan.
+    the picture a photo or a scan. A video is "video", and also the kind
+    the model saw in its frames (search_index's vt: a screen recording is
+    a screenshot).
     """
     kinds = set()
     if record.get("ty"):
         kinds.add(record["ty"])
+    if record.get("vt"):
+        kinds.add(record["vt"])
+    if record.get("mv"):
+        kinds.add(VIDEO_KIND)
     if record.get("dt") in DOCUMENT_KINDS:
         kinds.add(DOCUMENT_KINDS[record["dt"]])
-    return [kind for kind in prompts.PHOTO_TYPES if kind in kinds]
+    return [kind for kind in EXPORT_KINDS if kind in kinds]
 
 
 def _reasons(record, options):
@@ -1329,7 +1441,7 @@ def _reasons(record, options):
             flag(kind, kind in options["exclude_types"])
     if (document_type and document_type not in DOCUMENT_KINDS
             and document_type not in PRIVATE_DOCUMENT_TYPES
-            and not any(name in prompts.PHOTO_TYPES for name in flags)):
+            and not any(name in EXPORT_KINDS for name in flags)):
         flag(WRITING_FLAG, False)
     if not record.get("ds"):
         flag("undescribed", options["exclude_undescribed"])
@@ -1447,7 +1559,10 @@ class _Sizes:
         mode = self.options["images"]
         if row["id"] not in self.thumbs:
             return True
-        if mode == "original" and row["projection"] != imageinfo.PROJECTION_DUAL_FISHEYE:
+        if video_plan(row, self.options, self.library_id)[:2] == ("video", None):
+            return True             # the original video is copied
+        if (mode == "original" and row["projection"] != imageinfo.PROJECTION_DUAL_FISHEYE
+                and not _is_video(row)):
             return True
         return mode != "none" and self.stored_preview(row) is None
 
@@ -1455,10 +1570,14 @@ class _Sizes:
         """{thumbs, images, panos, data} bytes of one picture."""
         parts = {"thumbs": self.thumbs.get(row["id"], 0), "images": 0, "panos": 0,
                  "data": ESTIMATE_RECORD_BYTES}
+        plan = video_plan(row, self.options, self.library_id)
+        if plan[0] == "video":
+            parts["videos"] = plan[2]
         mode = self.options["images"]
         if mode == "none":
             return parts
-        if mode == "original" and row["projection"] != imageinfo.PROJECTION_DUAL_FISHEYE:
+        if (mode == "original" and row["projection"] != imageinfo.PROJECTION_DUAL_FISHEYE
+                and not _is_video(row)):
             parts["images"] = row["size"] or 0
         else:
             size = self.stored_preview(row)
@@ -1476,6 +1595,183 @@ class _Sizes:
         return parts
 
 
+def vector_bytes(dims):
+    """About how many bytes one picture's meaning vector adds to an export's vector files."""
+    return 4 * ((dims + 2) // 3) + XID_LENGTH + 3
+
+
+def _look_sizes(conn, library_id, options, ids):
+    """{image id: bytes its look vector adds to the export} for the pictures of ids
+    that have one ({} when the looks option is off)."""
+    if not options.get("looks"):
+        return {}
+    found = looks.fresh_looks(conn, library_id, ids)
+    size = vector_bytes(found["dims"]) if found["dims"] else 0
+    return {image_id: size for image_id in found["vectors"]}
+
+
+def _vector_sizes(conn, library_id, options, ids):
+    """{image id: bytes its up-to-date meaning vector adds to the export} for the
+    pictures of ids that have one ({} when the similar option is off)."""
+    if not options.get("similar"):
+        return {}
+    found = embeddings.fresh_vectors(conn, library_id, ids)
+    size = vector_bytes(found["dims"]) if found["dims"] else 0
+    return {image_id: size for image_id in found["vectors"]}
+
+
+def meaning_status(config, options, vectors=None):
+    """Whether an export with these options can ship search by meaning in the browser
+    (the "meaning" option; the export review shows the reason when not).
+
+    vectors is how many of the pictures to publish have an up-to-date meaning
+    vector (None: not counted). It can when the similar option is on and
+    vectors go, search by meaning is set up with a model file that can run in
+    a browser (browser_model.inspect, with its Dense head if it has one), a
+    readable license file, and vectors.db holds vectors made with that model
+    (its recipe) and a probe. Returns {"available", "reason" ('' when
+    available), "model_file", "dense_file", "license_file", "dims", "query_prefix",
+    "credit", "probe"}.
+    """
+    result = {"available": False, "reason": "", "model_file": "", "dense_file": "",
+              "license_file": "", "dims": 0, "query_prefix": "", "credit": "", "probe": []}
+    later = "Update meaning search on the Manage page first"
+    if not options.get("similar"):
+        result["reason"] = ("It needs More like this by meaning (the similar option): it "
+                            "searches the same vectors.")
+        return result
+    if vectors == 0:
+        result["reason"] = ("No picture to publish has an up-to-date meaning vector: %s."
+                            % later)
+        return result
+    settings = embeddings.settings(config)
+    endpoint, problem = embeddings.endpoint_for(config, settings)
+    if endpoint is None:
+        result["reason"] = problem
+        return result
+    model_path, problem = embeddings.model_source(config, settings)
+    if problem:
+        result["reason"] = problem
+        return result
+    if not model_path:
+        result["reason"] = ("Set embedding.model_file in config.json to the GGUF file the "
+                            "embedding server runs (see SETTINGS.md).")
+        return result
+    dense_path = embeddings.file_setting(settings["dense_file"])
+    current = embeddings.read_meta()
+    dims = embeddings.vector_size(current) if current else settings["dims"]
+    checked = browser_model.inspect(model_path, dense_path or None,
+                                    settings["dims"])
+    if not checked["supported"]:
+        result["reason"] = checked["why"]
+        return result
+    license_path = embeddings.file_setting(settings["license_file"])
+    if not license_path:
+        result["reason"] = ("Set embedding.license_file in config.json to the model's license "
+                            "text: it is published with the model.")
+        return result
+    try:
+        size = os.path.getsize(license_path)
+    except OSError:
+        size = -1
+    if not 0 < size <= MAX_LICENSE_BYTES:
+        result["reason"] = ("The license file %s (embedding.license_file) cannot be read%s."
+                            % (license_path, " or is empty" if size == 0 else
+                               " (larger than 1 MB)" if size > 0 else ""))
+        return result
+    try:
+        made_with = embeddings.recipe(config, settings)
+    except browser_model.ModelError as error:
+        result["reason"] = str(error)
+        return result
+    if (current is None or current["model"] != embeddings.model_key(endpoint, settings)
+            or current["dims"] != settings["dims"] or current["changed"]
+            or current["recipe"] != made_with):
+        result["reason"] = ("The meaning vectors were made with another model or other "
+                            "settings: %s." % later)
+        return result
+    if not current["probe"]:
+        result["reason"] = "%s (it checks the model)." % later
+        return result
+    result.update(available=True, model_file=model_path, dense_file=dense_path,
+                  license_file=license_path, dims=dims, query_prefix=settings["query_prefix"],
+                  credit=settings["credit"], probe=current["probe"])
+    return result
+
+
+_meaning_sizes = {}
+_meaning_lock = threading.Lock()
+
+
+def _meaning_key(status):
+    return json.dumps([browser_model.file_sha256(status["model_file"]),
+                       browser_model.file_sha256(status["dense_file"])
+                       if status["dense_file"] else "",
+                       status["dims"], status["query_prefix"], status["probe"],
+                       browser_model.FORMAT, browser_model.PART_BYTES], sort_keys=True)
+
+
+def _static_bytes(name):
+    with open(os.path.join(_static_dir(), name), "rb") as handle:
+        return handle.read()
+
+
+def meaning_files(status):
+    """The files of search by meaning in the browser for an available meaning_status():
+    {"files": {path in the export: bytes}, "assets": {asset name: bytes}, "id", "dims",
+    "parts", "bytes", "gzip" (all of them, as GitHub Pages and most web servers send them:
+    the size visitors download)}. Raises browser_model.ModelError."""
+    converted = browser_model.convert(status["model_file"], status["dense_file"] or None,
+                                      status["dims"], status["query_prefix"], status["probe"])
+    with open(status["license_file"], "rb") as handle:
+        license_text = handle.read()
+    files = {"data/" + rel: text.encode("ascii") for rel, text in converted["files"].items()}
+    files["data/" + MEANING_LICENSE] = license_text
+    assets = {name: _static_bytes(name) for name in MEANING_ASSETS}
+    extra = [license_text] + list(assets.values())
+    result = {"files": files, "assets": assets, "id": converted["id"],
+              "dims": converted["dims"], "parts": converted["parts"],
+              "bytes": converted["bytes"] + sum(len(data) for data in extra),
+              "gzip": converted["gzip"] + sum(len(_gzip_bytes(data)) for data in extra)}
+    with _meaning_lock:
+        _meaning_sizes.clear()
+        _meaning_sizes[_meaning_key(status)] = {key: result[key] for key in (
+            "id", "dims", "parts", "bytes", "gzip")}
+    return result
+
+
+def _gzip_bytes(data):
+    """data compressed as web servers send it."""
+    import gzip as gzip_module
+    return gzip_module.compress(data, browser_model.GZIP_LEVEL, mtime=0)
+
+
+def meaning_size(status):
+    """{"id", "dims", "parts", "bytes", "gzip"} of meaning_files(status), remembered (the
+    first time converts the model: a second or two). None when not available."""
+    if not status.get("available"):
+        return None
+    key = _meaning_key(status)
+    with _meaning_lock:
+        found = _meaning_sizes.get(key)
+    if found is None:
+        try:
+            meaning_files(status)
+        except (browser_model.ModelError, OSError):
+            return None
+        with _meaning_lock:
+            found = _meaning_sizes.get(key)
+    return dict(found) if found else None
+
+
+def meaning_text(info):
+    """The review step's and the log's line about search by meaning in the browser
+    (info: {"bytes", "gzip"} of meaning_size)."""
+    return ("Search by meaning in the browser: %s of model files; visitors download about %s "
+            "once, the first time they search (works offline and from disk)."
+            % (human_bytes(info["bytes"]), human_bytes(info["gzip"])))
+
+
 def _asset_bytes(options):
     return sum(_file_size(os.path.join(_static_dir(), name)) or 0
                for name in ASSETS + (MAP_ASSETS if options["location"] else ()))
@@ -1489,11 +1785,21 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
     {reason: count}, "unavailable": how many of the pictures to export
     need the library's folder (originals, pictures without a stored
     preview) while it cannot be reached, "needs_folder": how many need it
-    at all}, "flagged": [{id, reason, reasons, title, excluded, bytes
+    at all, "similar": with the similar option, {"vectors": how many of
+    the pictures to export have an up-to-date meaning vector, "stale":
+    an out-of-date one, "missing": none} (of the pictures to export),
+    "meaning": search by meaning in the browser {"available", "reason",
+    "bytes", "gzip" (when available)}, see meaning_status, "looks": with
+    the looks option, {"vectors": how many of the pictures to export have
+    a look vector, "missing": how many do not}},
+    "flagged": [{id, reason, reasons, title, excluded, bytes
     (what the picture adds to the export), parts (the same by kind, as in
-    size_parts), needs_folder, new_flags (see select_records)}],
-    "size_estimate": bytes, "size_parts": {thumbs,
-    images, panos, data}, "options": the options used}. Reasons: hidden,
+    size_parts), needs_folder, new_flags (see select_records), and for a
+    video, video: how it would be published, as counted in counts.videos
+    ("included", "not_playable" or "too_large", see video_plan; "poster"
+    when videos are not included)}],
+    "size_estimate": bytes, "size_parts": {thumbs, images, panos, data, videos,
+    vectors, meaning, looks}, "options": the options used}. Reasons: hidden,
     excluded (by id), undescribed, unchecked, a picture type (screenshot,
     document, ...), private, sensitive. reachable says whether the
     library's folder can be read (None: look now; it may take long for a
@@ -1509,31 +1815,96 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
     flagged_ids = {item["id"] for item in flagged}
     sizes = _Sizes(library_id, options, sorted({record["i"] for record in chosen}
                                                | flagged_ids))
-    parts = {"thumbs": 0, "images": 0, "panos": 0, "data": 0}
+    vectors = _vector_sizes(conn, library_id, options,
+                            {record["i"] for record in chosen} | flagged_ids)
+    look_sizes = _look_sizes(conn, library_id, options,
+                             {record["i"] for record in chosen} | flagged_ids)
+    parts = {"thumbs": 0, "images": 0, "panos": 0, "data": 0, "videos": 0,
+             "vectors": 0, "meaning": 0, "looks": 0}
+    looked = {"vectors": 0, "missing": 0} if options["looks"] else None
     needs_folder = 0
+    video_counts = {"total": 0, "included": 0, "not_playable": 0, "too_large": 0}
+    similar = {"vectors": 0, "stale": 0, "missing": 0} if options["similar"] else None
     for record in chosen:
         row = rows.get(record["i"])
         if row is None:
             continue
         for key, value in sizes.parts(record, row).items():
             parts[key] += value
+        if record["i"] in vectors:
+            parts["vectors"] += vectors[record["i"]]
+        if similar is not None:
+            similar["vectors" if record["i"] in vectors else "missing"] += 1
+        if record["i"] in look_sizes:
+            parts["looks"] += look_sizes[record["i"]]
+        if looked is not None:
+            looked["vectors" if record["i"] in look_sizes else "missing"] += 1
         if sizes.needs_original(row):
             needs_folder += 1
+        if _is_video(row):
+            video_counts["total"] += 1
+            kind, _source, _size, reason = video_plan(row, options, library_id)
+            if kind == "video":
+                video_counts["included"] += 1
+            elif reason:
+                video_counts[reason] += 1
+    if similar is not None and similar["missing"]:
+        # (Of those without a usable vector, how many have an older one.)
+        stale_ids = _stale_ids(conn, library_id, {record["i"] for record in chosen}, vectors)
+        similar["stale"] = len(stale_ids)
+        similar["missing"] -= similar["stale"]
     for item in flagged:
         row, record = rows.get(item["id"]), by_id.get(item["id"])
         if row is None or record is None:
             item.update(bytes=0, parts={}, needs_folder=False)
             continue
         item["parts"] = sizes.parts(record, row)
+        if item["id"] in vectors:
+            item["parts"]["vectors"] = vectors[item["id"]]
+        if item["id"] in look_sizes:
+            item["parts"]["looks"] = look_sizes[item["id"]]
         item["bytes"] = sum(item["parts"].values())
         item["needs_folder"] = sizes.needs_original(row)
+        if _is_video(row):
+            kind, _source, _size, reason = video_plan(row, options, library_id)
+            item["video"] = "included" if kind == "video" else reason or "poster"
     if reachable is None:
         reachable = folder_reachable(library)
     counts["needs_folder"] = needs_folder
     counts["unavailable"] = 0 if reachable else needs_folder
+    # Videos among the pictures to publish: how many go out as videos, and
+    # how many keep their poster only (and why).
+    counts["videos"] = video_counts
+    if similar is not None:
+        counts["similar"] = similar
+    if looked is not None:
+        counts["looks"] = looked
+    status = meaning_status(config, options, similar["vectors"] if similar else 0)
+    counts["meaning"] = {"available": status["available"], "reason": status["reason"]}
+    # (The size takes converting the model once: only when the option is on.)
+    size = meaning_size(status) if options["meaning"] else None
+    if size is None and status["available"] and options["meaning"]:
+        counts["meaning"].update(available=False, reason="The model file could not be "
+                                                         "converted for a browser.")
+    elif size is not None:
+        counts["meaning"].update(bytes=size["bytes"], gzip=size["gzip"])
+        if options["meaning"]:
+            parts["meaning"] = size["bytes"]
     parts["data"] += _asset_bytes(options)
     return {"counts": counts, "flagged": flagged,
             "size_estimate": sum(parts.values()), "size_parts": parts, "options": options}
+
+
+def _stale_ids(conn, library_id, ids, fresh):
+    """Of ids, those without a fresh vector (fresh: {id: ...}) that have an older one."""
+    store = embeddings.connect(create=False)
+    if store is None:
+        return set()
+    try:
+        have = embeddings.stored(store, [library_id])
+    finally:
+        store.close()
+    return {image_id for image_id in ids if image_id not in fresh and image_id in have}
 
 
 # How the log names what an export left out: reason -> (one, many).
@@ -1723,6 +2094,29 @@ class Writer:
             return None
         return stat
 
+    def write_file(self, rel, make, sig):
+        """Make rel with make(path) unless current(rel, sig); True if it was made.
+
+        make writes the whole file at path, replacing it in one step (for
+        files too large to hold in memory, such as videos). An OSError
+        while making it stops the export (ExportWriteError); other errors
+        are the source's and are raised as they are.
+        """
+        if self.current(rel, sig):
+            return False
+        path = self.path(rel)
+        try:
+            common.ensure_dir(os.path.dirname(path))
+        except OSError as error:
+            raise ExportWriteError(os_error_text(error, path))
+        try:
+            make(path)
+            stat = os.stat(path)
+        except OSError as error:
+            raise ExportWriteError(os_error_text(error, path))
+        self._record(rel, sig, stat, True)
+        return True
+
     def keep(self, rel):
         """Keep a file of the earlier export as it is (True), if it is still there unchanged."""
         stat = self.intact(rel)
@@ -1757,8 +2151,10 @@ def _guess_own_files(out_dir):
                    r"detail\.js|map\.js)$"),
         re.compile(r"^assets/[a-z-]+\.(js|css)$"),
         re.compile(r"^data/(manifest\.js|manifest\.json|locations\.js|locations\.json|"
-                   r"(index|detail)-\d+\.js|data-\d+\.json)$"),
+                   r"(index|detail|vectors|looks)-\d+\.js|data-\d+\.json)$"),
+        re.compile(r"^data/meaning/(model\.js|w-\d+\.js|LICENSE\.txt)$"),
         re.compile(r"^(thumbs|panos)/[a-z2-7]{%d}\.jpg$" % XID_LENGTH),
+        re.compile(r"^videos/[a-z2-7]{%d}\.mp4$" % XID_LENGTH),
         re.compile(r"^images/([a-z2-7]{%d}|\d+)\.[a-z0-9]{2,5}$" % XID_LENGTH),
         re.compile(r"^tiles/\d+/\d+/\d+\.jpg$"),
     )
@@ -1815,7 +2211,7 @@ def _version(data):
 
 
 def render_page(template, title, page_title, capabilities, export_id, options,
-                tiles_max=None, versions=None, data_version=None):
+                tiles_max=None, versions=None, data_version=None, meaning=None):
     """One page of the export: the template in static mode, as text.
 
     The page settings (JSON block) name this export's one library, its
@@ -1825,7 +2221,9 @@ def render_page(template, title, page_title, capabilities, export_id, options,
     GeoNames credit when the export holds place names (capabilities
     "places"; the map page, which has no foot, shows only that credit, in
     a corner of the map). versions ({asset name: hash}) go into the addresses of the
-    scripts and the style sheet.
+    scripts and the style sheet. meaning ({"credit"}, when the export ships the
+    query model of search by meaning) adds "Search by meaning: <credit> ·
+    license" to the foot of the search and detail pages.
     """
     import serve
     location = options["location"]
@@ -1856,6 +2254,11 @@ def render_page(template, title, page_title, capabilities, export_id, options,
     credits = [html.escape(options["credits"])] if options["credits"] else []
     if capabilities.get("places"):
         credits.append(PLACES_CREDIT)
+    if meaning is not None:
+        # (Not on the map page, which has no foot and does not use the model.)
+        credits.append('Search by meaning: %s<a href="data/%s" rel="license">license</a>' % (
+            html.escape(meaning["credit"]) + " &middot; " if meaning.get("credit") else "",
+            MEANING_LICENSE))
     if credits and template != "map.html":
         anchor = '<script type="application/json" id="app-config">'
         if anchor not in text:
@@ -1890,7 +2293,7 @@ class LogContext(jobs.JobContext):
 class _Picture:
     """One picture to export: its record, row and id in the export."""
 
-    __slots__ = ("record", "row", "xid", "ok", "ext", "pano", "error", "fatal")
+    __slots__ = ("record", "row", "xid", "ok", "ext", "pano", "video", "error", "fatal")
 
     def __init__(self, record, row, xid):
         self.record = record
@@ -1899,12 +2302,14 @@ class _Picture:
         self.ok = False
         self.ext = "jpg"
         self.pano = False
+        self.video = False      # videos/<xid>.mp4 was written (or kept)
         self.error = ""
         self.fatal = None       # an ExportWriteError: the export stops
 
     def files(self):
         """Every file of the export this picture may have."""
-        return (["thumbs/%s.jpg" % self.xid, "panos/%s.jpg" % self.xid]
+        return (["thumbs/%s.jpg" % self.xid, "panos/%s.jpg" % self.xid,
+                 "videos/%s.mp4" % self.xid]
                 + ["images/%s.%s" % (self.xid, ext) for ext in ORIGINAL_EXTENSIONS])
 
 
@@ -1930,10 +2335,20 @@ class _Export:
         self.secret = None
         self.failed = 0
         self.pano_failed = 0
+        self.video_failed = 0
+        self.video_tools = None
         self.kept = 0
         self.logged = 0
         self.count = None       # pictures published, once the export has finished
         self.marked = False     # the folder has been written to (see mark)
+        # Meaning vectors shipped (the similar option, see vector_files).
+        self.vector_stats = {"vectors": 0, "stale": 0, "missing": 0, "bytes": 0}
+        self.vector_parts = []      # [(name, payload)] of the vector files
+        # Look vectors shipped (the looks option, see look_files).
+        self.look_stats = {"vectors": 0, "missing": 0, "bytes": 0}
+        # Search by meaning in the browser (the meaning option, see meaning).
+        self.meaning = None
+        self.meaning_status = None
 
     # -- set up ---------------------------------------------------------------
 
@@ -2029,12 +2444,25 @@ class _Export:
             return None
         return os.path.join(self.root, *row["path"].split("/"))
 
+    def tools(self):
+        """ffmpeg and ffprobe (videos.Tools), or None."""
+        if self.video_tools is None:
+            self.video_tools = videos.find_tools(self.config) or False
+        return self.video_tools or None
+
     def read_original(self, row, **kwargs):
-        """images.read_image of a row's original (ImageReadError when it cannot be read)."""
+        """images.read_image of a row's original (ImageReadError when it cannot be read).
+
+        For a video, videos.read_video (its poster is the preview).
+        """
         images = _images()
         path = self.original_path(row)
         if path is None:
             raise images.ImageReadError("the library has no folder")
+        if _is_video(row):
+            return videos.read_video(path, self.tools(), mtime=row["mtime"],
+                                     want_preview=kwargs.get("want_preview", True),
+                                     want_sheet=False)
         return images.read_image(path, self.helper, mtime=row["mtime"], **kwargs)
 
     def _source_sig(self, kind, row, path=None):
@@ -2096,6 +2524,12 @@ class _Export:
 
     def _original(self, picture):
         row = picture.row
+        if _is_video(row):
+            # A video's picture is its poster (the video itself goes to
+            # videos/, see _video).
+            self._web_image(picture)
+            picture.ext = "jpg"
+            return
         if row["projection"] == imageinfo.PROJECTION_DUAL_FISHEYE:
             # The original is two unstitched fisheye circles, which no page
             # can show as the 360-degree picture: the site gets the
@@ -2157,6 +2591,26 @@ class _Export:
         self.writer.write(rel, clean_jpeg(data), sig)
         picture.pano = True
 
+    def _video(self, picture):
+        """Write videos/<xid>.mp4 of a video (see video_plan); True when it is published."""
+        row = picture.row
+        kind, source, size, _reason = video_plan(row, self.options, self.library_id)
+        if kind != "video":
+            return False
+        rel = "videos/%s.mp4" % picture.xid
+        if source is None:
+            source = self.original_path(row)
+            if source is None:
+                raise ValueError("the library has no folder")
+            sig = self._source_sig("video", row)
+        else:
+            sig = self._source_sig("video-proxy", row, source)
+        tools = self.tools()
+        if tools is None and not self.writer.current(rel, sig):
+            raise videos.ToolsMissing()
+        self.writer.write_file(rel, lambda path: videos.strip_copy(tools, source, path), sig)
+        return True
+
     def keep_previous(self, picture):
         """Keep the files an earlier export wrote for a picture that cannot be read now.
 
@@ -2180,6 +2634,12 @@ class _Export:
             self.writer.keep(rel)
         if mode != "none" and self.writer.keep("panos/%s.jpg" % xid):
             picture.pano = True
+        # The video itself only while the options still publish it (the
+        # owner may have turned videos off since, or the copy is gone).
+        if (_is_video(picture.row)
+                and video_plan(picture.row, self.options, self.library_id)[0] == "video"
+                and self.writer.keep("videos/%s.mp4" % xid)):
+            picture.video = True
         return True
 
     def note_failure(self, text):
@@ -2221,6 +2681,14 @@ class _Export:
                 picture.fatal = error
             except Exception as error:
                 picture.error = "no 360-degree panorama: %s" % (error,)
+        if _is_video(picture.row) and self.options["videos"] == "include":
+            # A video that cannot be copied keeps its poster.
+            try:
+                picture.video = self._video(picture)
+            except ExportWriteError as error:
+                picture.fatal = error
+            except Exception as error:
+                picture.error = "the video itself could not be copied: %s" % (error,)
         return picture
 
     def forget_picture(self, picture):
@@ -2271,7 +2739,10 @@ class _Export:
                 if picture.ok:
                     done.append(picture)
                     if picture.error:
-                        self.pano_failed += 1
+                        if _is_video(picture.row):
+                            self.video_failed += 1
+                        else:
+                            self.pano_failed += 1
                         self.note_failure("%s: %s" % (picture.row["path"], picture.error))
                 elif self.keep_previous(picture):
                     done.append(picture)
@@ -2334,6 +2805,8 @@ class _Export:
                 record["ix"] = picture.ext
             if picture.pano:
                 record["pn"] = 1
+            if picture.video:
+                record["vf"] = 1
         records.sort(key=lambda record: record["i"])
         return records
 
@@ -2367,6 +2840,9 @@ class _Export:
             detail_names.append(name)
             files["data/" + name] = "SEARCH_DATA.detail({\n%s\n});\n" % ",\n".join(lines)
 
+        vector_names = self.vector_files(pictures, files)
+        look_names = self.look_files(pictures, files)
+        meaning = self.meaning_data(files) if vector_names else None
         manifest = {
             "format": MARKER_FORMAT, "version": search_index.INDEX_VERSION,
             "title": self.title,
@@ -2377,6 +2853,12 @@ class _Export:
         }
         if self.options["credits"]:
             manifest["credits"] = self.options["credits"]
+        if vector_names:
+            manifest["vectors"] = vector_names
+        if look_names:
+            manifest["looks"] = look_names
+        if meaning is not None:
+            manifest["meaning"] = meaning
         if self.options["location"]:
             points = []
             for picture in pictures:
@@ -2389,7 +2871,119 @@ class _Export:
             manifest["locations"] = "locations.js"
         manifest["versions"] = {rel[len("data/"):]: _version(text.encode("ascii"))
                                 for rel, text in sorted(files.items())}
+        if meaning is not None:
+            manifest["versions"].update((rel[len("data/"):], _version(data))
+                                        for rel, data in sorted(self.meaning["files"].items()))
         return files, manifest
+
+    def vector_files(self, pictures, files):
+        """Add data/vectors-NNN.js (the similar option) to files; returns their names.
+
+        Each holds SEARCH_VECTORS.push({"dims", "ids": [export ids], "data":
+        base64 of the vectors one after the other, "model": the query model's
+        id with the meaning option}) for the pictures whose ids fall in it
+        (bucket_of, like the index shards). Only up-to-date vectors go
+        (embeddings.fresh_vectors); the model's name stays here.
+        """
+        self.vector_stats = {"vectors": 0, "stale": 0, "missing": 0, "bytes": 0}
+        if not self.options["similar"] or not pictures:
+            return []
+        found = embeddings.fresh_vectors(self.conn, self.library_id,
+                                         [picture.row["id"] for picture in pictures])
+        items = sorted((picture.xid, found["vectors"][picture.row["id"]])
+                       for picture in pictures if picture.row["id"] in found["vectors"])
+        self.vector_stats.update(vectors=len(items), stale=found["stale"],
+                                 missing=found["missing"])
+        if not items:
+            return []
+        dims = found["dims"]
+        count = _shard_count(len(items) * vector_bytes(dims), INDEX_SHARD_BYTES)
+        buckets = [[] for _ in range(count)]
+        for xid, vec in items:
+            buckets[bucket_of(xid, count)].append((xid, vec))
+        names = []
+        self.vector_parts = []
+        for number, entries in enumerate(buckets):
+            name = "vectors-%03d.js" % number
+            names.append(name)
+            payload = {"dims": dims, "ids": [xid for xid, _vec in entries],
+                       "data": base64.b64encode(b"".join(vec for _xid, vec in entries))
+                       .decode("ascii")}
+            self.vector_parts.append((name, payload))
+        self.write_vector_parts(files)
+        return names
+
+    def look_files(self, pictures, files):
+        """Add data/looks-NNN.js (the looks option) to files; returns their names.
+
+        Each holds SEARCH_LOOKS.push({"dims", "ids": [export ids], "data":
+        base64 of the look vectors one after the other, "model": the
+        recipe's opaque id (looks.look_id)}) for the pictures whose ids fall
+        in it (bucket_of, like the index shards).
+        """
+        self.look_stats = {"vectors": 0, "missing": 0, "bytes": 0}
+        if not self.options["looks"] or not pictures:
+            return []
+        found = looks.fresh_looks(self.conn, self.library_id,
+                                  [picture.row["id"] for picture in pictures])
+        items = sorted((picture.xid, found["vectors"][picture.row["id"]])
+                       for picture in pictures if picture.row["id"] in found["vectors"])
+        self.look_stats.update(vectors=len(items), missing=len(pictures) - len(items))
+        if not items:
+            return []
+        dims = found["dims"]
+        count = _shard_count(len(items) * vector_bytes(dims), INDEX_SHARD_BYTES)
+        buckets = [[] for _ in range(count)]
+        for xid, vec in items:
+            buckets[bucket_of(xid, count)].append((xid, vec))
+        names = []
+        for number, entries in enumerate(buckets):
+            name = "looks-%03d.js" % number
+            names.append(name)
+            payload = {"dims": dims, "ids": [xid for xid, _vec in entries],
+                       "data": base64.b64encode(b"".join(vec for _xid, vec in entries))
+                       .decode("ascii"), "model": found["model"]}
+            text = "SEARCH_LOOKS.push(%s);\n" % _js_json(payload)
+            files["data/" + name] = text
+            self.look_stats["bytes"] += len(text)
+        return names
+
+    def write_vector_parts(self, files, model=None):
+        """The texts of the vector files into files (with the query model's id, if any)."""
+        self.vector_stats["bytes"] = 0
+        for name, payload in self.vector_parts:
+            if model:
+                payload = dict(payload, model=model)
+            text = "SEARCH_VECTORS.push(%s);\n" % _js_json(payload)
+            files["data/" + name] = text
+            self.vector_stats["bytes"] += len(text)
+
+    def meaning_data(self, files):
+        """Search by meaning in the browser (the meaning option, see meaning_status): its
+        files (kept in self.meaning, written with the others) and manifest entry, or None
+        when the option is off or it cannot be used (the reason is logged)."""
+        self.meaning = None
+        self.meaning_status = None
+        if not self.options["meaning"]:
+            return None
+        status = meaning_status(self.config, self.options, self.vector_stats["vectors"])
+        self.meaning_status = status
+        if not status["available"]:
+            return None
+        try:
+            made = meaning_files(status)
+        except (browser_model.ModelError, OSError) as error:
+            status.update(available=False, reason="The model file could not be converted for "
+                                                  "a browser: %s" % common.redact(str(error)))
+            return None
+        self.meaning = made
+        self.write_vector_parts(files, made["id"])
+        names = sorted(rel[len("data/"):] for rel in made["files"])
+        return {"id": made["id"], "dims": made["dims"], "model": MEANING_FOLDER + "/model.js",
+                "parts": [name for name in names if name.startswith(MEANING_FOLDER + "/w-")],
+                "bytes": made["bytes"], "gzip": made["gzip"], "license": MEANING_LICENSE,
+                "credit": status["credit"],
+                "assets": {name: _version(data) for name, data in made["assets"].items()}}
 
     def manifest_text(self, manifest, files):
         """data/manifest.js, dated the day the export's contents last changed."""
@@ -2397,7 +2991,7 @@ class _Export:
         for rel in sorted(files):
             digest.update(rel.encode("ascii") + b"\n" + files[rel].encode("ascii"))
         for rel in sorted(self.writer.files):
-            if rel.startswith(("thumbs/", "images/", "panos/")):
+            if rel.startswith(("thumbs/", "images/", "panos/", "videos/")):
                 digest.update(("%s %s\n" % (rel, self.writer.files[rel][0])).encode("utf-8"))
         content = digest.hexdigest()
         generated = self.state.get("generated")
@@ -2622,12 +3216,21 @@ class _Export:
                             "panos": any(picture.pano for picture in pictures),
                             "file_names": self.options["file_names"],
                             "folders": self.options["folders"]}
+            if any(picture.video for picture in pictures):
+                capabilities["videos"] = True
             if location and any(record.get("co") for record in records):
                 # Place names (and with them the GeoNames credit, render_page).
                 capabilities["places"] = True
             files, manifest = self.data_files(pictures, records, capabilities)
             for rel in sorted(files):
                 self.writer.write(rel, files[rel].encode("ascii"))
+            if self.meaning is not None:
+                # (Not in files: their hashes are in the manifest already, and the
+                # page versions of data files are of their text.)
+                for rel, data in sorted(self.meaning["files"].items()):
+                    self.writer.write(rel, data)
+                for name, data in sorted(self.meaning["assets"].items()):
+                    self.writer.write("assets/" + name, data)
             manifest_bytes = self.manifest_text(manifest, files).encode("ascii")
             self.writer.write("data/manifest.js", manifest_bytes)
             versions = {}
@@ -2642,7 +3245,9 @@ class _Export:
                 page_title = self.title if name != "map.html" else "Map - %s" % self.title
                 text = render_page(template, self.title, page_title, capabilities,
                                    self.export_id, self.options, tiles_max, versions,
-                                   _version(manifest_bytes))
+                                   _version(manifest_bytes),
+                                   {"credit": self.meaning_status["credit"]}
+                                   if self.meaning is not None else None)
                 self.writer.write(name, text.encode("utf-8"))
             if not self.options["allow_indexing"]:
                 # Only heard at the root of a host; the pages say it too.
@@ -2662,6 +3267,28 @@ class _Export:
             if self.kept:
                 ctx.log("%d picture(s) could not be read; the files of the earlier export "
                         "were kept." % self.kept, "warn")
+            stats = self.vector_stats
+            if self.options["similar"] and (stats["vectors"] or stats["stale"]
+                                            or stats["missing"]):
+                ctx.log("More like this: %d picture(s) have a meaning vector (%s)." % (
+                    stats["vectors"], human_bytes(stats["bytes"])))
+                if stats["stale"] or stats["missing"]:
+                    ctx.log("%d picture(s) have no up-to-date meaning vector, so More like this "
+                            "finds them by their tags instead: Update meaning search on the "
+                            "Manage page, then export again."
+                            % (stats["stale"] + stats["missing"]), "warn")
+            looked = self.look_stats
+            if self.options["looks"] and looked["vectors"]:
+                ctx.log("Looks like this: %d picture(s) have a look vector (%s)%s." % (
+                    looked["vectors"], human_bytes(looked["bytes"]),
+                    "; %d have none yet (Update looks on the Manage page, then export "
+                    "again)" % looked["missing"] if looked["missing"] else ""))
+            if self.meaning is not None:
+                ctx.log(meaning_text(self.meaning))
+            elif self.options["meaning"] and self.meaning_status is not None and \
+                    self.meaning_status["reason"] and embeddings.configured(self.config):
+                ctx.log("Search by meaning in the browser is not included: %s"
+                        % self.meaning_status["reason"])
             return summary
         finally:
             if not finished and self.marked:
@@ -2715,9 +3342,16 @@ class _Export:
                 "output": self.out_dir, "zip": zip_file, "count": len(pictures),
                 "total": counts["total"], "excluded": by_reason, "failed": self.failed,
                 "pano_failed": self.pano_failed, "kept": self.kept,
+                "videos": sum(1 for picture in pictures if picture.video),
+                "video_failed": self.video_failed,
                 "written": self.writer.written,
                 "unchanged": self.writer.unchanged, "removed": removed, "bytes": total_bytes,
-                "images": self.options["images"], "stopped": stopped}
+                "images": self.options["images"], "stopped": stopped,
+                "vectors": self.vector_stats["vectors"],
+                "looks": self.look_stats["vectors"],
+                "meaning": {"id": self.meaning["id"], "bytes": self.meaning["bytes"],
+                            "gzip": self.meaning["gzip"]} if self.meaning is not None else None}
+
 
 
 def export_library(ctx, conn, config, library_id, out_dir=None, options=None, helper=None):
@@ -2771,6 +3405,8 @@ def _cli_options(args, library):
     for name in ("location", "file_names", "folders", "zip"):
         if getattr(args, name):
             options[name] = True
+    if args.videos:
+        options["videos"] = args.videos
     for name in ("undescribed", "private", "sensitive"):
         if getattr(args, "include_" + name):
             options["exclude_" + name] = False
@@ -2849,6 +3485,10 @@ def main(argv=None):
                         help="include pictures flagged as suggestive, explicit or graphic")
     parser.add_argument("--zip", action="store_true",
                         help="also write <output folder>.zip next to the folder")
+    parser.add_argument("--videos", choices=VIDEO_MODES,
+                        help="skip: videos are published as their poster frame (default); "
+                             "include: also the videos browsers can play (H.264, or a "
+                             "playable copy), up to max_video_mb, without their metadata")
     args = parser.parse_args(argv)
     try:
         db.init()

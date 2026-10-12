@@ -31,7 +31,7 @@ import common
 import imageinfo
 import jobs
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # The schema for SCHEMA_VERSION 1. Later versions add migrations below rather
 # than editing this list.
@@ -354,6 +354,22 @@ def _migrate_to_4(conn):
         conn.execute(statement)
 
 
+# Videos (see videos.py): media is 'image' or 'video'; duration is a video's
+# length in seconds (NULL for pictures, and when it is not known). A
+# video's other facts use the existing columns (width and height as shown,
+# taken_at with taken_source 'video', camera, lat, lon) and the exif
+# column's "video" object (codec, frame rate, rotation, ...).
+SCHEMA_V5 = (
+    "ALTER TABLE images ADD COLUMN media TEXT NOT NULL DEFAULT 'image'",
+    "ALTER TABLE images ADD COLUMN duration REAL",
+)
+
+
+def _migrate_to_5(conn):
+    for statement in SCHEMA_V5:
+        conn.execute(statement)
+
+
 # Ordered (version, function, rewrites_data). A migration that rewrites
 # existing data gets a backup copy (index.db.bak-v<old version>) first.
 MIGRATIONS = (
@@ -361,6 +377,7 @@ MIGRATIONS = (
     (2, _migrate_to_2, True),
     (3, _migrate_to_3, True),
     (4, _migrate_to_4, True),
+    (5, _migrate_to_5, True),
 )
 
 

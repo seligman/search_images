@@ -170,7 +170,9 @@ def has_json1():
 def _where(wanted):
     """The WHERE clause (and its arguments) of the candidates of one library."""
     photo, document = wanted["photo_types"] or [""], wanted["document_types"] or [""]
-    sql = ("library_id = ? AND missing_since IS NULL AND described = 1 AND ("
+    # (Videos are never refined: they are not documents or screenshots.)
+    sql = ("library_id = ? AND missing_since IS NULL AND described = 1 AND media <> 'video' "
+           "AND ("
            "(CASE WHEN json_valid(info) THEN json_extract(info, '$.photo_type') END) IN (%s) OR "
            "(CASE WHEN json_valid(info) THEN json_extract(info, '$.document_type') END) IN (%s))"
            " AND NOT (prompt_ver >= ? AND IFNULL(CASE WHEN json_valid(provenance) THEN "
@@ -214,7 +216,8 @@ def candidate_rows(conn, library, max_failures=None):
     else:
         rows = _python_filter(conn.execute(
             "SELECT %s FROM images WHERE library_id = ? AND missing_since IS NULL AND "
-            "described = 1 ORDER BY id" % COLUMNS, (library["id"],)).fetchall(), wanted)
+            "described = 1 AND media <> 'video' ORDER BY id" % COLUMNS,
+            (library["id"],)).fetchall(), wanted)
     if max_failures is not None:
         rows = [row for row in rows if row["describe_attempts"] < max_failures]
     return rows

@@ -48,6 +48,14 @@ its value is empty, zero, or the "nothing" value noted below:
                                            with location)
     w    displayed width                  hgt  displayed height
     p    "360" for a 360-degree photo
+    mv   1 for a video (see videos.py); its ty is always "video"
+    dr   a video's length in seconds (one decimal, rounded down, at least
+         0.1: players show whole seconds rounded down)
+    vc   a video's codec ("h264", "hevc", ...: the pages ask the browser
+         whether it can play it)
+    vt   a video's kind according to the AI model when it is not a photo
+         ("screenshot" for a screen recording, ...): searched with the
+         kind words, and an export's exclude_types look at it
     dg   duplicate group: the id of the group's cover picture, on every
          member of a group of two or more (see duplicate_groups; the cover
          is chosen by cover_key)
@@ -87,6 +95,7 @@ import image_edits
 import imageinfo
 import not_duplicates
 import prompts
+import videos
 
 # The shape of the records and of the /api/index answer. Raise it when either
 # changes, so browsers do not keep using an older index.
@@ -115,9 +124,10 @@ BURST_SECONDS = 2
 # camera whose clock was never set gives every picture the same time.
 BURST_GROUPS = 8
 # Where a trusted capture date comes from (the taken_source column): the
-# camera's EXIF data or a date in the file name. A file's modification time
-# changes when it is copied or edited, so it says little.
-RELIABLE_DATE_SOURCES = frozenset(("exif", "filename"))
+# camera's EXIF data, a date in the file name, or a video's own metadata
+# (videos.creation_date). A file's modification time changes when it is
+# copied or edited, so it says little.
+RELIABLE_DATE_SOURCES = frozenset(("exif", "filename", "video"))
 # Two pictures with trusted dates are near-duplicates only when they were
 # taken on the same calendar day, or at most this many seconds apart (a
 # burst across midnight).
@@ -185,7 +195,8 @@ _SCORE_FIELDS = (("q", "aesthetic"), ("sh", "sharpness"))
 
 _INDEX_COLUMNS = ("id, library_id, path, name, width, height, content_hash, dhash, taken_at, "
                   "taken_source, camera, lat, lon, info, described, prompt_ver, hidden, "
-                  "projection, place_city, place_region, place_country, place_cc, place_km")
+                  "projection, place_city, place_region, place_country, place_cc, place_km, "
+                  "media, duration, CASE WHEN media = 'video' THEN exif ELSE '' END AS vexif")
 # (record key, images column) of the place names.
 _PLACE_FIELDS = (("ci", "place_city"), ("rg", "place_region"), ("co", "place_country"),
                  ("cc", "place_cc"))
@@ -340,6 +351,8 @@ def record_for_row(row, for_export=False, export_options=None, info=None, edit=N
         record["hgt"] = row["height"]
     if row["projection"] in imageinfo.PROJECTIONS_360:
         record["p"] = "360"
+    if row["media"] == videos.MEDIA_VIDEO:
+        add_video(record, row)
     if row["hidden"] and not for_export:
         record["h"] = 1
     if edited and owner and not for_export:
@@ -349,6 +362,28 @@ def record_for_row(row, for_export=False, export_options=None, info=None, edit=N
         if row["prompt_ver"] <= 4:
             record["v4"] = 1
     return record
+
+
+def add_video(record, row):
+    """Add what a record says about a video (mv, dr, vc, vt; ty "video") from its row."""
+    record["mv"] = 1
+    # The kind of picture is "video" whatever the description says (the
+    # model only saw a few of its frames; see videos.effective_info). The
+    # model's own kind stays in vt when it is not a photo: a screen
+    # recording is still a screenshot to an export's privacy options.
+    kind = record.get("ty")
+    if kind and kind not in ("photo", videos.MEDIA_VIDEO):
+        record["vt"] = kind
+    record["ty"] = videos.MEDIA_VIDEO
+    duration = row["duration"]
+    if isinstance(duration, (int, float)) and math.isfinite(duration) and duration > 0:
+        # (Rounded down, as players show a length; site.js does the same.)
+        record["dr"] = max(0.1, math.floor(duration * 10) / 10)
+    facts = _load_info(row["vexif"]) if "vexif" in row.keys() else None
+    facts = facts.get("video") if isinstance(facts, dict) else None
+    codec = _text(facts.get("codec")) if isinstance(facts, dict) else ""
+    if codec:
+        record["vc"] = codec[:20]
 
 
 def add_place(record, row):
@@ -525,9 +560,12 @@ def exact_copies_only(record):
     """True for a record whose picture is grouped only with exact copies of itself.
 
     Described documents, scans, screenshots and diagrams (and anything
-    with a document type): pages of text look alike to a dHash.
+    with a document type): pages of text look alike to a dHash. Videos too:
+    a video never stacks with a photo, nor with another video unless it is
+    the same file.
     """
-    return record.get("ty") in EXACT_ONLY_TYPES or bool(record.get("dt"))
+    return (record.get("ty") in EXACT_ONLY_TYPES or bool(record.get("dt"))
+            or bool(record.get("mv")))
 
 
 def trusted_date(taken_at, taken_source):
