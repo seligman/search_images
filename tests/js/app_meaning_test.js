@@ -588,7 +588,9 @@ function exportPage(options) {
                             },
                             query: function (text) {
                                 log.query = text;
-                                return Int8Array.from(data.vectors[7]);
+                                // (options.far: a query like none of the pictures.)
+                                return Int8Array.from(options.far ? unit([-1].concat(
+                                    new Array(DIMS - 1).fill(0))) : data.vectors[7]);
                             }
                         });
                     }, 30);
@@ -747,6 +749,42 @@ test("a search loads the vectors, then the model, with its progress; then it run
              assert.strictEqual(kept[MODEL_ID + "\nkids playing outside"].model, MODEL_ID);
          });
      });
+
+test("a query no word matches: no spelling offered that only meaning would find", function () {
+    // "playing" is two edits from "lying" (in the snow angel's description),
+    // but "kids lying outside" has no word match either.
+    var page = exportPage();
+    return loaded(page).then(function () {
+        search(page, "kids playing outside");
+        return waitFor(function () {
+            return /found by meaning/.test(notes(page));
+        });
+    }).then(function () {
+        assert.ok(/closest in meaning/.test(byId(page, "meaning-notes").textContent),
+                  byId(page, "meaning-notes").textContent);
+        assert.ok(!/Did you mean/.test(byId(page, "meaning-notes").textContent),
+                  byId(page, "meaning-notes").textContent);
+        // A real typo is still offered.
+        search(page, "snwo");
+        return waitFor(function () {
+            return /Did you mean snow\?/.test(byId(page, "meaning-notes").textContent);
+        });
+    });
+});
+
+test("nothing has the words, nor is close in meaning: the empty page says so", function () {
+    var page = exportPage({far: true});
+    return loaded(page).then(function () {
+        search(page, "kids playing outside today");
+        return waitFor(function () {
+            return !byId(page, "empty").hidden &&
+                /close enough in meaning/.test(byId(page, "empty").textContent);
+        });
+    }).then(function () {
+        assert.ok(!/try fewer or more general words/.test(byId(page, "empty").textContent),
+                  byId(page, "empty").textContent);
+    });
+});
 
 test("choosing Words never loads the model", function () {
     var page = exportPage({words: true});

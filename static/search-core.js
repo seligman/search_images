@@ -4741,6 +4741,9 @@ var SearchCore = (function () {
         });
         check.typing = false;
         check.group = false;
+        // By the words alone: the meaning vector is the typed query's, so
+        // meaning would find its pictures whatever the corrected words are.
+        check.meaning = "words";
         if (!this.search(text, check).total) {
             return null;
         }

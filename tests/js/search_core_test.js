@@ -1942,6 +1942,24 @@ test("words and meaning: word matches first, then pictures that mean the same", 
     assert.strictEqual(index.search("year:2020", {vector: QUERY}).meaning, null);
 });
 
+test("did you mean: a correction must find pictures by its words, not by meaning", function () {
+    // (The query's meaning vector is of the words as typed: whatever the
+    // corrected words are, meaning would find the same pictures.)
+    var records = [
+        {i: 1, t: "Striped animal resting on a bedspread", g: ["bedspread"], dk: "2020-01-01",
+         ds: 1},
+        {i: 2, t: "A line of trees", g: ["line", "trees"], dk: "2020-01-02", ds: 1}
+    ];
+    var index = meaningIndex(records, {1: closeTo(0.9), 2: closeTo(0.2, 2)});
+    assert.deepStrictEqual(index.search("feline lounging", {vector: QUERY}).items, [1]);
+    // "line lounging" has no word match either: nothing is offered.
+    assert.strictEqual(index.suggest("feline lounging", {vector: QUERY}), null);
+    assert.strictEqual(index.suggest("feline lounging", {vector: QUERY, meaning: "meaning"}),
+                       null);
+    // A real typo is still corrected with meaning on.
+    assert.strictEqual(index.suggest("bedsprea", {vector: QUERY}).text, "bedspread");
+});
+
 test("a word match about something else ranks below the word matches that mean it", function () {
     var records = [
         {i: 1, t: "Zebra on a quilt", g: ["zebra", "quilt"], dk: "2020-01-01", ds: 1},

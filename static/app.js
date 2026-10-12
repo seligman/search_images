@@ -2967,6 +2967,10 @@
             } else if (waiting === "broken") {
                 lines.push("Search by meaning does not work in this browser, so only the words " +
                            "were looked for. Try other words.");
+            } else if (state.q && result.meaning && result.meaning.mode === "hybrid") {
+                // (Search by meaning ran too: no picture is close enough.)
+                lines.push("No picture has these words, and none is close enough in " +
+                           "meaning. Check the spelling, or describe it another way.");
             } else if (state.q) {
                 lines.push("Check the spelling, or try fewer or more general words.");
             }
