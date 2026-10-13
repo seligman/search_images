@@ -1,0 +1,6 @@
+# The people environment: a Python environment of its own for the face helper
+# (people_worker.py; see README, "People"). Nothing else needs these packages.
+# Tested with numpy 2.5.4 and opencv-python-headless 4.14:
+# requirements-people-pinned.txt installs exactly those builds (with their hashes).
+numpy>=2,<3
+opencv-python-headless>=4.10,<5

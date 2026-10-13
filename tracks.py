@@ -44,7 +44,9 @@ clock has by the GPS time (clock_offset: a whole quarter hour from it,
 give or take CLOCK_SLACK; a dashcam's clock knows no time zone). The GPS check
 (gps_check.py) then times the video by its GPS time and counts its
 position as a strong one, and the place estimates (place_estimates.py)
-use points of its track as pictures taken at those times.
+use points of its track as pictures taken at those times. When the time
+zone of its place had another offset at that moment (a clock that ignores
+daylight saving), local_times.py gives it the local time of its place.
 
 Tracks are kept in index.db (ensure_table; a table made on first use,
 not a schema version: everything in it can be read again), by content

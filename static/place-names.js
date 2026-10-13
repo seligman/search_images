@@ -1,9 +1,10 @@
 /* The Manage page's "Place names" panel: whether the place names are
    there (GeoNames, see places.py), how many pictures with a GPS position
-   have their place, and the buttons that download the place names and
-   give the pictures their place. Both run as a "places" job, listed in
-   the job panel like the others; this panel asks the server again every
-   few seconds while one waits or runs.
+   have their place, how many show the local time of their place (the
+   towns' time zones, see local_times.py), and the buttons that download
+   the place names and give the pictures their place. Both run as a
+   "places" job, listed in the job panel like the others; this panel asks
+   the server again every few seconds while one waits or runs.
 
    Pages are built with DOM calls and textContent only (never innerHTML).
 */
@@ -131,6 +132,50 @@
         return text;
     }
 
+    // Why times are what they are (local_times.status: data.local_times).
+    var TIME_KINDS = [["track", "by their GPS track"], ["gps", "by their GPS time"],
+                      ["gps_date", "by their GPS date"],
+                      ["like", "like other pictures from the same camera"]];
+
+    function timesText(data) {
+        var times = data.local_times;
+        if (!times || typeof times !== "object" || (!data.available && !data.rebuild)) {
+            return "";
+        }
+        if (times.state === "off") {
+            return "Local times are off (config.json \"local_times\"): every picture has " +
+                "its camera's time.";
+        }
+        if (times.state === "no_zones") {
+            return "The place index has no time zones yet: the next scan (or Look up every " +
+                "place again) builds it again from the downloaded files, and then pictures " +
+                "whose camera's clock was not the local time get the local time of their place.";
+        }
+        if (times.state === "no_tzdata") {
+            return "Times stay as the cameras' clocks have them: Python has no time zone " +
+                "database on this computer (install it with: pip install tzdata).";
+        }
+        var local = times.local || 0;
+        if (!local) {
+            return "Every picture has its camera's time: none is known to differ from the " +
+                "local time of its place.";
+        }
+        var kinds = times.kinds || {};
+        var parts = TIME_KINDS.filter(function (pair) {
+            return kinds[pair[0]];
+        }).map(function (pair) {
+            return fmt.number(kinds[pair[0]]) + " " + pair[1];
+        });
+        var text = fmt.plural(local, "picture") + " " + (local === 1 ? "shows" : "show") +
+            " the local time of " + (local === 1 ? "its" : "their") + " place instead of " +
+            "the camera's clock" + (parts.length ? " (" + parts.join(", ") + ")" : "") + ".";
+        if (times.offset_only) {
+            text += " For " + fmt.plural(times.offset_only, "of them", "of them") +
+                " only the UTC offset changed: the clock had the local time.";
+        }
+        return text + " The camera's clock is in each picture's details.";
+    }
+
     function jobText(job) {
         var text = SHELL.jobs.title(job) + ": " + SHELL.jobs.state(job.state).toLowerCase();
         if (job.state !== "queued") {
@@ -165,6 +210,10 @@
             status.textContent = "Not downloaded yet. " + counts(data);
         }
         box.appendChild(status);
+        var times = timesText(data);
+        if (times) {
+            box.appendChild(el("p", {className: "place-names-times", text: times}));
+        }
         if (data.error) {
             // (An index of another version is no failure: it is built again.)
             box.appendChild(SHELL.notice(data.rebuild ? "" : "error", data.error));

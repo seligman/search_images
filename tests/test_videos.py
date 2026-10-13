@@ -48,7 +48,7 @@ class ParseTest(unittest.TestCase):
         # The QuickTime creation date: local time where it was taken, with its offset.
         self.assertEqual((info["taken_at"], info["taken_source"], info["tz_offset"]),
                          ("2021-07-04T11:30:15", "video", "-07:00"))
-        self.assertEqual((info["lat"], info["lon"]), (47.6062, -122.3321))
+        self.assertEqual((info["lat"], info["lon"]), (33.4484, -112.074))
         self.assertEqual(info["camera"], "Acme Phone 9")
         self.assertEqual(info["video"], {
             "codec": "h264", "profile": "High", "fps": 30.0, "bitrate": 8000000,
@@ -806,7 +806,7 @@ class RealFfmpegTest(support.TempBaseMixin, unittest.TestCase):
             "-nostdin", "-v", "error", "-f", "lavfi", "-i",
             "testsrc=size=320x240:rate=10:duration=3", "-f", "lavfi", "-i",
             "sine=frequency=440:duration=3", "-c:v", "mpeg4", "-c:a", "aac",
-            "-metadata", "location=+47.6062-122.3321/",
+            "-metadata", "location=+33.4484-112.0740/",
             "-metadata", "creation_time=2021-07-04T18:30:15Z",
             "-metadata:s:v:0", "creation_time=2021-07-04T18:30:15Z", "-display_rotation:v:0",
             "90", "-f", "mov", self.clip]
@@ -864,14 +864,14 @@ class RealFfmpegTest(support.TempBaseMixin, unittest.TestCase):
         for stream in data["streams"]:
             tags.update(stream.get("tags") or {})
         lowered = json.dumps(tags).lower()
-        for word in ("location", "creation", "iso6709", "47.60", "2021"):
+        for word in ("location", "creation", "iso6709", "33.44", "2021"):
             self.assertNotIn(word, lowered)
         copied = videos.parse_probe(data, "out.mp4")
         self.assertEqual((copied["lat"], copied["taken_source"]), (None, ""))
         self.assertEqual(copied["video"]["rotation"], info["video"]["rotation"])
         with open(target, "rb") as handle:
             raw = handle.read()
-        self.assertNotIn(b"+47.6062", raw)
+        self.assertNotIn(b"+33.4484", raw)
 
 
 if __name__ == "__main__":

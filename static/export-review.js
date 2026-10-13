@@ -119,6 +119,12 @@ var EXPORT_REVIEW = (function () {
                        "Off, or for other videos (HEVC): the poster frame only. The AI " +
                        "model saw only a few still frames of each video and never heard " +
                        "its sound: watch the videos you publish."},
+        raw_files: {label: "RAW files",
+                    hint: "The camera RAW file of each picture that has one, as the " +
+                          "camera wrote it, for visitors to download: with every fact " +
+                          "in it (the time to the second, the camera and its serial " +
+                          "number). One that holds a GPS position goes only with " +
+                          "Location. They are large."},
         max_video_mb: {label: "Largest video",
                        hint: "Videos larger than this many megabytes are published as their " +
                              "poster frame only (the review step counts them)."},
@@ -136,10 +142,22 @@ var EXPORT_REVIEW = (function () {
                       "model from the picture itself, so \u201cLooks like this\u201d finds " +
                       "pictures that look alike. Searching by an example picture needs " +
                       "the server's image model: published sites do not have it."},
+        home_km: {label: "Keep home private",
+                  hint: "No GPS position, drive route or town within about this many " +
+                        "kilometres of home (squares of a grid around it, so that its edge " +
+                        "does not point at home), and no dashcam clip filmed there or " +
+                        "without a GPS fix, nor the words of its drive (the review lists " +
+                        "them). Keep to one size for all your trips: sites made with " +
+                        "different sizes together tell no more than the smallest."},
         album: {label: "The pictures of",
                 hint: "Choose what to publish: put the pictures in an album (a manual " +
                       "one) on the search page, then pick it here. The checks below still " +
                       "apply to them."},
+        people_names: {label: "People's names (as tags)",
+                       hint: "The names you gave people on the People page, as tags of the " +
+                             "pictures they are in, so a search for a name finds them in the " +
+                             "site. Unnamed and hidden people are left out. Faces, their " +
+                             "boxes and what was learnt from them are never published."},
         marks: {label: "Favorites, ratings and albums",
                 hint: "Which pictures are your favorites, their star ratings, and the " +
                       "names of your albums (with the searches of smart albums), so " +
@@ -168,6 +186,11 @@ var EXPORT_REVIEW = (function () {
         sensitive: {title: "Sensitive", one: "sensitive picture", many: "sensitive pictures",
                     word: "sensitive",
                     hint: "Suggestive, explicit or graphic, according to the AI model."},
+        home: {title: "Near home", one: "dashcam clip that may show where home is",
+               many: "dashcam clips that may show where home is", word: "near home",
+               hint: "Dashcam clips filmed near home, or without a GPS fix: a dashcam " +
+                     "prints its position over its video (without a fix, the last one it " +
+                     "had, often where the drive started). Watch one before you publish it."},
         document: {title: "Documents", one: "document", many: "documents", word: "document",
                    hint: "Letters, receipts, forms, tickets and other papers."},
         screenshot: {title: "Screenshots", one: "screenshot", many: "screenshots",
@@ -205,9 +228,9 @@ var EXPORT_REVIEW = (function () {
         chosen: {title: "Chosen by you",
                  hint: "Pictures you published or left out one by one."}
     };
-    var GROUP_ORDER = ["private", "sensitive", "document", "screenshot", "scan", "writing",
-                       "artwork", "meme", "diagram", "other", "video", "photo", "unchecked",
-                       "undescribed"];
+    var GROUP_ORDER = ["private", "sensitive", "home", "document", "screenshot", "scan",
+                       "writing", "artwork", "meme", "diagram", "other", "video", "photo",
+                       "unchecked", "undescribed"];
     var LEFT_OUT_ORDER = GROUP_ORDER.concat(["excluded", "hidden"]);
 
     function number(value) {
@@ -276,6 +299,10 @@ var EXPORT_REVIEW = (function () {
             }
             if (reason === "sensitive") {
                 return Boolean(options.exclude_sensitive);
+            }
+            if (reason === "home") {
+                // (A trip's export flags them only while it keeps home private.)
+                return true;
             }
             return types.indexOf(reason) >= 0;
         });
@@ -382,6 +409,10 @@ var EXPORT_REVIEW = (function () {
                     var lookKind = item.parts && item.parts.looks ? "vectors" : "missing";
                     counts.looks[lookKind] = Math.max(0, (counts.looks[lookKind] || 0) + delta);
                 }
+                if (item.raw && counts.raws) {
+                    counts.raws.total = Math.max(0, (counts.raws.total || 0) + delta);
+                    counts.raws[item.raw] = Math.max(0, (counts.raws[item.raw] || 0) + delta);
+                }
                 if (item.video && counts.videos) {
                     var videos = counts.videos;
                     videos.total = Math.max(0, (videos.total || 0) + delta);
@@ -464,6 +495,7 @@ var EXPORT_REVIEW = (function () {
         var exported = Number(counts.exported) || 0;
         if (!total) {
             return counts.album ? "The album has no pictures in this library."
+                : counts.trip ? "The trip has no pictures to publish."
                 : "This library has no pictures to publish yet.";
         }
         if (!exported) {
@@ -472,6 +504,11 @@ var EXPORT_REVIEW = (function () {
         if (counts.album && counts.album.name) {
             return number(exported) + " of the " + number(total) + (total === 1 ? " picture"
                 : " pictures") + " of the album \u201c" + counts.album.name + "\u201d will be " +
+                "published.";
+        }
+        if (counts.trip && counts.trip.title) {
+            return number(exported) + " of the " + number(total) + (total === 1 ? " picture"
+                : " pictures") + " of the trip \u201c" + counts.trip.title + "\u201d will be " +
                 "published.";
         }
         return number(exported) + " of " + number(total) + (total === 1 ? " picture" :
@@ -484,7 +521,8 @@ var EXPORT_REVIEW = (function () {
         }
         var parts = preview.size_parts || {};
         var named = [["thumbnails", parts.thumbs], ["pictures", parts.images],
-                     ["360-degree panoramas", parts.panos], ["videos", parts.videos],
+                     ["large panoramas", parts.panos], ["videos", parts.videos],
+                     ["RAW files", parts.raws],
                      ["pages and data", parts.data], ["meaning vectors", parts.vectors],
                      ["look vectors", parts.looks], ["search by meaning", parts.meaning]];
         var list = named.filter(function (item) {
@@ -527,13 +565,44 @@ var EXPORT_REVIEW = (function () {
             "publish." : "");
     }
 
+    /* What happens to the camera RAW files of the pictures to publish (counts:
+       preview_export's counts.raws {total, included, location}), in a
+       sentence; "" when none has one. */
+    function rawsText(counts, options) {
+        if (!counts || !counts.total) {
+            return "";
+        }
+        var total = Number(counts.total) || 0;
+        if (!options || !options.raw_files) {
+            return number(total) + (total === 1 ? " picture has a RAW file; it stays home"
+                : " pictures have RAW files; they stay home") + " (RAW files publishes them).";
+        }
+        var text = number(counts.included || 0) + " of " + number(total) +
+            (total === 1 ? " RAW file goes" : " RAW files go") + " along as the camera " +
+            "wrote " + (total === 1 ? "it" : "them") + ", with every fact in " +
+            (total === 1 ? "it" : "them") + ": the time to the second, the camera and its " +
+            "serial number";
+        if (counts.location) {
+            text += "; " + number(counts.location) + " stay" + (counts.location === 1 ? "s" : "") +
+                " home: " + (counts.location === 1 ? "it holds" : "they hold") + " a GPS " +
+                "position, and Location is off or " + (counts.location === 1 ? "its picture's"
+                : "their pictures'") + " own position is set aside" +
+                // (A trip's export: one near home stays too, see export.raw_plan.)
+                (typeof options.home_km === "number" && options.home_km > 0 ? " or near home"
+                    : "");
+        }
+        return text + ".";
+    }
+
     /* The drives among the pictures to publish (counts.drives of the preview:
-       {drives, described, private, sensitive}, see drives.export_texts): how
-       many keep their own description, and how many lose it to the options;
-       "" when none has one. */
+       {drives, described, private, sensitive, withheld}, see
+       drives.export_texts and export.withheld_clips): how many keep their own
+       description, and how many lose it to the options or to a clip left out
+       near home (a trip's export); "" when none has one. */
     function drivesText(counts) {
         var drives = counts && counts.drives;
-        var left = drives ? (drives["private"] || 0) + (drives.sensitive || 0) : 0;
+        var left = drives ? (drives["private"] || 0) + (drives.sensitive || 0) +
+            (drives.withheld || 0) : 0;
         if (!drives || !drives.drives || (!drives.described && !left)) {
             return "";
         }
@@ -546,6 +615,10 @@ var EXPORT_REVIEW = (function () {
         }
         if (drives.sensitive) {
             parts.push(number(drives.sensitive) + " without it (sensitive)");
+        }
+        if (drives.withheld) {
+            parts.push(number(drives.withheld) + " without it (written from clips filmed " +
+                       "near home, which are left out)");
         }
         return parts.join("; ") + ".";
     }
@@ -686,11 +759,21 @@ var EXPORT_REVIEW = (function () {
             // (Only said when on: most libraries have no marks.)
             shown.push("favorite star, rating and albums");
         }
+        if (options.people_names) {
+            shown.push("the names of the people in it (as tags)");
+        }
+        if (options.raw_files) {
+            shown.push("RAW file, when it has one (as the camera wrote it)");
+        }
         var text = "Published with each picture: its " + shown.slice(0, -1).join(", ") +
             " and " + shown[shown.length - 1] + ".";
         if (hidden.length) {
             text += " Not its " + (hidden.length === 1 ? hidden[0] : hidden.slice(0, -1)
                 .join(", ") + " or " + hidden[hidden.length - 1]) + ".";
+        }
+        if (options.location && typeof options.home_km === "number" && options.home_km > 0) {
+            text += " Nothing within about " + number(options.home_km) + " km of home: no " +
+                "position, route or town there.";
         }
         return text;
     }
@@ -722,6 +805,7 @@ var EXPORT_REVIEW = (function () {
         headline: headline,
         sizeText: sizeText,
         videoText: videoText,
+        rawsText: rawsText,
         drivesText: drivesText,
         routesText: routesText,
         overlayText: overlayText,

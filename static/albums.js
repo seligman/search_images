@@ -15,7 +15,10 @@
    Everyone else sees the albums and opens them; nothing changes. The
    pictures and the albums come from SITE.loadIndex, and the counts and
    covers from SearchCore (a smart album's search runs here, by meaning
-   too when the server can embed it), so they agree with the search page.
+   too when the server can embed it, and with the people of
+   SITE.peopleForSearch when it names a person), so they agree with the
+   search page. A smart album that names a person cannot be copied until
+   the people have come (nor where there are none to have).
 
    Pages are built with DOM calls and textContent only (never innerHTML).
 */
@@ -42,6 +45,12 @@
     var queryVectors = {};      // meaning text -> vector (Int8Array) or false (none)
     var vectorTries = {};       // meaning text -> how often it was asked for (-1: asking)
     var looksAsked = false;
+    // The people for person: in smart albums (the admin's hidden ones too, as the
+    // search page has them); the list is drawn again when they come.
+    var peopleSearch = SITE.peopleForSearch(function () {
+        render();
+    }, adminOn);
+    var PERSON_TERM = /(^|\s)-?person:/i;
 
     /* ---------- Albums and their pictures ---------------------------------- */
 
@@ -104,11 +113,33 @@
     // The pictures an album shows, in its order (as the search page has
     // them; a drive found by its own words with all of its clips).
     function picturesOf(album) {
-        var result = SearchCore.search(data.index, albumTerm(album), {
+        var result = SearchCore.search(data.index, albumTerm(album), peopleSearch.options({
             albums: data.albums, libraries: [], hidden: false, sort: "album", group: false,
             vectorFor: vectorFor, wholeDrives: true
-        });
+        }));
         return result.items;
+    }
+
+    // Smart albums that name a person need the people: asked for once.
+    function wantPeople() {
+        peopleSearch.want(data.albums.filter(function (album) {
+            return album.kind === "smart" && typeof album.query === "string";
+        }).map(function (album) {
+            return album.query;
+        }).join(" "));
+    }
+
+    /* Why a smart album's pictures cannot be copied now ('' when they can):
+       it names a person and the people have not come (or there are none). */
+    function notCopyable(album) {
+        if (!PERSON_TERM.test(album.query || "")) {
+            return "";
+        }
+        if (peopleSearch.pending()) {
+            return "Wait a moment: the people it looks for are on their way.";
+        }
+        return peopleSearch.options({}).people ? ""
+            : "The people it looks for are not available here.";
     }
 
     function coverOf(album, items) {
@@ -228,10 +259,12 @@
                                                  }
                                              }}}));
             } else {
+                var why = notCopyable(album);
                 actions.appendChild(el("button", {type: "button", className: "button small",
-                                                  text: "Copy to a new album",
-                                                  title: "A manual album with the pictures it " +
-                                                      "finds now (an export can be limited to it)",
+                                                  text: "Copy to a new album", disabled: !!why,
+                                                  title: why || "A manual album with the " +
+                                                      "pictures it finds now (an export can " +
+                                                      "be limited to it)",
                                                   on: {click: function () {
                                                       copyAlbum(album, items);
                                                   }}}));
@@ -864,6 +897,7 @@
         SITE.refreshIndex(function (loaded) {
             if (loaded) {
                 setData(loaded);
+                wantPeople();
             }
             go(arranging ? arranging.album.id : null, false);
         });
@@ -882,6 +916,7 @@
                 return;
             }
             setData(loaded);
+            wantPeople();
             go(wanted(), false);
             wantLooks();
             // Smart albums that search by meaning: their counts once the

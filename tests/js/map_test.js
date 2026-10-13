@@ -453,10 +453,10 @@ test("the open list reads back from the address and finds its pin again", functi
 
 test("a chip of the viewer opens a new search, without the timeline's dates", function () {
     var state = {q: "beach", lib: "lib_family1", filters: {type: ["photo"]}, from: "2019",
-                 to: "2019", view: "20.8,-156.4,9", ids: "", group: true};
-    var target = MAP.chipState(state, "place", "United States|Hawaii|Hilo");
+                 to: "2019", view: "37.1,-8.2,9", ids: "", group: true};
+    var target = MAP.chipState(state, "place", "Portugal|Algarve|Faro");
     assert.deepStrictEqual(target, {q: "", lib: "lib_family1",
-                                    filters: {place: ["United States|Hawaii|Hilo"]},
+                                    filters: {place: ["Portugal|Algarve|Faro"]},
                                     from: "", to: "", view: "", ids: "", group: true});
     target = MAP.chipState(state, "q", "tag:sunset");
     assert.strictEqual(target.q, "tag:sunset");
@@ -464,6 +464,84 @@ test("a chip of the viewer opens a new search, without the timeline's dates", fu
     assert.strictEqual(target.from + target.to, "");
     // The state it was made from is left as it was.
     assert.strictEqual(state.from, "2019");
+});
+
+/* ---------- Tiles and pins on a canvas (shared with the trip pages) ----------------- */
+
+// A canvas context that writes down what is drawn.
+function recorder() {
+    var calls = [];
+    var ctx = {globalAlpha: 1, calls: calls};
+    ["drawImage", "fillRect", "beginPath", "arc", "fill", "stroke", "fillText", "save",
+     "restore"].forEach(function (name) {
+        ctx[name] = function () {
+            calls.push([name].concat(Array.prototype.slice.call(arguments)));
+        };
+    });
+    return ctx;
+}
+
+function named(ctx, name) {
+    return ctx.calls.filter(function (call) {
+        return call[0] === name;
+    });
+}
+
+test("the tile layer draws the tiles of a view, stand-ins and the sea", function () {
+    var made = [];
+    global.Image = function () {
+        made.push(this);
+    };
+    try {
+        var asked = [];
+        var loads = 0;
+        var layer = new MAP.TileLayer({tileUrl: function (z, x, y) {
+            asked.push(z + "/" + x + "/" + y);
+            return "tile/" + z + "/" + x + "/" + y + ".jpg";
+        }, tileSize: TILE, tileZoom: 1, ocean: "#123456", onLoad: function () {
+            loads += 1;
+        }});
+        // Zoom 0: the world is 512 px wide; a view of 600 px from x -50 sees four
+        // columns, each tile asked for once.
+        var ctx = recorder();
+        assert.strictEqual(layer.draw(ctx, 0, -50, 0, 600, 256), 0);
+        assert.deepStrictEqual(asked, ["0/1/0", "0/0/0"]);
+        assert.strictEqual(named(ctx, "fillRect").length, 4);
+        assert.strictEqual(ctx.fillStyle, "#123456");
+        // A tile that arrives is drawn (and asks for a new drawing).
+        made[1].onload();
+        assert.strictEqual(loads, 1);
+        ctx = recorder();
+        layer.draw(ctx, 0, 0, 0, 512, 256);
+        // (Column 0 twice: the world repeats; column 1 is still the sea.)
+        assert.strictEqual(named(ctx, "drawImage").length, 2);
+        assert.strictEqual(named(ctx, "drawImage")[0][1], made[1]);
+        assert.strictEqual(named(ctx, "fillRect").length, 1);
+        // Past the tiles' detail: stretched, fainter, and a loaded coarser tile
+        // stands in for one still loading (a part of it, nine arguments).
+        ctx = recorder();
+        assert.strictEqual(layer.draw(ctx, 3, 0, 0, 256, 256), 2);
+        var stand = named(ctx, "drawImage");
+        assert.ok(stand.length >= 1 && stand[0].length === 10, JSON.stringify(stand[0]));
+        assert.strictEqual(ctx.globalAlpha, 1);
+    } finally {
+        delete global.Image;
+    }
+});
+
+test("pins: red for one, blue with a count for more, hollow for estimated places", function () {
+    var ctx = recorder();
+    MAP.drawPins(ctx, [{sx: 10, sy: 10, r: 7, group: {count: 1, estimated: 0}},
+                       {sx: 50, sy: 50, r: 12, group: {count: 1234, estimated: 0}},
+                       {sx: 90, sy: 90, r: 9, group: {count: 3, estimated: 3, picked: true}}]);
+    assert.strictEqual(named(ctx, "fill").length, 3);
+    // The picked pin's ring, the white edges, and the hollow pin's two rings.
+    assert.strictEqual(named(ctx, "stroke").length, 5);
+    assert.deepStrictEqual(named(ctx, "fillText").map(function (call) {
+        return call[1];
+    }), ["1,234", "3"]);
+    assert.strictEqual(named(ctx, "save").length, 1);
+    assert.strictEqual(named(ctx, "restore").length, 1);
 });
 
 /* ---------- Running -------------------------------------------------------------------- */

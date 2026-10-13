@@ -1,0 +1,498 @@
+/* The Trips pages (trips.html, trips.js). The colours and the buttons,
+   notices and cards come from style.css. */
+
+.trips-back {
+    margin: 0 0 6px;
+    font-size: 14px;
+}
+
+.trips-back a {
+    color: var(--link);
+    text-decoration: none;
+}
+
+.trips-back a::before {
+    content: "\2190\00a0";
+}
+
+.trips-back a:hover {
+    text-decoration: underline;
+}
+
+.trips-head {
+    min-width: 0;
+}
+
+.trips-head h1 {
+    overflow-wrap: anywhere;
+}
+
+.trip-dates {
+    margin-right: 10px;
+}
+
+.trip-flag {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 9px;
+    background: var(--warn-soft);
+    color: var(--warn-text);
+    font-size: 12px;
+    font-weight: 700;
+    vertical-align: 1px;
+}
+
+/* The list */
+
+.trip-year {
+    margin: 22px 0 10px;
+    font-size: 18px;
+    color: var(--text-muted);
+}
+
+.trip-year:first-child {
+    margin-top: 4px;
+}
+
+.trip-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 16px;
+}
+
+.trip-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px 10px 12px;
+}
+
+.trip-card.is-hidden {
+    opacity: 0.8;
+}
+
+.trip-cover {
+    display: grid;
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+    gap: 2px;
+    aspect-ratio: 16 / 10;
+    overflow: hidden;
+    border-radius: 6px;
+    background: var(--image-bg);
+    position: relative;
+}
+
+.trip-cover.cover-2 {
+    grid-template-columns: 1fr 1fr;
+}
+
+.trip-cover.cover-3 {
+    grid-template-columns: 2fr 1fr;
+    grid-template-rows: 1fr 1fr;
+}
+
+.trip-cover.cover-3 img:first-child {
+    grid-row: 1 / 3;
+}
+
+.trip-cover.cover-4 {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+}
+
+.trip-cover img {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    object-fit: cover;
+    display: block;
+}
+
+.trip-cover:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.trip-cover-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+.trip-card-head {
+    min-width: 0;
+    padding: 0 2px;
+}
+
+.trip-card-title {
+    margin: 0;
+    font-size: 17px;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+}
+
+.trip-card-title a {
+    color: var(--text);
+    text-decoration: none;
+}
+
+.trip-card-title a:hover {
+    text-decoration: underline;
+}
+
+.trip-card-facts,
+.trip-card-places {
+    margin: 4px 0 0;
+    color: var(--text-muted);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.trip-card-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: auto;
+    padding: 0 2px;
+}
+
+.trip-hidden {
+    margin-top: 26px;
+}
+
+.trip-hidden summary {
+    cursor: pointer;
+    margin-bottom: 12px;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+
+.trip-none-card p {
+    margin: 0 0 6px;
+}
+
+/* One trip */
+
+/* A long trip's days, linked */
+.trip-day-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    margin: -6px 0 14px;
+    font-size: 13px;
+}
+
+.trip-day-links a {
+    color: var(--link);
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.trip-day-links a:hover {
+    text-decoration: underline;
+}
+
+.trip-day-links .trip-day-number {
+    margin-right: 2px;
+    vertical-align: 0;
+}
+
+.trip-day:focus,
+.trip-day-links:focus,
+.trips-head h1:focus {
+    outline: none;
+}
+
+.trip-route-places {
+    margin: -4px 0 14px;
+    color: var(--text-muted);
+    font-size: 14px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.trip-map-card {
+    margin-bottom: 16px;
+    padding: 0;
+    overflow: hidden;
+}
+
+.trip-map {
+    position: relative;
+}
+
+.trip-map-canvas {
+    display: block;
+    width: 100%;
+    /* (On a phone held sideways too: the page around it stays in sight.) */
+    height: 380px;
+    height: min(380px, 60vh);
+    background: #1a2c3d;
+    cursor: grab;
+    touch-action: pan-y;
+}
+
+.trip-map-canvas:focus-visible {
+    outline: 3px solid var(--accent);
+    outline-offset: -3px;
+}
+
+.trip-map-tools {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.trip-map-zoom {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    box-shadow: var(--shadow);
+}
+
+.trip-map-zoom:hover {
+    background: var(--surface-2);
+}
+
+.trip-map-zoom:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.trip-map-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 16px;
+    margin: 0;
+    padding: 8px 14px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+.legend-pin::before,
+.legend-route::before {
+    content: "";
+    display: inline-block;
+    margin-right: 6px;
+    vertical-align: -1px;
+}
+
+.legend-pin::before {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: rgb(214, 58, 58);
+    border: 1.5px solid #ffffff;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+
+.legend-pin.is-estimated::before {
+    background: transparent;
+    border: 2.5px solid rgb(214, 58, 58);
+    box-shadow: none;
+}
+
+.legend-route::before {
+    width: 18px;
+    height: 4px;
+    border-radius: 2px;
+    background: rgb(255, 162, 31);
+    vertical-align: 2px;
+}
+
+.trip-map-hint {
+    margin-left: auto;
+}
+
+.trip-day {
+    margin-bottom: 14px;
+}
+
+.trip-day-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px 14px;
+}
+
+.trip-day-title {
+    margin: 0;
+    font-size: 18px;
+    line-height: 1.35;
+}
+
+.trip-day-number {
+    display: inline-block;
+    margin-right: 4px;
+    padding: 1px 8px;
+    border-radius: 9px;
+    background: var(--accent-soft);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 700;
+    vertical-align: 2px;
+}
+
+.trip-day-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.trip-places {
+    margin: 6px 0 0;
+    font-size: 14px;
+    overflow-wrap: anywhere;
+}
+
+.trip-day-facts {
+    margin: 4px 0 10px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+.trip-strip {
+    display: grid;
+    /* As many columns as best pictures a day has at most (best_per_day), so
+       the pictures are the same size on every day. */
+    grid-template-columns: repeat(var(--strip-count, 6), minmax(0, 1fr));
+    gap: 8px;
+}
+
+@media (max-width: 900px) {
+    .trip-strip {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+.trip-thumb {
+    position: relative;
+    display: block;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    padding: 0;
+    border: 0;
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--image-bg);
+    cursor: zoom-in;
+}
+
+.trip-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.15s ease;
+}
+
+.trip-thumb:hover img {
+    transform: scale(1.03);
+}
+
+.trip-thumb:focus-visible {
+    outline: 3px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.trip-thumb-badges {
+    position: absolute;
+    left: 6px;
+    bottom: 6px;
+    display: flex;
+    gap: 4px;
+    pointer-events: none;
+}
+
+.trip-none {
+    grid-column: 1 / -1;
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+/* Phones: the day's strip scrolls sideways, the map is lower. */
+@media (max-width: 600px) {
+    .trip-grid {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+
+    .trip-map-canvas {
+        height: 260px;
+        height: min(260px, 60vh);
+    }
+
+    .trip-map-hint {
+        display: none;
+    }
+
+    .trip-day {
+        padding: 12px 12px 14px;
+    }
+
+    .trip-day-title {
+        font-size: 16px;
+    }
+
+    .trip-strip {
+        display: flex;
+        overflow-x: auto;
+        scroll-snap-type: x mandatory;
+        gap: 6px;
+        margin: 0 -12px;
+        padding: 0 12px 4px;
+        scrollbar-width: none;
+    }
+
+    .trip-strip::-webkit-scrollbar {
+        display: none;
+    }
+
+    .trip-thumb {
+        flex: 0 0 42%;
+        scroll-snap-align: start;
+    }
+
+    .page-actions .button {
+        padding: 7px 11px;
+    }
+}
+
+@media (pointer: coarse) {
+    .trip-map-zoom {
+        width: 40px;
+        height: 40px;
+    }
+
+    /* (A target a finger finds: "All trips", the days.) */
+    .trips-back a {
+        display: inline-block;
+        padding: 10px 12px 10px 0;
+    }
+
+    .trip-day-links a {
+        padding: 6px 4px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .trip-thumb img {
+        transition: none;
+    }
+}

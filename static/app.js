@@ -57,6 +57,14 @@
    "Save as album" keeps the search (words, filters, sort, words/meaning)
    as a smart album; a search of one album shows it in its own order.
 
+   People (people_groups.py): person:"Name" finds the pictures of a person
+   whose face People recognised. The people come from SITE.peopleForSearch
+   (the server's /api/people: the admin's, hidden people too, so the People
+   page's Pictures of a hidden person work; others' only when the server
+   shows them people; never an export's), loaded when a search first names
+   person: (SearchCore's people option; until they come, person: warns of
+   nothing).
+
    Drives (runs of video clips recorded one after the other, record key
    dv, see drives.py and search-core's Drives) show as one tile each while
    "Fold drives" is on (the default; state.drives): the clip that stands
@@ -194,6 +202,7 @@
     var vectorsAsked = false;
     var restoreTimer = 0;
     var looks = null;           // the look vectors (SITE.loadLooks), once loaded
+    var peopleSearch = null;    // the people for person: (SITE.peopleForSearch)
     var looksWaiting = [];      // called once the look vectors have settled
     var looksSettled = false;
     var looksAsked = false;
@@ -261,8 +270,8 @@
                 group: state.group, drives: state.drives,
                 size: state.size === "m" ? "" : state.size,
                 hidden: state.hidden, junk: state.junk, sensitive: state.sensitive,
-                ids: state.ids, view: state.view, from: state.from, to: state.to,
-                by: state.by};
+                ids: state.ids, pick: state.pick, view: state.view, from: state.from,
+                to: state.to, by: state.by};
     }
 
     // The search state for links to other pages (without the view settings).
@@ -455,7 +464,25 @@
         }
         options.albums = data.albums;
         options.vectorFor = albumVector;
+        if (peopleSearch) {
+            peopleSearch.options(options);
+        }
         return options;
+    }
+
+    /* ---------- People ------------------------------------------------------------- */
+
+    // Load the people when the query (or a smart album it names) has a person:
+    // term (once), then search again with them.
+    function wantPeople() {
+        if (!peopleSearch) {
+            peopleSearch = SITE.peopleForSearch(function () {
+                if (data) {
+                    run({keepScroll: true});
+                }
+            }, adminOn);
+        }
+        peopleSearch.want(state.q + " " + albumQueries());
     }
 
     /* The meaning vector of a smart album's search (SearchCore's vectorFor):
@@ -1383,6 +1410,7 @@
             // everyone else when a search or the viewer needs them.)
             wantLooks();
         }
+        wantPeople();
         var search = searchOptions();
         search.timeline = true;
         result = SearchCore.search(data.index, state.q, search);
@@ -1450,8 +1478,8 @@
     }
 
     /* Places are chosen one level at a time: choosing a place drops the
-       places it is in and the places in it (Hawaii instead of the United
-       States), and taking a town or region away goes back to the place it
+       places it is in and the places in it (the Algarve instead of
+       Portugal), and taking a town or region away goes back to the place it
        is in, unless another place there is still chosen. */
     function placeChoice(values, value) {
         var at = values.indexOf(value);
@@ -2789,7 +2817,9 @@
                 return rec !== null && !(rec.h && !shown.hidden) &&
                     !(shown.library && rec.l !== shown.library);
             }).length;
-            chips.push(chipButton("Picked on the map: " + fmt.plural(pickedCount, "picture"),
+            // (A trip page's pictures say so: state.pick, "Trip: Name".)
+            chips.push(chipButton((state.pick ? state.pick + " \u00b7 " : "Picked on the map: ") +
+                                  fmt.plural(pickedCount, "picture"),
                                   function () {
                                       state.ids = "";
                                       changed();
@@ -3517,7 +3547,9 @@
             });
             if (everywhere) {
                 reasons.push({text: matching(everywhere) + " but " + isAre(everywhere) +
-                                    " not among the pictures picked on the map.",
+                                    " not among " + (state.pick ? "the pictures of " +
+                                                     "\u201c" + state.pick + "\u201d."
+                                        : "the pictures picked on the map."),
                               label: "Show all of them",
                               run: function () {
                                   state.ids = "";

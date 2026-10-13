@@ -15,7 +15,9 @@
    id, dims} (the export ships its query model: the page embeds the query
    with it) or {query, state: "off"} (the page's self-check fails), "albums":
    the names of the albums the manifest lists (the marks option), in
-   order}. A query with "with_albums" searches with those albums.
+   order, "trip": {title} (a trip's export, trip_export.py: its trip, whose
+   days list every picture)}. A query with "with_albums" searches with those
+   albums.
    Prints one line per test and exits with status 1 when any test fails.
 */
 "use strict";
@@ -411,6 +413,34 @@ if (expected.meaning) {
                 assert.deepStrictEqual(again, answer);
                 assert.strictEqual(loaded.length, count);
             });
+        });
+    });
+}
+
+if (expected.trip) {
+    test("a trip's export: the trip, its days and their pictures", function () {
+        return promised(SITE.loadTrips).then(function (found) {
+            var manifest = page.window.SEARCH_DATA_MANIFEST;
+            assert.ok(found && found.trips.length === 1, "one trip");
+            assert.strictEqual(manifest.versions[manifest.trips], sha1("data/" + manifest.trips));
+            assert.strictEqual(versions["data/" + manifest.trips],
+                               manifest.versions[manifest.trips]);
+            var trip = found.trips[0];
+            assert.strictEqual(trip.title, expected.trip.title);
+            assert.deepStrictEqual(trip.libraries, [manifest.library.id]);
+            var ids = {};
+            data.records.forEach(function (rec) {
+                ids[rec.i] = true;
+            });
+            var listed = trip.other.slice();
+            trip.days.forEach(function (day) {
+                assert.strictEqual(day.gaps.length, Math.max(0, day.ids.length - 1));
+                listed = listed.concat(day.ids);
+            });
+            listed.forEach(function (id) {
+                assert.ok(ids[id], id);
+            });
+            assert.strictEqual(listed.length, data.records.length);
         });
     });
 }

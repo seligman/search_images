@@ -1492,13 +1492,13 @@ test("is:edited finds the pictures the owner edited", function () {
 
 var PLACED = [
     {i: 1, t: "Beach at sunset", g: ["beach"], dk: "2019-05-14", co: "United States",
-     rg: "Hawaii", ci: "Kahului", cc: "US", km: 3},
-    {i: 2, t: "Harbour", g: ["boat"], dk: "2019-05-20", co: "United States", rg: "Hawaii",
-     ci: "Lahaina", cc: "US", km: 1},
+     rg: "Florida", ci: "Sarasota", cc: "US", km: 3},
+    {i: 2, t: "Harbour", g: ["boat"], dk: "2019-05-20", co: "United States", rg: "Florida",
+     ci: "Tampa", cc: "US", km: 1},
     {i: 3, t: "Golden Gate bridge", g: ["bridge"], dk: "2020-10-11", co: "United States",
      rg: "California", ci: "San Francisco", cc: "US", km: 2},
     {i: 4, t: "Out at sea", g: ["ocean"], dk: "2021-10-11", co: "United States",
-     rg: "Hawaii", cc: "US"},
+     rg: "Florida", cc: "US"},
     {i: 5, t: "Tower", g: ["tower"], dk: "2021-10-11", co: "France", rg: "Ile-de-France",
      ci: "Paris", cc: "FR"},
     {i: 6, t: "Palace", g: ["palace"], dk: "2022-03-01", co: "Monaco", ci: "Monaco", cc: "MC"},
@@ -1515,8 +1515,8 @@ function ids(result) {
 }
 
 test("place words find the pictures taken there", function () {
-    assert.deepStrictEqual(ids(search(PLACED, "hawaii")), [1, 2, 4]);
-    assert.deepStrictEqual(ids(search(PLACED, "kahului")), [1]);
+    assert.deepStrictEqual(ids(search(PLACED, "florida")), [1, 2, 4]);
+    assert.deepStrictEqual(ids(search(PLACED, "sarasota")), [1]);
     assert.deepStrictEqual(ids(search(PLACED, "\"united states\"")), [1, 2, 3, 4]);
     assert.deepStrictEqual(ids(search(PLACED, "new york")), []);
     // Other names of the country.
@@ -1533,7 +1533,7 @@ test("place words find the pictures taken there", function () {
     assert.deepStrictEqual(ids(search(PLACED, "place:beach")), []);
     assert.deepStrictEqual(ids(search(PLACED, "place:paris")), [5]);
     assert.deepStrictEqual(ids(search(PLACED, "place:\"san francisco\"")), [3]);
-    assert.deepStrictEqual(ids(search(PLACED, "beach -place:hawaii")), [8, 9]);
+    assert.deepStrictEqual(ids(search(PLACED, "beach -place:florida")), [8, 9]);
     // A word in the title ranks above the same word in the place.
     var records = PLACED.concat([{i: 10, t: "Paris poster", g: ["poster"], dk: "2020-01-01"}]);
     assert.strictEqual(search(records, "paris").items[0], 10);
@@ -1583,9 +1583,9 @@ test("the place facet is a tree that opens where a place is chosen", function ()
     assert.deepStrictEqual(ids(result), [1, 2, 3, 4]);
     assert.deepStrictEqual(result.facets.place.map(function (entry) {
         return entry.value;
-    }), ["United States", "United States|Hawaii", "United States|California", "France",
+    }), ["United States", "United States|Florida", "United States|California", "France",
          "Monaco", "United Kingdom"]);
-    result = search(PLACED, "", {filters: {place: ["United States|Hawaii"]}});
+    result = search(PLACED, "", {filters: {place: ["United States|Florida"]}});
     assert.deepStrictEqual(ids(result), [1, 2, 4]);
     var byValue = {};
     result.facets.place.forEach(function (entry) {
@@ -1593,9 +1593,9 @@ test("the place facet is a tree that opens where a place is chosen", function ()
     });
     assert.ok(byValue["United States"].open);
     assert.ok(!byValue["United States"].selected);
-    assert.ok(byValue["United States|Hawaii"].selected);
-    assert.strictEqual(byValue["United States|Hawaii|Kahului"].level, 2);
-    assert.strictEqual(byValue["United States|Hawaii|Kahului"].label, "Kahului");
+    assert.ok(byValue["United States|Florida"].selected);
+    assert.strictEqual(byValue["United States|Florida|Sarasota"].level, 2);
+    assert.strictEqual(byValue["United States|Florida|Sarasota"].label, "Sarasota");
     // The other countries keep their counts (the facet is disjunctive).
     assert.strictEqual(byValue.France.count, 1);
     // A town without a known region hangs under its country.
@@ -1606,15 +1606,15 @@ test("the place facet is a tree that opens where a place is chosen", function ()
         return entry.value;
     }), ["Monaco||Monaco"]);
     assert.strictEqual(SearchCore.placeParent("Monaco||Monaco"), "Monaco");
-    assert.strictEqual(SearchCore.placeParent("United States|Hawaii|Kahului"),
-                       "United States|Hawaii");
+    assert.strictEqual(SearchCore.placeParent("United States|Florida|Sarasota"),
+                       "United States|Florida");
     assert.strictEqual(SearchCore.placeParent("France"), "");
-    assert.strictEqual(SearchCore.placeLabel("United States|Hawaii|Kahului"),
-                       "Kahului, Hawaii, United States");
+    assert.strictEqual(SearchCore.placeLabel("United States|Florida|Sarasota"),
+                       "Sarasota, Florida, United States");
     assert.strictEqual(SearchCore.placeLabel("Monaco||Monaco"), "Monaco, Monaco");
-    assert.strictEqual(SearchCore.facetLabel("place", "United States|Hawaii"), "Hawaii");
-    assert.strictEqual(SearchCore.placeOf(PLACED[0]), "United States|Hawaii|Kahului");
-    assert.strictEqual(SearchCore.placeOf(PLACED[3]), "United States|Hawaii");
+    assert.strictEqual(SearchCore.facetLabel("place", "United States|Florida"), "Florida");
+    assert.strictEqual(SearchCore.placeOf(PLACED[0]), "United States|Florida|Sarasota");
+    assert.strictEqual(SearchCore.placeOf(PLACED[3]), "United States|Florida");
     assert.strictEqual(SearchCore.placeOf(PLACED[7]), "");
     // A chosen place no picture has is still listed, under its parents.
     result = search(PLACED, "", {filters: {place: ["Japan|Tokyo"]}});
@@ -1701,7 +1701,7 @@ test("the timeline counts per year, per month of one year, per day of one month"
     line = timed([{i: 1}, {i: 2, dk: "x"}], "").timeline;
     assert.deepStrictEqual(line, {level: null, bars: [], dated: 0, undated: 2});
     // The matches of the query, before duplicates are stacked.
-    line = timed(PLACED, "hawaii").timeline;
+    line = timed(PLACED, "florida").timeline;
     assert.deepStrictEqual(line.bars.map(function (bar) {
         return bar.key;
     }), ["2019", "2020", "2021"]);
@@ -1822,7 +1822,7 @@ var PEOPLE = ["none", "none", "1", "2", "3-5", "6-10", "crowd"];
 var SETTINGS = ["indoor", "outdoor", "outdoor", "vehicle", "unknown"];
 var EVENTS = ["none", "none", "none", "birthday", "wedding", "travel", "party", "meal"];
 var PLACES = [["United States", "US", "California", "Oakland"],
-              ["United States", "US", "Hawaii", "Hilo"], ["France", "FR", "Bretagne", "Brest"],
+              ["Portugal", "PT", "Algarve", "Faro"], ["France", "FR", "Bretagne", "Brest"],
               ["Japan", "JP", "Tokyo", "Shinjuku"], ["Singapore", "SG", "", "Singapore"],
               ["Iceland", "IS", "Capital Region", ""]];
 

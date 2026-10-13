@@ -11,7 +11,9 @@
    ?dialog=add opens the Add dialog, ?dialog=browse the folder picker, and
    ?dialog=edit|remove|failures|export&id=<library id> those dialogs (with
    &step=review the Export dialog's review step, with &step=done the result
-   of the library's last export), so they can be linked to. Nothing in the address ever makes the server look at a folder by
+   of the library's last export), ?dialog=trip-export&id=<trip id> the Export
+   dialog of a trip (trip_export.py; the trip page's Export button), so they
+   can be linked to. Nothing in the address ever makes the server look at a folder by
    itself or start a job: the folder picker always starts at the drives,
    and an export only starts with its button.
 */
@@ -304,6 +306,13 @@
         if (oldMeaning) {
             holder.removeChild(oldMeaning);
         }
+        if (peopleBox && peopleBox.parentNode) {
+            peopleBox.parentNode.removeChild(peopleBox);
+        }
+        peopleBox = peopleNotice(state && state.people);
+        if (peopleBox) {
+            holder.appendChild(peopleBox);
+        }
         var meaning = state ? state.meaning : null;
         var described = state && state.libraries.some(function (lib) {
             return (lib.counts || {}).described > 0;
@@ -319,6 +328,98 @@
             note.id = "meaning-notice";
             holder.appendChild(note);
         }
+    }
+
+    // People (faces, people.py): only shown when it is on, or face data is kept.
+    var peopleBox = null;
+
+    function peopleNotice(people) {
+        if (!people || (!people.enabled && !people.stored)) {
+            return null;
+        }
+        var kept = people.stored ? fmt.plural(people.faces, "face") + " found in " +
+            fmt.plural(people.pictures, "picture") + " looked at" + (people.people
+                ? ", " + fmt.plural(people.people, "person", "people") + " (" +
+                  fmt.number(people.named || 0) + " named)" : "") + ", kept on this computer " +
+            "only (data/faces.db: never sent anywhere, nor exported but for the names with " +
+            "an export's People's names option)." : "No faces found yet.";
+        var text = !people.enabled ? "People is off; face data from before is kept: " + kept
+            : people.ready ? "People: " + kept : "People cannot find faces: " + people.problem;
+        var actions = [];
+        if (people.stored || people.enabled) {
+            actions.push(el("a", {className: "button small", href: "/people", text: "People page",
+                                  title: "Name the people found, and put their faces right"}));
+        }
+        if (people.enabled) {
+            actions.push(button("Check face helper", "small", function (event) {
+                checkFaceHelper(event.currentTarget);
+            }, {key: "people-check", title: "Start the face helper, load its models and " +
+                "find a test face (a drawing)"}));
+        }
+        if (people.stored) {
+            var busy = (snapshot ? [snapshot.current].concat(snapshot.queue || []) : [])
+                .some(function (job) {
+                    return job && job.kind === "delete_faces";
+                });
+            actions.push(button(busy ? "Delete face data (waiting)" : "Delete face data",
+                "small danger-text", function () {
+                    queueJob("delete_faces", null, {confirm: true});
+                }, {key: "people-delete", disabled: busy, title: "Delete every face found " +
+                    "(data/faces.db), of every library"}));
+        }
+        var box = notice(people.enabled && !people.ready ? "warn" : "info", text, actions);
+        box.className += " people-notice";
+        return box;
+    }
+
+    function checkFaceHelper(node) {
+        if (node) {
+            node.disabled = true;
+        }
+        return SHELL.admin("/people/check", {}).then(function (reply) {
+            if (reply.ok) {
+                SHELL.toast("The face helper works: Python " + reply.python + ", OpenCV " +
+                            reply.opencv + ", numpy " + reply.numpy + " (" +
+                            reply.seconds.toFixed(1) + " s).", "ok", 6);
+            } else {
+                SHELL.toast("The face helper does not work: " + reply.problem, "error", 10);
+            }
+        }, function () {
+            // The message is shown already.
+        }).then(function () {
+            if (node) {
+                node.disabled = false;
+            }
+        });
+    }
+
+    // Delete face data: every face of every library goes.
+    function confirmDeleteFaces() {
+        var people = (state && state.people) || {};
+        var named = people.named || 0;
+        return SHELL.confirm({
+            title: "Delete all face data?",
+            message: [
+                el("p", {text: "The " + fmt.plural(people.faces || 0, "face") + " found in the " +
+                    fmt.plural(people.pictures || 0, "picture") + " looked at " +
+                    "(data/faces.db) are deleted, for every library, with the " +
+                    fmt.plural(people.people || 0, "person", "people") + " they were grouped " +
+                    "into" + (named ? " and the " + fmt.plural(named, "name") + " you gave " +
+                              "them" : "") + ". This cannot be undone. The pictures " +
+                    "themselves are not touched."}),
+                el("p", {className: "muted", text: "Names an export published with its " +
+                    "People's names option stay in that export, and person: searches saved " +
+                    "as smart albums stay in those albums, until you delete them."}),
+                el("p", {className: "muted", text: people.enabled ? "People is still on: " +
+                    "the next Find faces (or scan) looks at every picture again. Turn it " +
+                    "off in config.json (\"people\": {\"enabled\": false}) to keep it from " +
+                    "doing so." : "People is off, so no faces are looked for again."})
+            ],
+            confirmText: "Delete face data",
+            danger: true,
+            // (Names are work that cannot be had back: typed out before they go.)
+            typeName: named ? "delete" : undefined
+        });
     }
 
     /* ---------- Library cards -------------------------------------------- */
@@ -599,6 +700,24 @@
                         fmt.number(looksInfo.pending) + " to make: a GPU job)" : "") + "."
             ]));
         }
+        var facesInfo = lib.faces;
+        var peopleSetup = (state && state.people) || {};
+        if (facesInfo && facesInfo.pictures && (peopleSetup.enabled || facesInfo.done)) {
+            // "Faces: 7 in 4 pictures (4 of 7 pictures looked at; 3 to look at: ...)."
+            card.appendChild(el("p", {className: "card-note faces-line"}, [
+                "Faces: ",
+                el("strong", {text: fmt.number(facesInfo.faces)}),
+                " in " + fmt.plural(facesInfo.with_faces, "picture") + " (" +
+                    fmt.number(facesInfo.done) + " of " + fmt.plural(facesInfo.pictures,
+                                                                    "picture") +
+                    " looked at" + (peopleSetup.enabled && facesInfo.pending ? "; " +
+                     fmt.number(facesInfo.pending) + " to look at, a job for the processor" +
+                     (facesInfo.changed ? " (" + fmt.number(facesInfo.changed) +
+                      " of them again, for the current settings)" : "") : "") +
+                    (facesInfo.failed ? "; " + fmt.number(facesInfo.failed) +
+                     " could not be looked at" : "") + ")."
+            ]));
+        }
         var refining = lib.refine_info || {};
         if (refining.enabled) {
             card.appendChild(el("p", {className: "card-note" + (refining.ready ? "" :
@@ -702,6 +821,18 @@
                     (looksInfo.views ? "; and work out where " +
                      fmt.plural(looksInfo.views, "described 360 photo") + " open" : "")));
         }
+        if (facesInfo && peopleSetup.enabled && (facesInfo.pending || facesInfo.failed)) {
+            var retryFaces = !facesInfo.pending;
+            actions.appendChild(jobButton((retryFaces ? "Retry finding faces (" :
+                "Find faces (") + fmt.number(retryFaces ? facesInfo.failed : facesInfo.pending) +
+                ")", "", "faces", retryFaces ? {retry_failed: true} : {}, lib.id + ":faces",
+                off || !peopleSetup.ready, !peopleSetup.ready ? peopleSetup.problem :
+                    retryFaces ? "Look again at the " + fmt.plural(facesInfo.failed, "picture") +
+                    " that could not be looked at 3 times" :
+                    "Find the faces in the " + fmt.plural(facesInfo.pending, "picture") +
+                    " not looked at yet, on this computer's processor (nothing is sent " +
+                    "anywhere)"));
+        }
         if (lib.previews !== false) {
             actions.appendChild(jobButton("Build previews", "", "previews", {},
                 lib.id + ":previews", off,
@@ -766,7 +897,9 @@
     }
 
     function openExportFolder(lib) {
-        return SHELL.admin("/exports/" + encodeURIComponent(lib.id) + "/open-folder", {})
+        return SHELL.admin(lib.trip ? "/trips/" + encodeURIComponent(lib.trip) +
+                           "/export/open-folder" : "/exports/" + encodeURIComponent(lib.id) +
+                           "/open-folder", {})
             .then(function (reply) {
                 SHELL.toast("Opened " + reply.path + " in the file manager.", "ok", 4);
             }, function () {
@@ -833,14 +966,19 @@
         return found;
     }
 
+    // True for an export job of a library, or of a trip (lib.trip: its params' trip).
+    function exportsLib(job, lib) {
+        return job.kind === "export" && (lib.trip ? (job.params || {}).trip === lib.trip
+            : job.library_id === lib.id);
+    }
+
     // The export job of a library that is running or waiting, or null.
     function exportJobOf(lib) {
         var jobs = snapshot ? (snapshot.current ? [snapshot.current] : []).concat(snapshot.queue)
             : [];
         var found = null;
         jobs.forEach(function (job) {
-            if (!found && job.kind === "export" && job.library_id === lib.id &&
-                    job.state !== "cancelling") {
+            if (!found && exportsLib(job, lib) && job.state !== "cancelling") {
                 found = job;
             }
         });
@@ -851,7 +989,7 @@
     function lastExportJob(lib) {
         var found = null;
         (snapshot ? snapshot.recent : []).forEach(function (job) {
-            if (!found && job.kind === "export" && job.library_id === lib.id) {
+            if (!found && exportsLib(job, lib)) {
                 found = job;
             }
         });
@@ -1049,6 +1187,7 @@
         var libraries = lib ? [lib] : enabledLibraries();
         var ask = kind === "refine" ? confirmRefine(lib, params) :
             kind === "image_embed" && params.rebuild ? confirmRebuildLooks() :
+            kind === "delete_faces" ? confirmDeleteFaces() :
             confirmCloud(kind, libraries, params, found);
         return ask.then(function (ok) {
             if (!ok) {
@@ -2379,7 +2518,10 @@
     // published" (counts, size, and the flagged pictures to publish or
     // leave out one by one), then the export's progress and result. The
     // options are saved with the library when the export starts.
-    // options.step: "review" opens the review straight away.
+    // options.step: "review" opens the review straight away. lib may be a
+    // trip (tripExportDialog): {id, trip, name, pictures, libraries (names),
+    // export_info, video_info}: its pictures are the trip's, and it keeps
+    // home private (home_km).
     function exportDialog(lib, options) {
         options = options || {};
         var info = lib.export_info || {};
@@ -2403,12 +2545,17 @@
                 window.clearTimeout(countTimer);
                 stopListening();
                 SHELL.setState({dialog: null, id: null, step: null});
+                if (lib.trip) {
+                    // (Opened from the trip's page: closed, it goes back there.)
+                    backToTrip(lib.trip);
+                }
             }
         });
         box.dialog.classList.add("export-dialog");
         var footNote = el("span", {className: "foot-note", attrs: {"aria-live": "polite"}});
         var general = el("span", {className: "foot-note field-error", hidden: true});
-        var previewPath = "/libraries/" + encodeURIComponent(lib.id) + "/export/preview";
+        var previewPath = lib.trip ? "/trips/" + encodeURIComponent(lib.trip) +
+            "/export/preview" : "/libraries/" + encodeURIComponent(lib.id) + "/export/preview";
 
         function stopListening() {
             if (listener) {
@@ -2468,7 +2615,12 @@
             SHELL.setState({step: null});
             newView("Export \u201c" + lib.name + "\u201d as a website");
             var body = box.body;
-            body.appendChild(el("p", {text: "This makes a copy of the library that works as " +
+            body.appendChild(el("p", {text: lib.trip ? "This makes a website of the trip " +
+                "that works on its own: it opens on the trip's page (its days, map and best " +
+                "pictures), with the same search, viewer and picture pages for its pictures, " +
+                "no server and nothing to install. Put it on any web host, or open it from " +
+                "the folder. Nothing is uploaded; the files are written to a folder on this " +
+                "computer." : "This makes a copy of the library that works as " +
                 "a website on its own: the same search, viewer and picture pages, with no " +
                 "server and nothing to install. Put it on any web host, or open it from the " +
                 "folder. Nothing is uploaded; the files are written to a folder on this " +
@@ -2482,7 +2634,10 @@
                                                       text: "The album chosen before"}));
                 albumSelect.value = String(opts.album);
             }
-            SHELL.admin("/albums", undefined, {quiet: true}).then(function (reply) {
+            // (A trip's export is of the trip's pictures: no album.)
+            var albumList = lib.trip ? Promise.reject(null)
+                : SHELL.admin("/albums", undefined, {quiet: true});
+            albumList.then(function (reply) {
                 var chosen = albumSelect.value;
                 while (albumSelect.options.length > 1) {
                     albumSelect.remove(1);
@@ -2505,7 +2660,11 @@
             albumSelect.addEventListener("change", changed);
             fields.album = field(R.OPTIONS.album.label, albumSelect, {hint: R.OPTIONS.album.hint});
             body.appendChild(el("fieldset", {className: "group"}, [
-                el("legend", {text: "Which pictures"}), fields.album.node
+                el("legend", {text: "Which pictures"}), lib.trip ? el("p", {
+                    text: "The trip's " + fmt.plural(lib.pictures || 0, "picture") +
+                        ((lib.libraries || []).length ? " (in " + lib.libraries.join(", ") +
+                         ")" : "") + ", less what is left out below. The names of the " +
+                        "libraries are not published."}) : fields.album.node
             ]));
 
             // Pictures
@@ -2534,9 +2693,21 @@
             }
             fields.videos = {error: el("span", {className: "field-error", hidden: true}),
                              control: withVideos ? withVideos.input : modes.web};
+            // Camera RAW files: never published unless chosen; offered once the
+            // count finds pictures with one (or when chosen before).
+            var withRaws = check(R.OPTIONS.raw_files.label, opts.raw_files,
+                                 R.OPTIONS.raw_files.hint);
+            withRaws.input.addEventListener("change", changed);
+            withRaws.node.hidden = !opts.raw_files;
+            function rawAvailability(raws) {
+                if (raws && raws.total) {
+                    withRaws.node.hidden = false;
+                }
+            }
             body.appendChild(el("fieldset", {className: "group"}, [
                 el("legend", {text: "Pictures"}), modeList,
-                withVideos ? withVideos.node : null, fields.images.error, fields.videos.error
+                withVideos ? withVideos.node : null, withRaws.node, fields.images.error,
+                fields.videos.error
             ]));
 
             // What is left out
@@ -2575,8 +2746,13 @@
                 details.estimated_places.input.disabled = !details.location.input.checked;
                 details.routes.input.disabled = !details.location.input.checked;
             }
+            // (People's names only where there are people, or the option is on.)
+            var people = (state && state.people) || {};
             ["file_names", "folders", "location", "estimated_places", "routes", "similar",
-             "meaning", "looks", "marks"].forEach(function (key) {
+             "meaning", "looks", "marks", "people_names"].filter(function (key) {
+                return key !== "people_names" || people.stored || people.enabled ||
+                    opts.people_names;
+            }).forEach(function (key) {
                 details[key] = check(R.OPTIONS[key].label, opts[key], R.OPTIONS[key].hint);
                 if (key === "location") {
                     details[key].input.addEventListener("change", estimatedAvailability);
@@ -2585,6 +2761,34 @@
                 detailList.appendChild(details[key].node);
             });
             estimatedAvailability();
+            // Home (a trip's export): the squares around it that nothing shows. A
+            // choice of the sizes the server takes (trip_export.HOME_KM_STEPS), so
+            // that "off" is only ever chosen, never what an empty field means.
+            var homeKm = null;
+            var homeOff = null;
+            if (lib.trip) {
+                homeKm = el("select", {className: "input export-home-km"});
+                HOME_KM_STEPS.forEach(function (km) {
+                    homeKm.appendChild(el("option", {value: String(km),
+                                                     text: "About " + km + " km"}));
+                });
+                homeKm.appendChild(el("option", {value: "0", text: "Off: home is not kept out"}));
+                homeKm.value = String(HOME_KM_STEPS.indexOf(opts.home_km) >= 0 ||
+                                      opts.home_km === 0 ? opts.home_km : HOME_KM_DEFAULT);
+                homeOff = notice("warn", "Home is not kept out: positions, routes and towns " +
+                                 "near it, and the dashcam clips filmed there, are published " +
+                                 "like any others.");
+                homeOff.hidden = homeKm.value !== "0";
+                homeKm.addEventListener("change", function () {
+                    homeOff.hidden = homeKm.value !== "0";
+                    changed();
+                });
+                fields.home_km = field(R.OPTIONS.home_km.label, homeKm, {
+                    div: true, after: homeOff,
+                    hint: R.OPTIONS.home_km.hint + ((lib.export_info || {}).home === false
+                        ? " No home was found among the pictures: there is nothing to keep " +
+                          "out." : "")});
+            }
             // Search by meaning in the browser: on (as saved) only when it can
             // go; otherwise off, with the reason (the saved choice is kept).
             var meaningReason = el("span", {className: "field-hint field-reason", hidden: true});
@@ -2603,6 +2807,7 @@
             body.appendChild(el("fieldset", {className: "group"}, [
                 el("legend", {text: "Also publish"}),
                 detailList,
+                fields.home_km ? fields.home_km.node : null,
                 detailsLine,
                 el("p", {className: "field-hint", text: "Never published: where the pictures " +
                     "are on this computer, file dates and times (a picture without a date " +
@@ -2614,7 +2819,8 @@
             var title = el("input", {type: "text", className: "input", value: opts.title || "",
                                      placeholder: lib.name, autocomplete: "off"});
             fields.title = field(R.OPTIONS.title.label, title, {optional: true,
-                hint: R.OPTIONS.title.hint + " Blank: the library name."});
+                hint: R.OPTIONS.title.hint + (lib.trip ? " Blank: the trip's name."
+                                              : " Blank: the library name.")});
             var credits = el("input", {type: "text", className: "input",
                                        value: opts.credits || "", autocomplete: "off"});
             fields.credits = field(R.OPTIONS.credits.label, credits, {optional: true,
@@ -2683,6 +2889,12 @@
                 if (withVideos) {
                     result.videos = withVideos.input.checked ? "include" : "skip";
                 }
+                if (homeKm) {
+                    var km = Number(homeKm.value);
+                    result.home_km = km === 0 || HOME_KM_STEPS.indexOf(km) >= 0 ? km
+                        : HOME_KM_DEFAULT;
+                }
+                result.raw_files = withRaws.input.checked;
                 return result;
             }
 
@@ -2695,6 +2907,7 @@
             refreshCount = function () {
                 scheduleCount(function (reply) {
                     meaningAvailability((reply.counts || {}).meaning);
+                    rawAvailability((reply.counts || {}).raws);
                     countLine(reply);
                 });
             };
@@ -2826,6 +3039,11 @@
             if (videoNote) {
                 holder.appendChild(el("p", {className: "muted", text: videoNote}));
             }
+            var rawNote = R.rawsText(counts.raws, opts);
+            if (rawNote) {
+                holder.appendChild(opts.raw_files && (counts.raws || {}).included
+                    ? notice("warn", rawNote) : el("p", {className: "muted", text: rawNote}));
+            }
             var drivesNote = R.drivesText(counts);
             if (drivesNote) {
                 holder.appendChild(el("p", {className: "muted", text: drivesNote}));
@@ -2839,7 +3057,8 @@
                 holder.appendChild(notice("warn", overlayNote));
             }
             if (counts.unavailable) {
-                holder.appendChild(notice("error", "The folder of " + lib.name + " cannot be " +
+                holder.appendChild(notice("error", (lib.trip ? "A library folder of the " +
+                    "trip" : "The folder of " + lib.name) + " cannot be " +
                     "read right now (offline?), and " + fmt.plural(counts.unavailable,
                     "picture") + " to publish " + (counts.unavailable === 1 ? "needs" :
                     "need") + " it (" + (opts.images === "original" ? "originals are read " +
@@ -2938,7 +3157,11 @@
             if (folderValue && folderValue !== defaultFolder) {
                 params.out_dir = folderValue;
             }
-            SHELL.admin("/jobs", {kind: "export", library_id: lib.id, params: params},
+            if (lib.trip) {
+                params.trip = lib.trip;
+            }
+            SHELL.admin("/jobs", {kind: "export", library_id: lib.trip ? null : lib.id,
+                                  params: params},
                         {quiet: true}).then(function (reply) {
                 if (!reply.added) {
                     SHELL.toast("An export of " + lib.name + " is already running; it " +
@@ -3087,6 +3310,9 @@
             if (!summary.count || summary.failed) {
                 box.button("Back to the options", "", optionsView);
             }
+            if (lib.trip) {
+                box.button("Back to the trip", "", box.close);
+            }
             box.button("Close", "", box.close);
             box.button("Open folder", "primary", function () {
                 openExportFolder(lib);
@@ -3116,7 +3342,47 @@
 
     /* ---------- Dialogs from the URL ------------------------------------- */
 
+    // The sizes of the area around home a trip's export can keep out
+    // (trip_export.HOME_KM_STEPS), and the one it keeps out by default.
+    var HOME_KM_STEPS = [5, 10, 20, 40, 80, 160];
+    var HOME_KM_DEFAULT = 10;
+
+    // Back to a trip's page (from its Export dialog): back in the history when the
+    // trip's page opened it, else to the page.
+    function backToTrip(tripId) {
+        var page = "/trip/" + encodeURIComponent(tripId);
+        var from = "";
+        try {
+            from = document.referrer ? new URL(document.referrer).pathname : "";
+        } catch (error) {
+            from = "";
+        }
+        if (from === page && window.history.length > 1) {
+            window.history.back();
+        } else {
+            window.location.href = page;
+        }
+    }
+
+    // The Export dialog of a trip (trip_export.py), once its export is known.
+    function tripExportDialog(tripId, step) {
+        SHELL.setState({dialog: "trip-export", id: tripId});
+        SHELL.admin("/trips/" + encodeURIComponent(tripId) + "/export").then(function (info) {
+            exportDialog({id: "trip:" + tripId, trip: tripId, name: info.trip.title,
+                          pictures: info.trip.count, libraries: info.libraries,
+                          export_info: info, video_info: {count: info.trip.videos}},
+                         {step: step});
+        }, function () {
+            // (The message is shown already.)
+            SHELL.setState({dialog: null, id: null, step: null});
+        });
+        return null;
+    }
+
     function openDialog(kind, id, step) {
+        if (kind === "trip-export") {
+            return id ? tripExportDialog(id, step) : null;
+        }
         var lib = id ? findLibrary(id) : null;
         if (kind !== "add" && kind !== "browse" && !lib) {
             return null;

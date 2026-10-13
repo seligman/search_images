@@ -297,7 +297,7 @@
    Also: prepare(records) -> index with the same search / similar /
    suggest methods and get(id); normalize(text); tokens(text); fold(word)
    (the singular a word is searched as); forms(word); facetLabel(group,
-   value); placeLabel(value) ("Kahului, Hawaii, United States" for a
+   value); placeLabel(value) ("Albufeira, Algarve, Portugal" for a
    value of the place facet), placeParent(value), placeOf(record) (its
    place as the place facet names it), PLACE_SEPARATOR;
    dateLabel(key) ("May 2019" for "2019-05"); rangeLabel(from, to) (the
@@ -798,7 +798,8 @@ var SearchCore = (function () {
         people: "people", year: "year", before: "before", after: "after", lib: "lib",
         library: "lib", has: "has", is: "is", place: "place", places: "place", on: "on",
         similar: "similar", like: "similar", look: "look", looks: "look",
-        rating: "rating", rated: "rating", stars: "rating", album: "album", albums: "album"
+        rating: "rating", rated: "rating", stars: "rating", album: "album", albums: "album",
+        person: "person"
     });
     // Record keys (and field names) for highlights(text, query, field).
     var HIGHLIGHT_FIELDS = dict({
@@ -1180,6 +1181,10 @@ var SearchCore = (function () {
             filter = {kind: "lib", value: String(raw).replace(/^\s+|\s+$/g, "")};
         } else if (field === "album") {
             filter = {kind: "album", value: String(raw).replace(/^\s+|\s+$/g, "")};
+        } else if (field === "person") {
+            filter = {kind: "person", value: String(raw).replace(/^\s+|\s+$/g, "")};
+            hint = "try person:\"Name\", person:any or person:none";
+            filter = filter.value ? filter : null;
         } else if (field === "rating") {
             filter = ratingFilter(value);
             hint = "try rating:4, rating:>=3 or rating:0 for pictures without one";
@@ -1669,14 +1674,14 @@ var SearchCore = (function () {
         return Math.min(2, String(value).split(PLACE_SEPARATOR).length - 1);
     }
 
-    // "Kahului, Hawaii, United States" for a place value.
+    // "Albufeira, Algarve, Portugal" for a place value.
     function placeLabel(value) {
         return String(value).split(PLACE_SEPARATOR).filter(Boolean).reverse().join(", ");
     }
 
     /* A label for a facet value: facetLabel("type", "doc:receipt") is
        "Receipts", facetLabel("month", "2019-05") is "May 2019",
-       facetLabel("place", "United States|Hawaii") is "Hawaii". Library
+       facetLabel("place", "Portugal|Algarve") is "Algarve". Library
        values are ids; the page shows their names. */
     function facetLabel(group, value) {
         var text = value === null || value === undefined ? "" : String(value);
@@ -3555,6 +3560,109 @@ var SearchCore = (function () {
         return "album:" + (/\s/.test(name) ? "\"" + name + "\"" : name);
     }
 
+    /* ---------- People (person:) ------------------------------------------ */
+
+    /* The person that value names among people (the "people" of the server's
+       /api/people: [{id, name, label, ids, hidden}]): #<id> the one with that
+       id; else the one called so (its name, or "Person 12" while it has none:
+       any case, accents too), else the only one not hidden whose name starts
+       so; or null. {person, ambiguous} with details. */
+    function findPerson(people, value, details) {
+        var list = (Array.isArray(people) ? people : []).filter(function (person) {
+            return person && typeof person === "object" && person.id !== undefined &&
+                person.id !== null && isText(person.label);
+        });
+        var answer = function (person, ambiguous) {
+            return details ? {person: person, ambiguous: Boolean(ambiguous)} : person;
+        };
+        var text = String(value === null || value === undefined ? "" : value)
+            .replace(/^\s+|\s+$/g, "");
+        var k;
+        var byId = /^#(\d{1,18})$/.exec(text);
+        if (byId) {
+            for (k = 0; k < list.length; k++) {
+                if (String(list[k].id) === byId[1]) {
+                    return answer(list[k]);
+                }
+            }
+            return answer(null);
+        }
+        var wanted = albumKey(text);
+        if (!wanted) {
+            return answer(null);
+        }
+        for (k = 0; k < list.length; k++) {
+            if (albumKey(list[k].label) === wanted) {
+                return answer(list[k]);
+            }
+        }
+        var starts = list.filter(function (person) {
+            return !person.hidden && isText(person.name) &&
+                startsWith(albumKey(person.name), wanted);
+        });
+        return answer(starts.length === 1 ? starts[0] : null, starts.length > 1);
+    }
+
+    // Words person: takes besides names: anybody, or nobody.
+    var PERSON_WORDS = {any: "any", anyone: "any", anybody: "any", none: "none",
+                        nobody: "none", noone: "none"};
+
+    /* The person: term that names person (one of people) and no other: its
+       name (quoted when it has spaces), or person:#<id> when the name cannot
+       say it (quotes, another person's name first, or a word of its own). */
+    function personTerm(people, person) {
+        var name = String(person.label);
+        if (QUOTE_TEST.test(name) || findPerson(people, name) !== person ||
+                PERSON_WORDS[albumKey(name)]) {
+            return "person:#" + person.id;
+        }
+        return "person:" + (/\s/.test(name) ? "\"" + name + "\"" : name);
+    }
+
+    /* The pictures of the person a person: term names: {ids: {picture id:
+       true}, none (true for person:none: the pictures with nobody)}, or null
+       (with a warning) when it names nobody. Worked out once per search. */
+    function personSet(context, value) {
+        var sets = context.personSets || (context.personSets = Object.create(null));
+        if (sets[value] !== undefined) {
+            return sets[value];
+        }
+        var people = context.people;
+        var found = null;
+        if (!Array.isArray(people)) {
+            if (!context.peoplePending) {
+                context.warn("person: finds nobody here: the names of people are not " +
+                             "available on this page.");
+            }
+        } else {
+            var word = PERSON_WORDS[albumKey(value)];
+            // (Anybody: the people that are not hidden, strangers left out.)
+            var chosen = word ? people.filter(function (person) {
+                return person && !person.hidden;
+            }) : [];
+            if (!word) {
+                var match = findPerson(people, value, true);
+                if (match.person) {
+                    chosen = [match.person];
+                } else {
+                    context.warn(match.ambiguous ? "More than one name starts with \"" + value +
+                                 "\": type more of it." : "There is nobody called \"" +
+                                 value + "\" (see People).");
+                }
+            }
+            if (word || chosen.length) {
+                found = {ids: Object.create(null), none: word === "none"};
+                chosen.forEach(function (person) {
+                    (Array.isArray(person.ids) ? person.ids : []).forEach(function (id) {
+                        found.ids[id] = true;
+                    });
+                });
+            }
+        }
+        sets[value] = found;
+        return found;
+    }
+
     // Albums inside smart albums inside ... are worked out this deep at most.
     var ALBUM_DEPTH = 4;
 
@@ -3635,6 +3743,14 @@ var SearchCore = (function () {
             return function (rec) {
                 var at = index.position[String(rec.i)];
                 return at !== undefined && found.rank[at] >= 0;
+            };
+        case "person":
+            var person = personSet(context, filter.value);
+            if (!person) {
+                return null;
+            }
+            return function (rec) {
+                return person.none ? !person.ids[rec.i] : person.ids[rec.i] === true;
             };
         case "lib":
             var ids = libraryIds(filter.value, index, context.libraries);
@@ -4028,6 +4144,8 @@ var SearchCore = (function () {
             sort: isText(saved.sort) ? saved.sort : undefined,
             meaning: saved.by === "words" || saved.by === "meaning" ? saved.by : "hybrid",
             albums: opts.albums,
+            people: opts.people,
+            peoplePending: opts.peoplePending,
             vectorFor: opts.vectorFor,
             albumStack: stack.concat([album.id]),
             group: false,
@@ -4181,6 +4299,8 @@ var SearchCore = (function () {
                                ART_WORDS[folded]);
             });
         });
+        context.people = opts.people;
+        context.peoplePending = Boolean(opts.peoplePending);
         context.albumSets = this.albumSets(parsed, opts, context);
         var alive = this.visibility(opts, parsed.wantsHidden);
         var score = new Float64Array(n);
@@ -5733,7 +5853,7 @@ var SearchCore = (function () {
             "YYYY, YYYY-MM or YYYY-MM-DD)"},
         {example: "on:today", meaning: "taken on this day in earlier years (on:05-14: " +
             "that day in any year)"},
-        {example: "place:hawaii", meaning: "taken in a town, region or country (pictures " +
+        {example: "place:portugal", meaning: "taken in a town, region or country (pictures " +
             "with a GPS position, or an estimated place: is:place-estimated)"},
         {example: "has:text", meaning: "with text, a location (has:gps), people, animals, ..."},
         {example: "is:360", meaning: "360\u00b0 photos and videos; also is:video, is:drive, " +
@@ -5742,6 +5862,8 @@ var SearchCore = (function () {
         {example: "rating:>=4", meaning: "rated 4 or 5 stars (rating:5 exactly; rating:0 " +
             "not rated)"},
         {example: "album:\"Summer\"", meaning: "the pictures of an album (see Albums)"},
+        {example: "person:\"Anna\"", meaning: "the pictures of a person (see People; " +
+            "person:any, person:none)"},
         {example: "lib:name", meaning: "only pictures of one library"}
     ];
 
@@ -5780,6 +5902,8 @@ var SearchCore = (function () {
         rangeLabel: rangeLabel,
         findAlbum: findAlbum,
         albumTerm: albumTerm,
+        findPerson: findPerson,
+        personTerm: personTerm,
         timelineChoice: timelineChoice,
         PLACE_SEPARATOR: PLACE_SEPARATOR,
         meaningText: meaningText,

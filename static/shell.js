@@ -331,7 +331,10 @@ var SHELL = (function () {
         export: "Export",
         places: "Add place names",
         proxies: "Make playable copies",
-        drive_previews: "Make sped-up drives"
+        drive_previews: "Make sped-up drives",
+        faces: "Find faces",
+        group_faces: "Group faces into people",
+        delete_faces: "Delete face data"
     };
     var STATE_LABELS = {
         queued: "Waiting",
@@ -359,7 +362,10 @@ var SHELL = (function () {
         looks: "Making the looks of pictures",
         "opening views": "Finding where 360 photos open",
         drives: "Describing drives",
-        drive_previews: "Making sped-up previews of drives"
+        drive_previews: "Making sped-up previews of drives",
+        faces: "Finding faces",
+        people: "Grouping faces into people",
+        "delete faces": "Deleting face data"
     };
     var STAGE_VERBS = {
         scan: "Scanning",
@@ -370,7 +376,8 @@ var SHELL = (function () {
         delete: "Deleting the data of",
         export: "Exporting",
         zip: "Zipping the export of",
-        looks: "Making the looks of"
+        looks: "Making the looks of",
+        faces: "Finding the faces in"
     };
     var WAITING_STAGE = "waiting for another scan to finish";
 
@@ -388,6 +395,9 @@ var SHELL = (function () {
         if (job.kind === "image_embed" && params.rebuild) {
             return "Rebuild looks";
         }
+        if (job.kind === "faces" && params.retry_failed) {
+            return "Retry finding faces";
+        }
         if (job.kind === "process" && !job.library_id) {
             return "Process all libraries";
         }
@@ -395,6 +405,11 @@ var SHELL = (function () {
     }
 
     function jobLibrary(job) {
+        var params = job.params || {};
+        if (params.trip) {
+            // (A trip's export, trip_export.py: of no one library.)
+            return "the trip " + (params.trip_title || params.trip);
+        }
         if (!job.library_id) {
             return "all libraries";
         }
@@ -404,7 +419,8 @@ var SHELL = (function () {
     // "Scan + describe: Family", "Process all libraries".
     function jobTitle(job) {
         var kind = jobKind(job);
-        if ((job.kind === "process" || job.kind === "places") && !job.library_id) {
+        if ((job.kind === "process" || job.kind === "places" || job.kind === "delete_faces" ||
+                job.kind === "group_faces") && !job.library_id) {
             return kind;
         }
         return kind + ": " + jobLibrary(job);
@@ -546,6 +562,34 @@ var SHELL = (function () {
             if (summary.views_dropped) {
                 parts.push(plural(summary.views_dropped, "360 photo") + " back at the front");
             }
+        }
+        // (people.update: looked, faces, with_faces, failed, offline; a scan's own
+        // faces step as its "faces".)
+        var faced = job.kind === "faces" ? summary : summary.faces;
+        if (faced && typeof faced.looked === "number" &&
+                (faced.looked || faced.failed || job.kind === "faces")) {
+            parts.push(plural(faced.faces || 0, "face") + " found in " +
+                       plural(faced.looked, "picture") + " looked at");
+            if (faced.failed) {
+                parts.push(number(faced.failed) + " could not be looked at");
+            }
+            if (faced.offline) {
+                parts.push(number(faced.offline) + " wait for their folder");
+            }
+        }
+        // (people_groups.group: faces, grouped, people, new; the faces job's own as its
+        // "people".)
+        var grouped = job.kind === "group_faces" ? summary
+            : job.kind === "faces" ? summary.people : null;
+        if (grouped && typeof grouped.people === "number") {
+            parts.push(plural(grouped.people, "person", "people") + " (" +
+                       number(grouped.grouped || 0) + " of " + plural(grouped.faces || 0, "face") +
+                       (grouped["new"] ? "; " + number(grouped["new"]) + " new" : "") + ")");
+        }
+        if (job.kind === "delete_faces" && typeof summary.faces === "number") {
+            parts.push("face data deleted (" + plural(summary.faces, "face") +
+                       (summary.people ? ", " + plural(summary.people, "person", "people")
+                           : "") + ")");
         }
         if ((job.kind === "scan" || job.kind === "process") && summary.looks_pending) {
             // (Looks are made by the Update looks job only: it needs the image model.)
@@ -1071,12 +1115,14 @@ var SHELL = (function () {
         header.appendChild(el("a", {className: "shell-title", href: home,
                                     text: site.title || "Image Search"}));
         var nav = el("nav", {attrs: {"aria-label": "Pages"}});
-        nav.appendChild(link("Search", home, "search"));
+        nav.appendChild(link("Search", site.searchUrl ? site.searchUrl({}) : home, "search"));
+        // (Journeys found in the pictures, see trips.py; a trip export's own trip page.)
+        var tripsHref = site.tripsUrl ? site.tripsUrl() : null;
         // Pictures taken on this day in earlier years (on:today).
         if (site.searchUrl) {
             var today = link("", site.searchUrl({q: "on:today"}), "today");
-            // (A calendar on a phone, where Manage and Settings leave no room.)
-            today.className = "nav-today" + (adminOn ? " is-short" : "");
+            // (A calendar on a phone, where Trips, Manage and Settings leave no room.)
+            today.className = "nav-today" + (adminOn || tripsHref ? " is-short" : "");
             today.title = "Pictures taken on this day in earlier years";
             today.appendChild(el("span", {className: "nav-text", text: "On this day"}));
             nav.appendChild(today);
@@ -1089,6 +1135,13 @@ var SHELL = (function () {
             // (The owner's albums; others may look at them, only the admin
             // changes them.)
             nav.appendChild(link("Albums", "/albums", "albums"));
+        }
+        if (tripsHref) {
+            nav.appendChild(link(site.isStatic ? "Trip" : "Trips", tripsHref, "trips"));
+        }
+        if (!site.isStatic && capabilities.people) {
+            // (The people the faces show: the admin's, others' only when allowed.)
+            nav.appendChild(link("People", "/people", "people"));
         }
         if (adminOn) {
             nav.appendChild(link("Duplicates", "/duplicates", "duplicates"));

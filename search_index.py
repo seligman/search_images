@@ -1910,6 +1910,7 @@ def index_etag(conn, libraries, include_hidden, state=None, *, marks=None,
     key.append(drives_key(config))
     key.append(looks_state)
     key.append(insta360.level_enabled())
+    key.append(albums.people_searches_shown(config, include_hidden))
     return hashlib.sha1(json.dumps(key, separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
 
 
@@ -2078,7 +2079,8 @@ class IndexService:
                 INDEX_VERSION, int(time.time()),
                 _json([{"id": library_id, "name": name}
                        for library_id, name in libraries.items()]),
-                _json(albums.index_albums(conn, list(libraries), include_hidden)),
+                _json(albums.index_albums(conn, list(libraries), include_hidden,
+                                          albums.people_searches_shown(config, include_hidden))),
                 ",".join(piece for _image_id, piece in merged))
             data = gzip.compress(utf8(text), GZIP_LEVEL, mtime=0)
             self.builds += 1

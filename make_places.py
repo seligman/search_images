@@ -50,6 +50,8 @@ def _print_place(lat, lon):
     columns = index.columns(lat, lon)
     print("Nearest town: %s, %s, %s (%s), %.1f km away"
           % (town["name"], town["region"] or "-", town["country"], town["cc"], hit[1]))
+    if town["zone"]:
+        print("Time zone: %s" % town["zone"])
     shown = ", ".join(part for part in (columns["place_city"], columns["place_region"],
                                         columns["place_country"]) if part)
     print("Place: %s" % (shown or "(none)"))

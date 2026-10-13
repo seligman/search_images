@@ -52,15 +52,20 @@ import jobs
 import library_ops
 import llm
 import local_server
+import local_times
 import looks
 import not_duplicates
 import opening_views
+import people
+import people_groups
 import place_estimates
 import prompts
 import refine
 import search_index
 import settings
 import sheet_talk
+import trip_export
+import trips
 import videos
 
 URL_PREFIX = "/api/admin"
@@ -94,9 +99,12 @@ JOB_PARAMS = {
     "process": ("allow_mass_removal", "retry_failed", "redescribe_stale", "limit", "endpoint"),
     "previews": (),
     "delete_library": ("confirm_name",),
-    "export": ("options", "save_options", "out_dir"),
+    "export": ("options", "save_options", "out_dir", "trip"),
     "proxies": (),
     "drive_previews": (),
+    "faces": ("limit", "retry_failed"),
+    "group_faces": (),
+    "delete_faces": ("confirm",),
 }
 BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force", "save_options",
                "rebuild")
@@ -1089,7 +1097,35 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         found = looks_counts(config).get(library.get("id"))
         if found is not None:
             view["looks"] = found
+        faces = faces_counts(config).get(library.get("id"))
+        if faces is not None:
+            view["faces"] = faces
         return view
+
+    faces_memo = {"key": None, "value": {}}
+
+    def faces_counts(config):
+        """people.counts() of every library ({} when People is off and no face data is
+        kept), worked out again only when index.db, data/faces.db or the settings
+        changed."""
+        current = people.read_meta()
+        options = people.settings(config)
+        if not options["enabled"] and current is None:
+            return {}
+        ids = [library["id"] for library in config.get("libraries", []) if library.get("id")]
+        conn = get_conn()
+        try:
+            key = json.dumps([ids, search_index.data_state(conn, ids), current, options,
+                              people.setup_problem(options)], sort_keys=True)
+            with meaning_lock:
+                if faces_memo["key"] == key:
+                    return faces_memo["value"]
+            value = people.counts(conn, config, ids)
+        except sqlite3.Error:
+            return {}
+        with meaning_lock:
+            faces_memo.update(key=key, value=value)
+        return value
 
     looks_memo = {"key": None, "value": {}}
 
@@ -1184,9 +1220,12 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                 raise AdminError(400, "No enabled endpoint or group is called %s." % name,
                                  {"endpoint": "Unknown endpoint."})
             cleaned["endpoint"] = name.strip()
-        if kind == "export" and not library_id:
-            raise AdminError(400, "An export is made of one library; choose which.",
+        if kind == "export" and not library_id and not params.get("trip"):
+            raise AdminError(400, "An export is made of one library (or a trip); choose which.",
                              {"library_id": "Choose a library."})
+        if kind == "export" and library_id and params.get("trip"):
+            raise AdminError(400, "A trip's export takes its pictures from its own libraries: "
+                                  "send no library with it.", {"library_id": "Leave it out."})
         if kind == "delete_library":
             check_orphan_delete(config, library_id, params.get("confirm_name"))
             cleaned["confirm_name"] = db.library_names(get_conn()).get(library_id) or library_id
@@ -1214,6 +1253,22 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
             endpoint, problem = looks.endpoint_for(config)
             if endpoint is None:
                 raise AdminError(400, problem, {"image_embedding": problem})
+        if kind == "faces":
+            problem = people.setup_problem(people.settings(config))
+            if problem:
+                raise AdminError(400, problem, {"people": problem})
+        if kind == "group_faces":
+            # (The faces of every library are grouped together.)
+            if library_id is not None:
+                raise AdminError(400, "Faces are grouped for every library at once (send no "
+                                      "library).", {"library": "None."})
+            if not people.enabled(config):
+                raise AdminError(400, people.NOT_ENABLED, {"people": people.NOT_ENABLED})
+        if kind == "delete_faces":
+            # (All face data goes, of every library: only when asked for in so many words.)
+            if library_id is not None or params.get("confirm") is not True:
+                raise AdminError(400, "Deleting the face data needs confirm: true (and no "
+                                      "library: it is all deleted).", {"confirm": "Needed."})
         if cleaned.get("force") and "ids" not in cleaned:
             # Describing a whole library again is "Re-describe stale" (or a
             # new prompt version), never a single click.
@@ -1221,9 +1276,11 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                              {"force": "Needs ids."})
         return cleaned
 
-    def export_target(config, library, out_dir):
-        """(output folder, default folder) of an export: out_dir when given, else the default."""
-        default = export.default_output_dir(config, library)
+    def export_target(config, library, out_dir, default=None):
+        """(output folder, default folder) of an export: out_dir when given, else the default
+        (a library's, or the one given)."""
+        if default is None:
+            default = export.default_output_dir(config, library)
         if out_dir is None or out_dir == "":
             return default, default
         full = library_ops.expand_path(out_dir) if isinstance(out_dir, str) else ""
@@ -1232,6 +1289,57 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
             problem = "Type the whole path of a folder, such as %s." % library_ops.FULL_PATH_EXAMPLES
             raise AdminError(400, problem, {"out_dir": problem})
         return os.path.abspath(full), default
+
+    def check_target(config, target, owner, zip_too):
+        """Raise AdminError unless an export (of owner) may write to target, and in time."""
+        def check():
+            export.check_output_dir(target, config, owner)
+            export.check_writable(target)
+            if zip_too:
+                export.check_zip_path(export.zip_path_for(target), config)
+        try:
+            library_ops.run_with_timeout(check, EXPORT_FOLDER_TIMEOUT)
+        except library_ops.TimedOut:
+            raise AdminError(504, "The output folder did not answer within %g seconds (an "
+                                  "offline share?)." % EXPORT_FOLDER_TIMEOUT,
+                             {"out_dir": "Does not answer."})
+        except export.ExportError as error:
+            raise AdminError(400, str(error), {"out_dir": str(error)})
+        except OSError as error:
+            message = export.os_error_text(error, target)
+            raise AdminError(400, message, {"out_dir": message})
+
+    def load_trip(config, trip_id):
+        """trip_export.load of the enabled libraries' trips; AdminError 404 when there is no
+        such trip."""
+        if not isinstance(trip_id, str) or not trips.ID_RE.match(trip_id):
+            raise AdminError(404, "There is no trip %s." % (trip_id,), {"trip": "Unknown."})
+        try:
+            return trip_export.load(get_conn(), config, trip_id)
+        except export.ExportError as error:
+            raise AdminError(404, str(error), {"trip": "Unknown."})
+
+    def trip_export_job(config, params, save):
+        """export_job of a trip (params "trip"): (params to store, with the trip's title for
+        the job list, and the options to save or None)."""
+        built, trip, _libraries = load_trip(config, params.get("trip"))
+        options = params.get("options")
+        if options is not None and not isinstance(options, dict):
+            raise AdminError(400, "Send the export options as an object.",
+                             {"options": "Must be an object."})
+        try:
+            merged = trip_export.trip_options(built.export_options(trip), options)
+        except export.OptionsError as error:
+            raise options_error(error)
+        cleaned = {"trip": trip.id, "trip_title": trip.title}
+        if options and not save:
+            cleaned["options"] = {key: merged[key] for key in options}
+        target, default = export_target(config, None, params.get("out_dir"),
+                                        trip_export.default_output_dir(config, built, trip))
+        if os.path.normcase(target) != os.path.normcase(os.path.abspath(default)):
+            cleaned["out_dir"] = target
+        check_target(config, target, trip_export.owner_key(built, trip), merged["zip"])
+        return cleaned, ((options or {}) if save else None)
 
     def export_job(config, library_id, params, save):
         """Check an export job's params: (params to store, options to save or None).
@@ -1258,23 +1366,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         target, default = export_target(config, library, params.get("out_dir"))
         if os.path.normcase(target) != os.path.normcase(os.path.abspath(default)):
             cleaned["out_dir"] = target
-
-        def check():
-            export.check_output_dir(target, config, library["id"])
-            export.check_writable(target)
-            if merged["zip"]:
-                export.check_zip_path(export.zip_path_for(target), config)
-        try:
-            library_ops.run_with_timeout(check, EXPORT_FOLDER_TIMEOUT)
-        except library_ops.TimedOut:
-            raise AdminError(504, "The output folder did not answer within %g seconds (an "
-                                  "offline share?)." % EXPORT_FOLDER_TIMEOUT,
-                             {"out_dir": "Does not answer."})
-        except export.ExportError as error:
-            raise AdminError(400, str(error), {"out_dir": str(error)})
-        except OSError as error:
-            message = export.os_error_text(error, target)
-            raise AdminError(400, message, {"out_dir": message})
+        check_target(config, target, library["id"], merged["zip"])
         return cleaned, ((options or {}) if save else None)
 
     def free_space(folder):
@@ -1346,17 +1438,21 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         with_videos, usage = video_counts(conn), videos.proxy_usage()
         drive_usage = drives.preview_usage()
         looked = looks_counts(config)
+        faced = faces_counts(config)
         for view, library in zip(libraries, [library for library in config.get("libraries", [])
                                              if library.get("id")]):
             view["video_info"] = library_video_view(conn, config, library, with_videos, usage,
                                                     drive_usage)
             if library["id"] in looked:
                 view["looks"] = looked[library["id"]]
+            if library["id"] in faced:
+                view["faces"] = faced[library["id"]]
         return jsonify({
             "libraries": libraries,
             "videos": videos_view(config),
             "meaning": meaning_view(config),
             "looks": looks.status(config),
+            "people": people.status(config),
             "orphans": library_ops.orphans(conn, config, counts),
             "endpoints": endpoint_views(config),
             "default_endpoint": common.default_endpoint_name(config),
@@ -1547,7 +1643,18 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         library_id = data.get("library_id") or None
         params = clean_job(config, kind, library_id, data.get("params"))
         answer = {}
-        if kind == "export":
+        if kind == "export" and (data.get("params") or {}).get("trip"):
+            params, save = trip_export_job(config, data.get("params") or {},
+                                           params.pop("save_options", False))
+            if save is not None:
+                try:
+                    trip_export.save_options(get_conn(), config, params["trip"], save)
+                except export.OptionsError as error:
+                    raise options_error(error)
+                except (export.ExportError, trips.TripError, OSError) as error:
+                    raise AdminError(400, "The trip's export options cannot be saved: %s"
+                                     % error)
+        elif kind == "export":
             params, save = export_job(config, library_id, data.get("params") or {},
                                       params.pop("save_options", False))
             if save is not None:
@@ -1588,6 +1695,150 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                       "page.")
             raise AdminError(409, message)
         return jsonify({"ok": True, "jobs": snapshot(state.config())})
+
+    @bp.route("/people/check", methods=["POST"])
+    def people_check():
+        """Start the face helper, load its models and find the test face (people.check)."""
+        body()
+        return jsonify(people.check(state.config()))
+
+    # -- People: the people the faces show (people_groups.py) -------------------
+
+    def people_libraries(config):
+        return [library["id"] for library in common.enabled_libraries(config)
+                if library.get("id")]
+
+    def with_people(work, write=False):
+        """work(store) with data/faces.db open; GroupError and a busy store answered. A
+        change needs the store (404 without one)."""
+        exists = os.path.isfile(people.store_path())
+        if write and not exists:
+            raise AdminError(404, "There is no face data yet: find faces first (Manage).")
+        try:
+            # (A change brings an older file up to date; a look only reads.)
+            store = people.connect(create=write) if exists else None
+        except sqlite3.Error as error:
+            raise AdminError(500, "The face data cannot be read: %s" % common.redact(str(error)))
+        if store is None and write:
+            raise AdminError(404, "There is no face data yet: find faces first (Manage).")
+        try:
+            return work(store)
+        except people_groups.GroupError as error:
+            raise AdminError(error.status, str(error), error.fields, **error.extra)
+        except sqlite3.OperationalError as error:
+            raise busy(error)
+        finally:
+            if store is not None:
+                store.close()
+
+    def person_id_of(value, name="person"):
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= IMAGE_ID_MAX:
+            raise AdminError(400, "%s is a person's id (a number)." % name,
+                             {name: "A person's id."})
+        return value
+
+    @bp.route("/people", methods=["GET"])
+    def people_state():
+        """People's state for the People page: people.status() (finding faces), "groups":
+        people_groups.status() (the grouping) and the settings that group them."""
+        config = state.config()
+        options = people.settings(config)
+        return jsonify({
+            "people": people.status(config),
+            "groups": with_people(lambda store: people_groups.status(store, config)),
+            "settings": {"match": options["match"], "group_quality": options["group_quality"],
+                         "min_faces": options["min_faces"], "visitors": options["visitors"]}})
+
+    @bp.route("/people/<int:person_id>", methods=["GET"])
+    def person_detail(person_id):
+        """One person: its faces (best first, each with a picture it is in) and the people
+        whose faces look most like its own (people_groups.person_view)."""
+        config = state.config()
+        return jsonify(with_people(lambda store: people_groups.person_view(
+            store, get_conn(), config, person_id, people_libraries(config)), write=True))
+
+    @bp.route("/people/<int:person_id>", methods=["POST"])
+    def person_change(person_id):
+        """{name?, hidden?, cover?}: name a person ("" takes its name away), hide it, or
+        choose the face that stands for it (null: the best one)."""
+        changes = body()
+        return jsonify({"person": with_people(lambda store: people_groups.update_person(
+            store, person_id, {key: changes[key] for key in ("name", "hidden", "cover")
+                               if key in changes}), write=True)})
+
+    @bp.route("/people/<int:person_id>/merge", methods=["POST"])
+    def person_merge(person_id):
+        """{into: person id}: every face of this person goes to the other one."""
+        target = person_id_of(body().get("into"), "into")
+        quality = people.settings(state.config())["group_quality"]
+        return jsonify({"person": with_people(
+            lambda store: people_groups.merge(store, person_id, target, group_quality=quality),
+            write=True)})
+
+    @bp.route("/people/faces", methods=["POST"])
+    def people_faces():
+        """{action, faces (face ids, or "all" with person), person?, to?, name?}:
+        "move" the faces to person "to" (null: a new person called name), "reject" them
+        from person ("not this person"), "not_face" ("not a face") or "is_face" (a face
+        after all). With person, the answer's "source" is that person now (null when it
+        went: its last faces left)."""
+        data = body()
+        action = data.get("action")
+        if action not in ("move", "reject", "not_face", "is_face"):
+            raise AdminError(400, "action is move, reject, not_face or is_face.",
+                             {"action": "move, reject, not_face or is_face."})
+        person = data.get("person")
+        if person is not None:
+            person = person_id_of(person)
+
+        def work(store):
+            faces = data.get("faces")
+            if faces == "all":
+                if person is None:
+                    raise AdminError(400, "\"all\" faces needs the person.",
+                                     {"person": "Needed."})
+                faces = people_groups.person_faces(store, person)
+                if not faces:
+                    raise AdminError(404, "That person has no faces (any more).")
+            if action == "move":
+                to = data.get("to")
+                if to is not None:
+                    to = person_id_of(to, "to")
+                reply = {"person": people_groups.move_faces(store, faces, to,
+                                                            data.get("name") or "")}
+            elif action == "reject":
+                if person is None:
+                    raise AdminError(400, "Say which person they are not (person).",
+                                     {"person": "Needed."})
+                reply = people_groups.reject_faces(store, faces, person)
+            else:
+                reply = {"changed": people_groups.mark_not_face(store, faces,
+                                                                action == "not_face")}
+            if person is not None:
+                # (The person the faces came from, or null when it went with them.)
+                try:
+                    reply["source"] = people_groups.person_info(store, person)
+                except people_groups.GroupError:
+                    reply["source"] = None
+            return reply
+        return jsonify(with_people(work, write=True))
+
+    @bp.route("/people/other", methods=["GET"])
+    def people_other():
+        """?which=other (faces in no person, best first; the default) or not_face (marked
+        "not a face"), &offset=: one page of them."""
+        config = state.config()
+        which = request.args.get("which", "other")
+        if which not in ("other", "not_face"):
+            raise AdminError(400, "which is other or not_face.", {"which": "other or not_face."})
+        try:
+            offset = max(0, int(request.args.get("offset", "0")))
+        except ValueError:
+            raise AdminError(400, "offset is a number.", {"offset": "A number."})
+        answer = with_people(lambda store: people_groups.other_faces(
+            store, get_conn(), people_libraries(config), which, offset) if store is not None
+            else {"faces": [], "total": 0, "offset": 0})
+        return jsonify(answer)
 
     @bp.route("/abort-other", methods=["POST"])
     def abort_other():
@@ -1891,12 +2142,15 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         The choice is made for every copy of the shot and kept by content
         (gps_check.set_choice: only while it differs from what the check
         decides), and the check runs again at once, as the position may be
-        another picture's reference. Answers the picture's location_check
-        (as /api/image has it), the keys of its search record a position
-        changes (absent: none), "copies": how many copies the choice was
+        another picture's reference; so do the local times (local_times.py:
+        a time worked out from a position set aside is the camera's again).
+        Answers the picture's location_check (as /api/image has it), its
+        "time" (local_times.detail: taken_at, tz_offset, clock), the keys of
+        its search record a position changes (absent: none) -- and those of
+        its time when it changed --, "copies": how many copies the choice was
         also made for, and "others": {id: those keys} of the other pictures
-        whose position or place the check changed (at most
-        gps_check.OTHERS_MAX; "more": how many more there are).
+        whose position, place or time changed (at most gps_check.OTHERS_MAX;
+        "more": how many more there are).
         """
         use = body().get("use")
         if not isinstance(use, bool):
@@ -1912,17 +2166,21 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
             if not ids:
                 raise AdminError(404, "Picture %d has no GPS position." % image_id)
             gps_check.run(conn, config, changed=changed)
+            times = local_times.after_check(conn, config, changed)
         except sqlite3.OperationalError as error:
             raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
 
         def keys(picture_id):
             record = search_index.picture_record(conn, picture_id,
                                                  image_edits.load(conn, picture_id)) or {}
-            return {key: record[key] for key in gps_check.RECORD_KEYS if key in record}
+            wanted = gps_check.RECORD_KEYS + (local_times.RECORD_KEYS if picture_id in times
+                                              else ())
+            return {key: record[key] for key in wanted if key in record}
 
         others = sorted((set(ids) | changed) - {image_id})
         row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
         return jsonify({"id": image_id, "location_check": gps_check.picture_view(conn, row),
+                        "time": local_times.detail(conn, row),
                         "record": keys(image_id), "copies": len(ids) - 1,
                         "others": {str(other): keys(other)
                                    for other in others[:gps_check.OTHERS_MAX]},
@@ -1975,9 +2233,11 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         position lat, lon: a town picked from /places/towns, or one typed),
         "reject" (no estimate) or "clear" (the estimates decide again); see
         place_estimates.set_choice. The GPS check and the estimates run again
-        at once. Answers the picture's "place" and "place_estimate" (as
-        /api/image has them) and "record", the keys of its search record a
-        place changes (absent: none).
+        at once, and so do the local times (local_times.after_check). Answers
+        the picture's "place" and "place_estimate" (as /api/image has them),
+        its "time" (local_times.detail) and "record", the keys of its search
+        record a place changes (absent: none), and those of its time when it
+        changed.
         """
         data = body()
         choice = data.get("choice")
@@ -1997,6 +2257,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
             with conn:
                 place_estimates.set_choice(conn, image_id, choice, lat, lon)
             gps_check.run(conn, config)
+            times = local_times.after_check(conn, config)
         except place_estimates.ChoiceError as error:
             raise AdminError(error.status, str(error))
         except sqlite3.OperationalError as error:
@@ -2008,7 +2269,9 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                              image_edits.load(conn, image_id)) or {}
         return jsonify({"id": image_id, "place": serve.place_of(row, estimate),
                         "place_estimate": place_estimates.view(conn, row, estimate, admin=True),
-                        "record": {key: record[key] for key in gps_check.RECORD_KEYS
+                        "time": local_times.detail(conn, row),
+                        "record": {key: record[key] for key in gps_check.RECORD_KEYS + (
+                                       local_times.RECORD_KEYS if image_id in times else ())
                                    if key in record}})
 
     @bp.route("/places/towns", methods=["GET"])
@@ -2153,6 +2416,64 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
             new = album_change(lambda conn: albums.move_items(conn, album_id, ids, before))
         return jsonify({"order": new})
 
+    # -- trips (trips.py) ---------------------------------------------------------------
+
+    def trip_change(change):
+        """change(conn, config, library ids) of the trips of the enabled libraries; a
+        TripError answered with its status."""
+        config = state.config()
+        library_ids = [library["id"] for library in common.enabled_libraries(config)
+                       if library.get("id")]
+        try:
+            return change(get_conn(), config, library_ids)
+        except trips.TripError as error:
+            raise AdminError(error.status, str(error))
+        except OSError as error:
+            raise AdminError(500, "The trips' changes cannot be saved: %s" % error)
+
+    def trip_id_arg(trip_id):
+        if not trips.ID_RE.match(trip_id or ""):
+            raise AdminError(404, "There is no trip %s." % trip_id)
+        return trip_id
+
+    @bp.route("/trips/<trip_id>", methods=["POST"])
+    def edit_trip(trip_id):
+        """{title?, hidden?}: rename a trip ("" gives it back its own title), hide it or
+        show it again."""
+        data = body()
+        trip_id = trip_id_arg(trip_id)
+        if "title" not in data and "hidden" not in data:
+            raise AdminError(400, "Send a title or hidden.")
+        trip = trip_change(lambda conn, config, ids: trips.set_trip(
+            conn, config, ids, trip_id, title=data.get("title"), hidden=data.get("hidden")))
+        return jsonify({"trip": trip})
+
+    @bp.route("/trips/<trip_id>/split", methods=["POST"])
+    def split_trip(trip_id):
+        """{date}: split a trip before that day (one of its days after the first)."""
+        data = body()
+        trip_id = trip_id_arg(trip_id)
+        parts = trip_change(lambda conn, config, ids: trips.split_trip(
+            conn, config, ids, trip_id, data.get("date")))
+        return jsonify({"ids": parts})
+
+    @bp.route("/trips/merge", methods=["POST"])
+    def merge_trips():
+        """{ids}: make one trip of two or more (parts of a split trip are joined again)."""
+        data = body()
+        merged = trip_change(lambda conn, config, ids: trips.merge_trips(
+            conn, config, ids, data.get("ids")))
+        return jsonify({"id": merged})
+
+    @bp.route("/trips/<trip_id>/reset", methods=["POST"])
+    def reset_trip(trip_id):
+        """Forget the changes made to a trip: it shows as it was found."""
+        body()
+        trip_id = trip_id_arg(trip_id)
+        members = trip_change(lambda conn, config, ids: trips.reset_trip(
+            conn, config, ids, trip_id))
+        return jsonify({"ids": members})
+
     def picture_file(config, image_id):
         """The full path of a present picture of a configured library; AdminError 404 otherwise."""
         row = get_conn().execute("SELECT id, library_id, path FROM images "
@@ -2236,6 +2557,60 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                       saved_options=view["options"])
         return jsonify(result)
 
+    @bp.route("/trips/<trip_id>/export", methods=["GET"])
+    def trip_export_info(trip_id):
+        """A trip's export for the export dialog (trip_export.export_info)."""
+        config = state.config()
+        load_trip(config, trip_id)
+        try:
+            return jsonify(trip_export.export_info(get_conn(), config, trip_id))
+        except export.ExportError as error:
+            raise AdminError(404, str(error))
+
+    @bp.route("/trips/<trip_id>/export/preview", methods=["POST"])
+    def trip_export_preview(trip_id):
+        """{options, flagged, out_dir}: what an export of a trip would publish, as
+        /libraries/<id>/export/preview (trip_export.preview_trip; nothing is saved)."""
+        data = body()
+        config = state.config()
+        _built, _trip, libraries = load_trip(config, trip_id)
+        options = export_options_arg(data)
+        reachable = {library["id"]: folder_status(library).get("reachable") is not False
+                     for library in libraries}
+        try:
+            result = trip_export.preview_trip(get_conn(), config, trip_id, options,
+                                              reachable=reachable)
+        except export.OptionsError as error:
+            raise options_error(error)
+        except export.ExportError as error:
+            raise AdminError(400, str(error))
+        if data.get("flagged") is False:
+            result.pop("flagged", None)
+        info = trip_export.export_info(get_conn(), config, trip_id)
+        if "out_dir" in data:
+            target, _default = export_target(config, None, data.get("out_dir"),
+                                             info["default_output"])
+            result["free_bytes"] = free_space(target)
+        result.update(default_output=info["default_output"], last=info["last"],
+                      saved_options=info["options"])
+        return jsonify(result)
+
+    @bp.route("/trips/<trip_id>/export/open-folder", methods=["POST"])
+    def open_trip_export_folder(trip_id):
+        """Show a trip's exported site (its last export's folder) in the file manager."""
+        body()
+        config = state.config()
+        load_trip(config, trip_id)
+        last = trip_export.export_info(get_conn(), config, trip_id)["last"]
+        if not last:
+            raise AdminError(404, "This trip has not been exported yet.")
+        try:
+            there = library_ops.run_with_timeout(os.path.isdir, EXPORT_FOLDER_TIMEOUT,
+                                                 last["output"])
+        except library_ops.TimedOut:
+            raise AdminError(504, "The export folder did not answer (an offline share?).")
+        return reveal_export(last["output"], not there)
+
     @bp.route("/libraries/<library_id>/export/options", methods=["POST"])
     def export_options(library_id):
         """{options}: change a library's saved export options (those sent; the rest stay)."""
@@ -2268,13 +2643,20 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         body()
         config = state.config()
         find_library(config, library_id)
-        gone = ("The folder of the last export (%s) is not there any more: it was moved or "
-                "deleted, or its drive is not connected.")
         try:
             folder, missing = library_ops.run_with_timeout(
                 export.last_export_dir, EXPORT_FOLDER_TIMEOUT, config, library_id)
-            if folder is None:
-                raise AdminError(404, "This library has not been exported yet.")
+        except library_ops.TimedOut:
+            raise AdminError(504, "The export folder did not answer (an offline share?).")
+        if folder is None:
+            raise AdminError(404, "This library has not been exported yet.")
+        return reveal_export(folder, missing)
+
+    def reveal_export(folder, missing):
+        """Show an exported site's index.html (or its folder) in the file manager."""
+        gone = ("The folder of the last export (%s) is not there any more: it was moved or "
+                "deleted, or its drive is not connected.")
+        try:
             if missing:
                 raise AdminError(404, gone % folder)
             index = os.path.join(folder, "index.html")

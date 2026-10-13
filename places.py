@@ -8,10 +8,11 @@ into data/places/ -- only when the owner asks (make_places.py, or the
 Manage page's "Download place names"); this program does not ship them --
 and build() turns them into data/places/places.db:
 
-    cities     id, name, lat, lon, cell, country, region, population
+    cities     id, name, lat, lon, cell, country, region, population, zone
                (sorted by grid cell, see CELL_DEGREES)
     countries  id, cc (ISO code), name             (countryInfo.txt)
     regions    id, code ("US.HI"), name            (admin1CodesASCII.txt)
+    zones      id, name (the town's time zone: "Europe/Paris")
     meta       format, built (time), source, cities
 
 PlaceIndex reads that into memory and finds the nearest town of a
@@ -19,6 +20,13 @@ position by great-circle distance. It looks at the towns of the grid
 cells around the position only: first those within START_KM, then twice
 as far, ... up to MAX_KM, stopping as soon as the nearest town found is
 nearer than the distance searched (no town outside it can be nearer).
+
+A town's time zone (GeoNames' IANA time zone id) is the time zone of
+the pictures taken near it (PlaceIndex.zone_of, zones_near;
+local_times.py turns it into the local time of a picture). A places.db
+of the first format has no time zones: it still names places, and
+rebuild_if_needed() builds it again from the downloaded files (no
+download).
 
 place_columns() gives the images columns of a position (db.SCHEMA_V4):
 
@@ -78,7 +86,10 @@ CHUNK = 64 * 1024
 
 # The layout of places.db; raise it when it changes (an older file is then
 # built again from the downloaded files, see rebuild_if_needed).
-PLACES_FORMAT = 1
+PLACES_FORMAT = 2
+# Older layouts that can still be read (for place names; the first has no
+# time zones) until it is built again.
+READABLE_FORMATS = (1, 2)
 # The grid: cells of this many degrees of latitude and longitude.
 CELL_DEGREES = 0.5
 ROWS = int(round(180 / CELL_DEGREES))
@@ -116,6 +127,8 @@ FIND_MIN_CHARS = 2
 
 _NAME_SPACE_RE = re.compile(r"[\s|]+")
 _CC_RE = re.compile(r"^[A-Z]{2}$")
+# An IANA time zone id as GeoNames writes it ("America/Argentina/Ushuaia").
+_ZONE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z0-9_+\-]+){0,3}$")
 
 
 class PlacesError(Exception):
@@ -358,10 +371,13 @@ def _city_lines(path):
 
 
 def read_cities(path):
-    """[(name, lat, lon, cc, admin1 code, population)] of the towns in a GeoNames cities file.
+    """[(name, lat, lon, cc, admin1 code, population, time zone)] of the towns in a GeoNames
+    cities file.
 
     Lines that are not a town (wrong number of columns, an unusable
-    position) and the feature codes in SKIPPED_FEATURES are left out.
+    position) and the feature codes in SKIPPED_FEATURES are left out. The
+    time zone is "" when the line has none (or not one that looks like an
+    IANA id).
     """
     cities = []
     for line in _city_lines(path):
@@ -383,7 +399,10 @@ def read_cities(path):
             population = max(0, int(fields[14] or 0))
         except ValueError:
             population = 0
-        cities.append((name, lat, lon, cc, fields[10].strip(), population))
+        zone = fields[17].strip() if len(fields) > 17 else ""
+        if len(zone) > 64 or not _ZONE_RE.match(zone):
+            zone = ""
+        cities.append((name, lat, lon, cc, fields[10].strip(), population, zone))
     return cities
 
 
@@ -392,9 +411,10 @@ _PLACES_SCHEMA = (
     "name TEXT NOT NULL)",
     "CREATE TABLE regions (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, "
     "name TEXT NOT NULL)",
+    "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
     "CREATE TABLE cities (id INTEGER PRIMARY KEY, name TEXT NOT NULL, lat REAL NOT NULL, "
     "lon REAL NOT NULL, cell INTEGER NOT NULL, country INTEGER NOT NULL, "
-    "region INTEGER NOT NULL, population INTEGER NOT NULL)",
+    "region INTEGER NOT NULL, population INTEGER NOT NULL, zone INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
 
@@ -411,13 +431,15 @@ def _replace(source, target):
             time.sleep(0.1 * (attempt + 1))
 
 
-def build(folder=None, out_path=None, ctx=None, source=""):
+def build(folder=None, out_path=None, ctx=None, source="", built=None):
     """Build places.db (default data/places/places.db) from the GeoNames files in folder.
 
     folder (default data/places) holds cities1000.zip (or cities1000.txt),
     admin1CodesASCII.txt and countryInfo.txt. The new file replaces the old
     one only when it is complete. source is noted in the file (where the
-    files came from). Returns {"cities", "countries", "regions"}. Raises
+    files came from), and built (default now: when the files were
+    downloaded, for an index built again from the same files). Returns
+    {"cities", "countries", "regions", "zones"}. Raises
     PlacesError when a file is missing, cannot be read or written, holds no
     towns, or looks cut off (too many towns without their country's or
     region's name, see MAX_UNNAMED_COUNTRIES); the old file is then kept.
@@ -448,7 +470,7 @@ def build(folder=None, out_path=None, ctx=None, source=""):
     if _stopping(ctx):
         raise PlacesError("Building the place index was stopped.")
     try:
-        summary = _write_index(cities, countries, regions, out_path, source)
+        summary = _write_index(cities, countries, regions, out_path, source, built)
     except (sqlite3.Error, OSError) as error:
         raise PlacesError("Could not write the place index %s: %s" % (out_path, error))
     _report(ctx, "Place index ready: %d towns in %d countries." % (summary["cities"],
@@ -483,7 +505,7 @@ def check_names(cities, countries, regions):
                               % (name, count, total, what))
 
 
-def _write_index(cities, countries, regions, out_path, source):
+def _write_index(cities, countries, regions, out_path, source, built=None):
     """Write places.db (see build) through a temporary file; returns build()'s summary."""
     common.ensure_dir(os.path.dirname(os.path.abspath(out_path)))
     tmp = "%s.tmp-%d" % (out_path, os.getpid())
@@ -505,19 +527,25 @@ def _write_index(cities, countries, regions, out_path, source):
                 region_ids[code] = conn.execute(
                     "INSERT INTO regions (code, name) VALUES (?, ?)",
                     (code, regions[code])).lastrowid
+        zone_ids = {}
+        for zone in sorted({city[6] for city in cities if city[6]}):
+            zone_ids[zone] = conn.execute("INSERT INTO zones (name) VALUES (?)",
+                                          (zone,)).lastrowid
         rows = []
-        for name, lat, lon, cc, admin1, population in cities:
+        for name, lat, lon, cc, admin1, population, zone in cities:
             rows.append((cell_of(lat, lon), -population, name, lat, lon, country_ids[cc],
-                         region_ids.get("%s.%s" % (cc, admin1), 0), population))
+                         region_ids.get("%s.%s" % (cc, admin1), 0), population,
+                         zone_ids.get(zone, 0)))
         rows.sort()
         conn.executemany(
-            "INSERT INTO cities (name, lat, lon, cell, country, region, population) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [(name, lat, lon, cell, country, region, population)
-             for cell, _order, name, lat, lon, country, region, population in rows])
-        meta = {"format": str(PLACES_FORMAT), "built": str(int(time.time())),
+            "INSERT INTO cities (name, lat, lon, cell, country, region, population, zone) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(name, lat, lon, cell, country, region, population, zone)
+             for cell, _order, name, lat, lon, country, region, population, zone in rows])
+        meta = {"format": str(PLACES_FORMAT),
+                "built": str(int(time.time() if built is None else built)),
                 "source": source or GEONAMES_URL, "cities": str(len(rows)),
-                "cell_degrees": str(CELL_DEGREES)}
+                "cell_degrees": str(CELL_DEGREES), "zones": str(len(zone_ids))}
         conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", sorted(meta.items()))
         conn.commit()
     except BaseException:
@@ -537,7 +565,8 @@ def _write_index(cities, countries, regions, out_path, source):
                 os.remove(tmp)
             except OSError:
                 pass
-    return {"cities": len(rows), "countries": len(country_ids), "regions": len(region_ids)}
+    return {"cities": len(rows), "countries": len(country_ids), "regions": len(region_ids),
+            "zones": len(zone_ids)}
 
 
 def update(ctx=None, base_url=None, folder=None):
@@ -575,7 +604,9 @@ class PlaceIndex:
 
     def __init__(self, path=None):
         path = path or places_db_path()
-        read_meta(path)     # (raises PlacesError when it is from another version)
+        meta = read_meta(path)      # (raises PlacesError when it is from another version)
+        # (The first format has no time zones: has_zones is False.)
+        self.has_zones = has_zones(meta)
         try:
             conn = db.connect_readonly(path)
         except db.DatabaseError as error:
@@ -585,17 +616,20 @@ class PlaceIndex:
                               for row in conn.execute("SELECT id, cc, name FROM countries")}
             self.regions = {row[0]: row[1]
                             for row in conn.execute("SELECT id, name FROM regions")}
+            self.zone_names = ({row[0]: row[1] for row in conn.execute(
+                "SELECT id, name FROM zones")} if self.has_zones else {})
             self.lat = array.array("d")
             self.lon = array.array("d")
             self.cos = array.array("d")
             self.country = array.array("i")
             self.region = array.array("i")
+            self.zone = array.array("i")
             self.names = []
             self.cells = {}
             current, start = None, 0
             for index, row in enumerate(conn.execute(
-                    "SELECT cell, lat, lon, name, country, region FROM cities "
-                    "ORDER BY cell, id")):
+                    "SELECT cell, lat, lon, name, country, region, %s FROM cities "
+                    "ORDER BY cell, id" % ("zone" if self.has_zones else "0"))):
                 cell = row[0]
                 if cell != current:
                     if current is not None:
@@ -607,6 +641,7 @@ class PlaceIndex:
                 self.names.append(row[3])
                 self.country.append(row[4])
                 self.region.append(row[5])
+                self.zone.append(row[6])
             if current is not None:
                 self.cells[current] = (start, len(self.names))
         except sqlite3.Error as error:
@@ -656,11 +691,58 @@ class PlaceIndex:
         return best, found
 
     def town(self, index):
-        """{"name", "region", "country", "cc", "lat", "lon"} of a town number."""
+        """{"name", "region", "country", "cc", "lat", "lon", "zone"} of a town number (zone:
+        its time zone id, "" when unknown)."""
         cc, country = self.countries.get(self.country[index], ("", ""))
         return {"name": self.names[index], "region": self.regions.get(self.region[index], ""),
                 "country": country, "cc": cc, "lat": math.degrees(self.lat[index]),
-                "lon": math.degrees(self.lon[index])}
+                "lon": math.degrees(self.lon[index]),
+                "zone": self.zone_names.get(self.zone[index], "")}
+
+    def zone_of(self, lat, lon):
+        """(time zone id, km) of the nearest town at most MAX_KM away when it has a time
+        zone, or None (no town near, or a place index without time zones).
+
+        The nearest town's time zone is the place's: near a border between
+        two time zones it may be the other one (see zones_near).
+        """
+        if not self.has_zones or not world_map.valid_position(lat, lon):
+            return None
+        key = ("zone", lat, lon)
+        if key in self._memo:
+            return self._memo[key]
+        hit = self.nearest(float(lat), float(lon))
+        found = None
+        if hit is not None and self.zone[hit[0]] in self.zone_names:
+            found = (self.zone_names[self.zone[hit[0]]], hit[1])
+        if len(self._memo) >= MEMO_SIZE:
+            self._memo.clear()
+        self._memo[key] = found
+        return found
+
+    def zones_near(self, lat, lon, km):
+        """The time zone ids of the towns at most km from a position (a set; empty without
+        time zones). Slower than zone_of: for the few places where it matters."""
+        if not self.has_zones or not world_map.valid_position(lat, lon):
+            return set()
+        lat, lon = float(lat), float(lon)
+        phi, lam = math.radians(lat), math.radians(lon)
+        cos_phi = math.cos(phi)
+        limit = math.sin(min(math.pi / 2, km / (2 * EARTH_KM))) ** 2
+        found = set()
+        for cell in cells_near(lat, lon, km):
+            span = self.cells.get(cell)
+            if span is None:
+                continue
+            for index in range(span[0], span[1]):
+                zone = self.zone[index]
+                if zone in found or zone not in self.zone_names:
+                    continue
+                half = (math.sin((self.lat[index] - phi) / 2) ** 2 + cos_phi * self.cos[index]
+                        * math.sin((self.lon[index] - lam) / 2) ** 2)
+                if half <= limit:
+                    found.add(zone)
+        return {self.zone_names[zone] for zone in found}
 
     def _search_lists(self):
         """(folded names, populations) in town order, read once (see find_towns)."""
@@ -832,10 +914,16 @@ def read_meta(path=None):
         raise PlacesError("Could not read %s: %s" % (path, error))
     finally:
         conn.close()
-    if meta.get("format") != str(PLACES_FORMAT):
+    if meta.get("format") not in [str(number) for number in READABLE_FORMATS]:
         raise OutdatedIndex("%s was built by another version of this program (format %s)."
                             % (path, meta.get("format")))
     return meta
+
+
+def has_zones(meta):
+    """True when a places.db (its read_meta) holds the towns' time zones (not the first
+    format)."""
+    return bool(meta) and meta.get("format") != "1"
 
 
 def rebuild_if_needed(ctx=None):
@@ -843,39 +931,53 @@ def rebuild_if_needed(ctx=None):
 
     That is when it was built by another version of this program (or is
     damaged) while the GeoNames files are still in data/places: there is
-    no need to download them again. Returns build()'s summary, or None when
-    nothing was built (places.db is fine or missing, or the files are not
-    there). Raises PlacesError when the build fails.
+    no need to download them again. One of an older format that can still
+    be read (READABLE_FORMATS: place names without time zones) is built
+    again too. Returns build()'s summary, or None when nothing was built
+    (places.db is fine or missing, or the files are not there). Raises
+    PlacesError when the build fails.
     """
     path = places_db_path()
     if not os.path.exists(path) or not have_files():
         return None
     try:
-        read_meta(path)
-        return None
+        meta = read_meta(path)
     except PlacesError as error:
         _report(ctx, "The place index cannot be used (%s); building it again from the "
                      "downloaded files." % error)
+    else:
+        if meta.get("format") == str(PLACES_FORMAT):
+            return None
+        _report(ctx, "The place index has no time zones yet; building it again from the "
+                     "downloaded files (nothing is downloaded).")
+        try:
+            built = int(meta.get("built") or 0) or None
+        except ValueError:
+            built = None
+        return build(ctx=ctx, source=meta.get("source", ""), built=built)
     return build(ctx=ctx)
 
 
 def status(conn=None):
     """What the Manage page shows: {"available", "cities", "built", "source", "error",
-    "rebuild", "attribution_url", "license_url", "city_km", "max_km", "pictures":
-    {"located", "named", "region_only", "far", "pending"}}.
+    "rebuild", "zones", "attribution_url", "license_url", "city_km", "max_km",
+    "pictures": {"located", "named", "region_only", "far", "pending"}}.
 
     Reads only the facts of places.db, not its towns. rebuild: places.db
-    cannot be used but the downloaded files are there, so the places job
-    builds it again (rebuild_if_needed). pictures counts the present
+    cannot be used, or has no time zones (zones False), but the downloaded
+    files are there, so the places job (or the next scan) builds it again
+    (rebuild_if_needed). pictures counts the present
     pictures with a GPS position of every library -- what the places job
     looks up (when conn, an index.db connection, is given) -- and then
     also "gps_ignored", the present pictures whose position the GPS check
-    set aside (gps_check.py: they count nowhere else), and "estimates"
+    set aside (gps_check.py: they count nowhere else), "estimates"
     (place_estimates.status: the pictures without a position that have an
-    estimated place, or one the owner set).
+    estimated place, or one the owner set) and "local_times"
+    (local_times.status: the pictures that have the local time of their
+    place).
     """
     result = {"available": False, "cities": 0, "built": None, "source": "", "error": "",
-              "rebuild": False, "attribution_url": ATTRIBUTION_URL,
+              "rebuild": False, "zones": False, "attribution_url": ATTRIBUTION_URL,
               "license_url": LICENSE_URL, "city_km": CITY_KM, "max_km": MAX_KM}
     if os.path.exists(places_db_path()):
         try:
@@ -894,7 +996,9 @@ def status(conn=None):
                 result["built"] = int(meta.get("built") or 0) or None
             except ValueError:
                 pass
-            result.update(available=True, source=meta.get("source", ""))
+            result.update(available=True, source=meta.get("source", ""),
+                          zones=has_zones(meta))
+            result["rebuild"] = not result["zones"] and have_files()
     if conn is not None:
         row = conn.execute(
             "SELECT COUNT(*), SUM(place_km IS NOT NULL AND place_city <> ''), "
@@ -909,6 +1013,8 @@ def status(conn=None):
             "WHERE g.ignored = 1 AND i.lat IS NULL AND i.missing_since IS NULL").fetchone()[0]
         import place_estimates
         result["estimates"] = place_estimates.status(conn)
+        import local_times
+        result["local_times"] = local_times.status(conn)
     return result
 
 

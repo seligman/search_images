@@ -28,6 +28,7 @@ import library_ops
 import prompts
 import serve
 import test_ui_scripts
+import trip_export
 from test_admin import NOW, AdminFixture, insert_image
 
 if support.pillow_available():
@@ -532,7 +533,9 @@ class DialogTest(ExportFixture, unittest.TestCase):
         path = os.path.join(folder, "expected.json")
         reasons = list(export.FLAGS) + ["hidden", "excluded"]
         with open(path, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump({"options": sorted(export.DEFAULT_OPTIONS),
+            # (A trip's export has one more option: trip_export.TRIP_DEFAULTS.)
+            json.dump({"options": sorted(list(export.DEFAULT_OPTIONS)
+                                         + list(trip_export.TRIP_DEFAULTS)),
                        "photo_types": list(export.EXPORT_KINDS), "reasons": reasons}, handle)
         result = subprocess.run([NODE, NODE_TESTS, path], cwd=support.REPO,
                                 capture_output=True, timeout=120)

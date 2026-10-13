@@ -519,6 +519,154 @@ var MAP = (function () {
         return best;
     }
 
+    /* ---------- Tiles and pins on a canvas ------------------------------- */
+
+    /* The map's tiles on a canvas (the map page's, and the trip pages'
+       map, trips.js): options {tileUrl(z, x, y) (null: no tile), tileSize,
+       tileZoom (the most detailed tiles there are), ocean (the colour where
+       there is no tile), onLoad() (a tile arrived: draw again)}.
+       draw(ctx, zoom, left, top, w, h) draws the view whose top left corner
+       is world (left, top) at a whole zoom: the most detailed tiles there
+       are, stretched past that (fainter the further: only a hint of land and
+       sea), a coarser tile already loaded standing in for one that is not;
+       it returns how many levels the tiles are stretched. */
+    function TileLayer(options) {
+        this.options = options || {};
+        this.tile = this.options.tileSize || 256;
+        this.cache = {};
+    }
+
+    TileLayer.prototype.get = function (z, x, y) {
+        var key = z + "/" + x + "/" + y;
+        if (this.cache[key]) {
+            return this.cache[key];
+        }
+        var url = this.options.tileUrl ? this.options.tileUrl(z, x, y) : null;
+        if (!url) {
+            return null;
+        }
+        var onLoad = this.options.onLoad;
+        var img = new Image();
+        var entry = {img: img, loaded: false, failed: false};
+        this.cache[key] = entry;
+        img.onload = function () {
+            entry.loaded = true;
+            if (onLoad) {
+                onLoad();
+            }
+        };
+        img.onerror = function () {
+            entry.failed = true;
+        };
+        img.src = url;
+        return entry;
+    };
+
+    // Part of a coarser tile that is already loaded, in place of one that is not.
+    TileLayer.prototype.fromParent = function (ctx, z, x, y, dx, dy, dw, dh) {
+        for (var up = 1; up <= z; up++) {
+            var n = Math.pow(2, up);
+            var entry = this.cache[(z - up) + "/" + Math.floor(x / n) + "/" + Math.floor(y / n)];
+            if (entry && entry.loaded) {
+                var part = this.tile / n;
+                ctx.drawImage(entry.img, (x % n) * part, (y % n) * part, part, part,
+                              dx, dy, dw, dh);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    TileLayer.prototype.draw = function (ctx, zoom, left, top, w, h) {
+        var tz = Math.max(0, Math.min(zoom, this.options.tileZoom || 0));
+        var size = this.tile * Math.pow(2, zoom - tz);
+        // Tiles stretched far past their detail are only a hint of land and
+        // sea: drawn fainter, over the plain sea colour.
+        var stretch = zoom - tz;
+        ctx.globalAlpha = stretch <= 1 ? 1 : Math.max(0.35, 1 - 0.2 * (stretch - 1));
+        var cols = Math.pow(2, tz + 1);
+        var rows = Math.pow(2, tz);
+        var x0 = Math.floor(left / size);
+        var x1 = Math.floor((left + w) / size);
+        var y0 = Math.max(0, Math.floor(top / size));
+        var y1 = Math.min(rows - 1, Math.floor((top + h) / size));
+        for (var ty = y0; ty <= y1; ty++) {
+            var dy = Math.round(ty * size - top);
+            var dh = Math.round((ty + 1) * size - top) - dy;
+            for (var tx = x0; tx <= x1; tx++) {
+                // The world repeats sideways: column tx is column tx mod cols.
+                var x = ((tx % cols) + cols) % cols;
+                var dx = Math.round(tx * size - left);
+                var dw = Math.round((tx + 1) * size - left) - dx;
+                var entry = this.get(tz, x, ty);
+                if (entry && entry.loaded) {
+                    ctx.drawImage(entry.img, dx, dy, dw, dh);
+                } else if (!this.fromParent(ctx, tz, x, ty, dx, dy, dw, dh)) {
+                    ctx.fillStyle = this.options.ocean || "#1a2c3d";
+                    ctx.fillRect(dx, dy, dw, dh);
+                }
+            }
+        }
+        ctx.globalAlpha = 1;
+        // Keep the cache bounded in long sessions (oldest first; the
+        // coarse levels stay, they stand in for missing tiles).
+        var keys = Object.keys(this.cache);
+        if (keys.length > 500) {
+            for (var k = 0; k < keys.length - 300; k++) {
+                if (Number(keys[k].split("/")[0]) > 2) {
+                    delete this.cache[keys[k]];
+                }
+            }
+        }
+        return stretch;
+    };
+
+    /* Pins (screenPins' list) on a canvas: red for one picture, blue with
+       the count for a group, hollow for a group of estimated places only,
+       and a yellow ring around a picked group (group.picked). */
+    function drawPins(ctx, list) {
+        ctx.save();
+        ctx.font = "600 12px system-ui, -apple-system, \"Segoe UI\", sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        list.forEach(function (pin) {
+            var group = pin.group;
+            if (group.picked) {
+                ctx.beginPath();
+                ctx.arc(pin.sx, pin.sy, pin.r + 4, 0, Math.PI * 2);
+                ctx.lineWidth = 3;
+                ctx.strokeStyle = "rgba(255, 210, 63, 0.95)";
+                ctx.stroke();
+            }
+            ctx.beginPath();
+            ctx.arc(pin.sx, pin.sy, pin.r, 0, Math.PI * 2);
+            var color = group.count === 1 ? "rgba(214, 58, 58, 0.95)"
+                : "rgba(31, 103, 214, 0.95)";
+            if (group.estimated && group.estimated === group.count) {
+                // Only estimated places: a hollow pin.
+                ctx.fillStyle = "rgba(12, 17, 24, 0.35)";
+                ctx.fill();
+                ctx.lineWidth = 4;
+                ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+                ctx.stroke();
+                ctx.lineWidth = 2.5;
+                ctx.strokeStyle = color;
+                ctx.stroke();
+            } else {
+                ctx.fillStyle = color;
+                ctx.fill();
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+                ctx.stroke();
+            }
+            if (group.count > 1) {
+                ctx.fillStyle = "#ffffff";
+                ctx.fillText(countLabel(group.count), pin.sx, pin.sy + 0.5);
+            }
+        });
+        ctx.restore();
+    }
+
     /* ---------- The page ------------------------------------------------- */
 
     function startPage() {
@@ -606,12 +754,22 @@ var MAP = (function () {
         var view = {lat: 20, lon: 0, zoom: 1, w: 0, h: 0};
         var dpr = 0;
         var ratioQuery = null;
-        var tileCache = {};
+        var tileLayer = new TileLayer({tileUrl: SITE.tileUrl, tileSize: TILE, tileZoom: TILE_ZOOM,
+                                       ocean: OCEAN, onLoad: function () {
+                                           scheduleDraw();
+                                       }});
         var records = [];
         var indexById = {};
         var indexLibraries = [];
         var indexAlbums = [];
         var searchIndex = null;
+        // The people for person: (the search page's, SITE.peopleForSearch): the
+        // search runs again when they come.
+        var peopleSearch = SITE.peopleForSearch(function () {
+            if (loadState === "ready") {
+                applySearch(false);
+            }
+        }, adminOn);
         var vectorsWanted = false;
         var allLocations = null;
         var locations = [];
@@ -762,90 +920,9 @@ var MAP = (function () {
 
         /* Tiles */
 
-        function tileKey(z, x, y) {
-            return z + "/" + x + "/" + y;
-        }
-
-        function getTile(z, x, y) {
-            var key = tileKey(z, x, y);
-            if (tileCache[key]) {
-                return tileCache[key];
-            }
-            var url = SITE.tileUrl(z, x, y);
-            if (!url) {
-                return null;
-            }
-            var img = new Image();
-            var entry = {img: img, loaded: false, failed: false};
-            tileCache[key] = entry;
-            img.onload = function () {
-                entry.loaded = true;
-                scheduleDraw();
-            };
-            img.onerror = function () {
-                entry.failed = true;
-            };
-            img.src = url;
-            return entry;
-        }
-
-        // Part of a coarser tile that is already loaded, in place of one that is not.
-        function drawFromParent(z, x, y, dx, dy, dw, dh) {
-            for (var up = 1; up <= z; up++) {
-                var n = Math.pow(2, up);
-                var entry = tileCache[tileKey(z - up, Math.floor(x / n), Math.floor(y / n))];
-                if (entry && entry.loaded) {
-                    var part = TILE / n;
-                    ctx.drawImage(entry.img, (x % n) * part, (y % n) * part, part, part,
-                                  dx, dy, dw, dh);
-                    return true;
-                }
-            }
-            return false;
-        }
-
         function drawTiles(at) {
-            var tz = Math.min(view.zoom, TILE_ZOOM);
-            var size = TILE * Math.pow(2, view.zoom - tz);
-            // Tiles stretched far past their detail are only a hint of
-            // land and sea: drawn fainter, over the plain sea colour.
-            var stretch = view.zoom - tz;
-            ctx.globalAlpha = stretch <= 1 ? 1 : Math.max(0.35, 1 - 0.2 * (stretch - 1));
+            var stretch = tileLayer.draw(ctx, view.zoom, at.left, at.top, view.w, view.h);
             detailNote.hidden = stretch < 2;
-            var cols = Math.pow(2, tz + 1);
-            var rows = Math.pow(2, tz);
-            var x0 = Math.floor(at.left / size);
-            var x1 = Math.floor((at.left + view.w) / size);
-            var y0 = Math.max(0, Math.floor(at.top / size));
-            var y1 = Math.min(rows - 1, Math.floor((at.top + view.h) / size));
-            for (var ty = y0; ty <= y1; ty++) {
-                var dy = Math.round(ty * size - at.top);
-                var dh = Math.round((ty + 1) * size - at.top) - dy;
-                for (var tx = x0; tx <= x1; tx++) {
-                    // The world repeats sideways: column tx is column tx mod cols.
-                    var x = ((tx % cols) + cols) % cols;
-                    var dx = Math.round(tx * size - at.left);
-                    var dw = Math.round((tx + 1) * size - at.left) - dx;
-                    var entry = getTile(tz, x, ty);
-                    if (entry && entry.loaded) {
-                        ctx.drawImage(entry.img, dx, dy, dw, dh);
-                    } else if (!drawFromParent(tz, x, ty, dx, dy, dw, dh)) {
-                        ctx.fillStyle = OCEAN;
-                        ctx.fillRect(dx, dy, dw, dh);
-                    }
-                }
-            }
-            ctx.globalAlpha = 1;
-            // Keep the cache bounded in long sessions (oldest first; the
-            // coarse levels stay, they stand in for missing tiles).
-            var keys = Object.keys(tileCache);
-            if (keys.length > 500) {
-                for (var k = 0; k < keys.length - 300; k++) {
-                    if (Number(keys[k].split("/")[0]) > 2) {
-                        delete tileCache[keys[k]];
-                    }
-                }
-            }
         }
 
         /* Pins */
@@ -867,48 +944,9 @@ var MAP = (function () {
             });
         }
 
-        function drawPins(at) {
+        function drawPinsNow(at) {
             var list = screenPins(groupsNow(), at.left, at.top, view.w, view.h, at.w);
-            ctx.save();
-            ctx.font = "600 12px system-ui, -apple-system, \"Segoe UI\", sans-serif";
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-            list.forEach(function (pin) {
-                var group = pin.group;
-                if (group.picked) {
-                    ctx.beginPath();
-                    ctx.arc(pin.sx, pin.sy, pin.r + 4, 0, Math.PI * 2);
-                    ctx.lineWidth = 3;
-                    ctx.strokeStyle = "rgba(255, 210, 63, 0.95)";
-                    ctx.stroke();
-                }
-                ctx.beginPath();
-                ctx.arc(pin.sx, pin.sy, pin.r, 0, Math.PI * 2);
-                var color = group.count === 1 ? "rgba(214, 58, 58, 0.95)"
-                    : "rgba(31, 103, 214, 0.95)";
-                if (group.estimated && group.estimated === group.count) {
-                    // Only estimated places: a hollow pin.
-                    ctx.fillStyle = "rgba(12, 17, 24, 0.35)";
-                    ctx.fill();
-                    ctx.lineWidth = 4;
-                    ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
-                    ctx.stroke();
-                    ctx.lineWidth = 2.5;
-                    ctx.strokeStyle = color;
-                    ctx.stroke();
-                } else {
-                    ctx.fillStyle = color;
-                    ctx.fill();
-                    ctx.lineWidth = 2;
-                    ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
-                    ctx.stroke();
-                }
-                if (group.count > 1) {
-                    ctx.fillStyle = "#ffffff";
-                    ctx.fillText(countLabel(group.count), pin.sx, pin.sy + 0.5);
-                }
-            });
-            ctx.restore();
+            drawPins(ctx, list);
             pins = list;
         }
 
@@ -975,27 +1013,9 @@ var MAP = (function () {
                             at: entry.point.at};
                 });
             });
-            ctx.save();
-            ctx.lineCap = "round";
-            ctx.lineJoin = "round";
-            function stroke(lines, lineWidth, colour) {
-                ctx.lineWidth = lineWidth;
-                ctx.strokeStyle = colour;
-                lines.forEach(function (line) {
-                    ctx.beginPath();
-                    line.forEach(function (point, index) {
-                        if (index) {
-                            ctx.lineTo(point.sx, point.sy);
-                        } else {
-                            ctx.moveTo(point.sx, point.sy);
-                        }
-                    });
-                    if (line.length === 1) {
-                        ctx.lineTo(line[0].sx + 0.1, line[0].sy);
-                    }
-                    ctx.stroke();
-                });
-            }
+            var stroke = function (lines, lineWidth, colour) {
+                ROUTES.strokeLines(ctx, lines, lineWidth, colour);
+            };
             stroke(routesDrawn, 5.5, ROUTES.HALO);
             stroke(routesDrawn, 3, ROUTES.LINE);
             if (hoverRoute) {
@@ -1015,7 +1035,6 @@ var MAP = (function () {
                 ctx.strokeStyle = "#ffffff";
                 ctx.stroke();
             }
-            ctx.restore();
         }
 
         // The place on a route line at a screen point, or null.
@@ -1094,7 +1113,7 @@ var MAP = (function () {
             var at = corner();
             drawTiles(at);
             drawRoutes(at);
-            drawPins(at);
+            drawPinsNow(at);
             drawTarget();
         }
 
@@ -1925,13 +1944,18 @@ var MAP = (function () {
 
         function applySearch(refit) {
             var library = SHELL.library();
-            var found = SearchCore.search(searchIndex, search.q, {
+            // (person: in the search, or in a smart album it names, needs the people.)
+            peopleSearch.want(search.q + " " + (/(^|\s)-?albums?:/i.test(search.q)
+                ? indexAlbums.map(function (album) {
+                    return album && album.kind === "smart" ? String(album.query || "") : "";
+                }).join(" ") : ""));
+            var found = SearchCore.search(searchIndex, search.q, peopleSearch.options({
                 library: library || "", libraries: indexLibraries, filters: search.filters,
                 hidden: adminOn && search.hidden, sensitive: search.sensitive || undefined,
                 junk: search.junk, group: false, sort: search.sort || undefined,
                 range: {from: search.from, to: search.to}, seed: SITE.shuffleSeed(),
                 albums: indexAlbums
-            });
+            }));
             rank = {};
             found.items.forEach(function (id, index) {
                 rank[id] = index;
@@ -2113,6 +2137,8 @@ var MAP = (function () {
         hitPin: hitPin,
         WheelZoom: WheelZoom,
         fitView: fitView,
+        TileLayer: TileLayer,
+        drawPins: drawPins,
         formatView: formatView,
         parseView: parseView,
         chipState: chipState,

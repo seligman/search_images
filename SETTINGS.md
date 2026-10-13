@@ -11,7 +11,8 @@ too: if the file changed while it was open, **Save and exit** asks whether
 to save over those changes, reload the file or exit without saving. The
 helper module path can only be set in the file or with `settings.py`, never
 from a web page, and so can the program and command line of the model
-server (`local_server`).
+server (`local_server`); People's settings (`people`) are set in the file
+only.
 
 ## Where the file lives
 
@@ -52,6 +53,10 @@ The same variable is honored by every script.
     "gps_check": { "enabled": true },
     "place_estimates": { "enabled": true },
     "gps_tracks": { "enabled": true },
+    "trips": { "enabled": true },
+    "people": { "enabled": false },
+    "local_times": { "enabled": true },
+    "raw": { "enabled": true, "index_alone": true },
     "libraries": [ { ... }, { ... } ]
 }
 ```
@@ -882,7 +887,9 @@ locations, or a choice in the viewer). All keys are optional:
   accepted in the viewer stay).
 - `window_minutes` - how far in time (1 to 240, default 30) a located
   picture may be from the picture to count; on one side only, the nearest
-  must be within half of it.
+  must be within half of it. (Also how far apart a picture without a
+  position and the one whose time zone it takes for its local time may be,
+  see `local_times`.)
 - `max_spread_km` - how far apart (0.1 to 50, default 2) the located
   pictures before and after it may be, how far off their own positions
   may be by their own account, and how far the camera may have moved
@@ -926,6 +933,259 @@ pictures); drives get routes on the map and in the viewer. Optional:
 
 `"gps_tracks": false` means the same as `{"enabled": false}`.
 
+## trips
+
+Trips: libraries whose folder is named like a trip and runs of days away
+from home (see README, "Trips"). They are worked out whenever the Trips
+page is opened, so a change here shows at once. All keys are optional:
+
+```
+"trips": {
+    "enabled": true,
+    "library_folders": true,
+    "away_km": 50,
+    "max_gap_days": 1,
+    "min_pictures": 10,
+    "best_per_day": 6,
+    "home": ""
+}
+```
+
+- `enabled` - `false` turns the trips off (the Trips page says so).
+- `library_folders` - a library whose folder name starts with a date
+  ("2024-05-12 - Lakes") is a trip (default `true`).
+- `away_km` - how far from home (5 to 20000 km, default 50) a picture's
+  GPS position makes its day a day away.
+- `max_gap_days` - days away with at most this many days between them
+  (0 to 7, default 1) are one trip, unless a picture of a day between was
+  taken at home. Days away up to 3 days apart in one area (the last GPS
+  position before the gap and the first after it at most 500 km apart)
+  join too, also with `0`: days without pictures in the middle of a stay.
+- `min_pictures` - the fewest pictures (1 to 10000, default 10) a run of
+  days away needs to be a trip, or half as many taken on two days or
+  more. A library named like a trip is one however few it holds.
+  Visitors see a run of days away only when the pictures they may see
+  (not hidden) make one.
+- `best_per_day` - how many of a day's best pictures its strip shows (1 to
+  24, default 6).
+- `home` - where home is, as `"lat, lon"` (or `[lat, lon]`), when the
+  automatic choice (where pictures were taken on the most days) is wrong,
+  for instance after a move. It is used to tell the days away and to keep
+  the area around it out of a trip's export; it is never shown or
+  published.
+
+A trip's export (README, "Publishing a trip") takes the options of a
+library's `export` below (but `album`), and one more:
+
+- `home_km` - the size of the squares of the area around home that a
+  trip's export never shows: 5, 10 (default), 20, 40, 80 or 160 km, or 0
+  (home is not kept out): no position, town, estimated place or drive
+  route in it, no RAW file holding a position in it (or of a picture taken
+  there), and no dashcam clip filmed there (or without a GPS fix),
+  nor its drive's words, unless chosen in the review. The sizes' grids
+  nest, so exports made with different sizes tell no more together than
+  the smallest; a size kept from before that is none of these is read as
+  the default.
+
+They are kept with the trip in `data/trips.json` (`"exports"`), not in
+config.json: the Export dialog writes them when a trip's export starts.
+
+`"trips": false` means the same as `{"enabled": false}`.
+
+## people
+
+Optional, off by default: People, the faces in the pictures (see
+"People" in the README). A face detector finds the faces of every
+picture and a face recogniser makes a vector of each, on this computer's
+processor, in a helper program that runs with a Python environment of its
+own; then the faces are grouped into people, which you name on the
+People page. The faces, the people and their names are kept in
+`data/faces.db`, never sent anywhere and never exported (but for the
+names, with an export's `people_names` option). Every key is optional
+except `enabled`, `python` and `models_dir` (or full paths in `detector`
+and `recognizer`); all of them are set in `config.json` only (no page
+changes them).
+
+```
+"people": {
+    "enabled": true,
+    "python": "C:\path\to\people-env",
+    "models_dir": "C:\path\to\models\faces",
+    "detector": "face_detection_yunet_2023mar.onnx",
+    "recognizer": "face_recognition_sface_2021dec.onnx",
+    "after_scan": true,
+    "workers": 4,
+    "threads": 1,
+    "max_edge": 2048,
+    "min_score": 0.7,
+    "min_size": 20,
+    "max_faces": 64,
+    "match": 0.4,
+    "group_quality": 0.25,
+    "min_faces": 3,
+    "visitors": false
+}
+```
+
+- `enabled` - `true` turns People on. With `false` (the default) no face
+  is looked for, others (`visitors`) see nothing of People, and the
+  Manage page says nothing about faces unless face data from before is
+  kept (it then offers to delete it; you still see what is kept).
+- `python` - the python of the people environment: a Python 3.9 or later
+  with numpy and OpenCV (`opencv-python-headless`; see
+  `requirements-people.txt` and the README), or the folder of that
+  virtual environment (its `Scripts\python.exe` or `bin/python` is used).
+  A relative path is relative to the folder of `config.json`. The helper
+  (`people_worker.py`, in the program folder) runs with it, isolated from
+  the environment variables and folders of the search programs (`-I`),
+  and gets the pictures through a pipe. It gets only the environment
+  variables a Python needs (no API keys) and those of OpenCV, OpenMP and
+  OpenBLAS (OpenBLAS and OpenMP set to one thread unless you set them).
+  Do not install those packages into the Python that runs the search
+  programs: they do not need them. `requirements-people-pinned.txt` has
+  the versions People was tested with, and their hashes.
+- `models_dir` - the folder with the two model files (relative to the
+  folder of `config.json`).
+- `detector`, `recognizer` - the model files' names in `models_dir` (or
+  their own paths): by default YuNet (`face_detection_yunet_2023mar.onnx`,
+  MIT) and SFace (`face_recognition_sface_2021dec.onnx`, Apache-2.0) from
+  the OpenCV Zoo. The faces found are tied to the files' contents: other
+  files (or the settings below that change what is found) make the next
+  run look at every picture again; a face found again where it was keeps
+  what is known about it.
+- `after_scan` - `true` (the default): every scan ends by looking for the
+  faces of the pictures it found (only when People is on and set up; a
+  setup that does not work is a warning in the scan's log, not a failed
+  scan). `false` leaves that to **Find faces** on the Manage page and
+  `python people.py`.
+- `workers` - how many helpers run side by side (1 to 16, default 4), each
+  looking at one picture at a time with `threads` threads of OpenCV (0 to
+  64, default 1; 0 lets OpenCV choose, which is all the processor's
+  cores). More helpers find faces faster and keep more of the processor
+  busy; each one holds OpenCV and the models in memory (about 300 MB,
+  up to about 450 MB while it looks at a large picture).
+- `max_edge` - the largest size a picture is looked at (its long edge in
+  pixels, 320 to 4096, default 2048; pictures are looked at in their
+  stored preview, at most 2048 pixels, so larger values only matter for
+  libraries without previews). Each picture is looked at at that size and
+  at half of it, a quarter, ... down to 256 pixels, as the detector only
+  finds faces of about 10 to 300 pixels: small faces at the large sizes,
+  large ones at the small sizes. 1024 takes about a third of the time and
+  misses some small faces.
+- `min_score` - how sure the detector must be that it found a face (0.3
+  to 0.99, default 0.7). Lower values find more faces in profile and in
+  the background, and more things that are not faces (toys, statues,
+  wheels); each face keeps its score and a quality (0 to 1, from its
+  score, size, sharpness and how much it faces the camera), so what uses
+  the faces can choose the good ones.
+- `min_size` - the smallest face kept (its box's short side, 8 to 400
+  pixels of the picture looked at, default 20).
+- `max_faces` - at most this many faces per picture, the surest first (1
+  to 500, default 64).
+- `match` - how alike faces must be to be one person (0.2 to 0.9,
+  default 0.4): the faces are grouped by average linkage, two groups
+  becoming one while the cosine of their faces' vectors, on average over
+  every pair, is at least this; a face of lower quality joins the person
+  whose faces it is most like when it is that alike (0.1 more alike for
+  a person of fewer than 6 faces in its group: an average over a few
+  faces is unsure), and that person has no other face in its picture.
+  Two faces of one picture are never grouped together. Higher values mix
+  up fewer people (relatives, babies) and split one person (sunglasses,
+  profiles, different ages) into more groups. The recogniser's own
+  threshold for "the same person" is about 0.36.
+- `group_quality` - the faces of at least this quality (0 to 1, default
+  0.25) are grouped; the others (small, blurred, turned away) only join a
+  person afterwards.
+- `min_faces` - a group of at least this many faces (1 to 100, default 3)
+  is a person, when they are in pictures of at least two different
+  moments: pictures whose dHashes are at most 10 bits apart (copies of one
+  shot) or that were taken within 2 seconds of each other (a burst) are
+  one moment, so a burst or copies of one shot are nobody on their own.
+  Smaller groups stay among the other faces (a person you named stays a
+  person whatever its size).
+- `visitors` - `true` (with `enabled` true) shows people to others who
+  use the search pages from another computer (`serve.py --host`): the
+  People page (named people that are not hidden, and their faces), the
+  names in the viewer, `person:` and the smart albums that search for a
+  person; never the boxes of the faces, unnamed or hidden people, or
+  anything of hidden pictures. Default `false`: people are this
+  computer's only (smart albums with `person:` are not listed for
+  others).
+
+Changing `match`, `group_quality` or `min_faces` takes effect with the next
+grouping: **Group faces again** on the People page (or the next run that
+finds faces). What you said about people (names, merges, moved faces,
+"not this person", hidden people, "not a face") is kept.
+
+`python people.py --check` starts the helper, loads the models and looks
+for a face drawn by the program; it says what is wrong when that fails.
+
+## local_times
+
+Pictures whose camera's clock was not the local time of where they were
+taken -- a dashcam that ignores daylight saving, a phone on the time of
+the airport it left, a camera on home time abroad -- get the local time
+of their place, with that place's UTC offset (see README, "Times in the
+local time of the place"), when the moment they were taken is known for
+sure: by a video's GPS track, by the GPS time or GPS date saved with the
+picture, or by a picture of the same camera taken within 3 hours that has
+one of those (and whose clock can be this one's; a picture without a
+position takes its time zone only within `place_estimates`'
+`window_minutes`). The time zone of a place is the nearest town's in the
+place names (`data/places/places.db`, built again from the downloaded
+files when it has none), its offset at that moment comes from Python's
+time zone database (the `tzdata` package where the system has none, as on
+Windows). Without the place names or the time zone database nothing
+changes. The camera's own clock is kept beside the local time and shown
+in the picture's details. Worked out again after every scan, **Build
+previews** and **Add place names**, before an export with the location,
+and when you use or ignore a picture's position or set its place in the
+viewer. Optional:
+
+```
+"local_times": {
+    "enabled": true
+}
+```
+
+- `enabled` - `false` gives every picture its camera's time back at the
+  next scan (or **Build previews**, or **Add place names**), and keeps it
+  so; `true` again works the local times out again.
+
+`"local_times": false` means the same as `{"enabled": false}`.
+`python local_times.py --list` shows what a scan would give each picture,
+changing nothing.
+
+## raw
+
+Camera RAW files (`.dng`, `.arw`, `.cr2`, `.cr3`, `.nef`, `.nrw`, `.orf`,
+`.rw2`, `.raf`, `.pef`, `.srw`; see README, "RAW photos"). A RAW file with
+a picture of the same shot beside it (the same name in its folder, else
+the one picture of the same camera taken in the same second) is that
+picture's RAW original: shown in its details, downloadable on this
+computer, and the source of the EXIF facts the picture lacks. One without
+is indexed by the largest preview the camera stored in it. Optional:
+
+```
+"raw": {
+    "enabled": true,
+    "index_alone": true
+}
+```
+
+- `enabled` - `false` leaves RAW files out: they are not listed, the next
+  scan takes them away from their pictures (which keep only their own
+  EXIF) and marks the RAW files indexed on their own missing (they come
+  back, with their descriptions, when it is `true` again within
+  `purge_after_days`).
+- `index_alone` - `false` still pairs RAW files with their pictures, but
+  no longer indexes a RAW file without one (those indexed before are
+  marked missing).
+
+`"raw": false` means the same as `{"enabled": false}`. An export publishes
+RAW files only with its `raw_files` option (see `export` under
+`libraries`).
+
 ## libraries
 
 A list of folders to scan. Each library is one object:
@@ -958,8 +1218,11 @@ A list of folders to scan. Each library is one object:
 - `previews` - `true` (the default) keeps a 2048 px preview of every image
   in the data folder, used by the detail page and for describing, and for
   larger 360-degree photos also a panorama up to 4096 px wide for the 360
-  view. They take about 0.5 MB per picture (about 50 GB per 100,000). With
-  `false` they are made from the original each time they are shown.
+  view, and for wide photos (panoramas at least 2.2 times as wide as they
+  are tall, taller than their preview) a picture 1600 px tall for the
+  viewer's pan view on phones. They take about 0.5 MB per picture (about
+  50 GB per 100,000). With `false` they are made from the original each
+  time they are shown.
 - `newest_first` - describe the most recently taken images first (default
   `true`).
 - `endpoint` - the endpoint (or group) that describes this library's
@@ -1077,6 +1340,15 @@ A list of folders to scan. Each library is one object:
     videos you publish.
   - `max_video_mb` - videos larger than this many megabytes (default 200)
     are published as their poster only.
+  - `raw_files` - `true` also publishes the camera RAW file of each
+    published picture that has one (see `raw`), as the camera wrote it,
+    in `raws/` (default `false`: RAW files never go out). Nothing can be
+    taken out of a RAW file, so it carries every fact the camera wrote in
+    it (the time to the second, the camera's serial number); one that
+    holds a GPS position goes only with `location`, and only when its
+    picture's own position goes (not one set aside; in a trip's export,
+    neither that position nor the RAW file's own in the area around home,
+    `home_km`).
   - `looks` - `true` (the default) publishes the look vectors of the
     published pictures (about 350 bytes each, in `data/looks-NNN.js`), so
     "Looks like this" works in the site too; nothing goes when no
@@ -1129,6 +1401,10 @@ A list of folders to scan. Each library is one object:
     `file:`, `place:` or `has:gps` (or the Place filter) while
     `folders`, `file_names` or `location` is off, one with `lib:`, and one
     that looks for pictures like one that is not published.
+  - `people_names` - `true` also publishes the names of the people in the
+    pictures (People: named people who are not hidden), as tags of the
+    pictures they are in; default `false`. Faces, their boxes and
+    anything else of People are never published.
 
 A library removed from the file is not deleted from the database: its images
 stay there, unused, until you delete them or attach them to a library again

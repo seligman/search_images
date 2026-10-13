@@ -826,7 +826,7 @@ def reattach_orphan(conn, orphan_id, library_id, config, previews=None):
 
 def delete_library_data(conn, library_id, ctx=None, chunk=500):
     """Delete every row, thumbnail, preview and meaning vector of a library id (and its
-    read failures), and the looks (looks.py) no other row needs.
+    read failures), and the looks (looks.py) and faces (people.py) no other row needs.
 
     The playable copies of its videos (videos.py) go too, and so do its
     drives' descriptions and sped-up previews (drives.py).
@@ -857,6 +857,8 @@ def delete_library_data(conn, library_id, ctx=None, chunk=500):
                 ctx.step(len(part))
     import looks
     looks.forget_unreferenced(conn)     # (the looks of pictures no row has any more)
+    import people
+    people.forget_unreferenced(conn)    # (and their faces)
     result["previews_removed"] = cache.PreviewStore().delete_library(library_id)
     videos.delete_library_proxies(library_id)
     drives.forget_library(library_id)

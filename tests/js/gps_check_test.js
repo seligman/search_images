@@ -388,6 +388,47 @@ test("an answer that comes after the pane moved on does not draw over it", funct
     });
 });
 
+test("a position ignored takes its local time with it (local_times.after_check)", function () {
+    var page = serverPage(true);
+    var drawn = null;
+    var rec = null;
+    page.log.location = function () {
+        // (Its time is the camera's again; another picture's too.)
+        return response(200, {id: 1, record: {gx: 1, dk: "2021-03-04",
+                                              ts: "2021-03-04T08:00:10"},
+                              time: {taken_at: "2021-03-04T08:00:10", tz_offset: "",
+                                     clock: null},
+                              copies: 0, more: 0,
+                              location_check: {ignored: true, reason: "", choice: "ignore",
+                                               place: "Coralport", estimated: false},
+                              others: {"2": {gx: 1, dk: "2021-03-03",
+                                             ts: "2021-03-03T23:50:00"}}});
+    };
+    return loaded(page).then(function () {
+        rec = page.data.records[0];
+        rec.ts = "2021-03-04T15:00:10";
+        drawn = pane(page, rec, {id: 1, taken_at: "2021-03-04T15:00:10", tz_offset: "+09:00",
+                                 clock: {taken_at: "2021-03-04T08:00:10", tz_offset: "",
+                                         kind: "gps", zone: "Asia/Tokyo"},
+                                 location_check: {ignored: false, reason: "", choice: "",
+                                                  place: "", estimated: false}});
+        assert.ok(/Camera clock/.test(drawn.box.textContent), drawn.box.textContent);
+        button(drawn.box, "Ignore location").click();
+        return waitFor(function () {
+            return drawn.state.edited === 1;
+        });
+    }).then(function () {
+        assert.strictEqual(rec.ts, "2021-03-04T08:00:10");
+        assert.strictEqual(rec.gp, undefined);
+        assert.strictEqual(page.data.records[1].dk, "2021-03-03");
+        assert.strictEqual(page.data.records[1].ts, "2021-03-03T23:50:00");
+        assert.strictEqual(drawn.state.detail.taken_at, "2021-03-04T08:00:10");
+        assert.strictEqual(drawn.state.detail.clock, null);
+        assert.ok(!/Camera clock/.test(drawn.box.textContent), drawn.box.textContent);
+        return settle(5);
+    });
+});
+
 test("the Manage page counts the positions set aside in every state", function () {
     var page = serverPage(true);
     page.log.places = {available: true, cities: 3, built: null, rebuild: false, error: "",

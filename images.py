@@ -18,7 +18,12 @@ blended at the seams, a tripod under a soft fill at the bottom; the
 frames of Insta360 360-degree videos too, see videos.py), and
 front_view() cuts a natural looking picture from a panorama for the
 thumbnail. read_image(want_pano=True) also makes a larger panorama of a
-360 photo (PANO_EDGE wide) for the interactive 360 view.
+360 photo (PANO_EDGE wide) for the interactive 360 view, and a taller
+picture of a wide flat panorama (wide_pano_size) for the viewer's pan view.
+
+A camera RAW file (.dng, .arw, ...; raw_photos.py) is read by the largest
+JPEG preview it holds, turned upright by the RAW file's orientation, with
+the EXIF facts of the RAW file itself: there is no RAW decoder here.
 
 The EXIF helpers (sanitize_exif, parse_capture_date, exif_gps_to_decimal,
 camera_name, exif_metadata), sniff_mime() and the colour profile scrubbing
@@ -32,6 +37,7 @@ import io
 import itertools
 import math
 import os
+import struct
 import threading
 
 try:
@@ -45,6 +51,7 @@ except ImportError:
 import common
 import imageinfo
 import insta360
+import raw_photos
 from imageinfo import (
     AVIF_BRANDS, HEIF_BRANDS, exif_metadata, parse_capture_date, sanitize_exif, sniff_mime,
 )
@@ -63,6 +70,19 @@ PREVIEW_QUALITY = 85
 # show a picture wider than 4096 px in the 360 view.
 PANO_EDGE = 4096
 PANO_QUALITY = 85
+# A wide picture (a flat panorama, at least WIDE_ASPECT times as wide as it
+# is tall) opens in the viewer zoomed to fill the height of a screen much
+# narrower than itself, such as an upright phone's, and is panned sideways
+# (viewer.js, the same WIDE_ASPECT). Its 2048 px wide preview would then be
+# stretched two to four times: such a picture also gets a pano
+# WIDE_PANO_HEIGHT tall (about the pixels of an upright phone's screen;
+# never upscaled; at most WIDE_PANO_MAX_WIDTH wide, a size browsers show)
+# when that is at least WIDE_PANO_GAIN times taller than its preview (see
+# wide_pano_size).
+WIDE_ASPECT = 2.2
+WIDE_PANO_HEIGHT = 1600
+WIDE_PANO_MAX_WIDTH = 16384
+WIDE_PANO_GAIN = 1.25
 BROWSER_QUALITY = 90      # full-size JPEGs made for formats browsers cannot show
 # At most this many pixels (summed over all threads) are decoded at full size
 # at the same time. Decoding takes several bytes per pixel, so this bounds the
@@ -209,6 +229,8 @@ STITCH_VERSION = 3
 
 HEIF_MISSING = ("HEIC/HEIF images need pillow-heif; install it with: "
                 "python -m pip install pillow-heif")
+RAW_NO_PREVIEW = ("this RAW file holds no preview picture to show it by (only a RAW "
+                  "converter can make one)")
 AVIF_MISSING = ("AVIF images need a Pillow with AVIF support; upgrade it with: "
                 "python -m pip install --upgrade Pillow")
 
@@ -349,6 +371,8 @@ def _open_image(data, formats=None):
     """
     if not data:
         raise ImageReadError("file is empty")
+    if formats is None and raw_photos.maybe_raw(data[:16]) and raw_photos.is_raw_data(data):
+        return _open_raw(data)
     major, _ = imageinfo.ftyp_brands(data)
     heif = major in HEIF_BRANDS
     if heif:
@@ -378,10 +402,52 @@ def _open_image(data, formats=None):
                              % _error_text(error)) from error
 
 
+# The attribute of an opened image (_open_raw) that holds the raw_photos.RawInfo of
+# the RAW file it is the preview of. Not in image.info, which Pillow fills from the
+# file itself (a PNG's text chunks, say).
+_RAW_ATTRIBUTE = "_search_images_raw"
+
+
+def _open_raw(data):
+    """The largest JPEG preview of a camera RAW file's bytes, opened (raw_photos).
+
+    The image holds the raw_photos.RawInfo (raw_info), whose orientation
+    turns it upright when the RAW file says which way is up (see
+    _orientation_method). Raises ImageReadError when the file cannot be read
+    or holds no preview.
+    """
+    try:
+        info = raw_photos.read(data)
+    except (raw_photos.RawError, ValueError, struct.error) as error:
+        raise ImageReadError("cannot read this RAW file (%s)" % _error_text(error)) from error
+    preview = raw_photos.preview_jpeg(data, info)
+    if not preview:
+        raise ImageReadError(RAW_NO_PREVIEW)
+    image = _open_image(preview, formats=("JPEG", "MPO"))
+    setattr(image, _RAW_ATTRIBUTE, info)
+    return image
+
+
+def raw_info(image):
+    """The raw_photos.RawInfo of an image opened from a RAW file (_open_raw), or None."""
+    found = getattr(image, _RAW_ATTRIBUTE, None)
+    return found if isinstance(found, raw_photos.RawInfo) else None
+
+
 def _orientation_method(image):
-    """The transpose that makes this image upright, or None."""
+    """The transpose that makes this image upright, or None.
+
+    A RAW file's preview (_open_raw) goes by the RAW file's orientation
+    unless it carries one of its own.
+    """
     try:
         value = image.getexif().get(_ORIENTATION_TAG)
+    except Exception:
+        value = None
+    if value is None:
+        raw = raw_info(image)
+        value = raw.orientation if raw is not None else None
+    try:
         return _ORIENTATION_METHODS.get(int(value))
     except Exception:
         return None
@@ -394,6 +460,53 @@ def has_pano(width, height):
     is already the whole picture.
     """
     return max(int(width or 0), int(height or 0)) > PREVIEW_EDGE
+
+
+def is_wide(width, height):
+    """True for a wide picture: at least WIDE_ASPECT times as wide as it is tall."""
+    try:
+        width, height = float(width or 0), float(height or 0)
+    except (TypeError, ValueError):
+        return False
+    return width > 0 and height > 0 and width >= WIDE_ASPECT * height - 1e-9
+
+
+def wide_pano_size(width, height):
+    """(width, height) of the pano of a wide flat picture of this (displayed) size, or None.
+
+    WIDE_PANO_HEIGHT tall (never upscaled), at most WIDE_PANO_MAX_WIDTH wide;
+    None for a picture that is not wide (is_wide), or whose pano would not be
+    at least WIDE_PANO_GAIN times taller than its preview (which then shows
+    as much). Only for flat pictures: a 360-degree photo's pano is has_pano's.
+    """
+    if not is_wide(width, height):
+        return None
+    width, height = int(width), int(height)
+    preview_height = _fit_size((width, height), PREVIEW_EDGE)[1]
+    pano_height = min(height, int(WIDE_PANO_HEIGHT))
+    pano_width = max(1, int(round(width * float(pano_height) / height)))
+    if pano_width > WIDE_PANO_MAX_WIDTH:
+        pano_width = int(WIDE_PANO_MAX_WIDTH)
+        pano_height = max(1, int(round(height * float(pano_width) / width)))
+    if pano_height < preview_height * WIDE_PANO_GAIN:
+        return None
+    return (pano_width, pano_height)
+
+
+def gets_pano(width, height, projection="", media="image"):
+    """True if a picture with these index facts gets a pano (cache.PreviewStore).
+
+    A 360-degree photo larger than its preview (has_pano) and a wide flat
+    photo (wide_pano_size) do; videos never do (they play), nor does a
+    picture not looked at for 360 yet (projection "?").
+    """
+    if media == "video":
+        return False
+    if projection in PROJECTIONS_360:
+        return has_pano(width, height)
+    if projection:
+        return False
+    return wide_pano_size(width, height) is not None
 
 
 def _fit_size(size, edge):
@@ -1621,6 +1734,10 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
         dhash           16 hex chars (see compute_dhash)
         content_hash    sha1 hex of the original bytes
         mime            sniffed from the content, not the extension
+                        (raw_photos.MIME_TYPE for a camera RAW file: then
+                        the picture is its largest preview, upright, and
+                        exif the RAW file's, with "raw": its
+                        raw_photos.alone_record)
         taken_at, taken_source, tz_offset, camera, lat, lon
                         see exif_metadata()
         projection      "" for an ordinary photo, "equirectangular" or
@@ -1637,7 +1754,10 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
                         None. A dual-fisheye frame is then decoded
                         at full size and stitched at that width (the
                         preview is that panorama made smaller), so the
-                        pano holds the detail of the original.
+                        pano holds the detail of the original. For a wide
+                        flat photo (wide_pano_size) when want_pano is set:
+                        JPEG bytes of the picture at that size, for the
+                        viewer's pan view.
     mtime (the file's modification time) is only used when neither EXIF nor
     the file name gives a capture date; when omitted it is looked up.
     Raises ImageReadError (SourceReadError for I/O errors) when the file
@@ -1650,9 +1770,17 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
     working_edge = max(int(preview_edge), THUMB_SIZE)
     try:
         with image:
-            mime = _image_mime(image, data)
-            exif = extract_exif(image)
-            xmp = _image_xmp(image, data)
+            raw = raw_info(image)
+            if raw is not None:
+                # A RAW file shown by its preview: its own EXIF facts.
+                raw.format = raw_photos.format_of(name) or raw.format
+                mime = raw_photos.MIME_TYPE
+                exif = raw_photos.exif_dict(raw)
+                xmp = b""
+            else:
+                mime = _image_mime(image, data)
+                exif = extract_exif(image)
+                xmp = _image_xmp(image, data)
             maybe_360 = _may_be_360(image, exif, xmp, name)
             # A possible 360 photo is decoded large enough for its pano.
             pano_edge = int(PANO_EDGE) if want_pano and maybe_360 else 0
@@ -1661,7 +1789,14 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
             # stretched over the whole panorama.
             maybe_dual = maybe_360 and _is_unstitched_original(exif, name)
             decode_edge = _fisheye_source_edge(stitch_edge) if maybe_dual else stitch_edge
-            with _decoded(image, lambda w, h: _fit_size((w, h), decode_edge),
+
+            def decode_size(w, h):
+                # (A wide flat photo: large enough for its pano. A 360 photo
+                # is never wide.)
+                wide = wide_pano_size(w, h) if want_pano else None
+                return _fit_size((w, h), max(decode_edge, max(wide) if wide else 0))
+
+            with _decoded(image, decode_size,
                           resize=not maybe_dual) as (working, (width, height), icc):
                 projection = detect_projection(working, exif, xmp, name) if maybe_360 else ""
                 if projection == PROJECTION_DUAL_FISHEYE:
@@ -1675,6 +1810,12 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
                     pano_image = working
                     if pano_image.size != pano_size:
                         pano_image = working.resize(pano_size, _LANCZOS, reducing_gap=2.0)
+                    pano = _encode_jpeg(pano_image, PANO_QUALITY, icc)
+                wide = wide_pano_size(width, height) if want_pano and not projection else None
+                if wide:
+                    pano_image = working
+                    if pano_image.size != wide:
+                        pano_image = working.resize(wide, _LANCZOS, reducing_gap=2.0)
                     pano = _encode_jpeg(pano_image, PANO_QUALITY, icc)
                 working_size = _fit_size((width, height), working_edge)
                 if working.size != working_size:
@@ -1707,6 +1848,9 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
                              % _error_text(error)) from error
 
     meta = exif_metadata(exif, name, mtime)
+    if raw is not None:
+        # (The facts of the RAW file indexed on its own, see raw_photos.view.)
+        exif["raw"] = raw_photos.alone_record(raw, (width, height))
     if not meta["taken_source"] and mtime is None:
         meta.update(zip(("taken_at", "taken_source", "tz_offset"),
                         parse_capture_date(exif, name, _source_mtime(path, helper))))

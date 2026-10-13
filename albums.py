@@ -492,7 +492,23 @@ def smart_in_libraries(options, library_ids):
     return not chosen or any(item in library_ids for item in chosen)
 
 
-def index_albums(conn, library_ids, include_hidden=True):
+def people_searches_shown(config, include_hidden):
+    """True when the /api/index answer lists the smart albums that search for a person
+    (person:, People): for the admin (include_hidden), and for others only while
+    config.json's "people" shows them people ("enabled" and "visitors" both true, as
+    people_groups.may_see has it). A person's name is in such a search."""
+    if include_hidden:
+        return True
+    raw = config.get("people") if isinstance(config, dict) else None
+    return isinstance(raw, dict) and raw.get("enabled") is True and raw.get("visitors") is True
+
+
+def searches_person(query):
+    """True when a search (a smart album's) has a person: term."""
+    return any(term["field"] == "person" for term in query_terms(query))
+
+
+def index_albums(conn, library_ids, include_hidden=True, person_searches=True):
     """The albums as the /api/index answer lists them, by name.
 
     [{id, name, kind, cover, items (manual: the ids of its present pictures
@@ -502,6 +518,8 @@ def index_albums(conn, library_ids, include_hidden=True):
     Without include_hidden (anyone but the admin) an album is listed only
     when it can show something there: a manual album with a picture in the
     answer, a smart album not limited to other (say disabled) libraries.
+    Without person_searches (see people_searches_shown) the smart albums
+    whose search names a person (person:) are left out.
     """
     library_ids = list(library_ids)
     rows = conn.execute("SELECT %s FROM albums" % _ALBUM_COLUMNS).fetchall()
@@ -539,6 +557,8 @@ def index_albums(conn, library_ids, include_hidden=True):
             album["options"] = _options_of(row["options"])
             if not include_hidden and not smart_in_libraries(album["options"], library_ids):
                 continue
+            if not person_searches and searches_person(row["query"]):
+                continue        # (a person's name: People is not shown here)
         result.append(album)
     return result
 
@@ -803,6 +823,7 @@ FIELD_NAMES = {
     "is": "is", "place": "place", "places": "place", "on": "on", "similar": "similar",
     "like": "similar", "look": "look", "looks": "look", "rating": "rating",
     "rated": "rating", "stars": "rating", "album": "album", "albums": "album",
+    "person": "person",
 }
 QUOTE_CHARS = "\"\u201c\u201d\u201e"
 _FIELD_TERM_RE = re.compile(r"([A-Za-z]{1,12}):")

@@ -62,6 +62,18 @@
    VIEWER.Stage(box, options)  a zoomable picture (wheel, pinch,
        double-click, drag) or, for 360-degree photos, an interactive
        panorama (WebGL; the flat picture when WebGL is not available).
+       A wide picture (format.isWide: a flat panorama) with a preview, on
+       a stage much narrower than itself (an upright phone; a landscape
+       stage only when it has the pixels, format.panFill) opens in its pan
+       view: zoomed to fill the stage's height at its middle (the zoom
+       going by its most detailed picture to come), panned by a drag
+       (or a sideways scroll), with a minimap at the foot of the stage that
+       frames the part in view (a tap or a drag there moves the view; the
+       arrow keys when it has the focus); a double tap (or zooming out)
+       shows it whole, and back. A swipe that pushes on beyond the end the
+       pan has reached changes picture (format.panSwipe); its larger
+       picture (urls.pano, see SITE.panoUrl) replaces the preview once it
+       is zoomed in.
        options: onSwipe(direction) (a sideways swipe changes picture),
        onState(state), scrollPage (the stage is part of a page that
        scrolls: the wheel scrolls it unless Ctrl is held or the picture
@@ -108,6 +120,12 @@
        resets a view that was zoomed or turned) and the albums of the
        picture with "Add to album..." (A) -- the admin's to change
        (context.onMarked(ids) is told), shown to others when set.
+       People (the full record's people, see people_groups.picture_view):
+       the names of the people in it, each searching person:"Name"; the
+       admin's pane also has "Show faces", which draws the boxes of its
+       faces over the picture (a layer of its own over context.stage's
+       picture, following its place and zoom; each box names its person and
+       opens it on the People page), kept on for the next pictures.
    VIEWER.marks: favorite(ids, on, get), rate(ids, stars, get) (each
        resolves when the server has them; the records are changed in
        place), picker({ids, get, albums, mode ("add" or "remove"),
@@ -187,6 +205,45 @@ var VIEWER = (function () {
         return out;
     }
 
+    // Why a picture's time is the local time of its place (local_times.py:
+    // detail.clock.kind).
+    var CLOCK_REASONS = {
+        track: "by the video's GPS track",
+        gps: "by its GPS time",
+        gps_date: "by its GPS date",
+        like: "as for another picture from the same camera"
+    };
+
+    // What a picture's camera clock said when its time (taken) is the local
+    // time of its place (clock: detail.clock, see local_times.py): "Camera
+    // clock 08:11 (UTC+01:00); shown in the local time of its place
+    // (Europe/Paris), by the video's GPS track." -- with the date when
+    // the clock was on another day, and "the UTC offset is its place's" when
+    // only the offset changed. "" without a clock.
+    function clockText(taken, clock) {
+        var date = clock && typeof clock === "object" ? parseDate(clock.taken_at) : null;
+        if (!date || date.hour === null) {
+            return "";
+        }
+        var shown = parseDate(taken);
+        var sameDay = Boolean(shown) && shown.year === date.year &&
+            shown.month === date.month && shown.day === date.day;
+        var text = "Camera clock " + (sameDay ? "" : shortDate(clock.taken_at) + " at ") +
+            two(date.hour) + ":" + two(date.minute);
+        var offset = typeof clock.tz_offset === "string" ? clock.tz_offset : "";
+        if (/^[+-][0-9]{2}:[0-9]{2}$/.test(offset)) {
+            text += " (UTC" + offset + ")";
+        }
+        var moved = !sameDay || shown.hour !== date.hour || shown.minute !== date.minute;
+        text += moved ? "; shown in the local time of its place" :
+            "; the UTC offset is its place's";
+        if (typeof clock.zone === "string" && /^[A-Za-z][\w+\-\/]*$/.test(clock.zone)) {
+            text += " (" + clock.zone.replace(/_/g, " ") + ")";
+        }
+        var reason = CLOCK_REASONS[clock.kind];
+        return text + (reason ? ", " + reason : "") + ".";
+    }
+
     function number(value) {
         return typeof value === "number" && isFinite(value) ? value : null;
     }
@@ -241,6 +298,40 @@ var VIEWER = (function () {
             unit += 1;
         }
         return (unit === 0 ? String(bytes) : bytes.toFixed(bytes < 10 ? 1 : 0)) + " " + units[unit];
+    }
+
+    // A picture's camera RAW file (detail.raw: see raw_photos.view on the
+    // server, export.raw_detail in a published site), in words: its RAW
+    // original, "DSC01234.ARW (24 MB)" (", the same camera and second" when
+    // it was paired by camera and time; without a name when the site leaves
+    // file names out: "ARW file (16 MB)"), or, for a picture that is a RAW
+    // file, how it is shown: "ARW file, shown by the camera's preview in it;
+    // the RAW file holds 6000 x 4000" (its sensor data, which only a RAW
+    // converter shows). "" without one.
+    function rawText(raw) {
+        if (!raw || typeof raw !== "object") {
+            return "";
+        }
+        var kind = typeof raw.format === "string" && /^[A-Z0-9]{2,5}$/.test(raw.format)
+            ? raw.format + " file" : "RAW file";
+        if (raw.how === "alone") {
+            var sensor = Array.isArray(raw.sensor) && raw.sensor.length === 2 &&
+                number(raw.sensor[0]) && number(raw.sensor[1])
+                ? "; the RAW file holds " + raw.sensor[0] + " \u00d7 " + raw.sensor[1] : "";
+            return kind + ", shown by the camera's preview in it" + sensor;
+        }
+        var size = fileSize(raw.size);
+        var text = (typeof raw.name === "string" && raw.name ? raw.name : kind) +
+            (size ? " (" + size + ")" : "");
+        return raw.how === "time" ? text + ", the same camera and second" : text;
+    }
+
+    // Where a picture's RAW file can be downloaded (detail.raw.url): the
+    // server's /raw/<id> (for the owner), or a published site's
+    // raws/<id>.<ext>; "" for anything else.
+    function rawUrl(raw) {
+        var url = raw && typeof raw === "object" && typeof raw.url === "string" ? raw.url : "";
+        return /^\/raw\/[0-9]+$/.test(url) || /^raws\/[a-z0-9]+\.[a-z0-9]+$/.test(url) ? url : "";
     }
 
     // The length of a video: "0:24", "12:05", "1:02:03" ("" when unknown):
@@ -474,6 +565,150 @@ var VIEWER = (function () {
         var turn = Math.abs(a.yaw - b.yaw) % (2 * Math.PI);
         return Math.min(turn, 2 * Math.PI - turn) < 1e-3 && Math.abs(a.pitch - b.pitch) < 1e-3 &&
             Math.abs(a.fov - b.fov) < 1e-3;
+    }
+
+    /* ---------- Wide pictures (pure helpers) ----------------------------- */
+
+    /* A wide picture (a flat panorama: at least WIDE_ASPECT times as wide
+       as it is tall, images.WIDE_ASPECT) opens in its pan view -- zoomed
+       so that it fills the stage's height, at its middle (Stage.layout) --
+       where shown whole it would be a thin strip: less than PAN_HEIGHT px
+       tall, on a stage at least PAN_RATIO times narrower than the picture
+       (an upright phone's). The numbers were chosen by looking at phone
+       and desktop screenshots of real panoramas: below WIDE_ASPECT (2:1
+       photos, short panoramas) the whole picture across an upright phone
+       was the better view; a desktop window, or a phone held sideways,
+       shows even a 4:1 panorama whole well enough (only far wider ones
+       pan there). The middle was a better first view than the most
+       detailed part of the picture (often a bush or a wall at one end). */
+    var WIDE_ASPECT = 2.2;
+    var PAN_RATIO = 2.5;
+    var PAN_HEIGHT = 200;
+    // On a stage wider than it is tall (a desktop window, a phone held
+    // sideways) the whole picture is a wide strip already: the pan view
+    // opens there only when the picture has the pixels to fill the stage's
+    // height, magnified at most this much (else the sharp strip is better).
+    var PAN_UPSCALE = 1.5;
+    // A sideways swipe longer than this (px) changes picture.
+    var SWIPE_DISTANCE = 60;
+    // A drag on a wide picture that begins this near an end of it (px) begins
+    // at that end (what is left is too little to see: see panSwipe).
+    var PAN_END_SLACK = 24;
+
+    // Is rec a wide flat picture (a photo; not a video, not a 360 photo)?
+    function isWide(rec) {
+        return Boolean(rec && typeof rec === "object" && !rec.mv && rec.p !== "360" &&
+                       rec.w > 0 && rec.hgt > 0 && rec.w >= WIDE_ASPECT * rec.hgt - 1e-9);
+    }
+
+    /* The zoom at which a wide picture, fitted whole into a stage of
+       stageWidth x stageHeight as width x height (px), fills the stage's
+       height when it opens in its pan view there (see WIDE_ASPECT; isWide
+       says which pictures are wide, their preview's shape may be a hair
+       narrower); 0 when it is shown whole. pixelsHigh: how many pixels
+       high the most detailed picture of it is (optional; see PAN_UPSCALE). */
+    function panFill(width, height, stageWidth, stageHeight, pixelsHigh) {
+        if (!(width > 0 && height > 0 && stageWidth > 0 && stageHeight > 0)) {
+            return 0;
+        }
+        var aspect = width / height;
+        if (aspect < 0.99 * WIDE_ASPECT || aspect < PAN_RATIO * stageWidth / stageHeight ||
+                height >= PAN_HEIGHT) {
+            return 0;
+        }
+        if (stageWidth > stageHeight && pixelsHigh > 0 &&
+                pixelsHigh * PAN_UPSCALE < stageHeight) {
+            return 0;
+        }
+        return stageHeight / height;
+    }
+
+    /* The size ({w, h}) of the most detailed picture of a wide record the
+       stage will show: its larger picture when one comes (pano: its
+       address; SITE.widePanoSize), else its preview (SITE.previewSize).
+       Without the site's helpers, the record's own size. */
+    function detailSize(rec, pano) {
+        var site = typeof window !== "undefined" ? window.SITE : null;
+        var found = null;
+        if (site && pano && site.widePanoSize) {
+            found = site.widePanoSize(rec.w, rec.hgt);
+        } else if (site && !pano && site.previewSize) {
+            found = site.previewSize(rec);
+        }
+        if (!found || !(found[0] > 0 && found[1] > 0)) {
+            found = [rec.w || 0, rec.hgt || 0];
+        }
+        return {w: found[0], h: found[1]};
+    }
+
+    /* Where the left edge of a picture shownWidth wide goes (tx) on a stage
+       stageWidth wide for its point centre (0: its left edge, 1: its right
+       edge) to be in the middle, with no gap at either side; centred when
+       it is no wider than the stage. */
+    function panOffset(centre, shownWidth, stageWidth) {
+        if (shownWidth <= stageWidth) {
+            return (stageWidth - shownWidth) / 2;
+        }
+        return clamp(stageWidth / 2 - centre * shownWidth, stageWidth - shownWidth, 0);
+    }
+
+    // The point of the picture in the middle of the stage (panOffset the other way).
+    function panCentre(tx, shownWidth, stageWidth) {
+        if (shownWidth <= stageWidth) {
+            return 0.5;
+        }
+        return clamp((stageWidth / 2 - tx) / shownWidth, 0, 1);
+    }
+
+    // How far along a picture wider than the stage the view is: 0 at its
+    // left end, 1 at its right end.
+    function panAlong(tx, shownWidth, stageWidth) {
+        if (shownWidth <= stageWidth) {
+            return 0.5;
+        }
+        return clamp(-tx / (shownWidth - stageWidth), 0, 1) || 0;     // (never -0)
+    }
+
+    /* The part of a picture shownWidth x shownHeight at (tx, ty) that a
+       stage shows, as fractions of the picture: {left, width, top,
+       height} (the minimap's frame). */
+    function panWindow(tx, ty, shownWidth, shownHeight, stageWidth, stageHeight) {
+        var left = clamp(-tx / shownWidth, 0, 1) || 0;                // (never -0)
+        var top = clamp(-ty / shownHeight, 0, 1) || 0;
+        return {left: left, width: clamp(stageWidth / shownWidth, 0, 1 - left),
+                top: top, height: clamp(stageHeight / shownHeight, 0, 1 - top)};
+    }
+
+    /* The end of a picture wider than the stage that the view has reached
+       (within slack px, default half a pixel): -1 its left end (nothing
+       more to the left), 1 its right end, 0 neither (or it is no wider
+       than the stage). */
+    function panEnd(tx, shownWidth, stageWidth, slack) {
+        slack = slack === undefined ? 0.5 : slack;
+        if (shownWidth <= stageWidth + 1) {
+            return 0;
+        }
+        if (tx >= -slack) {
+            return -1;
+        }
+        return tx <= stageWidth - shownWidth + slack ? 1 : 0;
+    }
+
+    /* Does a drag on a wide picture change picture? It does when it began
+       with the view at an end of the picture (or within PAN_END_SLACK px of
+       it: end, see panEnd) and pushed
+       on beyond that end by more than SWIPE_DISTANCE (push px; dy: how far
+       it went up or down), mostly sideways: a swipe once the pan has
+       reached the end. 1: the next picture (a swipe to the left at the
+       right end), -1: the previous one, 0: it only panned. */
+    function panSwipe(end, push, dy) {
+        if (!end || Math.abs(push) <= SWIPE_DISTANCE || Math.abs(push) <= 1.5 * Math.abs(dy)) {
+            return 0;
+        }
+        if (end === 1 && push < 0) {
+            return 1;
+        }
+        return end === -1 && push > 0 ? -1 : 0;
     }
 
     /* The uniforms of the 360 video shader for a record's lens geometry
@@ -837,7 +1072,7 @@ var VIEWER = (function () {
         }).join(", ");
     }
 
-    /* "Kahului, Hawaii, United States (3 km)": the place of a record (its
+    /* "Albufeira, Algarve, Portugal (3 km)": the place of a record (its
        town, when one is near, with how far it is), or "". A place only
        estimated (pe: the picture has no usable position of its own, see
        place_estimates.py) says where it comes from (ps); the owner's own
@@ -895,8 +1130,11 @@ var VIEWER = (function () {
         monthLabel: monthLabel,
         shortDate: shortDate,
         longDate: longDate,
+        clockText: clockText,
         exposureParts: exposureParts,
         fileSize: fileSize,
+        rawText: rawText,
+        rawUrl: rawUrl,
         durationText: durationText,
         codecName: codecName,
         canPlayVideo: canPlayVideo,
@@ -916,8 +1154,20 @@ var VIEWER = (function () {
         levelUp: levelUp,
         levelInverted: levelInverted,
         levelMatrix: levelMatrix,
+        isWide: isWide,
+        panFill: panFill,
+        panOffset: panOffset,
+        panCentre: panCentre,
+        panAlong: panAlong,
+        panWindow: panWindow,
+        panEnd: panEnd,
+        panSwipe: panSwipe,
         MIN_FOV: MIN_FOV,
-        MAX_FOV: MAX_FOV
+        MAX_FOV: MAX_FOV,
+        WIDE_ASPECT: WIDE_ASPECT,
+        PAN_RATIO: PAN_RATIO,
+        PAN_HEIGHT: PAN_HEIGHT,
+        PAN_END_SLACK: PAN_END_SLACK
     };
 
     if (!hasDocument) {
@@ -1305,8 +1555,12 @@ var VIEWER = (function () {
 
     /* ---------- Stage: one picture, zoomable, or a panorama ------------------ */
 
-    var SWIPE_DISTANCE = 60;
     var DOUBLE_TAP_MS = 300;
+    // The minimap of a wide picture's pan view: this high at most (px), and
+    // at most this share of the stage's width (a very wide picture's is
+    // lower).
+    var MINIMAP_HEIGHT = 34;
+    var MINIMAP_SHARE = 0.6;
     // A 360 video with a level track (rec.lv) waits this long for the full
     // record that holds it before its frames are shown as they are.
     var LEVEL_WAIT_MS = 3000;
@@ -1443,6 +1697,14 @@ var VIEWER = (function () {
         this.token = 0;
         this.cancelSharp = null;            // stops loading the large panorama (sharpen)
         this.mode = "image";                // "image", "pano" or "video"
+        this.wide = false;                  // a wide picture (isWide), shown as a picture
+        this.filling = false;               // ... in its pan view (kept so by layout)
+        this.centre = 0.5;                  // ... with this point of it in the middle
+        this.large = null;                  // its larger picture (urls.pano), to load
+        this.detail = null;                 // ... the size of the most detailed one to come
+        this.previewIn = false;             // its preview is shown (the larger one may come)
+        this.thumbUrl = "";                 // (the minimap's picture)
+        this.minimap = null;                // the minimap (buildMinimap)
         this.view = openingView(null);
         this.zoom = 1;
         this.tx = 0;
@@ -2122,7 +2384,7 @@ var VIEWER = (function () {
         if (this.options.onState) {
             this.options.onState({zoomed: this.zoom > 1.01, pano: this.mode === "pano",
                                   zoom: this.zoom, video: this.mode === "video",
-                                  unlevelled: this.unlevelled()});
+                                  unlevelled: this.unlevelled(), moved: this.isMoved()});
         }
     };
 
@@ -2153,6 +2415,13 @@ var VIEWER = (function () {
         // (A 360 picture opens at its opening view, see openingView.)
         this.view = openingView(rec);
         this.zoom = 1;
+        this.wide = false;
+        this.filling = false;
+        this.centre = 0.5;
+        this.large = null;
+        this.detail = null;
+        this.previewIn = false;
+        this.hideMinimap();
         this.img.hidden = false;
         this.box.classList.remove("is-pano");
         this.box.removeAttribute("data-texture-width");
@@ -2166,6 +2435,19 @@ var VIEWER = (function () {
             return;
         }
         this.natural = {w: rec && rec.w ? rec.w : 0, h: rec && rec.hgt ? rec.hgt : 0};
+        // A wide picture opens in its pan view where the stage is much
+        // narrower than itself (see layout); its larger picture is loaded
+        // once it is zoomed in (wantLarge). Its zoom goes by the pixels of
+        // the most detailed picture that comes (detail), so it stays as it
+        // opened while the preview and the larger picture arrive. Not with
+        // only its thumbnail (an export without pictures): that would only
+        // show it blurred.
+        this.wide = isWide(rec) && Boolean(urls.preview);
+        this.filling = this.wide;
+        this.large = this.wide ? urls.pano || null : null;
+        this.detail = this.wide ? detailSize(rec, this.large) : null;
+        var largeComing = Boolean(this.large);
+        this.thumbUrl = urls.thumb || urls.preview || "";
         this.img.alt = altText(rec);
         this.img.src = urls.thumb || urls.preview || "";
         this.layout();
@@ -2198,6 +2480,11 @@ var VIEWER = (function () {
                 return;
             }
             self.img.src = loader.src;
+            self.previewIn = true;
+            if (!largeComing) {
+                // (The preview is the most detailed picture: its own pixels.)
+                self.detail = null;
+            }
             self.layout();
             if (wantPano) {
                 self.setNote(flatPanoramaNote());
@@ -2214,6 +2501,14 @@ var VIEWER = (function () {
                 return;
             }
             self.busy.hidden = true;
+            if (self.wide) {
+                // (Only its thumbnail: shown whole, as one with no preview.)
+                self.wide = self.filling = false;
+                self.large = self.detail = null;
+                self.zoom = 1;
+                self.hideMinimap();
+                self.layout();
+            }
             self.setNote("Showing a small version: the full picture cannot be read right now.");
             self.state();
         };
@@ -2379,13 +2674,54 @@ var VIEWER = (function () {
         this.base = {w: Math.max(1, w * scale), h: Math.max(1, h * scale)};
         this.img.style.width = this.base.w + "px";
         this.img.style.height = this.base.h + "px";
+        if (this.filling) {
+            // A wide picture's pan view: it fills the stage's height (shown
+            // whole where the stage is not much narrower), with the same
+            // point in the middle as before (a phone turned, the pane
+            // opened or closed).
+            this.zoom = this.panZoom() || 1;
+            this.tx = panOffset(this.centre, this.base.w * this.zoom, size.w);
+            this.ty = 0;
+        }
         this.place();
+        if (this.wide) {
+            // (A stage resized may open or leave the pan view: Reset follows.)
+            this.state();
+        }
+    };
+
+    // The pixels ({w, h}) of the picture the view goes by: a wide picture's
+    // most detailed one, which may still be on its way (detail; so the view
+    // stays as it opened while the preview and the larger picture arrive),
+    // else the picture shown.
+    Stage.prototype.pixels = function () {
+        if (this.wide && this.detail) {
+            return this.detail;
+        }
+        return {w: Math.max(this.natural.w || 0, this.img.naturalWidth || 0),
+                h: Math.max(this.natural.h || 0, this.img.naturalHeight || 0)};
+    };
+
+    // The zoom of a wide picture's pan view here (0: it is shown whole).
+    Stage.prototype.panZoom = function () {
+        if (!this.wide || this.mode !== "image") {
+            return 0;
+        }
+        var size = this.size();
+        var fill = panFill(this.base.w, this.base.h, size.w, size.h, this.pixels().h);
+        return fill > 1.01 ? Math.min(fill, this.maxZoom()) : 0;
     };
 
     Stage.prototype.maxZoom = function () {
-        var pixels = Math.max(this.natural.w || 0, this.img.naturalWidth || 0);
+        var pixels = this.pixels().w;
         var shown = this.base.w || 1;
-        return clamp(2 * pixels / shown, 2, 8);
+        var most = 8;
+        if (this.wide) {
+            // (A wide picture zooms in up to twice its pan view.)
+            var size = this.size();
+            most = Math.max(most, 2 * panFill(this.base.w, this.base.h, size.w, size.h));
+        }
+        return clamp(2 * pixels / shown, 2, most);
     };
 
     // Keep the picture centred when smaller than the stage, else covering it.
@@ -2398,6 +2734,195 @@ var VIEWER = (function () {
         this.img.style.transform = "translate(" + this.tx + "px, " + this.ty + "px) scale(" +
             this.zoom + ")";
         this.box.classList.toggle("is-zoomed", this.zoom > 1.01);
+        // (The pan view: on the detail page an upward swipe still scrolls.)
+        this.box.classList.toggle("is-filling", this.filling && this.zoom > 1.01);
+        if (this.wide) {
+            this.drawMinimap();
+            this.wantLarge();
+        }
+    };
+
+    /* A wide picture zoomed in (its pan view too) wants more pixels than
+       its preview's: its larger picture (urls.pano) is loaded, and replaces
+       the preview once it is there (the view stays where it is). */
+    Stage.prototype.wantLarge = function () {
+        var self = this;
+        if (!this.large || !this.previewIn || this.zoom <= 1.01 || this.mode !== "image") {
+            return;
+        }
+        var url = this.large;
+        var token = this.token;
+        this.large = null;
+        var loader = new Image();
+        loader.decoding = "async";
+        loader.onload = function () {
+            if (token !== self.token || self.mode !== "image") {
+                return;
+            }
+            self.cancelSharp = null;
+            self.natural = {w: loader.naturalWidth, h: loader.naturalHeight};
+            self.detail = null;
+            self.img.src = loader.src;
+            self.layout();
+        };
+        loader.onerror = function () {
+            if (token === self.token) {
+                self.cancelSharp = null;        // (the preview stays)
+                // (Its pixels are all there is: the view goes by them.)
+                self.detail = null;
+                if (self.mode === "image") {
+                    self.layout();
+                }
+            }
+        };
+        this.dropSharp();
+        this.cancelSharp = function () {
+            loader.onload = null;
+            loader.onerror = null;
+            loader.removeAttribute("src");      // (stops the download)
+        };
+        loader.src = url;
+    };
+
+    /* Move a picture wider than the stage sideways by dx px (a sideways
+       scroll, the minimap's keys); its pan view keeps the new middle. */
+    Stage.prototype.panBy = function (dx) {
+        this.tx += dx;
+        this.place();
+        this.followCentre();
+        this.state();
+    };
+
+    // Move the view so that the point at (0: the picture's left edge, 1: its right edge)
+    // is in the middle of the stage.
+    Stage.prototype.panTo = function (at) {
+        this.tx = panOffset(clamp(at, 0, 1), this.base.w * this.zoom, this.size().w);
+        this.place();
+        this.followCentre();
+    };
+
+    // The pan view keeps the point now in the middle there (see layout).
+    Stage.prototype.followCentre = function () {
+        if (this.filling) {
+            this.centre = panCentre(this.tx, this.base.w * this.zoom, this.size().w);
+        }
+    };
+
+    Stage.prototype.hideMinimap = function () {
+        if (this.minimap) {
+            this.minimap.root.hidden = true;
+        }
+        this.box.classList.remove("has-minimap");
+    };
+
+    /* The minimap of a wide picture wider (or taller) than the stage: the
+       whole picture small at the foot of the stage, the part in view
+       framed (format.panWindow). */
+    Stage.prototype.drawMinimap = function () {
+        var size = this.size();
+        var w = this.base.w * this.zoom;
+        var h = this.base.h * this.zoom;
+        if (!this.wide || this.mode !== "image" || !this.thumbUrl ||
+                (w <= size.w + 1 && h <= size.h + 1)) {
+            this.hideMinimap();
+            return;
+        }
+        var map = this.minimap || this.buildMinimap();
+        var aspect = this.base.w / this.base.h;
+        var width = Math.max(1, Math.min(MINIMAP_HEIGHT * aspect, size.w * MINIMAP_SHARE));
+        map.frame.style.width = width + "px";
+        map.frame.style.height = Math.max(1, width / aspect) + "px";
+        if (map.img.getAttribute("src") !== this.thumbUrl) {
+            map.img.src = this.thumbUrl;
+        }
+        var view = panWindow(this.tx, this.ty, w, h, size.w, size.h);
+        map.view.style.left = (100 * view.left) + "%";
+        map.view.style.width = (100 * view.width) + "%";
+        map.view.style.top = (100 * view.top) + "%";
+        map.view.style.height = (100 * view.height) + "%";
+        var along = Math.round(100 * panAlong(this.tx, w, size.w));
+        map.root.setAttribute("aria-valuenow", String(along));
+        map.root.setAttribute("aria-valuetext", w <= size.w + 1 ? "All of it across"
+            : along <= 0 ? "At the left end" : along >= 100 ? "At the right end"
+                : along + "% of the way across");
+        map.root.hidden = false;
+        this.box.classList.add("has-minimap");
+    };
+
+    /* The minimap's nodes: a slider (role) whose picture a tap or a drag
+       moves the view to, and whose keys (minimapKey) move along it. */
+    Stage.prototype.buildMinimap = function () {
+        var self = this;
+        var img = el("img", {className: "stage-minimap-img", alt: "", draggable: false});
+        var view = el("span", {className: "stage-minimap-view"});
+        var frame = el("span", {className: "stage-minimap-frame"}, [img, view]);
+        var root = el("div", {className: "stage-minimap", hidden: true,
+                              title: "Where you are in the picture: tap or drag to move " +
+                                  "(arrow keys, Home, End)",
+                              attrs: {role: "slider", "aria-label": "Where in the panorama",
+                                      "aria-valuemin": "0", "aria-valuemax": "100"}},
+                      [frame]);
+        root.tabIndex = 0;
+        var dragging = null;
+        function moveTo(event) {
+            var rect = frame.getBoundingClientRect();
+            if (rect.width > 0) {
+                self.panTo((event.clientX - rect.left) / rect.width);
+            }
+        }
+        root.addEventListener("pointerdown", function (event) {
+            if (event.button !== undefined && event.button !== 0 &&
+                    event.pointerType === "mouse") {
+                return;
+            }
+            try {
+                root.setPointerCapture(event.pointerId);
+            } catch (error) {
+                // (Capture is a nicety: a drag that leaves the minimap.)
+            }
+            dragging = event.pointerId;
+            moveTo(event);
+        });
+        root.addEventListener("pointermove", function (event) {
+            if (dragging === event.pointerId) {
+                moveTo(event);
+            }
+        });
+        function stop(event) {
+            if (dragging === event.pointerId) {
+                dragging = null;
+                self.state();
+            }
+        }
+        root.addEventListener("pointerup", stop);
+        root.addEventListener("pointercancel", stop);
+        root.addEventListener("keydown", function (event) {
+            if (!event.ctrlKey && !event.metaKey && !event.altKey && self.minimapKey(event.key)) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        });
+        this.box.insertBefore(root, this.note);
+        this.minimap = {root: root, frame: frame, img: img, view: view};
+        return this.minimap;
+    };
+
+    /* The keys of the minimap (it has the focus): the left and right arrows
+       move a quarter of the stage along the picture, Page Up and Page Down
+       most of the stage, Home and End to its ends. False for other keys. */
+    Stage.prototype.minimapKey = function (key) {
+        if (!this.wide || this.mode !== "image") {
+            return false;
+        }
+        var size = this.size();
+        var far = this.base.w * this.zoom;
+        var moves = {ArrowLeft: size.w / 4, ArrowRight: -size.w / 4, PageUp: size.w * 0.9,
+                     PageDown: -size.w * 0.9, Home: far, End: -far};
+        if (!Object.prototype.hasOwnProperty.call(moves, key)) {
+            return false;
+        }
+        this.panBy(moves[key]);
+        return true;
     };
 
     // Zoom to `zoom` keeping the stage point (x, y) where it is.
@@ -2409,6 +2934,8 @@ var VIEWER = (function () {
         x = x === undefined ? size.w / 2 : x;
         y = y === undefined ? size.h / 2 : y;
         zoom = clamp(zoom, 1, this.maxZoom());
+        // (Zoomed by hand: no longer the pan view, which layout keeps.)
+        this.filling = false;
         var u = (x - this.tx) / this.zoom;
         var v = (y - this.ty) / this.zoom;
         this.zoom = zoom;
@@ -2434,6 +2961,14 @@ var VIEWER = (function () {
             this.redraw();
             return;
         }
+        if (this.wide && this.mode === "image") {
+            // (Back to its pan view, at its middle.)
+            this.filling = true;
+            this.centre = 0.5;
+            this.layout();
+            this.state();
+            return;
+        }
         this.zoom = 1;
         this.place();
         this.state();
@@ -2449,6 +2984,10 @@ var VIEWER = (function () {
         if (this.mode === "pano") {
             return !sameView(this.view || openingView(null), openingView(this.rec));
         }
+        if (this.panZoom()) {
+            // (A wide picture opens in its pan view, at its middle.)
+            return !this.filling || Math.abs(this.centre - 0.5) > 0.005;
+        }
         return this.zoom > 1.01;
     };
 
@@ -2461,8 +3000,9 @@ var VIEWER = (function () {
         if (event.button !== undefined && event.button !== 0 && event.pointerType === "mouse") {
             return;
         }
-        // (A video's player takes its own clicks and drags.)
-        if (event.target.closest && event.target.closest("button, a, video, .stage-controls")) {
+        // (A video's player takes its own clicks and drags; so does the minimap.)
+        if (event.target.closest &&
+                event.target.closest("button, a, video, .stage-controls, .stage-minimap")) {
             return;
         }
         try {
@@ -2474,8 +3014,13 @@ var VIEWER = (function () {
         this.pointers[event.pointerId] = p;
         var ids = Object.keys(this.pointers);
         if (ids.length === 1) {
+            // (end: the end of a wide picture the view is at, see panSwipe.)
             this.gesture = {kind: "drag", startX: p.x, startY: p.y, lastX: p.x, lastY: p.y,
-                            moved: false, touch: event.pointerType !== "mouse", time: Date.now()};
+                            moved: false, touch: event.pointerType !== "mouse", time: Date.now(),
+                            end: this.wide && this.mode === "image"
+                                ? panEnd(this.tx, this.base.w * this.zoom, this.size().w,
+                                         PAN_END_SLACK) : 0,
+                            push: 0};
         } else if (ids.length === 2) {
             var a = this.pointers[ids[0]];
             var b = this.pointers[ids[1]];
@@ -2532,6 +3077,8 @@ var VIEWER = (function () {
             var size = this.size();
             this.view = panoDrag(this.view, dx, dy, size.w, size.h);
             this.redraw();
+        } else if (this.zoom > 1.01 && this.wide) {
+            this.dragWide(g, dx, dy);
         } else if (this.zoom > 1.01) {
             this.tx += dx;
             this.ty += dy;
@@ -2541,6 +3088,32 @@ var VIEWER = (function () {
             this.img.style.transform = "translate(" + (this.tx + (p.x - g.startX) * 0.5) + "px, " +
                 this.ty + "px)";
         }
+    };
+
+    /* A drag of dx, dy px on a wide picture zoomed in (its pan view too):
+       it pans; pushed on beyond the end the drag began at (g.end), the
+       picture follows the finger a little (g.push: how far), as a hint that
+       a swipe there changes picture (see pointerUp, panSwipe). */
+    Stage.prototype.dragWide = function (g, dx, dy) {
+        if (g.push && dx * g.push < 0) {
+            // (Coming back: first the picture comes back to the end.)
+            var back = Math.abs(dx) > Math.abs(g.push) ? -g.push : dx;
+            g.push += back;
+            dx -= back;
+        }
+        var wanted = this.tx + dx;
+        this.tx = wanted;
+        this.ty += dy;
+        this.place();
+        var beyond = wanted - this.tx;
+        if (g.touch && g.end && beyond * g.end < 0 && this.options.onSwipe) {
+            g.push += beyond;
+        }
+        if (g.push) {
+            this.img.style.transform = "translate(" + (this.tx + g.push * 0.4) + "px, " +
+                this.ty + "px) scale(" + this.zoom + ")";
+        }
+        this.followCentre();
     };
 
     Stage.prototype.pointerUp = function (event) {
@@ -2575,6 +3148,16 @@ var VIEWER = (function () {
                 return;
             }
         }
+        if (this.wide && this.mode === "image" && this.zoom > 1.01 && g.moved) {
+            // A swipe once the pan has reached an end changes picture.
+            var turn = panSwipe(g.end, g.push, dy);
+            this.place();
+            if (turn && g.touch && this.options.onSwipe) {
+                this.options.onSwipe(turn);
+                return;
+            }
+            this.state();
+        }
         if (!g.moved && g.touch) {
             var now = Date.now();
             if (this.lastTap && now - this.lastTap.time < DOUBLE_TAP_MS &&
@@ -2594,6 +3177,19 @@ var VIEWER = (function () {
             this.reset();
             return;
         }
+        if (this.panZoom()) {
+            // A wide picture: the whole of it, and back to its pan view
+            // (there, with the place tapped in the middle).
+            if (this.zoom > 1.01) {
+                this.zoomTo(1, x, y);
+            } else {
+                this.centre = clamp((x - this.tx) / (this.base.w * this.zoom), 0, 1);
+                this.filling = true;
+                this.layout();
+                this.state();
+            }
+            return;
+        }
         if (this.zoom > 1.01) {
             this.zoomTo(1, x, y);
         } else {
@@ -2603,7 +3199,7 @@ var VIEWER = (function () {
 
     Stage.prototype.doubleClick = function (event) {
         if (this.mode === "video" ||
-                (event.target.closest && event.target.closest("button, a"))) {
+                (event.target.closest && event.target.closest("button, a, .stage-minimap"))) {
             return;
         }
         if (this.tappedTwice && Date.now() - this.tappedTwice < 800) {
@@ -2616,20 +3212,25 @@ var VIEWER = (function () {
     };
 
     Stage.prototype.wheel = function (event) {
+        var unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1;
+        // A wide picture wider than the stage: a sideways scroll (a
+        // touchpad's) pans it.
+        if (this.wide && this.mode === "image" && !event.ctrlKey &&
+                Math.abs(event.deltaX || 0) > Math.abs(event.deltaY || 0) &&
+                this.base.w * this.zoom > this.size().w + 1) {
+            event.preventDefault();
+            this.panBy(-event.deltaX * unit);
+            return;
+        }
         // A stage in a page: the wheel scrolls the page, unless Ctrl is
-        // held (a touchpad pinch too) or the picture is zoomed in. A video
-        // does not zoom.
-        if ((this.options.scrollPage && !event.ctrlKey && !this.isZoomed()) ||
-                this.mode === "video") {
+        // held (a touchpad pinch too) or the picture is zoomed in (by
+        // hand: not a wide picture's pan view). A video does not zoom.
+        if ((this.options.scrollPage && !event.ctrlKey &&
+             (!this.isZoomed() || this.filling)) || this.mode === "video") {
             return;
         }
         event.preventDefault();
-        var delta = event.deltaY;
-        if (event.deltaMode === 1) {
-            delta *= 16;
-        } else if (event.deltaMode === 2) {
-            delta *= 400;
-        }
+        var delta = event.deltaY * unit;
         var factor = Math.exp(-clamp(delta, -300, 300) * 0.0025);
         var p = this.point(event);
         this.zoomBy(factor, p.x, p.y);
@@ -3471,7 +4072,30 @@ var VIEWER = (function () {
         if (source && SOURCES[source]) {
             notes.push(SOURCES[source]);
         }
-        return text + (notes.length ? " (" + notes.join("; ") + ")" : "");
+        text += notes.length ? " (" + notes.join("; ") + ")" : "";
+        // (The time of the place, not the camera's: its clock under it.)
+        var clock = detail ? clockText(taken, detail.clock) : "";
+        if (!clock) {
+            return text;
+        }
+        return el("span", {className: "info-date"}, [
+            el("span", {text: text}), el("span", {className: "info-clock-note", text: clock})]);
+    }
+
+    // A picture's RAW file (rawText), with a link that downloads it when
+    // there is one (rawUrl); "" without a RAW file.
+    function rawFact(detail) {
+        var raw = detail && detail.raw && typeof detail.raw === "object" ? detail.raw : null;
+        var text = rawText(raw);
+        var url = rawUrl(raw);
+        if (!text || !url) {
+            return text;
+        }
+        return el("span", {className: "info-raw"}, [
+            el("span", {text: text}),
+            el("a", {className: "info-raw-link", href: url, text: "Download",
+                     title: "Download the RAW file as the camera wrote it",
+                     attrs: {download: ""}})]);
     }
 
     // The place of a picture, as a chip that finds the pictures taken there.
@@ -3576,27 +4200,52 @@ var VIEWER = (function () {
        (words), choice ("use", "ignore" or ""), place (of the position set
        aside), estimated}, or null for a picture without a position. */
 
-    // The record keys a position changes (gps_check.RECORD_KEYS).
+    // The record keys a position changes (gps_check.RECORD_KEYS), and those
+    // of its time, which the local time of a place changes with it
+    // (local_times.RECORD_KEYS).
     var LOCATION_KEYS = ["gp", "ci", "rg", "co", "cc", "km", "pe", "ps", "gx"];
+    var TIME_KEYS = ["dk", "ts"];
+
+    // A record's position and place keys as the server's answer has them
+    // (keys; a key it does not have is taken away), and its time keys when
+    // the answer has them (only when the time changed).
+    function patchPlaceKeys(target, keys) {
+        LOCATION_KEYS.forEach(function (key) {
+            var value = keys ? keys[key] : undefined;
+            if (value === undefined) {
+                delete target[key];
+            } else {
+                target[key] = value;
+            }
+        });
+        TIME_KEYS.forEach(function (key) {
+            if (keys && keys[key] !== undefined) {
+                target[key] = keys[key];
+            }
+        });
+    }
+
+    // The picture's time in the details (shown) as the server's answer has
+    // it after a choice about its position or place (answer.time, see
+    // local_times.detail: the local time of the place may have changed).
+    function patchTime(shown, answer) {
+        var time = answer && answer.time && typeof answer.time === "object" ? answer.time : null;
+        if (time) {
+            shown.taken_at = time.taken_at;
+            shown.tz_offset = time.tz_offset;
+            shown.clock = time.clock || null;
+        }
+    }
 
     /* Use (true) or ignore (false) the picture's GPS position. The server
        keeps the choice (for every copy of the shot) and checks the positions
-       again; the place keys of the record -- and of the other records whose
-       position the check changed (answer.others, found with context.get) --
-       change in place, the pane is drawn again (unless it shows another
-       picture by now) and context.onEdited(id, detail) is told (the search
-       sees the change). */
+       (and the local times) again; the place and time keys of the record --
+       and of the other records whose position, place or time changed
+       (answer.others, found with context.get) -- change in place, the pane
+       is drawn again (unless it shows another picture by now) and
+       context.onEdited(id, detail) is told (the search sees the change). */
     function chooseLocation(box, rec, detail, context, use, button) {
-        function patch(target, keys) {
-            LOCATION_KEYS.forEach(function (key) {
-                var value = keys ? keys[key] : undefined;
-                if (value === undefined) {
-                    delete target[key];
-                } else {
-                    target[key] = value;
-                }
-            });
-        }
+        var patch = patchPlaceKeys;
         return busy(button, SHELL.admin("/images/" + encodeURIComponent(rec.i) + "/location",
                                         {use: use}))
             .then(function (answer) {
@@ -3616,6 +4265,7 @@ var VIEWER = (function () {
                     shown[key] = detail[key];
                 });
                 shown.location_check = answer ? answer.location_check || null : null;
+                patchTime(shown, answer);
                 var ignored = Boolean(shown.location_check && shown.location_check.ignored);
                 var copies = answer && answer.copies > 0 ? answer.copies : 0;
                 var more = changed - copies + (answer && answer.more > 0 ? answer.more : 0);
@@ -3713,28 +4363,22 @@ var VIEWER = (function () {
 
     /* Tell the server the owner's choice about the picture's place (body:
        {choice: "accept" | "set" | "reject" | "clear", lat, lon}); the place
-       keys of the record change in place, the pane is drawn again (unless
-       it shows another picture by now) and context.onEdited(id, detail) is
-       told. */
+       and time keys of the record change in place, the pane is drawn again
+       (unless it shows another picture by now) and context.onEdited(id,
+       detail) is told. */
     function choosePlace(box, rec, detail, context, body, button, said) {
         box.placeForm = null;
         return busy(button, SHELL.admin("/images/" + encodeURIComponent(rec.i) + "/place", body))
             .then(function (answer) {
                 var released = releaseSheet(box);
-                LOCATION_KEYS.forEach(function (key) {
-                    var value = answer && answer.record ? answer.record[key] : undefined;
-                    if (value === undefined) {
-                        delete rec[key];
-                    } else {
-                        rec[key] = value;
-                    }
-                });
+                patchPlaceKeys(rec, answer ? answer.record : null);
                 var shown = {};
                 Object.keys(detail || {}).forEach(function (key) {
                     shown[key] = detail[key];
                 });
                 shown.place = answer ? answer.place || null : null;
                 shown.place_estimate = answer ? answer.place_estimate || null : null;
+                patchTime(shown, answer);
                 toast(said, "ok");
                 var focused = document.activeElement;
                 var hadFocus = !focused || focused === document.body || box.contains(focused);
@@ -5062,6 +5706,9 @@ var VIEWER = (function () {
             var length = durationText(rec.dr);
             badges.appendChild(badge("Video" + (length ? " \u00b7 " + length : ""), "is-video"));
         }
+        if (detail && detail.raw && detail.raw.how === "alone") {
+            badges.appendChild(badge("RAW", "is-raw"));
+        }
         if (rec.h) {
             badges.appendChild(badge("Hidden", "is-hidden"));
         }
@@ -5110,13 +5757,15 @@ var VIEWER = (function () {
         var factList = facts([
             ["Taken", dateText(rec, detail)],
             ["Place", placeFact(rec, context, detail)],
+            ["People", peopleFact(rec, detail, context)],
             ["Camera", rec.cm ? chip(rec.cm, "camera", rec.cm, context, "More from this camera") : ""],
             ["Settings", exposure + (lens ? (exposure ? " \u00b7 " : "") + lens : "")],
             ["Video", rec.mv ? videoFacts(rec, detail) : ""],
             ["Library", libraryName],
             ["File", fileName],
             ["Folder", folder],
-            ["Size", size]
+            ["Size", size],
+            ["RAW", rawFact(detail)]
         ]);
         if (factList) {
             box.appendChild(factList);
@@ -5346,6 +5995,152 @@ var VIEWER = (function () {
                                     "info-similar-section info-looks-section"));
         }
         keepPlaceForm(box, rec, detail, context);
+        faceBoxesFor(rec, detail, context);
+    }
+
+    /* ---------- People: names in the pane, faces over the picture --------- */
+
+    var FACES_KEY = "searchImages.faceBoxes";
+    var faceLayer = null;       // {stage, rec, layer, observer, place}
+
+    // The person: search for one of a picture's people ({id, label}).
+    function personSearch(person) {
+        if (window.SearchCore && SearchCore.personTerm) {
+            return SearchCore.personTerm([person], person);
+        }
+        return "person:#" + person.id;
+    }
+
+    // The "People" fact: the names of the people in the picture, and the
+    // admin's "Show faces"; "" when there is nothing to say.
+    function peopleFact(rec, detail, context) {
+        var found = detail && detail.people && typeof detail.people === "object"
+            ? detail.people : null;
+        if (!found) {
+            return "";
+        }
+        var names = Array.isArray(found.names) ? found.names : [];
+        var faces = admin() && Array.isArray(found.faces) ? found.faces : [];
+        if (!names.length && !faces.length) {
+            return "";
+        }
+        var row = el("div", {className: "info-chips info-people"});
+        names.forEach(function (person) {
+            var node = chip(person.label, "q", personSearch(person), context,
+                            "Show all pictures of " + person.label);
+            if (!person.named) {
+                node.classList.add("is-unnamed");
+            }
+            row.appendChild(node);
+        });
+        if (!names.length) {
+            row.appendChild(el("span", {className: "muted", text: faces.length === 1
+                ? "A face of nobody known" : faces.length + " faces of nobody known"}));
+        }
+        if (faces.length && context.stage && !rec.mv && rec.p !== "360") {
+            var toggle = el("button", {type: "button", className: "button small info-faces",
+                                       text: facesWanted() ? "Hide faces" : "Show faces",
+                                       title: "Draw the boxes of the faces found in the picture " +
+                                           "(on for the next pictures too)",
+                                       attrs: {"aria-pressed": facesWanted() ? "true" : "false"}});
+            toggle.addEventListener("click", function () {
+                var on = !facesWanted();
+                storage(FACES_KEY, on ? "1" : "0");
+                toggle.setAttribute("aria-pressed", on ? "true" : "false");
+                toggle.textContent = on ? "Hide faces" : "Show faces";
+                faceBoxesFor(rec, detail, context);
+            });
+            row.appendChild(toggle);
+        }
+        return row;
+    }
+
+    function facesWanted() {
+        return storage(FACES_KEY) === "1";
+    }
+
+    function dropFaceBoxes() {
+        if (!faceLayer) {
+            return;
+        }
+        if (faceLayer.observer) {
+            faceLayer.observer.disconnect();
+        }
+        window.removeEventListener("resize", faceLayer.place);
+        faceLayer.stage.img.removeEventListener("load", faceLayer.place);
+        if (faceLayer.layer.parentNode) {
+            faceLayer.layer.parentNode.removeChild(faceLayer.layer);
+        }
+        faceLayer = null;
+    }
+
+    /* The admin's boxes of the faces of rec over context.stage's picture
+       (when "Show faces" is on and the stage shows that picture flat), or
+       none. The layer is the stage's child, laid over the picture as it is
+       shown (its place, size and zoom, read whenever the picture's style
+       changes), so the stage itself does not know about it. */
+    function faceBoxesFor(rec, detail, context) {
+        var stage = context.stage;
+        var faces = admin() && detail && detail.people && Array.isArray(detail.people.faces)
+            ? detail.people.faces : [];
+        if (faceLayer && faceLayer.stage === stage && faceLayer.rec === rec && faces.length &&
+                facesWanted()) {
+            faceLayer.place();
+            return;
+        }
+        dropFaceBoxes();
+        if (!hasDocument || !stage || !stage.img || !faces.length || !facesWanted() ||
+                stage.rec !== rec || stage.mode !== "image" || rec.mv || rec.p === "360") {
+            return;
+        }
+        var layer = el("div", {className: "face-layer"});
+        faces.forEach(function (face) {
+            var box = el("div", {className: "face-box" + (face.person ? "" : " is-unknown") +
+                                 (face.hidden ? " is-hidden" : "")});
+            box.style.left = (100 * face.x) + "%";
+            box.style.top = (100 * face.y) + "%";
+            box.style.width = (100 * face.w) + "%";
+            box.style.height = (100 * face.h) + "%";
+            var name = face.person ? el("a", {className: "face-name",
+                                              text: face.label + (face.hidden ? " (hidden)" : ""),
+                                              href: "/people?person=" +
+                                                  encodeURIComponent(face.person),
+                                              title: "Open " + face.label + " on the People page"})
+                : el("span", {className: "face-name", text: "?",
+                              title: "A face in no person (see Other faces on the People page)"});
+            // (A press on a name is the link's, not the start of a drag of the picture.)
+            name.addEventListener("pointerdown", function (event) {
+                event.stopPropagation();
+            });
+            box.appendChild(name);
+            layer.appendChild(box);
+        });
+        stage.box.appendChild(layer);
+        var current = {stage: stage, rec: rec, layer: layer, observer: null};
+        current.place = function () {
+            if (faceLayer !== current) {
+                return;
+            }
+            if (stage.rec !== rec || stage.mode !== "image" || stage.img.hidden) {
+                dropFaceBoxes();
+                return;
+            }
+            var outer = stage.box.getBoundingClientRect();
+            var shown = stage.img.getBoundingClientRect();
+            layer.style.left = (shown.left - outer.left) + "px";
+            layer.style.top = (shown.top - outer.top) + "px";
+            layer.style.width = shown.width + "px";
+            layer.style.height = shown.height + "px";
+        };
+        if (typeof MutationObserver === "function") {
+            current.observer = new MutationObserver(current.place);
+            current.observer.observe(stage.img, {attributes: true,
+                                                 attributeFilter: ["style", "src", "hidden"]});
+        }
+        window.addEventListener("resize", current.place);
+        stage.img.addEventListener("load", current.place);
+        faceLayer = current;
+        current.place();
     }
 
     // The "Looks like this" strip: thumbnails of pictures (ids) that open in the viewer
@@ -5493,7 +6288,8 @@ var VIEWER = (function () {
             },
             onState: function (state) {
                 root.classList.toggle("is-pano", state.pano);
-                reset.hidden = !state.pano && !state.zoomed;
+                // (Not at a wide picture's pan view: it opens there.)
+                reset.hidden = !state.pano && !state.moved;
                 // (Not for a 360 video shown unlevelled: views are kept for
                 // its level panorama.)
                 openHere.hidden = !state.pano || !admin() || Boolean(state.unlevelled);
@@ -5856,6 +6652,11 @@ var VIEWER = (function () {
                    lightbox.stage.driveKey(key)) {
             // The strip of a drive has the focus: the arrows, Page Up, Page
             // Down, Home and End move in the drive.
+            event.preventDefault();
+        } else if (event.target && /(^| )stage-minimap( |$)/.test(event.target.className || "") &&
+                   lightbox.stage.minimapKey(key)) {
+            // The minimap of a wide picture has the focus: the arrows, Page
+            // Up, Page Down, Home and End move along the picture.
             event.preventDefault();
         } else if (event.target === lightbox.handle && (key === "ArrowUp" || key === "ArrowDown")) {
             // (The sheet's handle moves the sheet with them.)

@@ -10,7 +10,10 @@ Anthropic's Claude). A library can also be published as a static website.
 
 Supported image types are JPG/JPEG, PNG, GIF, WebP, TIFF, BMP, HEIC/HEIF,
 AVIF (HEIC needs `pillow-heif`; AVIF needs a Pillow built with AVIF support)
-and Insta360 `.insp` photos. RAW files (`.dng`, `.arw`, ...) are not indexed.
+and Insta360 `.insp` photos. Camera RAW files (`.dng`, `.arw`, `.cr2`,
+`.cr3`, `.nef`, ...) go with the JPEG (or HEIC) of the same shot beside them,
+or are shown by the preview the camera stored in them: see [RAW
+photos](#raw-photos).
 Videos (MOV, MP4, M4V, 3GP, AVI, MKV, WebM, WMV, MTS, MPEG, and Insta360
 `.insv` 360-degree videos) are indexed too when ffmpeg is installed: see
 [Videos](#videos).
@@ -42,8 +45,12 @@ You need Python 3.9 or newer and a few packages:
     python -m pip install -r requirements.txt
 
 `pillow-heif` is only needed to scan libraries that contain HEIC images.
-Without it the scanner still runs and skips HEIC files with a warning. Each
-script also prints an install command if a package is missing.
+Without it the scanner still runs and skips HEIC files with a warning.
+`tzdata` gives Python the world's time zones where the system has none of
+its own (Windows), for [times in the local time of the
+place](#times-in-the-local-time-of-the-place); without it times stay as
+the cameras' clocks have them. Each script also prints an install command
+if a package is missing.
 
 Videos need the `ffmpeg` and `ffprobe` programs (from
 https://ffmpeg.org/download.html or your system's package manager), on the
@@ -249,6 +256,49 @@ scan stitches the ones in the index again (and the 360-degree videos):
 their previews, panoramas and thumbnails are made anew, their descriptions
 are kept. A scan stopped part way carries on with
 the rest the next time.
+
+### RAW photos
+
+A camera that saves RAW files (`.dng`, `.arw`, `.cr2`, `.cr3`, `.nef`,
+`.nrw`, `.orf`, `.rw2`, `.raf`, `.pef`, `.srw`) mostly saves a JPEG (or a
+HEIC) of the same shot beside each one. Such a RAW file is not a picture
+of its own: it is that picture's RAW original. A scan pairs them
+
+- by name: the same folder and the same name before the extension,
+  whatever the case (`DSC01234.ARW` with `DSC01234.JPG`), when they can be
+  one shot: not when their EXIF names other camera makers, or times more
+  than a minute apart (two cameras that both name their files
+  `IMG_1234`), and else
+- by camera and time: the one picture of the same camera taken in the
+  same second by the camera's clock (a JPEG renamed, or kept in another
+  folder). With two such pictures (a burst), neither.
+
+The picture's details then show its RAW file ("RAW: DSC01234.ARW (24
+MB)") with a **Download** link on this computer (other computers see the
+name only). The picture gets the EXIF facts only its RAW file has (the
+lens, the exposure, a GPS position, the date when the JPEG lost it), but
+never its orientation; its own facts always win, and when the RAW file
+goes away it has only its own again. A RAW file is never published unless
+an export's **RAW files** option says so (see [Publishing a
+library](#publishing-a-library)).
+
+A RAW file with no such picture is indexed as a picture of its own, shown
+by the largest preview the camera stored in it (turned upright; often
+about 1600 x 1000 pixels, a full-size one in some cameras' files), with
+the EXIF of the RAW file, and described like any picture. There is no RAW
+converter here: a RAW file without a preview (some 360-degree cameras
+write none) cannot be shown, and the log says so (it is tried again when
+the file changes). When a picture of its name turns up beside it later,
+the RAW file goes with that picture: its own entry is marked missing
+(and removed after `purge_after_days`), its description, your edit and
+your marks go to the picture when it has none of its own, and the
+picture is hidden when you had hidden the RAW file.
+
+Pairing reads only the EXIF of a RAW file (a few small reads, also on a
+share), once: unchanged RAW files are not read again.
+`"raw": {"enabled": false}` in `config.json` leaves RAW files out
+altogether, and `"raw": {"index_alone": false}` pairs them but indexes
+none on its own (see SETTINGS.md).
 
 ### From the command line
 
@@ -525,11 +575,14 @@ or a position far from the fixes around it) and repeats are left out.
   says "from the video's GPS track"). When its file names no time zone (a
   dashcam's clock knows none), it gets the UTC offset its clock has by the
   GPS time (`-08:00`), when that is a whole quarter hour (give or take a
-  minute); its time stays the camera's clock. The scan's log says what
-  offsets the clocks have. That offset is the camera's clock's -- a
-  dashcam's often ignores daylight saving -- so only the same camera's
-  pictures (and the clips of its folder) go by it, never the library's
-  other pictures.
+  minute). The scan's log says what offsets the clocks have. That offset
+  is the camera's clock's -- a dashcam's often ignores daylight saving --
+  so only the same camera's pictures (and the clips of its folder) go by
+  it, never the library's other pictures; when the time zone of the place
+  had another offset then, the clip (and the clips of its drive without a
+  fix) gets the local time of its place, with the camera's clock kept in
+  its details (see [Times in the local time of the
+  place](#times-in-the-local-time-of-the-place)).
 - The GPS check times such a clip by its GPS time and counts its position
   as a strong one; a clip without a fix in a folder of clips whose clocks
   keep time (the camera was still looking for satellites, or stood in a
@@ -763,6 +816,28 @@ the page header or the filters.
   pane beside the picture instead, closed until you open it. On touch
   screens the controls are at least 40 pixels to the finger (links within
   a sentence and the timeline's bars aside).
+- **Wide panoramas** (photos at least 2.2 times as wide as they are tall)
+  open on an upright phone zoomed to fill the screen's height, at their
+  middle, instead of as a thin strip across it: drag (or scroll sideways)
+  to look along them. The small picture at the foot of the screen (the
+  minimap) frames the part you see: tap or drag on it to go there, or give
+  it the keyboard focus (`Tab`) and use the arrow keys, `Page Up`/`Page
+  Down`, `Home` and `End`. A double tap (or zooming out) shows the whole
+  panorama, a double tap on it goes back there; **Reset the view** (`0`)
+  goes back to the middle. Next and previous stay easy: the arrow buttons
+  and keys work as always, and a swipe changes picture once the panorama
+  has reached its end -- drag to its end, then swipe on (a swipe from the
+  middle only moves along it). The same happens wherever the whole
+  panorama would be a strip less than 200 pixels tall on a screen much
+  narrower than it (the details page on a phone). In a desktop window or
+  on a phone held sideways that is only a very wide panorama (in a large
+  desktop window one about 7 times as wide as it is tall, or wider), and
+  only one with the pixels to fill the height (at most 1.5 times
+  enlarged): the others are shown whole as before. These photos get a
+  larger picture (1600 pixels tall, made from the original next to the
+  preview) so the view stays sharp; an export with web-size pictures
+  publishes it too (one with thumbnails only shows them whole). A video
+  is always shown whole.
 - **The address** holds the search, the filters, the sort order and the open
   picture, so links, reloads and the Back button bring the same view back.
 - **Keyboard**: `/` jumps to the search box, `Esc` clears it or closes the
@@ -865,7 +940,7 @@ about it.
   `scan`, `artwork`, `receipt`, `chat`, `whiteboard`, `menu`, `ticket`, ...
 - `people:none` - how many people: `none`, `1`, `2`, `3-5`, `6-10`,
   `crowd` or `any`; `beach no people` works too, and the word `people`
-  finds every picture with people in it
+  finds every picture with people in it (as the AI model counted them)
 - `year:2019`, `year:2015-2019` - taken in those years
 - `before:2019-06`, `after:2019` - taken before June 2019, or from 2020 on
   (`YYYY`, `YYYY-MM` or `YYYY-MM-DD`)
@@ -875,9 +950,9 @@ about it.
 - `on:today` - taken on this day in earlier years; `on:05-14` - on May 14
   of any year; `on:2019-05-14` - on that day (dates from the camera or the
   file name only, not a file's time)
-- `place:hawaii`, `place:"new york"` - taken in a town, region or country
+- `place:portugal`, `place:"new york"` - taken in a town, region or country
   (see [Place names](#place-names)); place names are also found as ordinary
-  words (`beach hawaii`), and a few other names of countries too (`usa`,
+  words (`beach portugal`), and a few other names of countries too (`usa`,
   `america`, `uk`, `britain`, `holland`, ...; `us` alone or as `US`: next
   to other words a lower-case `us` is skipped like "me"). A word found only
   in the place names ranks below the same word in what a picture shows: a
@@ -903,6 +978,10 @@ about it.
   spaces; `album:#12` the album with id 12, which is what the albums'
   links use when a name could mean another album). Alone it shows the
   album in its own order.
+- `person:"Ann Lee"` - the pictures of a person found by their face (see
+  [People](#people): its name or "Person 12", in any case, or the start of
+  the only name that starts so; `person:#12` by number; `person:any`
+  anybody, `person:none` nobody); only where People is shown
 - `similar:1234` - the pictures most like picture 1234, closest first (what
   **More like this** searches; see below)
 - `look:1234` - the pictures that look most like picture 1234, closest
@@ -998,8 +1077,9 @@ only when they change) and compares them in the browser, as it does the
 words. Unlike the rest of a search, what you type then goes to the
 server (`/api/embed`), and from there to the embedding endpoint: one on
 this computer or network unless `allow_cloud` is set (see SETTINGS.md).
-The server's request log leaves the words out, the browser does not
-cache the answers, and each computer only ever gets back its own
+The server's request log leaves the words out (of every address it
+logs it keeps only ids and switches: no words searched for, place, tag,
+person's name or trip title), the browser does not cache the answers, and each computer only ever gets back its own
 searches. Vectors are kept in `data/vectors.db`; deleting it is harmless
 (**Update meaning search** makes it again). Deleting a library's indexed
 data deletes its vectors too.
@@ -1194,10 +1274,12 @@ place happens on this computer, and nothing about your pictures is sent.
 `make_places.py --from DIR` builds the index from the files downloaded by
 hand (`cities1000.zip`, `admin1CodesASCII.txt` and `countryInfo.txt` from
 https://download.geonames.org/export/dump/), `--redo` looks up every
-picture again, and `--lookup LAT LON` prints the place of a position.
+picture again, and `--lookup LAT LON` prints the place of a position (and
+its time zone). The index keeps each town's time zone too, for [times in
+the local time of the place](#times-in-the-local-time-of-the-place).
 
 A picture's place is the town nearest to its position, by great-circle
-distance: "Kahului, Hawaii, United States (3 km)" in the viewer. When the
+distance: "Albufeira, Algarve, Portugal (3 km)" in the viewer. When the
 nearest town is more than 50 km away, only its region and country are
 kept (out in the country, or off the coast); when no town is within
 250 km (the open sea), the picture has no place. Neighbourhoods are not
@@ -1380,6 +1462,171 @@ accepted from an estimate that came from a dashcam's GPS track only as
 the track's positions go (with **Drive routes**, and not near where a
 drive starts or ends).
 
+### Trips
+
+**Trips** (in the page header) lists the journeys your pictures tell of,
+newest first and by year, each with a few of its best pictures, its dates
+and the places it went to. Nothing has to be set up; they are worked out
+from the index whenever the page is opened:
+
+- **A library named like a trip** is one: a library whose folder starts
+  with a date (`2024-05-12 - Lakes`, `2024-05 Lakes`, `20240512_Lakes`;
+  the library's name leaves the date out). All its pictures belong to it.
+  Its days are those its pictures were taken on (a date from the camera,
+  the video or the file name -- not the date an editor saved a picture,
+  an EXIF date without the camera's own); pictures more than a week apart
+  from the rest (a camera whose clock was set wrong) and those dated only
+  by their file are listed as the trip's **Other pictures**.
+- **Days away from home** are one: days with a picture whose GPS position
+  is more than 50 km from home, joined when at most one day without such a
+  picture lies between them (and none of its pictures was taken at home),
+  or up to three days in one area (the last position before the gap and
+  the first after it at most 500 km apart: a stay with days without
+  pictures, a road trip), when the run holds at least 10 pictures, or 5
+  taken on two days or more. Home is where pictures were taken on the most
+  days -- it is only used to tell the days away, and is never shown, sent
+  to a page or published. A run of days away that overlaps a library named
+  like a trip, near its pictures, becomes part of that trip.
+- The pictures of the other libraries taken on a trip's days belong to it
+  when they were taken away from home and near the trip (their position,
+  or their estimated place, more than 50 km from home and at most 1,000 km
+  from the trip's own pictures -- a picture whose date is wrong, taken on
+  another continent, does not join; without either, on a day with a
+  picture away, unless their place is a town of home). A copy of one of a
+  trip library's pictures in another library (the same file, or the same
+  camera and second) is left out: the trip shows the trip library's.
+- Pictures taken from a plane (their GPS altitude) are part of the trip,
+  but the towns they were taken over are not among its places.
+
+A trip's page (`/trip/<id>`) shows its title, dates and how many pictures,
+videos and drives it has, the places it went to in order, and a map: the
+routes of its drives (see [Routes](#routes-a-dashcams-gps)), its located
+pictures as pins and their estimated places as hollow pins (see [Estimated
+places](#estimated-places)), fitted to the trip -- a picture or two far
+from all the others (a wrong date) is left out of the fit and noted.
+Drag it to move it, zoom with its buttons, `Ctrl` and the wheel, a double
+click or two fingers; with the keyboard the arrow keys move it, `+` and
+`-` zoom, `0` shows the whole trip and `Enter` opens the pin nearest the
+middle. A click on a pin opens its pictures in the viewer, a click on a
+route the clip there. Then comes a section for each day: its date, its
+places, what it holds (pictures, videos, drives, 360-degree ones), a
+strip of its best pictures (a click opens the viewer on the day's
+pictures; Back closes it) and **Open in search** (exactly the day's
+pictures on the search page, under a "Trip: name, day 2" chip; when
+there are too many for an address, the libraries they are in on that
+date). **Open in search** at the top does the same for the whole trip,
+and **Other pictures** for those; **On the big map** shows the trip's
+libraries on its dates on the map. A trip of more than five days lists
+its days under its places, as links. The page shows what the search page
+shows by default: no explicit or graphic picture, in its strips, map,
+viewer or counts.
+
+The best pictures of a day are your favorites first, then the higher
+rating, then the better looking (the aesthetic and sharpness scores of
+the descriptions; less for blurry, dark or overexposed ones), with
+pictures of signs, menus and other papers, of screens and those marked
+accidental after the others (unless a favorite or rated). Each stack of
+near-duplicates (copies, bursts and look-alikes, as the search page
+stacks them), each set of the day's pictures that look alike (with
+[looks](#looks-like-this-and-search-by-a-picture) set up: the same view
+taken again, a video of it) and each drive (its middle clip) counts once,
+and a picture taken within two minutes of one already chosen waits until
+all others had their turn, so the strip covers the day. Hidden, private
+and sensitive pictures, screenshots, documents, scans, diagrams and memes
+are never chosen; a day of only those shows its best one that is not
+hidden, private or sensitive. Six a day by default (`best_per_day`). A
+trip's card takes a picture a day first (unless another day has only
+clearly worse ones), and 360 photos and wide panoramas last.
+
+On this computer each trip's page offers **Rename** (an empty name gives
+it back the one it was found with), **Hide** (it moves to **Hidden
+trips** at the bottom of the list, where **Show again** brings it back),
+**Merge with the trip before** / **after** (by date), **Split here** on
+each day after the first (that day and the ones after it become a trip
+of their own; **Join with the part before** / **after** undoes it) and
+**As found**, which forgets those changes, and **Export...**, which
+publishes the trip as a website of its own (see [Publishing a
+trip](#publishing-a-trip)). They are kept in `data/trips.json` and follow
+a trip whose first day moves when pictures are added. A trip split in
+parts merges with another trip only once its parts are joined again.
+Other computers (a server started with `--host`) see the trips without
+the hidden ones, and without hidden pictures; they cannot change them.
+What they see of a trip comes from the pictures they may see: its dates,
+its title (unless you gave it one), and whether a run of days away is a
+trip at all. The settings are `trips` in config.json (see SETTINGS.md).
+
+### Times in the local time of the place
+
+A camera dates a picture by its own clock, and that clock is not always
+the local time of where the picture was taken. Many dashcams ignore
+daylight saving, so their videos are an hour behind all summer; a phone
+in an aeroplane keeps the time of the airport it left until it lands; a
+camera taken abroad keeps the time of home. When the moment a picture
+was taken is known for sure, and the time zone of its place says the
+clocks there showed another time, the picture gets that time: the time
+shown, the timeline, "on this day", date searches and everything else go
+by the local time of the place, with that place's UTC offset at that
+moment (daylight saving included), as a phone writes it. The moment is
+known from:
+
+- a video's GPS track (a dashcam's, see [Routes](#routes-a-dashcams-gps)):
+  its GPS time against the clock (a clock set to UTC too);
+- the GPS time saved with a picture, when it is a whole number of quarter
+  hours from the clock (to the minute): the fix was made as the picture
+  was taken. A GPS time that is the clock's own time is no proof (some
+  cameras write their local time there);
+- the GPS date of a picture whose file gives a UTC offset that date says
+  cannot be right, while its clock read as the local time of its place
+  fits it: a phone that showed the local time but wrote the offset of the
+  time zone it came from. Only the offset changes then;
+- a picture of the same camera taken within 3 hours of it that has one of
+  the above (by the clock), with the same offset in its file (or a copy
+  of it, taken in the same second): the clips of a drive before the
+  dashcam had a GPS fix, a picture whose position the GPS check set aside,
+  pictures taken in the air. Not when that picture's clock cannot be this
+  one's: it would put this picture before its own GPS fix (a fix may be
+  old, never from later), or this picture was taken in a time zone with
+  another UTC offset than that picture's place (the camera went from one
+  to the other, and its clock may have been set in between). A picture
+  without a position also takes that picture's time zone when they were
+  taken within 30 minutes of each other (the window of [estimated
+  places](#estimated-places)).
+
+The time zone of a place is the one of the nearest town in the place
+names (see [Place names](#place-names); a place index made by an older
+version is built again from the downloaded files for it, nothing is
+downloaded). Times stay as the camera's clock has them for a picture
+whose file gives a UTC offset that is right for its place (a phone's,
+mostly), near the border of a time zone (a town within 50 km more than
+the nearest one has the clock's offset, or another offset than the
+nearest one's: which side it was taken on is not known), and far from
+any town. A picture whose UTC offset does not fit its place without
+anything to say which of the two is wrong is left as it is too. Without
+the place names or Python's time zone database (`pip install tzdata` on
+Windows: the log says so) no local time is worked out: pictures that have
+one keep it, the others keep their camera's time.
+
+The local times are worked out again after every scan, **Build
+previews** and **Add place names** (after the GPS check, which runs again
+when times change), before an export that publishes the location (after
+its GPS check), and at once when you use or ignore a picture's position
+or set its place in the viewer; so a file read again, or a position set
+aside or given back, is decided again. The camera's own clock stays in the
+picture's details, under the time: "Camera clock 08:11 (UTC+01:00); shown
+in the local time of its place (Europe/Paris), by the video's GPS track."
+(other computers see the time zone only of pictures with a position). The
+Manage page's place names say how many pictures show a local time and
+why, and
+
+    python local_times.py [--list]
+
+shows what the next scan gives each library (`--list` names every
+picture, and those left as they are), changing nothing. Drives follow
+their clips by their camera's clock, so a drive across a time zone border
+stays one. It is all reversible: `"local_times": {"enabled": false}` in
+`config.json` gives every picture its camera's time back at the next scan
+(see SETTINGS.md).
+
 ### Where 360 pictures open
 
 A 360-degree photo or video opens in the viewer (and shows in its
@@ -1427,9 +1674,10 @@ other name, such as an alias your router hands out, is refused with
 There is no login. Anyone who can reach the computer can search every
 library that is turned on, see file and folder names, dates, GPS positions,
 place names and the map, camera EXIF data and the model that described each
-picture, download the original files with all their metadata, and turn off
-"Hide sensitive pictures". Hidden pictures and turned-off libraries stay
-out. With search by meaning set up, their searches are embedded by this
+picture, download the original files with all their metadata (but not
+the RAW files: only this computer can), and turn off "Hide sensitive
+pictures". Hidden pictures and turned-off libraries stay out. With
+search by meaning set up, their searches are embedded by this
 computer's embedding model too (and may start it; each computer can ask
 a few times a second; only this server's own pages can ask, and other
 computers are not told why it is unavailable when it is). In this mode
@@ -1444,8 +1692,8 @@ a library](#publishing-a-library)): it leaves out what you choose.
 The header of every page links to **Duplicates**, **Manage** and
 **Settings** when the server runs on this computer (the default address,
 `127.0.0.1`), and to **Albums** (see [Favorites, ratings and
-albums](#favorites-ratings-and-albums)). Most of what the command line
-does can be done there:
+albums](#favorites-ratings-and-albums)) and **Trips** (see
+[Trips](#trips)). Most of what the command line does can be done there:
 
 - **Manage** lists each library with its folder, whether the folder can be
   reached, how many pictures are described, waiting, out of date or failed,
@@ -1562,6 +1810,207 @@ cannot; the browser marks their requests, which are refused). Only run the
 server on a computer you trust. Do not put the server behind a reverse
 proxy on the same computer: every visitor would then look local.
 
+## People
+
+People finds the faces in your pictures, on your own computer: a face
+detector marks each face (a box and five landmarks: the eyes, the tip of
+the nose and the corners of the mouth) and a face recogniser turns each
+face into a vector, so that the faces of one person are close to each
+other. The faces are then grouped into people, which you name on the
+**People** page; `person:"Name"` finds a person's pictures. It is off
+until you turn it on, and the rest of the program works the same without
+it.
+
+Faces are the most private data this program keeps. They are kept in a
+database of their own, `data/faces.db`, with the people and their names;
+no picture, face or name is sent anywhere (the models run on this
+computer's processor, no graphics card is needed, and no AI model
+describing pictures ever gets a name), no search record holds them, and
+no export publishes them -- except the names, as tags, when an export's
+**People's names** option is on. Others who use the search pages from
+another computer (`--host`) see nothing of People unless you allow it
+(`visitors` in [SETTINGS.md](SETTINGS.md)). Hidden pictures are looked at
+too, as nothing leaves the computer. The face helper gets none of the
+program's API keys (only the few environment variables a Python needs).
+
+### Setting up People
+
+People runs its models in a helper program (`people_worker.py`) with a
+Python environment of its own, so the search programs never need its
+packages:
+
+1. Make the environment and install its packages (numpy and OpenCV's
+   `opencv-python-headless`; Python 3.9 or later), on Windows:
+
+       python -m venv C:\path\to\people-env
+       C:\path\to\people-env\Scripts\python.exe -m pip install -r requirements-people.txt
+
+   or on Linux and macOS:
+
+       python3 -m venv /home/you/people-env
+       /home/you/people-env/bin/python -m pip install -r requirements-people.txt
+
+   (tested with numpy 2.5.4 and opencv-python-headless 4.14 on Python
+   3.14: `requirements-people-pinned.txt` installs exactly those builds,
+   with the SHA-256 of their files, on Python 3.12 or later, with
+   `--require-hashes`). Each run notes the OpenCV it ran with, and warns
+   when it is another version than the one that found the faces kept.
+2. Download the two model files of the OpenCV Zoo into a folder of your
+   choice:
+   - the YuNet face detector, `face_detection_yunet_2023mar.onnx` (232,589
+     bytes, SHA-256
+     `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`,
+     MIT license), from
+     https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet
+     or https://huggingface.co/opencv/face_detection_yunet;
+   - the SFace face recogniser, `face_recognition_sface_2021dec.onnx`
+     (38,696,353 bytes, SHA-256
+     `0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79`,
+     Apache-2.0 license), from
+     https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface
+     or https://huggingface.co/opencv/face_recognition_sface.
+
+   Keep each model's license file next to it. The files themselves are
+   under those open licenses, but the models were trained on collections
+   of faces meant for research: YuNet on WIDER FACE (CC BY-NC-ND 4.0, no
+   commercial use), and SFace, by its paper, on CASIA-WebFace, VGGFace2
+   and MS-Celeb-1M (withdrawn by its publisher in 2019; the OpenCV Zoo
+   does not say which of them its file was trained on). Check whether
+   that matters for what you do; this program never ships the models.
+3. Turn People on in `config.json` (see `people` in
+   [SETTINGS.md](SETTINGS.md)):
+
+       "people": {
+           "enabled": true,
+           "python": "C:\\path\\to\\people-env",
+           "models_dir": "C:\\path\\to\\models\\faces"
+       }
+
+4. Check it: `python people.py --check` starts the helper, loads the
+   models and looks for a face the program draws (a few ellipses); it
+   says what is wrong when that fails. The Manage page's **Check face
+   helper** does the same.
+
+### Finding faces
+
+Once People is set up, every scan ends by looking for the faces of the
+new pictures, and the Manage page counts each library's faces and offers
+**Find faces (N)** for the pictures not looked at yet (a job for the
+processor: the helpers share the pictures, see `workers` in
+[SETTINGS.md](SETTINGS.md)); from the command line:
+
+    python people.py [--library NAME_OR_ID ...] [--limit N] [--retry-failed]
+    python people.py --status
+
+Each picture is looked at once, in its stored preview (a video in its
+poster frame; a 360-degree photo or video in its flat preview, keeping
+only the faces near its horizon, where the projection hardly stretches
+them -- the people holding the camera, mostly; the viewer draws no boxes
+on those), at several sizes so that small faces in a crowd and a face
+that fills the picture are both found. Copies of a picture share their faces, and a moved or
+renamed picture keeps them. A run that is stopped keeps what it found; the
+next one goes on. A picture that cannot be read is tried again by the
+next runs, three times (**Retry finding faces** or `--retry-failed`
+tries again after that). Other model files, or settings that change what
+is found, make the next run look at every picture again. Each face keeps
+how sure the detector was and a quality (its size, sharpness and how much
+it faces the camera), as the detector also finds faces in profile, far in
+the background, and things that only look like faces (toys, statues,
+wheels).
+
+### People: grouping faces, names and the People page
+
+After each run that found faces (and with **Group faces again** on the
+People page), the faces are grouped into people: the clear faces are
+grouped by average linkage (two groups become one while their faces are,
+on average, at least as alike as `match`; never two faces of one
+picture), a group of at least `min_faces` faces, in pictures of at least
+two different moments, is a person (the frames of a burst, or copies of
+one shot, are one moment), and then each face of lower quality (small,
+blurred, turned away) joins the person whose faces it is most like, if
+it is as alike (a little more for a person of only a few faces) and
+that person has no other face in its picture. Many groups of things that are not
+faces (wheels, sweets, teddy bears, a dog) are left out by how sure the
+recogniser is about them; statues, toys and prints with faces of their
+own, and portraits on banknotes, are not: **None are faces** clears such
+a "person". A person keeps its number and name from one grouping to the
+next; unnamed people are shown as "Person 12".
+
+Expect the recogniser to mix up babies and toddlers, and sometimes
+relatives who look alike, and to split one person into a large group and
+a few small ones (sunglasses, profiles, pictures from decades ago): the
+People page shows those as "Maybe the same person". Faces in no person
+(too few pictures, too small or blurred) are listed under **Other
+faces**. A person's faces are shown best first, one of each moment
+before a second of any.
+
+The **People** page (in the header) lists the people, named ones first,
+each with a face, how many pictures they are in and **Pictures** (their
+pictures on the search page). Open a person to put it right:
+
+- **Name** (or **Rename**; an empty name takes it away). A name another
+  person has already is refused, with an offer to merge the two.
+- **Merge into...**, or **Merge here** on a person under "Maybe the
+  same person": every face of one goes to the other.
+- Select faces (a click; **Select all**) and choose **Not <name>** (they
+  leave for good and never come back to that person), **Move to...**
+  (another person, or a new one: a split), **Not a face**, or **Use as
+  cover** (the face that stands for the person).
+- **Hide** a person (strangers in the background): not listed, not
+  offered in searches; **Show hidden people** brings them back.
+- **None are faces** marks every face of a group of things.
+
+What you say is kept: later groupings never put a face back in a person
+you took it out of, keep the faces you moved where you put them, and keep
+merged people together (but for the faces of lower quality that had
+joined one of them by themselves: later groupings place those again). In
+the person picker (**Move to...**, **Merge into...**) Enter takes the
+person whose name you typed, else a new person of that name, else the
+only person whose name has what you typed in it. **Other faces** puts
+faces in a person (**Add to a person...**) or marks them as not faces;
+**Not faces** takes that mark back (the faces then wait in Other faces
+for **Group faces again**).
+
+On the search page `person:"Ann Lee"` (any case; the start of the only
+name that starts so; `person:#12` by number; `person:any`, `person:none`)
+finds a person's pictures, combined with anything else (`person:Ann
+person:Bob beach`, `-person:Ann`), also in smart albums and on the map.
+A hidden person is found by its whole name or number only, and
+`person:any` counts the people that are not hidden. (`people:2` still
+counts the people the AI model saw in a picture, from its
+description.) The viewer's
+information pane names the people in the picture (each a link to their
+pictures); **Show faces** there draws the box of every face over the
+picture, with its person's name (a link to the People page), and stays
+on for the next pictures until you hide them.
+
+People is the admin's: the People page, the names and the boxes are only
+on this computer, unless `config.json`'s `people` has `"visitors": true`
+(and People is on): then others see the People page (named people that
+are not hidden, and their faces), the names in the pane, `person:` and
+the smart albums that search for a person -- never the boxes, the
+unnamed or hidden people, or the faces of hidden pictures. Without it,
+those smart albums are not listed for them either (their searches name
+people).
+
+### Deleting all face data
+
+**Delete face data** on the Manage page (it asks first), or
+
+    python people.py --delete-all
+
+deletes every face found, of every library, with the people and the
+names you gave them (`data/faces.db` as a whole; the pictures are not
+touched). When some of it cannot be deleted (the file is open in another
+program, or read-only), it says so and fails: close that program and
+delete it again. Names that an export published with its **People's
+names** option stay in that export, and `person:` searches saved as
+smart albums stay in those albums, until you delete them. Deleting a
+library's indexed data, or a picture that is gone for good, also deletes
+its faces, and the people (and names) left without a face. To stop
+finding faces, set `"enabled": false` in `config.json`'s `people` (the
+faces kept stay until you delete them, for you only).
+
 ## Publishing a library
 
 A library can be exported as a static website: the same search, viewer and
@@ -1573,7 +2022,8 @@ On the Manage page, **Export...** on a library opens a dialog:
 1. **Options**, in plain words: the whole library or only the pictures of
    one album (the way to choose what to publish: put them in an album
    first); web-size pictures, originals (with their
-   hidden details removed) or thumbnails only; what to leave out
+   hidden details removed) or thumbnails only, and the RAW files (offered
+   when the pictures have some); what to leave out
    (screenshots, documents, scans, videos, pictures flagged as private or
    sensitive, pictures not checked yet); whether to also publish file
    names, folder names or locations (and, with locations, estimated
@@ -1638,7 +2088,8 @@ publish more. To publish less, change the options in the Export dialog (or
 `export` in `config.json`). `serve.py package` always uses the saved
 options.
 
-- `--images web` (the default) publishes 2048 px pictures, `original` the
+- `--images web` (the default) publishes 2048 px pictures (and for wide
+  panoramas their larger picture, for phones), `original` the
   originals with their metadata removed (HEIC, HEIF, AVIF and TIFF become
   JPEG, BMP becomes PNG; an unstitched 360-degree photo, with its two
   fisheye circles, is published as the stitched panorama), and `none`
@@ -1697,9 +2148,16 @@ options.
   them. A smart album is left out when its search cannot be published: one
   limited to another library, one that searches by folder, file name or
   place (`folder:`, `file:`, `place:`, `has:gps`, the Place filter) while
-  those are not published, by library (`lib:`), or for pictures like one
-  that is not published. Without `--marks`, not even the name of the
-  album the export is limited to goes out.
+  those are not published, by library (`lib:`), for pictures like one
+  that is not published, or for a person (`person:`: the site has no
+  people, and the search would publish a name). Without `--marks`, not
+  even the name of the album the export is limited to goes out.
+- The names of people (see [People](#people)) go only with
+  `--people-names` (**People's names (as tags)** in the dialog,
+  `people_names` in the saved options): then the named people who are not
+  hidden become tags of the pictures they are in. Faces, their boxes, the
+  people's numbers and anything learnt from the faces are never
+  published.
 - Titles, descriptions, tags and the text read from pictures are published
   as the AI model wrote them: they can name people or places a picture
   shows, whatever the options say. Read through what you publish.
@@ -1711,6 +2169,8 @@ options.
   its colours but loses its texts), and their ids do not reveal the
   database's. Each picture shows its title, description, tags, the text
   read in it, the day it was taken and the camera model and settings.
+  (RAW files, published only with **RAW files**, are the exception: see
+  below.)
 - Videos are published as their poster frame. With **Include videos** in
   the dialog (`--videos include`, or `"videos": "include"` in the saved
   options) the videos browsers can play (H.264, or a playable copy made
@@ -1723,6 +2183,20 @@ options.
   The AI model checked only a few still frames of each video for private
   or sensitive content and never heard its sound: watch the videos you
   publish. **Videos** under **Leave out** leaves every video out.
+- RAW files (see [RAW photos](#raw-photos)) are never published unless
+  you tick **RAW files** in the dialog (`--raw-files`, or `"raw_files":
+  true` in the saved options). Then the RAW file of each published
+  picture goes along as the camera wrote it (`raws/<id>.<ext>`, with a
+  **Download** link in the site's viewer): nothing can be taken out of a
+  RAW file without spoiling it, so it carries every fact the camera wrote
+  in it -- the time to the second, the camera and lens, the camera's
+  serial number. One that holds a GPS position goes only with the
+  location option, and only when its picture's own position goes (not
+  one the GPS check or you set aside; in a trip's export, neither that
+  position nor the RAW file's own may be near home); one changed since
+  the last scan is looked at again for that. The review says how many go and how many
+  stay home, and counts their size (they are large). A RAW file indexed
+  on its own is published as its preview, like any picture.
 - With `similar` (on by default) the meaning vectors of the published
   pictures go along (about 350 bytes each), so **More like this** and
   `similar:` go by meaning in the site. Only vectors made from a
@@ -1791,6 +2265,86 @@ Opened from disk, the 360-degree view shows the flat panorama (browsers do
 not allow it for files), and a 360-degree video plays flat (its front
 lens); over http they can be turned around.
 
+### Publishing a trip
+
+A trip can be published as a website of its own that opens on the trip's
+page -- its title, dates, places, map and days with their best pictures,
+as visitors see it on your server -- with the search, viewer, picture and
+map pages of the trip's pictures (only those) beside it. On the trip's
+page, **Export...** opens the Export dialog of the Manage page for the
+trip. From the command line:
+
+    python export.py --trip lib_2b7c9d10 --location --routes
+    python export.py --trip away-20240512 --home-km 20
+
+The trip's id is the end of its page's address (`/trip/<id>`). Its
+pictures are those of the trip in every library (the libraries' names are
+never published), less what the options leave out: everything under
+[Publishing a library](#publishing-a-library) applies -- the options and
+switches, the review, the folder rules, the zip, `--serve` -- except that
+a trip cannot be limited to an album. The site's title is the trip's name
+unless you give another. The options of a trip's last export from the
+dialog are kept with the trip (in `data/trips.json`) and are the next
+export's, also for `export.py --trip` (as the saved options of a library
+are for `--library`). Without `--out` the site goes to
+`data/exports/trip-<first day>-<name>/` (or the folder in `data/exports`
+the trip was last exported to). Each trip and each library needs a folder
+of its own: an export (of a trip or of a library) into a folder that holds
+another trip's or library's export refuses to start, unless that trip is
+not found any more (or that library is gone from the settings).
+`--home-km` goes only with `--trip`.
+
+The trip's page in the site holds its title, its dates (the first and
+last day of the published pictures) and those of its days, which
+pictures each day holds in the order they were taken and roughly how far
+apart (within 20 seconds, within two minutes or further, so that its
+strip can be spread over the day: no times), which of them look alike,
+and with **Location** the places of the trip and of each day, from the
+place names of the published pictures. The best pictures of each day are
+chosen in the visitor's browser as on your server, among the published
+pictures. Unless you give a title (or gave the trip a name), the site's
+title is made from the places of the published pictures that are not
+near home.
+
+**Home is never shown.** A trip often starts and ends at home: a library
+named like a trip holds the pictures of the drive out, a dashcam the clips
+of leaving the garage. A trip's export keeps an area around home out of
+it -- **Keep home private** in the dialog, `--home-km KM` (`home_km` in
+its options): 5, 10 (the default), 20, 40, 80 or 160 km, or 0, which turns
+it off (the dialog asks for it by name, so an empty field never does):
+
+- The area is the square of a grid of 10 km squares (`home_km`) that holds
+  home, with the eight squares around it: at least 10 km from home every
+  way and at most 20 km (30 km across). The grid lies the same way
+  wherever home is in its square, so the area's edges do not point at
+  home (those of a circle around home would: its centre is home). The
+  grids of the sizes nest -- a square of one size is four of the next
+  smaller -- so sites made with different sizes tell together no more
+  than the one of the smallest size. Still, keep to one size.
+- With **Location**, no position in the area is published: its pictures
+  keep their region and country but not their town, nor the AI model's
+  landmark and place-guess words, and neither does any picture whose town
+  has pictures in the area; estimated places in it are not shown, and
+  drive routes are cut at its edge (besides the 500 m left out at both
+  ends of every drive), and a RAW file holding a position in it, or whose
+  picture was taken in it, stays home. Home is no place the trip went to: those pictures
+  are left out of the places of the trip and of its days, and of the
+  site's title.
+- Whatever the options, a dashcam's clip whose GPS track enters the area,
+  or that has no fix (its overlay then prints the last position it had,
+  often where the drive started), is left out as **Near home**: the review
+  step lists them, and you can publish one after watching it. The words
+  of its drive (its title, description and tags, written from frames of
+  that clip too) are left out with it.
+- Home is where the trips find it (where pictures were taken on the most
+  days), or the `home` setting of `trips` (see SETTINGS.md); with no home
+  found there is nothing to keep out. Home itself is never written
+  anywhere.
+- Titles, descriptions, tags and the text read from the pictures are
+  published as written, as for a library (a picture's own description may
+  name the town it was taken in): read them in the review. So are the
+  landmark and place-guess words of the pictures outside the area.
+
 ## Comparing models
 
     python compare_models.py --endpoints local,cloud --sample 100 --endpoint-limit cloud=20
@@ -1857,13 +2411,18 @@ private:
   (kept apart from the model's), your favorites, ratings and albums, the
   positions the GPS check set aside (with your choices), the estimated
   places, the GPS tracks read from videos (where a dashcam drove: see
-  [Routes](#routes-a-dashcams-gps)) and where 360 pictures open.
+  [Routes](#routes-a-dashcams-gps)), the camera clocks of pictures shown
+  in the local time of their place, and where 360 pictures open.
 - `thumbs.db` and `previews/` - thumbnails, and 2048 px previews, 360
-  panoramas and the contact sheets of videos (about 0.5 MB per picture).
+  panoramas, the larger pictures of wide panoramas and the contact sheets
+  of videos (about 0.5 MB per picture).
 - `proxies/` - playable copies of videos (only with `video_proxies`).
 - `drives.json` - the descriptions of drives (runs of video clips, see
   [Drives](#drives)); `drive-previews/` - their sped-up previews (only
   with `drive_previews`).
+- `trips.json` - your changes to the trips: names, hidden trips, merges
+  and splits (see [Trips](#trips)), and the options of their exports (see
+  [Publishing a trip](#publishing-a-trip)).
 - `jobs.db` and `logs/` - the Manage page's jobs and their logs, which name
   files. With the `LOG_ERRORS` environment variable set, the LLM's replies
   to failed requests are saved in `logs/` too. `logs/model-server.log` is
@@ -1875,6 +2434,11 @@ private:
 - `image_vectors.db` - the look vectors of the pictures (see [Looks like
   this](#looks-like-this-and-search-by-a-picture)); safe to delete, but
   making them again takes a long run of the image model.
+- `faces.db` - the faces found in the pictures, the people they were
+  grouped into and their names (only with People, see [People](#people)):
+  the most private file here, never exported (but for the names with an
+  export's People's names option); delete it with
+  `python people.py --delete-all`.
 - `exports/` - static sites (`exports/<library name>/`) and the list of
   files each export wrote (`exports/state/`).
 - `reports/` - model comparison reports.
@@ -1882,8 +2446,8 @@ private:
   Duplicates page).
 - `cache/` (near-duplicate groups, rebuilt when missing) and `tmp/`.
 - `places/` - the GeoNames files and the place index made from them (see
-  [Place names](#place-names)); not private, and made again by
-  `make_places.py`.
+  [Place names](#place-names); with the towns' time zones); not private,
+  and made again by `make_places.py`.
 - `tiles/` and `blue_marble.jpg` (from `make_tiles.py`), `world_map.png`
   (from `world_map.py`).
 - `images.db` and `thumbs/` - the database of older versions (see
@@ -1891,7 +2455,8 @@ private:
 - `*.lock` files and `abort` - used while tools run.
 
 To keep the descriptions, back up `config.json`, `data/index.db`,
-`data/drives.json` and `data/not-duplicates.json` while no tool is running.
+`data/drives.json`, `data/not-duplicates.json` and `data/trips.json` while
+no tool is running.
 
 ### Other tools
 
@@ -1912,6 +2477,12 @@ draws a world map with a pin for each place pictures were taken (by default
 
 downloads the place names and looks up the places of the pictures (see
 [Place names](#place-names)).
+
+    python local_times.py [--list]
+
+shows which pictures get the local time of their place, and why (see
+[Times in the local time of the
+place](#times-in-the-local-time-of-the-place)); it changes nothing.
 
     python make_tiles.py
 
@@ -1941,7 +2512,17 @@ writes the missing or damaged ones.
 - `looks.py` - looks: the look vectors of the pictures
   (`data/image_vectors.db`), the job that makes them, and the server's
   answers to `/api/looks` and `/api/looks/query`
+- `people.py` - People: the faces in the pictures (`data/faces.db`), the
+  job and scan step that find them, and the helper program it runs;
+  `people_worker.py` is that helper (it runs in the people environment,
+  see [People](#people)), and `requirements-people.txt` lists that
+  environment's packages (`requirements-people-pinned.txt`: the versions
+  tested, with their hashes); `people_groups.py` groups the faces into people
+  and keeps what you say about them, and answers the server's
+  `/api/people`, `/face/<id>` and the People page
 - `export.py` - publish one library as a static website
+- `trip_export.py` - publish one trip as a static website (`export.py
+  --trip`), home kept out
 - `compare_models.py` - compare how endpoints describe the same images
 - `progress.py`, `world_map.py`, `make_tiles.py`, `make_places.py` - see
   [Other tools](#other-tools)
@@ -1957,6 +2538,9 @@ writes the missing or damaged ones.
   their descriptions and their sped-up previews (see [Drives](#drives))
 - `tracks.py` - the GPS tracks of videos (a dashcam's) and the routes of
   drives (see [Routes](#routes-a-dashcams-gps))
+- `trips.py` - trips: libraries named like a trip and runs of days away
+  from home, your changes to them, and the server's answer to `/api/trips`
+  (see [Trips](#trips))
 - `places.py` - place names: the GeoNames download, the place index and
   the nearest town of a GPS position (`static/place-names.js` is their
   part of the Manage page)
@@ -1966,6 +2550,11 @@ writes the missing or damaged ones.
 - `place_estimates.py` - estimated places for pictures without a usable
   position, and your own places (see [Estimated
   places](#estimated-places))
+- `local_times.py` - times in the local time of the place (see [Times in
+  the local time of the place](#times-in-the-local-time-of-the-place))
+- `raw_photos.py` - camera RAW files: their previews and EXIF, read
+  without a RAW converter, and the rules that pair them with their
+  pictures (see [RAW photos](#raw-photos))
 - `example_helper.py` - the hooks a helper module can have
 - `search_index.py` - the compact search records the search page downloads
   and searches in the browser, and the groups of near-duplicate pictures
@@ -1985,7 +2574,9 @@ writes the missing or damaged ones.
   `embed-engine.js` and `embed-kernel.js` run the embedding model in a
   published site (only there, and only once a search needs it);
   `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
-  `duplicates.js` the Duplicates page, `albums.js` the Albums page;
+  `duplicates.js` the Duplicates page, `albums.js` the Albums page,
+  `trips.js` the Trips pages (with `trips.css`; `map.js` lends them its
+  tiles and pins), `people.js` the People page (with `people.css`);
   `manage.js` and `settings.js` run
   Manage and Settings, `model-server.js` the Settings page's Model server
   panel, and `export-review.js` holds the rules and words of the Export
@@ -2114,6 +2705,30 @@ Other changes to be aware of:
 - A GPS position written in a picture's text (a dashcam's overlay, read by
   the model) is now left out of its meaning vector, so the next **Update
   meaning search** (or scan) makes the vectors of those pictures again.
+- Wide panoramas open zoomed in on phones now (see **Wide panoramas** under
+  [Searching](#searching)), with a larger picture of their own: the first
+  scan after upgrading reads each wide photo once more to make it, next to
+  its preview (about 1 to 3 MB a photo; nothing else changes). Until then
+  the server makes it from the original the first time it is wanted.
+- Pictures whose camera's clock was not the local time of where they were
+  taken (a dashcam that ignores daylight saving, a phone on the time of
+  the airport it left) get the local time of their place now (see [Times
+  in the local time of the
+  place](#times-in-the-local-time-of-the-place)). The first scan after
+  upgrading builds the place index again from the downloaded files, for
+  the towns' time zones (a second; nothing is downloaded), and works the
+  times out; the search index then sees those pictures as changed. Their
+  camera's clock is kept in a table of their own in `index.db` (the
+  database's version does not change). On Windows install `tzdata`
+  (`python -m pip install -r requirements.txt` does); without it times
+  stay as they were. `python local_times.py --list` shows what changes.
+- Camera RAW files are listed now (see [RAW photos](#raw-photos)): the
+  first scan after upgrading pairs each with the picture of its name
+  beside it (only the RAW file's EXIF is read; the pictures are not read
+  again and keep their descriptions), and indexes the RAW files that have
+  none by their previews, which the describe step then describes. A
+  picture's RAW file is kept in its EXIF data (the database's version does
+  not change). `"raw": {"enabled": false}` keeps them out, as before.
 - `config.json` is now written with non-ASCII characters escaped (`\u00fc`),
   and read as UTF-8. A file saved in the system's encoding still loads, with a
   warning.
@@ -2141,7 +2756,13 @@ The page scripts' own tests (`tests/js/`) run as part of this when Node.js
 is installed, and are skipped when it is not. No test needs a model or
 ffmpeg: `tests/fake_llm.py`, `tests/fake_model_server.py` and
 `tests/fake_embed_server.py` stand in for the models on 127.0.0.1, and
-`tests/fake_ffmpeg.py` for ffmpeg and ffprobe. A few video tests also use
+`tests/fake_ffmpeg.py` for ffmpeg and ffprobe, and
+`tests/fake_people_worker.py` for the face helper (it finds faces drawn
+as coloured squares). `tests/test_people_live.py` runs the real face
+helper and models on faces drawn in code when
+`SEARCH_IMAGES_PEOPLE_PYTHON` (the people environment) and
+`SEARCH_IMAGES_PEOPLE_MODELS` (the folder of the model files) are set,
+and is skipped otherwise. A few video tests also use
 a real ffmpeg when there is one on the PATH (or named by the
 `SEARCH_IMAGES_TEST_FFMPEG` environment variable), and are skipped
 otherwise. The browser's embedding engine is tested on tiny made-up
@@ -2168,6 +2789,15 @@ sample images are covered by their own licenses, listed in
 `static/worldmap.jpg` is an equirectangular projection derived from NASA's
 Blue Marble imagery and is in the public domain. Source:
 https://commons.wikimedia.org/wiki/File:Equirectangular-projection.jpg
+
+The face models People uses (downloaded by you, see [People](#people))
+are from the OpenCV Zoo, https://github.com/opencv/opencv_zoo: YuNet (Wu,
+Peng and Yu, "YuNet: A Tiny Millisecond-level Face Detector", 2023; MIT
+license) and SFace (Zhong et al., "SFace: Sigmoid-Constrained Hypersphere
+Loss for Robust Face Recognition", 2021; Apache-2.0 license). They were
+trained on face collections with research-only terms (WIDER FACE; the
+SFace paper's CASIA-WebFace, VGGFace2 and MS-Celeb-1M): see [Setting up
+People](#setting-up-people).
 
 Place names (downloaded when you ask for them, see [Place
 names](#place-names)) are from GeoNames, https://www.geonames.org/, under

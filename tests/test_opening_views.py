@@ -248,6 +248,32 @@ class TableTest(support.TempBaseMixin, unittest.TestCase):
         self.assertNotIn("ov", self.records()[self.pano])
         self.assertFalse(opening_views.any_views(self.conn))
 
+    def test_a_first_view_at_the_front_changes_nothing(self):
+        # (A picture without a view opens at the front: its thumbnail, cut from the
+        # original by the scan, stays.)
+        key = opening_views.content_key("hash-pano.jpg", self.pano)
+        before = self.updated(self.pano)
+        with self.conn:
+            self.assertFalse(opening_views.store_auto(self.conn, key, 0.0, 0.0, "k1",
+                                                      now=NOW + 1))
+        self.assertEqual(self.updated(self.pano), before)
+        self.assertNotIn("ov", self.records()[self.pano])
+        # Nearly the front (FRONT_SLACK) is the front too.
+        with self.conn:
+            self.assertFalse(opening_views.store_auto(self.conn, key, 0.3, -0.2, "k2",
+                                                      now=NOW + 2))
+        # Turned away from it and back: both are changes.
+        with self.conn:
+            self.assertTrue(opening_views.store_auto(self.conn, key, 90.0, 0.0, "k3",
+                                                     now=NOW + 3))
+            self.assertTrue(opening_views.store_auto(self.conn, key, 0.0, 0.0, "k4",
+                                                     now=NOW + 4))
+        self.assertEqual(self.updated(self.copy), NOW + 4)
+        # A first view of another content that is not the front: a change.
+        with self.conn:
+            self.assertTrue(opening_views.store_auto(self.conn, "#%d" % self.flat, -45.0, 0.0,
+                                                     "k"))
+
     def test_views_of_contents_that_are_gone_are_dropped(self):
         with self.conn:
             opening_views.set_owner(self.conn, self.pano, 30, 0)
@@ -446,6 +472,20 @@ class LooksRunTest(support.TempBaseMixin, unittest.TestCase):
         # (Grey words: no view beats the front by enough.)
         self.assertEqual(self.view()["yaw"], 0.0)
         self.assertFalse(reddish(middle(self.thumb(self.pano))))
+
+    def test_a_photo_that_opens_at_the_front_keeps_its_thumbnail(self):
+        # Words no view matches better than the front: the photo opens at the front,
+        # as it did, so its thumbnail (cut from the original by the scan) is not cut
+        # again from the stored preview.
+        self.conn.execute("UPDATE images SET info = ? WHERE id = ?",
+                          (described("A field", "Grass. Sky."), self.pano))
+        self.conn.commit()
+        summary, _ctx = self.run_looks()
+        self.assertEqual(summary["error"], "")
+        self.assertEqual((summary["views"], summary["views_turned"]), (1, 0))
+        self.assertEqual(self.view()["yaw"], 0.0)
+        self.assertEqual(self.thumb(self.pano), b"old thumbnail")
+        self.assertEqual(self.thumb(self.copy), b"old thumbnail")
 
     def test_the_looks_line_says_the_looks_own_time(self):
         # The opening views take their own time (seconds a photo): the looks'

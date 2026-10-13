@@ -31,6 +31,11 @@ IMAGE_EXTENSIONS = (
     ".tif", ".tiff", ".avif", ".bmp",
     ".insp",            # Insta360 360-degree photos (JPEG data)
 )
+# Camera RAW files (raw_photos.py): paired with the picture of the same shot
+# beside them, or indexed by their preview when they have none.
+RAW_EXTENSIONS = (
+    ".dng", ".arw", ".cr2", ".cr3", ".nef", ".nrw", ".orf", ".rw2", ".raf", ".pef", ".srw",
+)
 # Formats Pillow can only read through an optional plugin (pillow-heif, or a
 # Pillow build with AVIF support), and that browsers may not display.
 HEIC_EXTENSIONS = (".heic", ".heif", ".hif", ".avif")
@@ -1145,10 +1150,17 @@ def is_video_file(name):
     return name.lower().endswith(VIDEO_EXTENSIONS)
 
 
-def is_media_file(name, videos=False):
-    """True for a picture, or (with videos) a picture or a video."""
+def is_raw_file(name):
+    """True for a file name with a camera RAW extension (RAW_EXTENSIONS)."""
+    return name.lower().endswith(RAW_EXTENSIONS)
+
+
+def is_media_file(name, videos=False, raws=False):
+    """True for a picture, or (with videos) a picture or a video; with raws, a camera
+    RAW file too."""
     lowered = name.lower()
-    return lowered.endswith(IMAGE_EXTENSIONS) or (videos and lowered.endswith(VIDEO_EXTENSIONS))
+    return (lowered.endswith(IMAGE_EXTENSIONS) or (videos and lowered.endswith(VIDEO_EXTENSIONS))
+            or (raws and lowered.endswith(RAW_EXTENSIONS)))
 
 
 def library_videos(library):

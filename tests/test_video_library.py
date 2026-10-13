@@ -122,7 +122,7 @@ class ScanTest(VideoLibraryCase):
         self.assertEqual((clip["taken_at"], clip["taken_source"], clip["tz_offset"]),
                          ("2021-07-04T11:30:15", "video", "-07:00"))
         self.assertEqual((clip["lat"], clip["lon"], clip["camera"]),
-                         (47.6062, -122.3321, "Acme Phone 9"))
+                         (33.4484, -112.074, "Acme Phone 9"))
         self.assertEqual(json.loads(clip["exif"])["video"]["codec"], "h264")
         self.assertEqual(clip["content_hash"], videos.quick_hash(self.clip)[0])
         self.assertEqual(clip["has_preview"], 1)

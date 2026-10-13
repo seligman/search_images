@@ -20,6 +20,7 @@ disk by double-clicking index.html.
                 [meaning/model.js meaning/w-NNN.js meaning/LICENSE.txt]
     thumbs/<id>.jpg   images/<id>.<ext>   [panos/<id>.jpg]   [tiles/z/x/y.jpg]
     [videos/<id>.mp4] (with the videos option "include")
+    [raws/<id>.<ext>] (with the raw_files option)
     [robots.txt]      (unless search engines may index the site)
     .search-images-export   {"format": 1, "export_id": "<random>"}
 
@@ -98,7 +99,28 @@ is:favorite and rating: work in the published site too. A smart album
 whose search cannot be published is left out: one limited to another
 library, or going by what the export leaves out (folder:, file:,
 place:, has:gps or the Place filter while the matching option is off;
-lib:), or naming a picture or an album that is not published.
+lib:), naming a picture or an album that is not published, or a person
+(person:, whose name it would publish).
+
+Faces and their people (people.py, people_groups.py) are never published:
+no face, box or vector, and no name -- unless the "people_names" option is
+on (off by default): then the names of the named people who are not hidden
+become tags of the pictures they are in (people_groups.export_names), so a
+search for a name finds them in the site. Nothing else of People goes.
+
+A 360-degree photo also goes out with its large panorama (panos/<id>.jpg)
+for the 360 view, and so does a wide photo (images.gets_pano) when the
+web-size pictures go out, for the viewer's pan view (with "original" the
+original itself is as large).
+
+A camera RAW file (raw_photos.py) never goes out, unless the raw_files
+option is on: then the RAW file of each published picture (its RAW
+original, or the RAW file a picture is) is copied as it is (raws/<id>.<ext>,
+see raw_plan), since nothing can be taken out of it without spoiling it:
+with every fact the camera wrote in it (the time to the second, the camera
+and its serial number). One that holds a GPS position goes only with the
+location option on; the review counts them (counts.raws). A RAW file
+indexed on its own is published as its preview, like any picture.
 
 A video is published as its poster frame (its thumbnail and web-size
 picture), and with the videos option "include" also as a video: the
@@ -128,7 +150,14 @@ command line:
                      [--include-screenshots] [--include-documents]
                      [--include-undescribed] [--include-private]
                      [--include-sensitive] [--zip] [--album NAME] [--marks]
+                     [--people-names]
+                     [--raw-files]
+    python export.py --trip ID [--home-km KM] [the same switches]
     python export.py --serve FOLDER [--port 8000]
+
+--trip exports a trip (trips.py) instead: the pictures of its libraries,
+with its page as the site's first page and home kept out (trip_export.py,
+which uses _Export over several libraries: library_ids, owner_key, home).
 
 --serve tries an export on this computer (only it can open the site): a
 small web server for the folder that, unlike "python -m http.server",
@@ -175,10 +204,12 @@ import gps_check
 import imageinfo
 import jobs
 import library_ops
+import local_times
 import looks
 import place_estimates
 import places
 import prompts
+import raw_photos
 import search_index
 import tracks
 import videos
@@ -233,7 +264,7 @@ RESERVED_SLUGS = frozenset(["state", "con", "prn", "aux", "nul"]
                            + ["com%d" % n for n in range(1, 10)]
                            + ["lpt%d" % n for n in range(1, 10)])
 # The folders of an export this tool manages (and may clean up).
-MANAGED_FOLDERS = ("assets", "data", "thumbs", "images", "panos", "tiles", "videos")
+MANAGED_FOLDERS = ("assets", "data", "thumbs", "images", "panos", "tiles", "videos", "raws")
 # The extensions of exported originals (see original_picture).
 ORIGINAL_EXTENSIONS = ("jpg", "png", "gif", "webp")
 # Free space an export leaves on the disk it writes to, at least.
@@ -274,8 +305,13 @@ UNCHECKED_FLAG = "unchecked"
 # types, and "video" (every video, whatever the model saw in its frames).
 VIDEO_KIND = "video"
 EXPORT_KINDS = prompts.PHOTO_TYPES + (VIDEO_KIND,)
+# The flag of a dashcam's clip that may show where home is (a trip export's, see
+# trip_export.py: its GPS track enters the home area, or it has no fix).
+HOME_FLAG = "home"
+# How the state of a trip's export names its owner (trip_export.KEY_PREFIX).
+TRIP_OWNER_PREFIX = "trip:"
 # Every flag a picture can have (see _reasons), most serious first.
-FLAGS = (("private", "sensitive") + EXPORT_KINDS
+FLAGS = (("private", "sensitive", HOME_FLAG) + EXPORT_KINDS
          + (WRITING_FLAG, UNCHECKED_FLAG, "undescribed"))
 # Pictures that cannot be read are named in the log up to this many times
 # (then only counted), so an unreachable library does not flood the log.
@@ -308,16 +344,18 @@ DEFAULT_OPTIONS = {
     "allow_indexing": False,        # False: the pages ask search engines not to index them
     "videos": "skip",               # "skip" (posters only) | "include" (playable videos too)
     "max_video_mb": 200,            # larger videos keep their poster only
+    "raw_files": False,             # the RAW files of the pictures, as they are (raw_plan)
     "similar": True,                # meaning vectors, so "More like this" works (no model needed)
     "meaning": True,                # the query model too: typed searches by meaning (when it
                                     # can be used, see meaning_status)
     "looks": True,                  # look vectors, so "Looks like this" works (no model needed)
     "album": None,                  # an album id: only that manual album's pictures (None: all)
     "marks": False,                 # favorites, ratings and album names (see albums.py)
+    "people_names": False,          # the names of people (people_groups.py) as tags
 }
 _BOOLEAN_OPTIONS = ("location", "file_names", "folders", "exclude_private", "exclude_sensitive",
                     "exclude_undescribed", "zip", "allow_indexing", "similar", "meaning",
-                    "looks", "marks", "estimated_places", "routes")
+                    "looks", "marks", "estimated_places", "routes", "people_names", "raw_files")
 # Where the query model goes (in data/), and the scripts that run it (in assets/).
 MEANING_FOLDER = "meaning"
 MEANING_ASSETS = ("embed-kernel.js", "embed-engine.js")
@@ -574,10 +612,14 @@ def options_summary(options):
         summary["videos"] = options["videos"]
     if options["marks"]:
         summary["marks"] = True
+    if options["people_names"]:
+        summary["people_names"] = True
     if options["location"] and options["estimated_places"]:
         summary["estimated_places"] = True
     if options["location"] and options["routes"]:
         summary["routes"] = True
+    if options["raw_files"]:
+        summary["raw_files"] = True
     return summary
 
 
@@ -659,7 +701,9 @@ def check_output_dir(out_dir, config, library_id=None):
     data folder or the program, sits in the data folder outside
     data/exports (or is that folder, or its state folder), is not empty
     and lacks the marker an export leaves, or holds the export of another
-    library that is still in the settings. Inside the program folder (a git
+    library that is still in the settings, or of another trip that is still
+    found (a trip's export goes by "trip:<its key>", see trip_export.py; a
+    library's by its id). Inside the program folder (a git
     checkout) only folders git ignores are allowed: site/, site_*/,
     exports/ (and data/exports when the data root is there), so private
     photos never end up in a commit. A folder that cannot be read raises
@@ -711,6 +755,15 @@ def check_output_dir(out_dir, config, library_id=None):
     state = load_state(marker["export_id"]) if marker and marker.get("export_id") else None
     owner = state.get("library_id") if state else None
     if library_id and owner and owner != library_id:
+        if str(owner).startswith(TRIP_OWNER_PREFIX):
+            import trip_export          # (it imports this module)
+            title = trip_export.owner_title(config, owner)
+            if title is not None:
+                raise ExportError(
+                    "%s holds the export of the trip %s. Choose another folder: each trip "
+                    "and each library needs a folder of its own (an export replaces what "
+                    "the folder holds)." % (out_dir, title))
+            return
         other = common.get_library(config, owner)
         if other is not None:
             raise ExportError(
@@ -1470,6 +1523,129 @@ def video_plan(row, options, library_id):
     return "video", source, size, ""
 
 
+def raw_plan(row, options, position=None, home=None):
+    """What an export does with a picture's camera RAW file (raw_photos.py): (its path in
+    the library, size, extension, reason), or None for a picture without one.
+
+    The RAW file is the picture's RAW original, or the RAW file the picture
+    is. reason is "" when it goes out (the raw_files option), "off" while
+    that option is off, "location" for one that holds a GPS position while
+    the picture's own position does not go out: the location option is off,
+    the picture has no position (the GPS check or the owner set it aside),
+    or position is False (the caller keeps it back; None: the picture's
+    position goes out when it has one, as _location says); or when the
+    picture's position or the RAW file's own lies in home (a trip export's
+    area around home, see _Routes; None: no such area).
+    """
+    if _is_video(row):
+        return None
+    try:
+        exif = json.loads(row["exif"] or "{}", parse_constant=lambda _name: None)
+    except (TypeError, ValueError):
+        return None
+    entry = raw_photos.paired_record(exif)
+    if entry is not None:
+        if not raw_photos.safe_path(entry["path"]):
+            return None
+        path, size, raw_exif = entry["path"], entry.get("size") or 0, entry.get("exif")
+    elif (isinstance(exif, dict) and isinstance(exif.get("raw"), dict)
+          and exif["raw"].get("how") == "alone" and raw_photos.safe_path(row["path"])):
+        path, size, raw_exif = row["path"], row["size"] or 0, exif
+    else:
+        return None
+    reason = ""
+    if not options.get("raw_files"):
+        reason = "off"
+    elif isinstance(raw_exif, dict):
+        found = imageinfo.exif_gps_to_decimal(raw_exif.get("GPS"))
+        if found != (None, None) and not raw_position_goes(row, options, position, home,
+                                                           found):
+            reason = "location"
+    return path, int(size or 0), os.path.splitext(path)[1].lower()[1:], reason
+
+
+def raw_position_goes(row, options, position=None, home=None, raw_position=None):
+    """True when a RAW file holding a GPS position (raw_position: (lat, lon), when
+    known) may go out with a picture: its own position goes out too (the location
+    option, a position of its own -- not one set aside -- and position not False, see
+    raw_plan), and neither it nor the RAW file's lies in home (raw_plan's)."""
+    if position is None:
+        position = _location(row) is not None
+    if not (options.get("location") and position):
+        return False
+    return not (_in_area(home, row["lat"], row["lon"])
+                or (raw_position is not None and _in_area(home, *raw_position)))
+
+
+def _in_area(home, lat, lon):
+    """True when a position lies in home (an area with contains(lat, lon), or None)."""
+    return (home is not None and world_map.valid_position(lat, lon)
+            and home.contains(lat, lon))
+
+
+def raw_changed_with_position(row, plan, source, options, helper=None, position=None,
+                              home=None):
+    """True when a RAW file that changed since the scan read it (another size or time:
+    geotagged since, say) now holds a GPS position that may not go out
+    (raw_position_goes; home as raw_plan's). Its EXIF is read again for that (a few
+    small reads); one as the scan read it is not. plan is raw_plan's, source the
+    file's path; raises OSError or raw_photos.RawError when it cannot be read."""
+    try:
+        exif = json.loads(row["exif"] or "{}", parse_constant=lambda _name: None)
+    except (TypeError, ValueError):
+        exif = {}
+    entry = raw_photos.paired_record(exif)
+    if entry is None:
+        entry = {"path": row["path"], "size": row["size"], "mtime": row["mtime"]}
+    stat = os.stat(source)
+    if raw_photos.same_file(entry, plan[0], stat.st_size, stat.st_mtime):
+        return False
+    gps = raw_photos.exif_dict(raw_photos.read_file(source, helper)).get("GPS")
+    found = imageinfo.exif_gps_to_decimal(gps)
+    return (found != (None, None)
+            and not raw_position_goes(row, options, position, home, found))
+
+
+def raw_reason(row, options, home=None):
+    """raw_plan's reason for a row ("" when its RAW file goes out), or None without one."""
+    plan = raw_plan(row, options, home=home)
+    return plan[3] if plan is not None else None
+
+
+def raw_detail(row, plan, xid, options):
+    """The "raw" of a published picture's details (viewer.js rawText): {format, size,
+    how, url, sensor (for a RAW file published as a picture of its own), and name with
+    the file_names option}."""
+    exif = json.loads(row["exif"] or "{}", parse_constant=lambda _name: None)
+    entry = raw_photos.paired_record(exif)
+    detail = {"format": plan[2].upper(), "size": plan[1],
+              "how": entry.get("how") or "name" if entry is not None else "alone",
+              "url": "raws/%s.%s" % (xid, plan[2])}
+    sensor = exif["raw"].get("sensor") if entry is None else None
+    if (isinstance(sensor, list) and len(sensor) == 2
+            and all(isinstance(value, int) and value > 0 for value in sensor)):
+        detail["sensor"] = sensor
+    if options["file_names"]:
+        detail["name"] = plan[0].rsplit("/", 1)[-1]
+    return detail
+
+
+def _copy_raw(source, path, helper=None):
+    """Copy a RAW file to path as it is, replacing what is there in one step."""
+    loader = getattr(helper, "load_image", None) if helper is not None else None
+    data = loader(source) if loader is not None else None
+    if data is not None:
+        common.write_file_atomic(path, bytes(data), fsync=False)
+        return
+    temp = "%s.tmp-%d-%d" % (path, os.getpid(), threading.get_ident())
+    try:
+        shutil.copyfile(source, temp)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.remove(temp)
+
+
 def published_codec(row, source):
     """The codec of the video an export publishes for a row ("" when not known).
 
@@ -1488,11 +1664,14 @@ def published_codec(row, source):
 
 
 def _load_rows(conn, library_id):
-    """{id: row} of the present, visible pictures of a library."""
-    rows = conn.execute(
-        "SELECT %s FROM images WHERE library_id = ? AND missing_since IS NULL AND hidden = 0"
-        % _ROW_COLUMNS, (library_id,))
-    return {row["id"]: row for row in rows}
+    """{id: row} of the present, visible pictures of a library (or of a list of them)."""
+    library_ids = [library_id] if isinstance(library_id, str) else list(library_id)
+    rows = {}
+    for one in library_ids:
+        rows.update((row["id"], row) for row in conn.execute(
+            "SELECT %s, library_id FROM images WHERE library_id = ? AND missing_since IS NULL "
+            "AND hidden = 0" % _ROW_COLUMNS, (one,)))
+    return rows
 
 
 def _hidden_count(conn, library_id, among=None):
@@ -1566,16 +1745,17 @@ def picture_kinds(record):
     return [kind for kind in EXPORT_KINDS if kind in kinds]
 
 
-def _reasons(record, options):
+def _reasons(record, options, extra=()):
     """(every flag of a record, the flags that leave it out under options).
 
-    The most serious first, in FLAGS order (private, sensitive, the kinds
-    of picture, other writing, an older description, not described): a
+    The most serious first, in FLAGS order (private, sensitive, home, the
+    kinds of picture, other writing, an older description, not described): a
     picture is counted under the first flag that leaves it out, and the
     review step groups it under its first flag. A description by the
     older version 4 prompt says nothing about private or sensitive content
     or the kind of picture, so it is "unchecked", left out like a picture
-    not described yet.
+    not described yet. extra: flags found elsewhere (HOME_FLAG), which
+    leave it out.
     """
     flags = []
     active = []
@@ -1590,6 +1770,8 @@ def _reasons(record, options):
         flag("private", options["exclude_private"])
     if record.get("se"):
         flag("sensitive", options["exclude_sensitive"])
+    if HOME_FLAG in extra:
+        flag(HOME_FLAG, True)
     for kind in picture_kinds(record):
         if kind in REVIEW_TYPES or kind in options["exclude_types"]:
             flag(kind, kind in options["exclude_types"])
@@ -1604,7 +1786,20 @@ def _reasons(record, options):
     return flags, active
 
 
-def select_records(conn, config, library, options):
+def add_people_names(conn, library_id, records):
+    """The "people_names" option: the names of the people in each picture (named, not
+    hidden: people_groups.export_names) become tags of its record (g, lower case like
+    every tag). Nothing else of People is ever published."""
+    import people_groups
+    names = people_groups.export_names(conn, library_id)
+    for record in records:
+        found = names.get(record["i"])
+        if found:
+            record["g"] = search_index.record_tags(list(record.get("g") or []) + found)
+    return records
+
+
+def select_records(conn, config, library, options, only=None, extra=None):
     """Pick the records of a library's export.
 
     Returns (records to export, every record {id: record}, flagged list,
@@ -1612,20 +1807,26 @@ def select_records(conn, config, library, options):
     variant) with database ids still, and flagged lists every picture the
     review step should show: {id, reason, reasons, title, excluded, and
     new_flags when the owner chose to publish it before it got these
-    flags, which leave it out again}.
+    flags, which leave it out again}. only: the ids of the pictures that
+    may go (a trip's; None: the whole library, or its album); extra:
+    {id: flags found elsewhere} (see _reasons).
     """
     library_id = library["id"]
     records = search_index.build_records(conn, config, [library_id], for_export=True,
                                          export_options=options)
+    if options["people_names"]:
+        add_people_names(conn, library_id, records)
     album = album_choice(conn, library_id, options)
     if album is not None:
         records = [record for record in records if record["i"] in album["ids"]]
+    if only is not None:
+        records = [record for record in records if record["i"] in only]
     include = include_choices(options)
     exclude = set(options["exclude_ids"])
     chosen, excluded, flagged = [], {}, []
     for record in records:
         image_id = record["i"]
-        flags, active = _reasons(record, options)
+        flags, active = _reasons(record, options, (extra or {}).get(image_id, ()))
         new_flags = None
         if image_id in exclude:
             reason = "excluded"
@@ -1652,7 +1853,7 @@ def select_records(conn, config, library, options):
                 item["new_flags"] = new_flags
             flagged.append(item)
     by_reason = collections.Counter(excluded.values())
-    hidden = _hidden_count(conn, library_id, album["ids"] if album is not None else None)
+    hidden = _hidden_count(conn, library_id, album["ids"] if album is not None else only)
     if hidden:
         by_reason["hidden"] = hidden
     counts = {"total": len(records) + hidden, "exported": len(chosen),
@@ -1701,9 +1902,10 @@ def folder_reachable(library, helper=None):
 class _Sizes:
     """The sizes of the files an export writes for each picture (estimated when not known)."""
 
-    def __init__(self, library_id, options, ids):
+    def __init__(self, library_id, options, ids, home=None):
         self.library_id = library_id
         self.options = options
+        self.home = home        # (a trip export's area around home: see raw_plan)
         self.previews = cache.PreviewStore()
         self.thumbs = _thumb_sizes(ids)
         self.images = None
@@ -1727,6 +1929,9 @@ class _Sizes:
         if (mode == "original" and row["projection"] != imageinfo.PROJECTION_DUAL_FISHEYE
                 and not _is_video(row)):
             return True
+        plan = raw_plan(row, self.options, home=self.home)
+        if plan is not None and not plan[3]:
+            return True             # its RAW file is copied
         return mode != "none" and self.stored_preview(row) is None
 
     def parts(self, record, row):
@@ -1736,20 +1941,24 @@ class _Sizes:
         plan = video_plan(row, self.options, self.library_id)
         if plan[0] == "video":
             parts["videos"] = plan[2]
+        raw = raw_plan(row, self.options, home=self.home)
+        if raw is not None and not raw[3]:
+            parts["raws"] = raw[1]
         mode = self.options["images"]
         if mode == "none":
             return parts
         if (mode == "original" and row["projection"] != imageinfo.PROJECTION_DUAL_FISHEYE
-                and not _is_video(row)):
+                and not _is_video(row) and not common.is_raw_file(row["name"])):
             parts["images"] = row["size"] or 0
         else:
             size = self.stored_preview(row)
             parts["images"] = size if size is not None else min(row["size"] or 0,
                                                                 ESTIMATE_WEB_BYTES)
-        if record.get("p") == "360" and not _is_video(row):
+        if not _is_video(row) and (record.get("p") == "360" or mode == "web"):
             if self.images is None:
                 self.images = _images()
-            if self.images.has_pano(row["width"], row["height"]):
+            if self.images.gets_pano(row["width"], row["height"], row["projection"],
+                                     row["media"]):
                 try:
                     size = _file_size(self.previews.pano_path_for(self.library_id, row["id"]))
                 except ValueError:
@@ -1763,12 +1972,60 @@ def vector_bytes(dims):
     return 4 * ((dims + 2) // 3) + XID_LENGTH + 3
 
 
+def _library_list(library_ids):
+    """A library id, or a list of them, as a list."""
+    return [library_ids] if isinstance(library_ids, str) else list(library_ids)
+
+
+def fresh_looks(conn, library_ids, ids):
+    """looks.fresh_looks of the pictures ids of one library or more (a trip's), together."""
+    library_ids = _library_list(library_ids)
+    if len(library_ids) == 1:
+        return looks.fresh_looks(conn, library_ids[0], ids)
+    result = {"model": "", "dims": 0, "vectors": {}, "missing": len(set(ids))}
+    store = looks.connect(create=False)
+    if store is None:
+        return result
+    try:
+        for library_id in library_ids:
+            found = looks.fresh_looks(conn, library_id, ids, store=store)
+            result.update(model=found["model"], dims=found["dims"])
+            result["vectors"].update(found["vectors"])
+    finally:
+        store.close()
+    result["missing"] = len(set(ids)) - len(result["vectors"])
+    return result
+
+
+def fresh_vectors(conn, library_ids, ids, carried=None):
+    """embeddings.fresh_vectors of the pictures ids of one library or more, together."""
+    library_ids = _library_list(library_ids)
+    if len(library_ids) == 1:
+        return embeddings.fresh_vectors(conn, library_ids[0], ids, carried=carried)
+    result = {"model": "", "dims": 0, "vectors": {}, "stale": 0, "missing": len(set(ids))}
+    store = embeddings.connect(create=False)
+    if store is None:
+        return result
+    result["missing"] = 0
+    try:
+        for library_id in library_ids:
+            found = embeddings.fresh_vectors(conn, library_id, ids, store=store,
+                                             carried=carried)
+            result.update(model=found["model"], dims=found["dims"])
+            result["vectors"].update(found["vectors"])
+            result["stale"] += found["stale"]
+            result["missing"] += found["missing"]
+    finally:
+        store.close()
+    return result
+
+
 def _look_sizes(conn, library_id, options, ids):
     """{image id: bytes its look vector adds to the export} for the pictures of ids
-    that have one ({} when the looks option is off)."""
+    that have one ({} when the looks option is off). library_id: one, or a list."""
     if not options.get("looks"):
         return {}
-    found = looks.fresh_looks(conn, library_id, ids)
+    found = fresh_looks(conn, library_id, ids)
     size = vector_bytes(found["dims"]) if found["dims"] else 0
     return {image_id: size for image_id in found["vectors"]}
 
@@ -1787,10 +2044,10 @@ def _carried(pairs):
 def _vector_sizes(conn, library_id, options, ids, carried=None):
     """{image id: bytes its up-to-date meaning vector adds to the export} for the
     pictures of ids that have one ({} when the similar option is off). carried: see
-    embeddings.fresh_vectors."""
+    embeddings.fresh_vectors. library_id: one, or a list."""
     if not options.get("similar"):
         return {}
-    found = embeddings.fresh_vectors(conn, library_id, ids, carried=carried)
+    found = fresh_vectors(conn, library_id, ids, carried=carried)
     size = vector_bytes(found["dims"]) if found["dims"] else 0
     return {image_id: size for image_id in found["vectors"]}
 
@@ -1947,9 +2204,10 @@ def meaning_text(info):
             % (human_bytes(info["bytes"]), human_bytes(info["gzip"])))
 
 
-def _asset_bytes(options):
-    return sum(_file_size(os.path.join(_static_dir(), name)) or 0
-               for name in ASSETS + (MAP_ASSETS if options["location"] else ()))
+def _asset_bytes(options, names=None):
+    if names is None:
+        names = ASSETS + (MAP_ASSETS if options["location"] else ())
+    return sum(_file_size(os.path.join(_static_dir(), name)) or 0 for name in names)
 
 
 def preview_export(conn, config, library_id, options=None, reachable=None):
@@ -1982,8 +2240,12 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
     video, video: how it would be published, as counted in counts.videos
     ("included", "not_playable" or "too_large", see video_plan; "poster"
     when videos are not included)}],
+    "raws": the pictures to publish with a camera RAW file (raw_plan): {"total",
+    "included" (those whose RAW file goes along), "location" (those whose RAW
+    file stays home: it holds a GPS position and the location option is
+    off)},
     "size_estimate": bytes, "size_parts": {thumbs, images, panos, data, videos,
-    vectors, meaning, looks}, "options": the options used}. Reasons: hidden,
+    vectors, meaning, looks, raws}, "options": the options used}. Reasons: hidden,
     excluded (by id), undescribed, unchecked, a picture type (screenshot,
     document, ...), private, sensitive. reachable says whether the
     library's folder can be read (None: look now; it may take long for a
@@ -1992,20 +2254,118 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
     library = common.get_library(config, library_id)
     if library is None or not library.get("id"):
         raise ExportError("There is no library %r in the settings." % (library_id,))
-    library_id = library["id"]
     options = library_options(library, options)
-    chosen, by_id, flagged, counts = select_records(conn, config, library, options)
-    rows = _load_rows(conn, library_id)
+    return preview_pictures(conn, config, [library], options, reachable=reachable)
+
+
+class _AllSizes:
+    """_Sizes of the pictures of one library or more (each by its row's library)."""
+
+    def __init__(self, library_ids, options, ids, rows, home=None):
+        by_library = collections.defaultdict(list)
+        for image_id in ids:
+            row = rows.get(image_id)
+            if row is not None:
+                by_library[row["library_id"]].append(image_id)
+        self.sizes = {library_id: _Sizes(library_id, options, by_library.get(library_id, []),
+                                         home=home)
+                      for library_id in library_ids}
+
+    def needs_original(self, row):
+        return self.sizes[row["library_id"]].needs_original(row)
+
+    def parts(self, record, row):
+        return self.sizes[row["library_id"]].parts(record, row)
+
+
+def add_counts(total, counts):
+    """Add select_records' counts of one library to total's (in place)."""
+    total["total"] = total.get("total", 0) + counts["total"]
+    total["exported"] = total.get("exported", 0) + counts["exported"]
+    reasons = dict(total.get("by_reason") or {})
+    for reason, count in counts["by_reason"].items():
+        reasons[reason] = reasons.get(reason, 0) + count
+    total["by_reason"] = dict(sorted(reasons.items()))
+
+
+def per_library(fetch, conn, library_ids, config):
+    """{image id: ...} of fetch(conn, library_id, config) of each library, together."""
+    found = {}
+    for library_id in library_ids:
+        found.update(fetch(conn, library_id, config))
+    return found
+
+
+def withheld_clips(records, chosen_ids, extra):
+    """The ids of the clips of every drive (dv) one of whose clips is left out by a flag
+    found elsewhere (extra, as select_records'): its drive's words were written from
+    the frames of that clip too (a trip export's clip filmed near home), so they do not
+    go either (see drop_drive_words). records: {id: record} before the drives are
+    worked out again over the export (their dv still the database's)."""
+    drives_out = {records[image_id].get("dv") for image_id in (extra or {})
+                  if image_id in records and image_id not in chosen_ids and extra[image_id]}
+    drives_out.discard(None)
+    return {image_id for image_id, record in records.items()
+            if record.get("dv") in drives_out}
+
+
+def drop_drive_words(records, clip_ids):
+    """Take the drive words (drives.TEXT_KEYS and their flags) off the records of the
+    drives that have a clip among clip_ids, after drives.export_texts (the words are on
+    each drive's first clip, which the drive's dv names). In place; returns how many
+    drives lost words."""
+    covers = {record["dv"] for record in records
+              if record["i"] in clip_ids and record.get("dv") is not None}
+    lost = 0
+    for record in records:
+        if record["i"] in covers and any(key in record for key, _field in drives.TEXT_KEYS):
+            lost += 1
+            for key in tuple(key for key, _field in drives.TEXT_KEYS) + drives.FLAG_KEYS:
+                record.pop(key, None)
+    return lost
+
+
+def preview_pictures(conn, config, libraries, options, only=None, extra=None, home=None,
+                     reachable=None, assets=None, with_ids=False):
+    """preview_export of the pictures of one library or more (library dicts), with
+    options already checked. only and extra as select_records' (a trip's pictures and
+    the home flags: a drive with a clip left out by one loses its words, see
+    withheld_clips; counts["drives"]["withheld"] says how many), home as _Routes',
+    assets the names of the scripts and style sheets the export carries (default: a
+    library export's); reachable: whether the folders can be read (or {library id:
+    whether its folder can}; None: look at each now). with_ids: the answer's "ids"
+    holds the ids of the pictures to publish."""
+    chosen, by_id, flagged = [], {}, []
+    counts = {"total": 0, "exported": 0, "by_reason": {}}
+    for library in libraries:
+        some, found, marked, counted = select_records(conn, config, library, options,
+                                                      only=only, extra=extra)
+        chosen.extend(some)
+        by_id.update(found)
+        flagged.extend(marked)
+        add_counts(counts, counted)
+        if len(libraries) == 1 and "album" in counted:
+            counts["album"] = counted["album"]
+    library_ids = [library["id"] for library in libraries]
+    rows = _load_rows(conn, library_ids)
     flagged_ids = {item["id"] for item in flagged}
-    sizes = _Sizes(library_id, options, sorted({record["i"] for record in chosen}
-                                               | flagged_ids))
+    sizes = _AllSizes(library_ids, options, sorted({record["i"] for record in chosen}
+                                                   | flagged_ids), rows, home=home)
     # The drives as the export would publish them (on copies of the records).
     published = [dict(record) for record in chosen]
     counts["drives"] = drives.export_texts(published, options,
                                            drives.settings(config)["min_clips"],
-                                           drives.clip_texts(conn, library_id, config),
-                                           drives.clip_places(conn, library_id, config))
-    track_routes = _Routes(conn, config, library_id, options)
+                                           per_library(drives.clip_texts, conn, library_ids,
+                                                       config),
+                                           per_library(drives.clip_places, conn, library_ids,
+                                                       config))
+    if extra:
+        lost = drop_drive_words(published, withheld_clips(
+            by_id, {record["i"] for record in chosen}, extra))
+        if lost:
+            counts["drives"]["withheld"] = lost
+            counts["drives"]["described"] = max(0, counts["drives"]["described"] - lost)
+    track_routes = _Routes(conn, config, library_ids, options, home=home)
     chosen_rows = [rows[record["i"]] for record in chosen if record["i"] in rows]
     counts["routes"] = {
         "on": track_routes.on,
@@ -2014,15 +2374,16 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
         "routes": len(track_routes.routes([row["id"] for row in chosen_rows])),
         "overlay": sum(1 for row in chosen_rows if row["id"] in track_routes.related),
         "near": sum(1 for row in chosen_rows if track_routes.near_end(row))}
-    vectors = _vector_sizes(conn, library_id, options,
+    vectors = _vector_sizes(conn, library_ids, options,
                             {record["i"] for record in chosen} | flagged_ids,
                             carried=_carried((record["i"], record) for record in published))
-    look_sizes = _look_sizes(conn, library_id, options,
+    look_sizes = _look_sizes(conn, library_ids, options,
                              {record["i"] for record in chosen} | flagged_ids)
     parts = {"thumbs": 0, "images": 0, "panos": 0, "data": 0, "videos": 0,
-             "vectors": 0, "meaning": 0, "looks": 0}
+             "vectors": 0, "meaning": 0, "looks": 0, "raws": 0}
+    raw_counts = {"total": 0, "included": 0, "location": 0}
     looked = {"vectors": 0, "missing": 0} if options["looks"] else None
-    needs_folder = 0
+    needs_folder = collections.Counter()
     video_counts = {"total": 0, "included": 0, "not_playable": 0, "too_large": 0}
     similar = {"vectors": 0, "stale": 0, "missing": 0} if options["similar"] else None
     for record in chosen:
@@ -2040,17 +2401,24 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
         if looked is not None:
             looked["vectors" if record["i"] in look_sizes else "missing"] += 1
         if sizes.needs_original(row):
-            needs_folder += 1
+            needs_folder[row["library_id"]] += 1
         if _is_video(row):
             video_counts["total"] += 1
-            kind, _source, _size, reason = video_plan(row, options, library_id)
+            kind, _source, _size, reason = video_plan(row, options, row["library_id"])
             if kind == "video":
                 video_counts["included"] += 1
             elif reason:
                 video_counts[reason] += 1
+        raw = raw_plan(row, options, home=home)
+        if raw is not None:
+            raw_counts["total"] += 1
+            if not raw[3]:
+                raw_counts["included"] += 1
+            elif raw[3] == "location":
+                raw_counts["location"] += 1
     if similar is not None and similar["missing"]:
         # (Of those without a usable vector, how many have an older one.)
-        stale_ids = _stale_ids(conn, library_id, {record["i"] for record in chosen}, vectors)
+        stale_ids = _stale_ids(conn, library_ids, {record["i"] for record in chosen}, vectors)
         similar["stale"] = len(stale_ids)
         similar["missing"] -= similar["stale"]
     for item in flagged:
@@ -2066,15 +2434,22 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
         item["bytes"] = sum(item["parts"].values())
         item["needs_folder"] = sizes.needs_original(row)
         if _is_video(row):
-            kind, _source, _size, reason = video_plan(row, options, library_id)
+            kind, _source, _size, reason = video_plan(row, options, row["library_id"])
             item["video"] = "included" if kind == "video" else reason or "poster"
-    if reachable is None:
-        reachable = folder_reachable(library)
-    counts["needs_folder"] = needs_folder
-    counts["unavailable"] = 0 if reachable else needs_folder
+        raw = raw_plan(row, options, home=home)
+        if raw is not None:
+            item["raw"] = raw[3] or "included"
+    counts["needs_folder"] = sum(needs_folder.values())
+    counts["unavailable"] = 0
+    for library in libraries:
+        known = reachable.get(library["id"]) if isinstance(reachable, dict) else reachable
+        if needs_folder[library["id"]] and not (
+                known if known is not None else folder_reachable(library)):
+            counts["unavailable"] += needs_folder[library["id"]]
     # Videos among the pictures to publish: how many go out as videos, and
     # how many keep their poster only (and why).
     counts["videos"] = video_counts
+    counts["raws"] = raw_counts
     if similar is not None:
         counts["similar"] = similar
     if looked is not None:
@@ -2090,9 +2465,12 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
         counts["meaning"].update(bytes=size["bytes"], gzip=size["gzip"])
         if options["meaning"]:
             parts["meaning"] = size["bytes"]
-    parts["data"] += _asset_bytes(options)
-    return {"counts": counts, "flagged": flagged,
-            "size_estimate": sum(parts.values()), "size_parts": parts, "options": options}
+    parts["data"] += _asset_bytes(options, assets)
+    result = {"counts": counts, "flagged": flagged,
+              "size_estimate": sum(parts.values()), "size_parts": parts, "options": options}
+    if with_ids:
+        result["ids"] = sorted(record["i"] for record in chosen)
+    return result
 
 
 def _stale_ids(conn, library_id, ids, fresh):
@@ -2101,7 +2479,7 @@ def _stale_ids(conn, library_id, ids, fresh):
     if store is None:
         return set()
     try:
-        have = embeddings.stored(store, [library_id])
+        have = embeddings.stored(store, _library_list(library_id))
     finally:
         store.close()
     return {image_id for image_id in ids if image_id not in fresh and image_id in have}
@@ -2116,6 +2494,8 @@ REASON_WORDS = {
                      "pictures described by an older version (not checked)"),
     "private": ("picture with private information", "pictures with private information"),
     "sensitive": ("sensitive picture", "sensitive pictures"),
+    HOME_FLAG: ("dashcam clip that may show where home is",
+                "dashcam clips that may show where home is"),
     "failed": ("picture that could not be read", "pictures that could not be read"),
     "other": ("other picture", "other pictures"),
 }
@@ -2226,22 +2606,29 @@ class _Routes:
     positions their tracks gave them (or places estimated from them), less what is
     within routes_trim metres of where a drive of any library starts or ends
     (tracks.privacy_zones); otherwise none of them. related: the ids of the library's
-    dashcam clips (tracks.related_ids), whose texts never hold a position."""
+    dashcam clips (tracks.related_ids), whose texts never hold a position.
+    library_id: one, or a list (a trip's libraries). home (a trip export's, see
+    trip_export.py): the area around home, which no position and no route enters
+    (an object with contains(lat, lon) and trim(route)); None: no such area."""
 
-    def __init__(self, conn, config, library_id, options):
+    def __init__(self, conn, config, library_id, options, home=None):
         self.conn = conn
         self.config = config
-        self.library_id = library_id
+        self.library_ids = _library_list(library_id)
+        self.home = home
         self.on = bool(options["location"] and options["routes"]
                        and tracks.settings(config)["enabled"])
         self.metres = options["routes_trim"]
-        rows = conn.execute("SELECT id, content_hash, media, lat, lon FROM images "
-                            "WHERE library_id = ? AND media = 'video' "
-                            "AND missing_since IS NULL", (library_id,)).fetchall()
+        rows = []
+        self.related = set()
+        for one in self.library_ids:
+            rows.extend(conn.execute("SELECT id, content_hash, media, lat, lon FROM images "
+                                     "WHERE library_id = ? AND media = 'video' "
+                                     "AND missing_since IS NULL", (one,)).fetchall())
+            self.related |= tracks.related_ids(conn, config, one)
         self.found = tracks.for_rows(conn, rows)
         self.from_track = {row["id"] for row in rows if tracks.is_position(
             self.found.get(row["id"]), row["lat"], row["lon"])}
-        self.related = tracks.related_ids(conn, config, library_id)
         # (Where the drives of every library start and end: a place estimated
         # from another library's track, or a copy of a clip, is near them too.)
         self._zones = None
@@ -2264,19 +2651,29 @@ class _Routes:
         if facts is None:
             return True
         metres = max(self.metres, tracks.DEFAULT_TRIM_METRES)
-        return any(not tracks.outside(lat, lon, self.zones, metres)
+        return any(not tracks.outside(lat, lon, self.zones, metres) or self.at_home(lat, lon)
                    for _at, lat, lon, _speed in facts.points)
+
+    def at_home(self, lat, lon):
+        """True when a position is within the home area (never with no home)."""
+        return (self.home is not None and world_map.valid_position(lat, lon)
+                and self.home.contains(lat, lon))
 
     def position(self, row):
         """True when a picture's own position may go out: any but a track's, and a
-        track's only when routes go and it is outside the zones."""
+        track's only when routes go and it is outside the zones; none in the home area."""
+        if self.at_home(row["lat"], row["lon"]):
+            return False
         if row["id"] not in self.from_track:
             return True
         return self.on and tracks.outside(row["lat"], row["lon"], self.zones, self.metres)
 
     def estimate(self, estimate_row):
         """True when the position of a place estimate (or the owner's place) may go out:
-        one from a track (its detail's "track", an accepted one's too) as position()."""
+        one from a track (its detail's "track", an accepted one's too) as position(); none
+        in the home area."""
+        if self.at_home(estimate_row.get("lat"), estimate_row.get("lon")):
+            return False
         try:
             detail = json.loads(estimate_row.get("detail") or "{}")
         except ValueError:
@@ -2297,8 +2694,10 @@ class _Routes:
         if not self.on:
             return []
         found = []
-        for route in tracks.routes(self.conn, self.config, [self.library_id], ids=set(ids)):
+        for route in tracks.routes(self.conn, self.config, self.library_ids, ids=set(ids)):
             route = tracks.trim_route(route, self.zones, self.metres)
+            if route is not None and self.home is not None:
+                route = self.home.trim(route)
             if route is None:
                 continue
             for clip in route["c"]:
@@ -2476,16 +2875,19 @@ def _guess_own_files(out_dir):
     """
     found = []
     patterns = (
-        re.compile(r"^(index|detail|map)\.html$|^robots\.txt$"),
+        re.compile(r"^(index|detail|map|search)\.html$|^robots\.txt$"),
         re.compile(r"^(style\.css|site\.js|shell\.js|search-core\.js|viewer\.js|app\.js|"
                    r"detail\.js|map\.js)$"),
         re.compile(r"^assets/[a-z-]+\.(js|css)$"),
         re.compile(r"^data/(manifest\.js|manifest\.json|locations\.js|locations\.json|"
+                   r"routes\.js|trips\.js|"
                    r"(index|detail|vectors|looks)-\d+\.js|data-\d+\.json)$"),
         re.compile(r"^data/meaning/(model\.js|w-\d+\.js|LICENSE\.txt)$"),
         re.compile(r"^(thumbs|panos)/[a-z2-7]{%d}\.jpg$" % XID_LENGTH),
         re.compile(r"^videos/[a-z2-7]{%d}\.mp4$" % XID_LENGTH),
         re.compile(r"^images/([a-z2-7]{%d}|\d+)\.[a-z0-9]{2,5}$" % XID_LENGTH),
+        re.compile(r"^raws/[a-z2-7]{%d}\.(%s)$" % (XID_LENGTH, "|".join(
+            extension[1:] for extension in common.RAW_EXTENSIONS))),
         re.compile(r"^tiles/\d+/\d+/\d+\.jpg$"),
     )
     for folder, _dirs, files in os.walk(out_dir):
@@ -2541,7 +2943,7 @@ def _version(data):
 
 
 def render_page(template, title, page_title, capabilities, export_id, options,
-                tiles_max=None, versions=None, data_version=None, meaning=None):
+                tiles_max=None, versions=None, data_version=None, meaning=None, extra=None):
     """One page of the export: the template in static mode, as text.
 
     The page settings (JSON block) name this export's one library, its
@@ -2553,11 +2955,12 @@ def render_page(template, title, page_title, capabilities, export_id, options,
     a corner of the map). versions ({asset name: hash}) go into the addresses of the
     scripts and the style sheet. meaning ({"credit"}, when the export ships the
     query model of search by meaning) adds "Search by meaning: <credit> ·
-    license" to the foot of the search and detail pages.
+    license" to the foot of the search and detail pages. extra: more page settings
+    (a trip export's: its pages' names, see trip_export.py).
     """
     import serve
     location = options["location"]
-    extra = {"title": title}
+    extra = dict(extra or {}, title=title)
     if data_version:
         extra["dataVersion"] = data_version
     text = serve.render_template_file(
@@ -2623,7 +3026,8 @@ class LogContext(jobs.JobContext):
 class _Picture:
     """One picture to export: its record, row and id in the export."""
 
-    __slots__ = ("record", "row", "xid", "ok", "ext", "pano", "video", "error", "fatal")
+    __slots__ = ("record", "row", "xid", "ok", "ext", "pano", "video", "error", "fatal",
+                 "raw", "raw_error", "raw_reason")
 
     def __init__(self, record, row, xid):
         self.record = record
@@ -2635,12 +3039,16 @@ class _Picture:
         self.video = False      # videos/<xid>.mp4 was written (or kept)
         self.error = ""
         self.fatal = None       # an ExportWriteError: the export stops
+        self.raw = None         # raw_plan's, when raws/<xid>.<ext> was written (or kept)
+        self.raw_error = ""
+        self.raw_reason = ""    # "location": its RAW file stays home (_raw_file)
 
     def files(self):
         """Every file of the export this picture may have."""
         return (["thumbs/%s.jpg" % self.xid, "panos/%s.jpg" % self.xid,
                  "videos/%s.mp4" % self.xid]
-                + ["images/%s.%s" % (self.xid, ext) for ext in ORIGINAL_EXTENSIONS])
+                + ["images/%s.%s" % (self.xid, ext) for ext in ORIGINAL_EXTENSIONS]
+                + ["raws/%s%s" % (self.xid, ext) for ext in common.RAW_EXTENSIONS])
 
 
 class _Export:
@@ -2652,6 +3060,12 @@ class _Export:
         self.config = config
         self.library = library
         self.library_id = library["id"]
+        # The libraries of the pictures (a trip export: more than one, see
+        # trip_export.py), and the key its state goes by.
+        self.library_ids = [self.library_id]
+        self.owner_key = self.library_id
+        # The area around home that no position enters (a trip export's, see _Routes).
+        self.home = None
         self.out_dir = out_dir
         self.options = options
         self.title = options["title"] or common.library_label(library)
@@ -2666,6 +3080,8 @@ class _Export:
         self.failed = 0
         self.pano_failed = 0
         self.video_failed = 0
+        self.raw_failed = 0
+        self.raw_located = 0    # RAW files kept back for their GPS position (_raw_file)
         self.video_tools = None
         self.kept = 0
         self.logged = 0
@@ -2688,7 +3104,7 @@ class _Export:
 
     def prepare(self):
         """Check the folder, and settle the export id, secret and earlier files (nothing is written)."""
-        check_output_dir(self.out_dir, self.config, self.library_id)
+        check_output_dir(self.out_dir, self.config, self.owner_key)
         check_writable(self.out_dir)
         if self.options["zip"]:
             check_zip_path(zip_path_for(self.out_dir), self.config)
@@ -2713,7 +3129,7 @@ class _Export:
         else:
             # A new or empty folder: keep the ids of an earlier export of
             # this library into the same folder, if it was emptied since.
-            state = _state_for_folder(self.out_dir, self.library_id)
+            state = _state_for_folder(self.out_dir, self.owner_key)
             if state is not None:
                 self.export_id = state["export_id"]
         if state is None:
@@ -2722,13 +3138,15 @@ class _Export:
                      "secret": secrets.token_hex(32), "files": {}}
             if guessed:
                 state["files"] = {rel: ["", -1, -1] for rel in guessed}
-        if state.get("library_id") not in (None, self.library_id):
+        if state.get("library_id") not in (None, self.owner_key):
             # (check_output_dir refuses the export of a library that is
             # still in the settings.)
-            self.ctx.log("%s held an export of a library that is no longer in the settings; "
-                         "it is replaced." % self.out_dir, "warn")
+            self.ctx.log("%s held an export of %s; it is replaced." % (
+                self.out_dir, "a trip that is no longer found"
+                if str(state["library_id"]).startswith(TRIP_OWNER_PREFIX)
+                else "a library that is no longer in the settings"), "warn")
             state.pop("count", None)
-        state["library_id"] = self.library_id
+        state["library_id"] = self.owner_key
         state["out_dir"] = self.out_dir
         self.state = state
         self.secret = state["secret"]
@@ -2920,8 +3338,9 @@ class _Export:
             try:
                 self.previews.write_pano(self.library_id, row["id"], data)
             except OSError as error:
-                self.ctx.log("Could not keep the 360-degree panorama of %s: %s"
-                             % (row["path"], error), "warn")
+                self.ctx.log("Could not keep the %s of %s: %s"
+                             % ("360-degree panorama" if row["projection"]
+                                else "larger picture", row["path"], error), "warn")
         self.writer.write(rel, clean_jpeg(data), sig)
         picture.pano = True
 
@@ -2950,6 +3369,29 @@ class _Export:
             raise videos.ToolsMissing()
         self.writer.write_file(rel, lambda path: videos.strip_copy(tools, source, path), sig)
         return True
+
+    def _raw_file(self, picture):
+        """Copy a picture's RAW file to raws/<xid>.<ext> as it is (raw_plan); sets
+        picture.raw, or picture.raw_reason ("location") for one kept back for its GPS
+        position (also one geotagged since the scan read it)."""
+        plan = raw_plan(picture.row, self.options, home=self.home)
+        if plan is not None and plan[3] == "location":
+            picture.raw_reason = "location"
+        if plan is None or plan[3]:
+            return
+        if not self.root:
+            raise ValueError("the library has no folder")
+        source = os.path.join(self.root, *plan[0].split("/"))
+        sig = self._source_sig("raw", picture.row, source)
+        if sig is None:
+            raise ValueError("%s is not there" % plan[0])
+        if raw_changed_with_position(picture.row, plan, source, self.options, self.helper,
+                                     home=self.home):
+            picture.raw_reason = "location"
+            return
+        self.writer.write_file("raws/%s.%s" % (picture.xid, plan[2]),
+                               lambda path: _copy_raw(source, path, self.helper), sig)
+        picture.raw = plan
 
     def keep_previous(self, picture):
         """Keep the files an earlier export wrote for a picture that cannot be read now.
@@ -2980,6 +3422,11 @@ class _Export:
                 and video_plan(picture.row, self.options, self.library_id)[0] == "video"
                 and self.writer.keep("videos/%s.mp4" % xid)):
             picture.video = True
+        # (Its RAW file too, while the options still publish it.)
+        plan = raw_plan(picture.row, self.options, home=self.home)
+        if (plan is not None and not plan[3]
+                and self.writer.keep("raws/%s.%s" % (xid, plan[2]))):
+            picture.raw = plan
         return True
 
     def note_failure(self, text):
@@ -3013,14 +3460,17 @@ class _Export:
             picture.error = "%s" % (error,) or type(error).__name__
             return picture
         picture.ok = True
-        if (mode != "none" and picture.record.get("p") == "360" and not _is_video(picture.row)
-                and _images().has_pano(picture.row["width"], picture.row["height"])):
+        full_360 = picture.record.get("p") == "360"
+        if (mode != "none" and not _is_video(picture.row) and (full_360 or mode == "web")
+                and _images().gets_pano(picture.row["width"], picture.row["height"],
+                                        picture.row["projection"], picture.row["media"])):
             try:
                 self._pano(picture)
             except ExportWriteError as error:
                 picture.fatal = error
             except Exception as error:
-                picture.error = "no 360-degree panorama: %s" % (error,)
+                picture.error = "no %s: %s" % ("360-degree panorama" if full_360
+                                               else "larger picture", error)
         if _is_video(picture.row) and self.options["videos"] == "include":
             # A video that cannot be copied keeps its poster.
             try:
@@ -3029,6 +3479,14 @@ class _Export:
                 picture.fatal = error
             except Exception as error:
                 picture.error = "the video itself could not be copied: %s" % (error,)
+        if self.options["raw_files"] and not _is_video(picture.row):
+            # A RAW file that cannot be copied leaves the picture published without it.
+            try:
+                self._raw_file(picture)
+            except ExportWriteError as error:
+                picture.fatal = error
+            except Exception as error:
+                picture.raw_error = "its RAW file could not be copied: %s" % (error,)
         return picture
 
     def forget_picture(self, picture):
@@ -3078,6 +3536,11 @@ class _Export:
                     raise picture.fatal
                 if picture.ok:
                     done.append(picture)
+                    if picture.raw_reason == "location":
+                        self.raw_located += 1
+                    if picture.raw_error:
+                        self.raw_failed += 1
+                        self.note_failure("%s: %s" % (picture.row["path"], picture.raw_error))
                     if picture.error:
                         if _is_video(picture.row):
                             self.video_failed += 1
@@ -3110,7 +3573,8 @@ class _Export:
 
         Besides the keys of search_index, a record may have "ix" (the
         extension of its picture when not jpg), "pn": 1 (it has a large
-        360-degree panorama) and "tn": its place in capture order among the
+        panorama: a 360-degree photo's, or a wide photo's for the pan view)
+        and "tn": its place in capture order among the
         exported pictures of its day (1, 2, ...; only on days with more
         than one), so pictures of one day sort as they were taken while
         their times stay out of the export.
@@ -3126,14 +3590,17 @@ class _Export:
         # Drives over the exported clips only, with the drives' own words the
         # options allow (drives.export_texts), with export ids below.
         drives.export_texts(records, self.options, drives.settings(self.config)["min_clips"],
-                            drives.clip_texts(self.conn, self.library_id, self.config),
-                            drives.clip_places(self.conn, self.library_id, self.config))
+                            per_library(drives.clip_texts, self.conn, self.library_ids,
+                                        self.config),
+                            per_library(drives.clip_places, self.conn, self.library_ids,
+                                        self.config))
         # A position from a video's GPS track goes out only with the routes, and
         # never near where a drive starts or ends (_Routes): else its place
         # names stay, without the position. A dashcam's clips (and their
         # drives) never have a position in their texts: the overlay of one
         # without a fix prints the last it had, often where the drive started.
-        self.track_routes = _Routes(self.conn, self.config, self.library_id, self.options)
+        self.track_routes = _Routes(self.conn, self.config, self.library_ids, self.options,
+                                    home=self.home)
         dashcam_drives = set()
         for picture in pictures:
             if not self.track_routes.position(picture.row):
@@ -3181,8 +3648,8 @@ class _Export:
                 record["pn"] = 1
             if picture.video:
                 record["vf"] = 1
-                codec = published_codec(picture.row, video_plan(picture.row, self.options,
-                                                                self.library_id)[1])
+                codec = published_codec(picture.row, video_plan(
+                    picture.row, self.options, picture.row["library_id"])[1])
                 if codec:
                     # (What the site's player gets: a playable copy is H.264.)
                     record["vc"] = codec[:20]
@@ -3211,7 +3678,7 @@ class _Export:
         for album in every:
             if album["kind"] == "manual":
                 items = [xids[image_id] for image_id in albums.album_items(
-                    self.conn, album["id"], [self.library_id], include_hidden=False)
+                    self.conn, album["id"], self.library_ids, include_hidden=False)
                          if image_id in xids]
                 if items:
                     manual[album["id"]] = items
@@ -3268,12 +3735,14 @@ class _Export:
         folder: (the folders option), file: (file_names), place:, has:gps
         and the Place filter (location), lib: (the libraries' own names);
         nor when it looks for pictures like one that is not published
-        (similar:, look:). Returns {"options", "changes": {(start, stop):
+        (similar:, look:); nor when it looks for a person (person:: an
+        export holds no people, and the search names one). Returns
+        {"options", "changes": {(start, stop):
         new value} (similar: and look: name the picture by its export id),
         "albums": the album: terms (album_numbers checks them)}.
         """
         options = dict(album.get("options") or {})
-        if not albums.smart_in_libraries(options, [self.library_id]):
+        if not albums.smart_in_libraries(options, self.library_ids):
             return None
         options.pop("lib", None)
         filters = dict(options.get("filters") or {})
@@ -3291,7 +3760,7 @@ class _Export:
         for term in albums.query_terms(album.get("query") or ""):
             field = term["field"]
             value = term["value"].strip()
-            if field == "lib" or (field in needs and not self.options[needs[field]]):
+            if field in ("lib", "person") or (field in needs and not self.options[needs[field]]):
                 return None
             if (field == "has" and not self.options["location"]
                     and value.lower().startswith(_LOCATION_WORDS)):
@@ -3322,6 +3791,9 @@ class _Export:
         details = []
         for picture in pictures:
             entry = detail_entry(picture.row, picture.record)
+            if picture.raw is not None:
+                entry = dict(entry or {}, raw=raw_detail(picture.row, picture.raw, picture.xid,
+                                                         self.options))
             if entry is not None:
                 details.append((picture.xid, _js_json(entry)))
         details.sort()
@@ -3358,9 +3830,9 @@ class _Export:
             manifest["albums"] = self.published_albums
         if self.options["location"]:
             points = []
-            estimates = place_estimates.for_libraries(self.conn, [self.library_id])
-            routes = self.track_routes or _Routes(self.conn, self.config, self.library_id,
-                                                  self.options)
+            estimates = place_estimates.for_libraries(self.conn, self.library_ids)
+            routes = self.track_routes or _Routes(self.conn, self.config, self.library_ids,
+                                                  self.options, home=self.home)
             for picture in pictures:
                 where = _location(picture.row)
                 if where is not None:
@@ -3406,10 +3878,10 @@ class _Export:
         self.vector_stats = {"vectors": 0, "stale": 0, "missing": 0, "bytes": 0}
         if not self.options["similar"] or not pictures:
             return []
-        found = embeddings.fresh_vectors(self.conn, self.library_id,
-                                         [picture.row["id"] for picture in pictures],
-                                         carried=_carried((picture.row["id"], picture.record)
-                                                          for picture in pictures))
+        found = fresh_vectors(self.conn, self.library_ids,
+                              [picture.row["id"] for picture in pictures],
+                              carried=_carried((picture.row["id"], picture.record)
+                                               for picture in pictures))
         items = sorted((picture.xid, found["vectors"][picture.row["id"]])
                        for picture in pictures if picture.row["id"] in found["vectors"])
         self.vector_stats.update(vectors=len(items), stale=found["stale"],
@@ -3444,8 +3916,8 @@ class _Export:
         self.look_stats = {"vectors": 0, "missing": 0, "bytes": 0}
         if not self.options["looks"] or not pictures:
             return []
-        found = looks.fresh_looks(self.conn, self.library_id,
-                                  [picture.row["id"] for picture in pictures])
+        found = fresh_looks(self.conn, self.library_ids,
+                            [picture.row["id"] for picture in pictures])
         items = sorted((picture.xid, found["vectors"][picture.row["id"]])
                        for picture in pictures if picture.row["id"] in found["vectors"])
         self.look_stats.update(vectors=len(items), missing=len(pictures) - len(items))
@@ -3638,6 +4110,24 @@ class _Export:
 
     # -- everything -----------------------------------------------------------
 
+    def select(self):
+        """(records to export, counts) of select_records (trip_export.py: of a trip)."""
+        chosen, _records, _flagged, counts = select_records(
+            self.conn, self.config, self.library, self.options)
+        return chosen, counts
+
+    def assets(self):
+        """The names of the scripts and style sheets the export carries (in assets/)."""
+        return ASSETS + (MAP_ASSETS if self.options["location"] else ())
+
+    def pages(self):
+        """(file in the export, template) of its pages."""
+        return PAGES + (MAP_PAGES if self.options["location"] else ())
+
+    def page_settings(self):
+        """More settings of every page (render_page's extra), or None."""
+        return None
+
     def check_sources(self, chosen, rows, sizes):
         """Refuse an export whose pictures cannot be read at all (the library is offline).
 
@@ -3703,10 +4193,10 @@ class _Export:
         self.prepare()
         finished = False
         try:
-            chosen, _records, _flagged, counts = select_records(
-                self.conn, self.config, self.library, self.options)
-            rows = _load_rows(self.conn, self.library_id)
-            sizes = _Sizes(self.library_id, self.options, [record["i"] for record in chosen])
+            chosen, counts = self.select()
+            rows = _load_rows(self.conn, self.library_ids)
+            sizes = _AllSizes(self.library_ids, self.options,
+                              [record["i"] for record in chosen], rows, home=self.home)
             # Refused before anything is written: the folder and the record
             # of the last export stay as they were.
             self.check_sources(chosen, rows, sizes)
@@ -3757,20 +4247,20 @@ class _Export:
             manifest_bytes = self.manifest_text(manifest, files).encode("ascii")
             self.writer.write("data/manifest.js", manifest_bytes)
             versions = {}
-            for name in ASSETS + (MAP_ASSETS if location else ()):
+            for name in self.assets():
                 with open(os.path.join(_static_dir(), name), "rb") as handle:
                     data = handle.read()
                 versions[name] = _version(data)
                 self.writer.write("assets/" + name, data)
             tiles_max = self.tiles() if location else None
-            pages = PAGES + (MAP_PAGES if location else ())
-            for name, template in pages:
+            for name, template in self.pages():
                 page_title = self.title if name != "map.html" else "Map - %s" % self.title
                 text = render_page(template, self.title, page_title, capabilities,
                                    self.export_id, self.options, tiles_max, versions,
                                    _version(manifest_bytes),
                                    {"credit": self.meaning_status["credit"]}
-                                   if self.meaning is not None else None)
+                                   if self.meaning is not None else None,
+                                   self.page_settings())
                 self.writer.write(name, text.encode("utf-8"))
             if not self.options["allow_indexing"]:
                 # Only heard at the root of a host; the pages say it too.
@@ -3793,6 +4283,19 @@ class _Export:
             if self.options["marks"]:
                 ctx.log("Favorites, ratings and %d album(s) were published (the marks option)."
                         % len(self.published_albums))
+            if self.options["raw_files"]:
+                ctx.log("%d RAW file(s) were published as the cameras wrote them (the "
+                        "raw_files option)%s." % (summary["raws"], "; the RAW files of %d "
+                                                  "picture(s) stay home: they hold a GPS "
+                                                  "position, and the picture's own position "
+                                                  "is not published%s" % (
+                                                      self.raw_located,
+                                                      " or is near home"
+                                                      if self.home is not None else "")
+                                                  if self.raw_located else ""))
+                if self.raw_failed:
+                    ctx.log("%d RAW file(s) could not be copied (see the warnings above)."
+                            % self.raw_failed, "warn")
             if self.failed:
                 ctx.log("%d picture(s) could not be exported (see the warnings above)."
                         % self.failed, "warn")
@@ -3876,6 +4379,8 @@ class _Export:
                 "pano_failed": self.pano_failed, "kept": self.kept,
                 "videos": sum(1 for picture in pictures if picture.video),
                 "video_failed": self.video_failed,
+                "raws": sum(1 for picture in pictures if picture.raw is not None),
+                "raw_failed": self.raw_failed, "raw_located": self.raw_located,
                 "written": self.writer.written,
                 "unchanged": self.writer.unchanged, "removed": removed, "bytes": total_bytes,
                 "images": self.options["images"], "stopped": stopped,
@@ -3927,8 +4432,11 @@ def export_library(ctx, conn, config, library_id, out_dir=None, options=None, he
     try:
         if options["location"]:
             # Positions read since the last GPS check (a stopped scan's) are
-            # checked first: one it sets aside is never published.
-            gps_check.run_safely(conn, config, ctx)
+            # checked first: one it sets aside is never published. The local
+            # times follow it (one worked out from a position set aside is
+            # the camera's time again).
+            if gps_check.run_safely(conn, config, ctx) is not None:
+                local_times.after_check_safely(conn, config, ctx)
         return job.run()
     finally:
         lock.release()
@@ -3937,13 +4445,14 @@ def export_library(ctx, conn, config, library_id, out_dir=None, options=None, he
 # ---------------------------------------------------------------------------
 # Command line
 
-def _cli_options(args, library):
-    """The options the command line switches change (the saved ones are the base)."""
+def _cli_options(args, library, current=None):
+    """The options the command line switches change (the saved ones are the base;
+    current: the options they change, default the library's)."""
     options = {}
     if args.images:
         options["images"] = args.images
     for name in ("location", "file_names", "folders", "zip", "marks", "estimated_places",
-                 "routes"):
+                 "routes", "people_names", "raw_files"):
         if getattr(args, name, False):
             options[name] = True
     if getattr(args, "routes_trim", None) is not None:
@@ -3953,7 +4462,8 @@ def _cli_options(args, library):
     for name in ("undescribed", "private", "sensitive"):
         if getattr(args, "include_" + name):
             options["exclude_" + name] = False
-    current = library_options(library)
+    if current is None:
+        current = library_options(library)
     excluded = [kind for kind in current["exclude_types"]
                 if not (kind == "screenshot" and args.include_screenshots)
                 and not (kind == "document" and args.include_documents)]
@@ -4091,6 +4601,7 @@ def report(summary, log=print):
 
 
 def main(argv=None):
+    import trip_export          # (it imports this module: only once it is loaded)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(
@@ -4098,7 +4609,16 @@ def main(argv=None):
                     "library). The library's saved export options are used, changed by "
                     "the options given here.")
     parser.add_argument("--library", help="the library's name or id (needed for an "
-                                           "export)")
+                                           "export, unless --trip)")
+    parser.add_argument("--trip", metavar="ID",
+                        help="export a trip instead (trip_export.py): its id, as the Trips "
+                             "page's address shows it (/trip/ID); the site opens on the "
+                             "trip's page, and its other options are the trip's last "
+                             "export's")
+    parser.add_argument("--home-km", type=int, metavar="KM",
+                        help="with --trip: the size of the squares around home that are "
+                             "never shown (no position, route, town or dashcam clip there; "
+                             "default %d km, 0: off)" % trip_export.HOME_KM)
     parser.add_argument("--out", help="output folder (default: data/exports/<library name> "
                                       "in the data folder); it must be empty or an earlier "
                                       "export")
@@ -4146,6 +4666,14 @@ def main(argv=None):
     parser.add_argument("--marks", action="store_true",
                         help="also publish favorites, ratings and album names (so "
                              "is:favorite, rating: and album: work in the site)")
+    parser.add_argument("--people-names", action="store_true",
+                        help="also publish the names of the people in the pictures (People: "
+                             "the named people who are not hidden) as tags; faces never go")
+    parser.add_argument("--raw-files", action="store_true",
+                        help="also publish the camera RAW file of each picture that has one, "
+                             "as it is: with every fact the camera wrote in it (the time, "
+                             "the camera's serial number; one holding a GPS position only "
+                             "with --location)")
     parser.add_argument("--videos", choices=VIDEO_MODES,
                         help="skip: videos are published as their poster frame (default); "
                              "include: also the videos browsers can play (H.264, or a "
@@ -4164,8 +4692,16 @@ def main(argv=None):
         except (ExportError, OSError) as error:
             raise SystemExit("Error: %s" % error)
         return None
+    if args.home_km is not None and not args.trip:
+        parser.error("--home-km only applies with --trip (a library's export has no area "
+                     "around home)")
+    if args.trip:
+        if args.library or args.album:
+            parser.error("--trip exports the trip's own pictures: no --library or --album")
+        return trip_export.main_cli(args, lambda arguments, current: _cli_options(
+            arguments, None, current))
     if not args.library:
-        parser.error("--library is needed (or --serve FOLDER)")
+        parser.error("--library or --trip is needed (or --serve FOLDER)")
     try:
         db.init()
         config = common.load_config()

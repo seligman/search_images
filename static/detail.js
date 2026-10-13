@@ -39,7 +39,7 @@
             try {
                 var url = new URL(from);
                 same = url.origin === window.location.origin &&
-                    url.pathname === new URL(SITE.homeUrl(), window.location.href).pathname;
+                    url.pathname === new URL(SITE.searchUrl({}), window.location.href).pathname;
             } catch (error) {
                 same = false;
             }
@@ -70,7 +70,8 @@
         var stage = new VIEWER.Stage(byId("detail-stage"), {
             scrollPage: true,
             onState: function (state) {
-                reset.hidden = !state.pano && !state.zoomed;
+                // (Not at a wide picture's pan view: it opens there.)
+                reset.hidden = !state.pano && !state.moved;
                 // (Not for a 360 video shown unlevelled, see VIEWER.Stage.)
                 openHere.hidden = !state.pano || !adminOn || Boolean(state.unlevelled);
                 // (A video does not zoom.)

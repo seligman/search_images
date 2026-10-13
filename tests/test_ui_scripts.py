@@ -297,8 +297,8 @@ class ServerRecordsTest(fixtures.IndexFixture, unittest.TestCase):
                               info=fixtures.V5_INFO, described=1, prompt_ver=5, provenance=prov,
                               dhash="0f0f0f0f0f0f0f0f", content_hash="aa",
                               taken_at="2019-05-14T10:00:00", camera="Apple iPhone 12",
-                              lat=1.0, lon=2.0, place_city="Kahului", place_region="Hawaii",
-                              place_country="United States", place_cc="US", place_km=2.6)
+                              lat=1.0, lon=2.0, place_city="Albufeira", place_region="Algarve",
+                              place_country="Portugal", place_cc="PT", place_km=2.6)
         fixtures.insert_image(conn, "lib_family1", "2019/Beach/IMG_0002.jpg",
                               info=fixtures.V5_INFO, described=1, prompt_ver=5, provenance=prov,
                               dhash="0f0f0f0f0f0f0f0e", content_hash="bb",

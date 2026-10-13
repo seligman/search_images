@@ -29,7 +29,7 @@ def fake_tools():
 def clip_probe(duration=24.0, **changes):
     """A landscape H.264 phone video: local date with offset, a position, the phone's name."""
     tags = {"com.apple.quicktime.creationdate": "2021-07-04T11:30:15-0700",
-            "com.apple.quicktime.location.ISO6709": "+47.6062-122.3321+010.000/",
+            "com.apple.quicktime.location.ISO6709": "+33.4484-112.0740+010.000/",
             "com.apple.quicktime.make": "Acme", "com.apple.quicktime.model": "Phone 9"}
     tags.update(changes.pop("format_tags", {}))
     return fake_ffmpeg.probe_json(duration=duration, format_tags=tags, **changes)

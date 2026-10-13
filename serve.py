@@ -8,6 +8,7 @@ in the browser with no server (see export.py, which does the work).
 """
 
 import argparse
+import collections
 import contextlib
 import errno
 import hashlib
@@ -19,6 +20,7 @@ import mimetypes
 import os
 import re
 import socket
+import sqlite3
 import sys
 import threading
 import urllib.parse
@@ -34,11 +36,16 @@ import gps_check
 import image_edits
 import imageinfo
 import jobs
+import local_times
 import looks
 import opening_views
+import people
+import people_groups
 import place_estimates
+import raw_photos
 import search_index
 import tracks
+import trips
 import videos
 import world_map
 
@@ -57,7 +64,7 @@ TILE_ZOOM_LIMIT = 20
 CACHE_SECONDS = 3600
 TILE_CACHE_SECONDS = 86400
 # Originals with these extensions are converted to JPEG for browsers.
-CONVERTED_EXTENSIONS = common.HEIC_EXTENSIONS + (".tif", ".tiff")
+CONVERTED_EXTENSIONS = common.HEIC_EXTENSIONS + (".tif", ".tiff") + common.RAW_EXTENSIONS
 # Provenance fields the detail page may show (who described an image, when).
 PROVENANCE_FIELDS = ("model", "endpoint", "prompt_ver", "profile", "at")
 # SQLite integers are 64-bit; larger ids in a URL simply do not exist.
@@ -72,10 +79,12 @@ LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 CONTENT_SECURITY_POLICY = ("default-src 'self'; img-src 'self' data: blob:; "
                            "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; "
                            "base-uri 'none'; form-action 'self'; object-src 'none'")
+FACE_CROPS = 512            # face pictures (/face/<id>) kept in memory
 # The name each page template goes by in the page settings ("page").
 PAGE_NAMES = {"page.html": "search", "detail.html": "detail", "map.html": "map",
               "manage.html": "manage", "settings.html": "settings",
-              "duplicates.html": "duplicates", "albums.html": "albums"}
+              "duplicates.html": "duplicates", "albums.html": "albums",
+              "trips.html": "trips"}
 
 
 def _images():
@@ -480,6 +489,7 @@ class ServerState:
         self.embedder = embeddings.QueryEmbedder(config_loader=self.config, log=print)
         self.looks = looks.LooksService()
         self.examples = looks.ExampleEmbedder(config_loader=self.config)
+        self.trips = trips.TripsService()
         self._lock = threading.Lock()
         self._config = None
         self._config_key = None
@@ -556,6 +566,12 @@ def _source_etag(kind, image_id, stat, made_by=""):
     360-degree photos are stitched, images.stitch_key())."""
     text = "%s:%d:%d:%r:%s" % (kind, image_id, stat.st_size, stat.st_mtime, made_by)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:24]
+
+
+def _pano_kind(row):
+    """What a row's pano is called in messages."""
+    return ("360-degree panorama" if row["projection"] in imageinfo.PROJECTIONS_360
+            else "larger picture")
 
 
 def _made_by(images, row):
@@ -672,12 +688,24 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             return None, None
         return full, stat
 
-    def page(name):
+    def people_shown():
+        """True when the pages show people (names, the People page) to this requester:
+        People is on or there is face data, and the requester may see it (the admin;
+        others only with "visitors": true)."""
+        config = state.config()
+        return people_groups.may_see(config, is_admin()) and (
+            people.enabled(config) or os.path.isfile(people.store_path()))
+
+    def page(name, extra=None):
         capabilities = {"admin": is_admin()}
+        if not trips.settings(state.config())["enabled"]:
+            capabilities["trips"] = False   # (no Trips link: see SITE.tripsUrl)
+        if people_shown():
+            capabilities["people"] = True
         return render_template_file(name, "server", "/static/", None,
                                     tiles_max=tiles_max_zoom(),
                                     libraries=visible_libraries(state.config()),
-                                    capabilities=capabilities)
+                                    capabilities=capabilities, extra=extra)
 
     def admin_page(name):
         if not is_admin():
@@ -719,6 +747,152 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     def albums_page():
         # Everyone may look at the albums; only the admin changes them.
         return page("albums.html")
+
+    @app.route("/trips")
+    def trips_page():
+        # The trips (trips.py); everyone may look, only the admin changes them.
+        return page("trips.html")
+
+    @app.route("/trip/<trip_id>")
+    def trip_page(trip_id):
+        # One trip's page; the page asks /api/trips and says when there is no such trip.
+        if not trips.ID_RE.match(trip_id):
+            return not_found()
+        return page("trips.html", extra={"trip": trip_id})
+
+    @app.route("/api/trips")
+    def api_trips():
+        """{"enabled", "best_per_day", "trips": [...]} of the enabled libraries (see
+        trips.view): visitors get no hidden trip and no hidden picture."""
+        status, body, headers = state.trips.respond(
+            get_conn(), state.config(), visible_libraries(state.config()), admin=is_admin(),
+            etag_matches=request.if_none_match.contains)
+        return Response(body, status=status, headers=headers, mimetype="application/json")
+
+    @app.route("/people")
+    def people_page():
+        # The people the faces show (people_groups.py): the admin's, and with "visitors":
+        # true in config.json's "people", others may look at the named ones.
+        if not people_shown():
+            return Response("There is no People page here.", status=404, mimetype="text/plain")
+        return page("people.html")
+
+    def open_faces():
+        """data/faces.db for reading, or None (none, or it cannot be read)."""
+        try:
+            return people.connect(create=False)
+        except Exception:
+            return None
+
+    @app.route("/api/people")
+    def api_people():
+        """The people of the enabled libraries' pictures (people_groups.search_data), for
+        person: and the People page; ?hidden=1 (the admin's) lists hidden people too.
+        Nobody else gets anything unless config.json's "people" says "visitors": true."""
+        config = state.config()
+        admin = is_admin()
+        if not people_groups.may_see(config, admin):
+            response = jsonify({"error": "People is not shown here."})
+            response.status_code = 404
+            return response
+        if not same_origin():
+            # (Names are for this server's own pages only.)
+            response = jsonify({"error": "Requests from other sites are not allowed."})
+            response.status_code = 403
+            return response
+        names = visible_libraries(config)
+        store = open_faces()
+        try:
+            hidden = admin and request.args.get("hidden") == "1"
+            key = json.dumps([people_groups.state_key(store),
+                              search_index.data_state(get_conn(), list(names)),
+                              list(names), admin, hidden, people.settings(config)["visitors"]])
+            etag = hashlib.sha1(key.encode("utf-8")).hexdigest()[:32]
+            if request.if_none_match.contains(etag):
+                response = Response(status=304)
+            else:
+                response = jsonify(people_groups.search_data(
+                    store, get_conn(), config, list(names), admin, include_hidden_people=hidden))
+            response.set_etag(etag)
+        finally:
+            if store is not None:
+                store.close()
+        response.headers["Cache-Control"] = "private, no-cache"
+        return response
+
+    face_crops = collections.OrderedDict()      # ETag -> JPEG bytes (the last FACE_CROPS)
+    face_lock = threading.Lock()
+
+    def face_response(response):
+        # (Asked again every time, cheaply, by its ETag: a face id names another face
+        # after Delete face data, and a person may be hidden or unnamed since.)
+        response.cache_control.public = False
+        response.cache_control.private = True
+        response.cache_control.no_cache = True
+        response.cache_control.max_age = None
+        return response
+
+    @app.route("/face/<int:face_id>")
+    def face_picture(face_id):
+        """A square picture of one face (people_groups.crop), cut from its picture's
+        preview: for the admin, or (with "visitors": true) a named person's face in a
+        picture the requester may see. Never kept by the browser without asking."""
+        config = state.config()
+        admin = is_admin()
+        # (Faces only show on this server's own pages, never in another site's.)
+        if not people_groups.may_see(config, admin) or face_id > MAX_IMAGE_ID or \
+                not same_origin():
+            return not_found()
+        store = open_faces()
+        if store is None:
+            return not_found()
+        try:
+            face, row = people_groups.face_source(store, get_conn(), face_id,
+                                                  list(visible_libraries(config)), admin)
+            epoch = people_groups.state_key(store)[:1]
+        finally:
+            store.close()
+        if face is None:
+            return not_found()
+        path = None
+        if row["has_preview"] == 1:
+            try:
+                path = state.previews.path_for(row["library_id"], row["id"])
+            except ValueError:
+                path = None
+        try:
+            stat = os.stat(path) if path else None
+        except OSError:
+            stat = None
+        box = (face["x"], face["y"], face["w"], face["h"])
+        etag = hashlib.sha1(json.dumps([epoch, face_id, box, row["id"],
+                                        stat.st_size if stat else 0,
+                                        stat.st_mtime_ns if stat else 0]).encode(
+                                            "utf-8")).hexdigest()[:24]
+        if request.if_none_match.contains(etag):
+            return face_response(not_modified(etag))
+        with face_lock:
+            data = face_crops.get(etag)
+        if data is None:
+            try:
+                source = None
+                if stat is not None:
+                    with open(path, "rb") as handle:
+                        source = handle.read()
+                else:
+                    source = state.thumbs().get(row["id"])
+                if source is None:
+                    return not_found()
+                data = people_groups.crop(source, box)
+            except Exception:
+                return not_found()
+            with face_lock:
+                face_crops[etag] = data
+                while len(face_crops) > FACE_CROPS:
+                    face_crops.popitem(last=False)
+        response = Response(data, mimetype="image/jpeg")
+        response.set_etag(etag)
+        return face_response(response).make_conditional(request)
 
     @app.route("/api/locations")
     def api_locations():
@@ -899,12 +1073,41 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         # also gets its position, the pictures it came from and the choice).
         record["place_estimate"] = place_estimates.view(get_conn(), row, estimate,
                                                         admin=is_admin())
+        # The camera's own clock, when the time is the local time of the place
+        # (local_times.py).
+        clock = local_times.view(get_conn(), row, admin=is_admin())
+        if clock is not None:
+            record["clock"] = clock
+        # A camera RAW file (raw_photos.view): the picture's RAW original, or the
+        # RAW file the picture is (shown by its preview). Only the owner may
+        # download it (/raw/<id>): it holds every fact the camera wrote.
+        raw = raw_photos.view(record["exif"], row["name"], row["size"])
+        record["exif"].pop("raw", None)
+        if raw is not None:
+            if is_admin():
+                raw["url"] = "/raw/%d" % row["id"]
+            record["raw"] = raw
         if is_admin():
             # The GPS check of the picture: why its position was set aside.
             record["location_check"] = gps_check.picture_view(get_conn(), row)
         elif row["lat"] is None and gps_check.is_ignored(get_conn(), image_id):
             # A position set aside is nobody else's business, not even raw.
             record["exif"].pop("GPS", None)
+        # Who is in it (people_groups.picture_view): the names, and the admin also the
+        # boxes of its faces. Nobody else gets them unless People's "visitors" says so.
+        found = None
+        if people_groups.may_see(state.config(), is_admin()):
+            store = open_faces()
+            if store is not None:
+                try:
+                    found = people_groups.picture_view(store, get_conn(), row, state.config(),
+                                                       is_admin())
+                except sqlite3.Error:
+                    found = None
+                finally:
+                    store.close()
+        if found is not None:
+            record["people"] = found
         if record["projection"]:
             # Where its 360 view opens (opening_views.py; the admin is also
             # told whether it is the one set with "Open here").
@@ -1035,16 +1238,17 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     @app.route("/pano/<int:image_id>")
     def pano(image_id):
         # The large panorama of a 360 photo (cache.PreviewStore), for the
-        # 360 view; 404 for any other picture (a 360 video too: it plays),
-        # and for a 360 photo not larger than its preview (which is then
-        # the whole picture).
+        # 360 view, or the larger picture of a wide photo, for the viewer's
+        # pan view (images.gets_pano); 404 for any other picture (a video
+        # too: it plays), and for one not larger than its preview (which
+        # is then as good).
         row = visible_row(image_id, "id, path, name, width, height, has_preview, projection, "
                                     "media")
-        if (row is None or row["projection"] not in imageinfo.PROJECTIONS_360
-                or row["media"] == videos.MEDIA_VIDEO):
+        if row is None or row["media"] == videos.MEDIA_VIDEO:
             return not_found()
         images = _images()
-        if images is not None and not images.has_pano(row["width"], row["height"]):
+        if images is not None and not images.gets_pano(row["width"], row["height"],
+                                                       row["projection"], row["media"]):
             return not_found()
         # A pano on disk is trusted like the preview it belongs to: the
         # scanner writes (or removes) it whenever it writes the preview.
@@ -1075,8 +1279,8 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
                 result = images.read_image(full, state.helper, want_preview=False,
                                            want_pano=True, mtime=stat.st_mtime)
             except images.ImageReadError as error:
-                print("Could not make the 360-degree panorama of image %d: %s"
-                      % (row["id"], error))
+                print("Could not make the %s of image %d: %s"
+                      % (_pano_kind(row), row["id"], error))
                 return not_found()
             data = result.get("pano")
             if not data:
@@ -1096,8 +1300,8 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
                     try:
                         state.previews.write_pano(row["library_id"], row["id"], data)
                     except OSError as error:
-                        print("Could not save the 360-degree panorama of image %d: %s"
-                              % (row["id"], error))
+                        print("Could not save the %s of image %d: %s"
+                              % (_pano_kind(row), row["id"], error))
         return send_bytes(data, "image/jpeg", etag)
 
     @app.route("/video/<int:image_id>")
@@ -1139,6 +1343,45 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             return not_found()
         response.headers["Accept-Ranges"] = "bytes"
         return private_cache(response)
+
+    @app.route("/raw/<int:image_id>")
+    def raw_file(image_id):
+        # The RAW file of a picture (its RAW original, or the RAW file it is), as
+        # it is: a download for the owner only (raw_photos.py). Not for a page
+        # of another site, nor for anyone else.
+        site = request.headers.get("Sec-Fetch-Site")
+        if not is_admin() or (site is not None and site not in ("same-origin", "none")):
+            return not_found()
+        row = visible_row(image_id, "id, path, name, exif")
+        if row is None:
+            return not_found()
+        exif = load_json(row["exif"], {})
+        entry = raw_photos.paired_record(exif)
+        if entry is not None and raw_photos.safe_path(entry["path"]):
+            source = {"library_id": row["library_id"], "path": entry["path"]}
+        elif raw_photos.view(exif, row["name"]) is not None and common.is_raw_file(row["name"]):
+            source = row
+        else:
+            return not_found()
+        full = disk_path(source, library_roots(state.config()))
+        stat = common.stat_path(state.helper, full) if full else None
+        if stat is None:
+            return not_found()
+        name = source["path"].rsplit("/", 1)[-1]
+        etag = _source_etag("raw", row["id"], stat)
+        try:
+            _head, data = _read_head(state.helper, full)
+            if data is not None:
+                response = Response(data, mimetype="application/octet-stream")
+                response.set_etag(etag)
+                response.headers["Content-Disposition"] = (
+                    "attachment; filename*=UTF-8''%s" % urllib.parse.quote(name))
+                return private_cache(response.make_conditional(request))
+            return private_cache(send_file(
+                full, mimetype="application/octet-stream", conditional=True, etag=etag,
+                max_age=CACHE_SECONDS, as_attachment=True, download_name=name))
+        except OSError:
+            return not_found()
 
     @app.route("/image/<int:image_id>")
     def image(image_id):
@@ -1381,21 +1624,62 @@ def main(argv=None):
         app.extensions["search_images"].close()
 
 
-_EMBED_QUERY_RE = re.compile(r"(/api/embed)\?[^\s\"]*")
+# The query of a requested address in a request log line: Werkzeug logs the
+# address decoded (uri_to_iri), so a typed quote or accented letter shows as
+# itself, but a space stays %20 and "&", "=" and "+" stay as they are.
+_LOGGED_QUERY_RE = re.compile(r"(\s/[^\s?]*)\?(\S*)")
+# The query parameters whose values are only ids, numbers or switches: they are
+# logged as they are. Any other value is logged as "...": words searched for
+# (q=, on the pages and in /api/embed, or a person's name in person:"Name"), a
+# place (place=), tags and the other facets, a trip's title (pick=), the map's
+# centre (view=), dates (from=, to=).
+_LOGGED_PARAMETERS = frozenset((
+    "album", "by", "dialog", "drives", "hidden", "id", "kind", "lib", "limit", "log", "min",
+    "offset", "page", "person", "since", "size", "sort", "stack", "step", "v", "which"))
+_PARAMETER_NAME_RE = re.compile(r"[A-Za-z_]{1,20}\Z")
+
+
+def _quiet_query(match):
+    """A _LOGGED_QUERY_RE match as quiet_request_line logs it (a part without a name
+    of the right shape, or without "=", is "..." too)."""
+    parts = []
+    for part in match.group(2).split("&"):
+        name, equals, _value = part.partition("=")
+        if not part:
+            parts.append(part)
+        elif equals and name in _LOGGED_PARAMETERS:
+            parts.append(part)
+        elif equals and _PARAMETER_NAME_RE.match(name):
+            parts.append(name + "=...")
+        else:
+            parts.append("...")
+    return "%s?%s" % (match.group(1), "&".join(parts))
+
+
+def quiet_request_line(message):
+    """A request log line without what people typed or chose: the value of every query
+    parameter but those of _LOGGED_PARAMETERS is "..." (GET /?q=... HTTP/1.1,
+    GET /api/embed?q=..., GET /detail?id=39&place=...)."""
+    return _LOGGED_QUERY_RE.sub(_quiet_query, message)
 
 
 class QueryLogFilter(logging.Filter):
-    """Keeps what people type out of the request log: /api/embed?q=... (search by
-    meaning sends the words to the server) is logged as /api/embed?q=..."""
+    """Keeps what people type or choose out of the request log (quiet_request_line):
+    the words of a search (/?q=..., /api/embed?q=... when searching by meaning, a
+    person:"Name" from the People page), a place chosen (/?place=...), a trip's title
+    (/?pick=..., a trip page's Open in search), a town looked for in the viewer's
+    Place dialog (its q=)."""
 
     def filter(self, record):
         try:
             message = record.getMessage()
         except Exception:       # (a record that cannot be formatted is left alone)
             return True
-        if "/api/embed?" in message:
-            record.msg = _EMBED_QUERY_RE.sub(r"\1?q=...", message)
-            record.args = ()
+        if "?" in message:
+            quiet = quiet_request_line(message)
+            if quiet != message:
+                record.msg = quiet
+                record.args = ()
         return True
 
 

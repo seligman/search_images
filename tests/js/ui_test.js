@@ -47,7 +47,7 @@ test("the address keeps a search and reads it back", function () {
                            year: ["2019"]},
                  group: false, size: "l", hidden: true, junk: true, sensitive: "show",
                  ids: "5-2.2", view: "-17.5,179.9,4", from: "2019-03", to: "2019-05-14",
-                 by: "meaning", drives: false};
+                 by: "meaning", drives: false, pick: "Trip: Lakes, day 2"};
     var query = SITE.searchState.params(state);
     var back = SITE.searchState.read("?" + query);
     assert.deepStrictEqual(back, state);
@@ -280,11 +280,11 @@ test("a full record becomes the compact search record", function () {
     assert.strictEqual(SITE.compactRecord(null), null);
     // The place: the town only when one is near, and how far it is.
     var placed = SITE.compactRecord({id: 5, library_id: "lib_x", name: "c.jpg", path: "c.jpg",
-                                     lat: 20.9, lon: -156.5,
-                                     place: {city: "Kahului", region: "Hawaii",
-                                             country: "United States", cc: "US", km: 2.6}});
-    assert.deepStrictEqual(placed, {i: 5, l: "lib_x", n: "c.jpg", gp: 1, ci: "Kahului",
-                                    rg: "Hawaii", co: "United States", cc: "US", km: 3});
+                                     lat: 37.1, lon: -8.2,
+                                     place: {city: "Albufeira", region: "Algarve",
+                                             country: "Portugal", cc: "PT", km: 2.6}});
+    assert.deepStrictEqual(placed, {i: 5, l: "lib_x", n: "c.jpg", gp: 1, ci: "Albufeira",
+                                    rg: "Algarve", co: "Portugal", cc: "PT", km: 3});
     var far = SITE.compactRecord({id: 6, library_id: "lib_x", name: "d.jpg", path: "d.jpg",
                                   place: {city: "", region: "", country: "Fiji", cc: "FJ"}});
     assert.deepStrictEqual(far, {i: 6, l: "lib_x", n: "d.jpg", co: "Fiji", cc: "FJ"});
@@ -327,8 +327,8 @@ test("dates in words", function () {
 });
 
 test("places in words", function () {
-    assert.strictEqual(format.placeText({co: "United States", rg: "Hawaii", ci: "Kahului",
-                                         km: 3}), "Kahului, Hawaii, United States (3 km)");
+    assert.strictEqual(format.placeText({co: "Portugal", rg: "Algarve", ci: "Albufeira",
+                                         km: 3}), "Albufeira, Algarve, Portugal (3 km)");
     assert.strictEqual(format.placeText({co: "France", rg: "Bretagne", ci: "Brest", km: 0}),
                        "Brest, Bretagne, France (under 1 km)");
     assert.strictEqual(format.placeText({co: "Singapore", ci: "Singapore"}),

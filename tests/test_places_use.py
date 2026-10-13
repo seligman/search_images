@@ -32,8 +32,8 @@ except ImportError:
 
 quiet = support.quiet
 REMOTE = {"REMOTE_ADDR": "192.0.2.5"}
-MAUI = (20.88, -156.46)
-OFF_HAWAII = (20.3, -154.6)
+TOWN = (37.08, -8.234)          # 1.6 km from Albufeira (test_places.TOWNS)
+OFF_COAST = (36.3, -9.5)        # out at sea, about 90 km from Sagres
 
 
 @unittest.skipUnless(support.pillow_available(), "Pillow is not installed")
@@ -66,39 +66,39 @@ class ScanTest(support.TempBaseMixin, unittest.TestCase):
 
     def test_new_pictures_get_their_place(self):
         install_places()
-        self.picture("maui.jpg", MAUI)
-        self.picture("sea.jpg", OFF_HAWAII)
+        self.picture("town.jpg", TOWN)
+        self.picture("sea.jpg", OFF_COAST)
         self.picture("none.jpg", None)
         summary, _ctx = self.scan()
         rows = self.rows()
-        self.assertEqual((rows["maui.jpg"]["place_city"], rows["maui.jpg"]["place_region"],
-                          rows["maui.jpg"]["place_country"]),
-                         ("Kahului", "Hawaii", "United States"))
-        self.assertLess(rows["maui.jpg"]["place_km"], 3)
+        self.assertEqual((rows["town.jpg"]["place_city"], rows["town.jpg"]["place_region"],
+                          rows["town.jpg"]["place_country"]),
+                         ("Albufeira", "Algarve", "Portugal"))
+        self.assertLess(rows["town.jpg"]["place_km"], 3)
         self.assertEqual(rows["sea.jpg"]["place_city"], "")
-        self.assertEqual(rows["sea.jpg"]["place_region"], "Hawaii")
+        self.assertEqual(rows["sea.jpg"]["place_region"], "Algarve")
         self.assertIsNone(rows["none.jpg"]["place_km"])
         # Looked up as they were read: nothing was left for afterwards.
         self.assertEqual(summary["places"]["checked"], 0)
         self.assertIsNone(places._shared)
 
     def test_pictures_scanned_before_get_their_place_later(self):
-        self.picture("maui.jpg", MAUI)
+        self.picture("town.jpg", TOWN)
         summary, _ctx = self.scan()
         self.assertNotIn("places", summary)
-        self.assertIsNone(self.rows()["maui.jpg"]["place_km"])
+        self.assertIsNone(self.rows()["town.jpg"]["place_km"])
         install_places()
         summary, ctx = self.scan()
         self.assertEqual(summary["places"]["checked"], 1)
-        self.assertEqual(self.rows()["maui.jpg"]["place_city"], "Kahului")
+        self.assertEqual(self.rows()["town.jpg"]["place_city"], "Albufeira")
         self.assertIn("Place names for 1 picture", "\n".join(
             entry["message"] for entry in ctx.snapshot(log_tail=100)["log_tail"]))
 
     def test_a_picture_that_moved_gets_its_new_place(self):
         install_places()
-        path = self.picture("trip.jpg", MAUI)
+        path = self.picture("trip.jpg", TOWN)
         self.scan()
-        self.assertEqual(self.rows()["trip.jpg"]["place_city"], "Kahului")
+        self.assertEqual(self.rows()["trip.jpg"]["place_city"], "Albufeira")
         # The same name, a new position (the file was edited): looked up again.
         os.remove(path)
         self.imagegen.jpeg_with_exif(self.folder, "trip.jpg", gps=(48.86, 2.35),
@@ -114,8 +114,8 @@ class RouteTest(AdminFixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.addCleanup(places.release)
-        self.maui = insert_image(self.conn, "lib_family1", "maui.jpg", lat=MAUI[0],
-                                 lon=MAUI[1])
+        self.town = insert_image(self.conn, "lib_family1", "town.jpg", lat=TOWN[0],
+                                 lon=TOWN[1])
         self.plain = insert_image(self.conn, "lib_family1", "plain.jpg")
 
     def test_the_state_without_and_with_place_names(self):
@@ -195,14 +195,14 @@ class RouteTest(AdminFixture, unittest.TestCase):
         self.assertEqual(state["last"]["state"], "done", state["last"])
         self.assertEqual(state["pictures"]["named"], 1)
         self.assertEqual(state["last"]["summary"]["places"]["named"], 1)
-        detail = self.client.get("/api/image/%d" % self.maui).get_json()
-        self.assertEqual(detail["place"]["city"], "Kahului")
-        self.assertEqual(detail["place"]["country"], "United States")
+        detail = self.client.get("/api/image/%d" % self.town).get_json()
+        self.assertEqual(detail["place"]["city"], "Albufeira")
+        self.assertEqual(detail["place"]["country"], "Portugal")
         self.assertLess(detail["place"]["km"], 3)
         self.assertIsNone(self.client.get("/api/image/%d" % self.plain).get_json()["place"])
         records = {record["i"]: record for record in
                    self.client.get("/api/index").get_json()["records"]}
-        self.assertEqual(records[self.maui]["ci"], "Kahului")
+        self.assertEqual(records[self.town]["ci"], "Albufeira")
         self.assertNotIn("co", records[self.plain])
 
     def test_a_failed_download_is_reported(self):
@@ -245,7 +245,7 @@ class ExportTest(support.TempBaseMixin, unittest.TestCase):
         info = {"title": "Beach", "description": "A beach.", "photo_type": "photo",
                 "document_type": "none", "tags": ["beach"], "people": "none",
                 "sensitive": "none", "private_info": False}
-        for number, (lat, lon) in enumerate((MAUI, (48.86, 2.35))):
+        for number, (lat, lon) in enumerate((TOWN, (48.86, 2.35))):
             name = "p%d.jpg" % number
             Image.new("RGB", (40, 30), (number * 90, 120, 200)).save(
                 os.path.join(self.folder, name), "JPEG")
@@ -280,10 +280,10 @@ class ExportTest(support.TempBaseMixin, unittest.TestCase):
         for record in records:
             self.assertFalse({"ci", "rg", "co", "cc", "km"} & set(record), record)
         self.assertNotIn("GeoNames", page)
-        self.assertNotIn("Kahului", page)
+        self.assertNotIn("Albufeira", page)
         self.assertFalse(support.page_config(page)["capabilities"].get("places"))
         records, page = self.export(True)
-        self.assertEqual(sorted(record["ci"] for record in records), ["Kahului", "Paris"])
+        self.assertEqual(sorted(record["ci"] for record in records), ["Albufeira", "Paris"])
         self.assertIn('href="https://www.geonames.org/"', page)
         self.assertIn('rel="license"', page)
         self.assertTrue(support.page_config(page)["capabilities"]["places"])

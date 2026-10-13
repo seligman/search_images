@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>People - Image Search</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="__ASSET_PREFIX__style.css">
+<link rel="stylesheet" href="__ASSET_PREFIX__people.css">
+</head>
+<body class="people-page">
+<main id="people" class="admin-main people-main">
+<div class="page-head">
+<div>
+<h1 id="people-title">People</h1>
+<p id="people-lead" class="lead">The people in the pictures, found by their faces on this computer.</p>
+</div>
+<div id="people-actions" class="page-actions"></div>
+</div>
+<div id="people-notices" aria-live="polite"></div>
+<div id="people-body"><p class="message">Loading...</p></div>
+</main>
+<div id="people-selection" class="people-selection" hidden></div>
+<noscript><p>This page needs JavaScript.</p></noscript>
+<script type="application/json" id="app-config">__APP_CONFIG__</script>
+<script src="__ASSET_PREFIX__site.js"></script>
+<script src="__ASSET_PREFIX__shell.js"></script>
+<script src="__ASSET_PREFIX__search-core.js"></script>
+<script src="__ASSET_PREFIX__people.js"></script>
+</body>
+</html>

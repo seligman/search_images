@@ -516,6 +516,9 @@ STAGE_LABELS = {
     "looks": "Making the looks of pictures",
     "drives": "Describing drives",
     "drive_previews": "Making sped-up previews of drives",
+    "faces": "Finding faces",
+    "people": "Grouping faces into people",
+    "delete faces": "Deleting face data",
 }
 # The job queue lives in data/jobs.db, a database of its own: a running scan
 # keeps index.db's write lock almost all the time, and adding, pausing or
@@ -997,12 +1000,15 @@ class JobManager:
             return self._current is not None and self._current["job"]["id"] == job_id
 
     def latest_by_library(self):
-        """{library id or None: its latest job} (None: jobs for every library); deletions left out."""
+        """{library id or None: its latest job} (None: jobs for every library); deletions (of
+        a library's data, or of the face data) left out, and so are the exports of trips (of
+        no one library, see trip_export.py)."""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM jobs WHERE id IN (SELECT MAX(id) FROM jobs WHERE kind <> "
-                "'delete_library' GROUP BY library_id)").fetchall()
+                "SELECT * FROM jobs WHERE id IN (SELECT MAX(id) FROM jobs WHERE kind NOT IN "
+                "('delete_library', 'delete_faces') AND NOT (kind = 'export' AND "
+                "library_id IS NULL) GROUP BY library_id)").fetchall()
         finally:
             conn.close()
         return {row["library_id"]: job_record(row) for row in rows}
@@ -1555,6 +1561,8 @@ def _scan_summary(result, params, offline_fails):
         summary["gps_check"] = result["gps_check"]
     if isinstance(result.get("embed"), dict):
         summary["embed"] = result["embed"]
+    if isinstance(result.get("faces"), dict):
+        summary["faces"] = result["faces"]
     if isinstance(result.get("looks_pending"), int):
         summary["looks_pending"] = result["looks_pending"]
     if isinstance(result.get("views_pending"), int):
@@ -1678,7 +1686,8 @@ def run_previews(ctx, conn, config, params, helper=None):
     """Build missing previews (and other details older rows lack); no scan, no describing.
 
     The GPS check (gps_check.run) follows, as after a scan (also when
-    stopped): a picture read again may have a position it had not.
+    stopped): a picture read again may have a position it had not. Then
+    the local times (local_times.run_safely).
     """
     import cache
     import scan
@@ -1713,6 +1722,11 @@ def run_previews(ctx, conn, config, params, helper=None):
     checked = gps_check.run_safely(conn, config, ctx)
     if checked is not None:
         summary["gps_check"] = checked
+    # (Tracks read, and dates read again, may change local times.)
+    import local_times
+    localised = local_times.run_safely(conn, config, ctx)
+    if localised is not None:
+        summary["local_times"] = localised
     if params.get("library_id") and len(results) == 1 and results[0].get("offline"):
         summary["error"] = "The folder of %s is not available (offline?)." % results[0]["name"]
     return summary
@@ -1731,9 +1745,23 @@ def run_export(ctx, conn, config, params, helper=None):
     "options" (they override the library's saved export options for this
     export only). Raises JobError when the export cannot be made (an
     unknown or disabled library, a folder it must not write to, bad
-    options); one picture that cannot be read is only counted.
+    options); one picture that cannot be read is only counted. With
+    "trip" (a trip's id; no library) the trip is exported instead
+    (trip_export.export_trip).
     """
     import export
+    if params.get("trip"):
+        import trip_export
+        options = params.get("options")
+        try:
+            return trip_export.export_trip(ctx, conn, config, params["trip"],
+                                           params.get("out_dir") or None,
+                                           options if isinstance(options, dict) else None,
+                                           helper=helper)
+        except export.ExportError as error:
+            raise JobError(str(error))
+        except OSError as error:
+            raise JobError(export.os_error_text(error))
     if not params.get("library_id"):
         raise JobError("An export is made of one library; choose which.")
     library = job_libraries(config, params)[0]
@@ -1762,7 +1790,8 @@ def run_places(ctx, conn, config, params, helper=None):
     looked up, enabled or not: it only touches the database, and the
     Manage page counts them all (places.status). Raises JobError when
     there are no place names (or the download fails). The GPS check
-    (gps_check.run) follows.
+    (gps_check.run) follows, and the local times (local_times.py: the
+    place index holds the time zones).
     """
     import places
     summary = {}
@@ -1784,6 +1813,10 @@ def run_places(ctx, conn, config, params, helper=None):
         checked = gps_check.run_safely(conn, config, ctx)
         if checked is not None:
             summary["gps_check"] = checked
+        import local_times
+        localised = local_times.run_safely(conn, config, ctx)
+        if localised is not None:
+            summary["local_times"] = localised
     except places.PlacesError as error:
         if ctx.should_stop():
             return summary          # (cancelled: no error)
@@ -1828,6 +1861,65 @@ def run_drive_previews(ctx, conn, config, params, helper=None):
         raise JobError(str(error))
 
 
+def run_faces(ctx, conn, config, params, helper=None):
+    """Find the faces in a library's pictures (or every enabled library's) that were not
+    looked at yet (people.update). params "limit": at most that many; "retry_failed":
+    also the pictures that failed 3 times. Raises JobError when People is off or its
+    setup is not complete."""
+    import people
+    libraries = job_libraries(config, params)
+    options = people.settings(config)
+    problem = people.setup_problem(options)
+    if problem:
+        raise JobError(problem)
+    limit = params.get("limit")
+    summary = people.update(
+        conn, config, ctx, library_ids=[library["id"] for library in libraries],
+        limit=limit if isinstance(limit, int) and not isinstance(limit, bool) else None,
+        retry_failed=bool(params.get("retry_failed")), helper=helper)
+    if not summary["error"] and not summary["pending"] and not summary["stopped"]:
+        ctx.log("Faces are up to date (%d picture(s))." % summary["up_to_date"])
+    return summary
+
+
+def run_group_faces(ctx, conn, config, params, helper=None):
+    """Group the faces found into people again (people_groups.group), for every library:
+    after "match", "group_quality" or "min_faces" changed, or to see what a grouping
+    makes of the faces now. What the owner said about the people is kept."""
+    import sqlite3
+    import people
+    import people_groups
+    options = people.settings(config)
+    if not options["enabled"]:
+        raise JobError(people.NOT_ENABLED)
+    if not os.path.isfile(people.store_path()):
+        raise JobError("There are no faces to group yet: find faces first.")
+    try:
+        store = people.connect()        # (an older file is brought up to date)
+    except sqlite3.Error as error:
+        raise JobError("The face data cannot be read: %s" % error)
+    try:
+        return people_groups.group(store, options, ctx, conn=conn)
+    finally:
+        store.close()
+
+
+def run_delete_faces(ctx, conn, config, params, helper=None):
+    """Delete all face data (people.delete_all): data/faces.db goes as a whole, with the
+    people and their names. Raises JobError when some of it could not be deleted."""
+    import people
+    ctx.stage("delete faces")
+    result = people.delete_all()
+    if result["error"]:
+        raise JobError("The face data was NOT deleted (not all of it): %s. Close what has "
+                       "data/faces.db open and delete it again." % result["error"])
+    ctx.log("Deleted the face data: %d face(s) of %d picture(s) and %d people (%d named)%s."
+            % (result["faces"], result["pictures"], result["people"], result["named"],
+               "" if result["removed"] else
+               " (data/faces.db was open elsewhere: it was emptied and wiped)"))
+    return result
+
+
 RUNNERS = {
     "scan": run_scan,
     "describe": run_describe,
@@ -1841,4 +1933,7 @@ RUNNERS = {
     "places": run_places,
     "proxies": run_proxies,
     "drive_previews": run_drive_previews,
+    "faces": run_faces,
+    "group_faces": run_group_faces,
+    "delete_faces": run_delete_faces,
 }

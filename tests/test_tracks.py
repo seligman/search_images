@@ -568,7 +568,7 @@ class ScanTest(LibraryCase):
             self.assertEqual((rows[name]["lat"], rows[name]["tz_offset"]), (None, ""))
         # The phone keeps its own position (and is not asked for a track it has not).
         phone = rows["IMG_0001.MOV"]
-        self.assertEqual((phone["lat"], phone["lon"]), (47.6062, -122.3321))
+        self.assertEqual((phone["lat"], phone["lon"]), (33.4484, -112.074))
         conn = self.conn()
         kept = conn.execute("SELECT content_key, fixes FROM video_tracks").fetchall()
         self.assertEqual(sorted(row[1] for row in kept), [0, 0, 0, 61, 61, 61, 61, 61])
@@ -620,7 +620,7 @@ class ScanTest(LibraryCase):
         rows = self.rows()
         self.assertTrue(all(row["lat"] is None for name, row in rows.items()
                             if name != "IMG_0001.MOV"))
-        self.assertEqual(rows["IMG_0001.MOV"]["lat"], 47.6062)
+        self.assertEqual(rows["IMG_0001.MOV"]["lat"], 33.4484)
         self.assertIn("5 video(s) in Trip no longer have the position of their GPS track",
                       self.log_text())
         conn = self.conn()

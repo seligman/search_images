@@ -128,6 +128,8 @@ def scan_line(line):
     for match in IP_RE.finditer(line):
         address = match.group(1)
         parts = address.split(".")
+        if line[max(0, match.start(1) - 2):match.start(1)] == "==":
+            continue                    # (a pinned version, package==4.10.0.84)
         if all(0 <= int(p) <= 255 for p in parts) and not address.startswith(ALLOWED_IPS):
             problems.append("IP address " + address)
     for match in GGUF_RE.finditer(line):

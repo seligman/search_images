@@ -36,6 +36,9 @@
                                 nearest the screen point x, y, within slack
                                 pixels: {clip, at (seconds into it),
                                 distance, sx, sy}, or null
+   ROUTES.strokeLines(ctx, lines, width, colour)  draws lines of screen
+                                points ([[{sx, sy}]]) on a canvas, round
+                                ended (a line of one point is a dot)
    ROUTES.fitZoom(box, w, h, tile, pad, maxZoom)  the (fractional) zoom
                                 that shows a box {south, north, west,
                                 east} in w x h pixels with pad around it
@@ -245,6 +248,32 @@ var ROUTES = (function () {
             });
         });
         return best;
+    }
+
+    function strokeLines(ctx, lineList, width, colour) {
+        ctx.save();
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.lineWidth = width;
+        ctx.strokeStyle = colour;
+        (lineList || []).forEach(function (line) {
+            if (!line.length) {
+                return;
+            }
+            ctx.beginPath();
+            line.forEach(function (point, index) {
+                if (index) {
+                    ctx.lineTo(point.sx, point.sy);
+                } else {
+                    ctx.moveTo(point.sx, point.sy);
+                }
+            });
+            if (line.length === 1) {
+                ctx.lineTo(line[0].sx + 0.1, line[0].sy);
+            }
+            ctx.stroke();
+        });
+        ctx.restore();
     }
 
     function fitZoom(box, w, h, tile, pad, maxZoom) {
@@ -482,6 +511,7 @@ var ROUTES = (function () {
         placeOf: placeOf,
         lines: lines,
         nearest: nearest,
+        strokeLines: strokeLines,
         fitZoom: fitZoom,
         boxOf: boxOf,
         MiniMap: MiniMap

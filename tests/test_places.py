@@ -31,10 +31,10 @@ quiet = support.quiet
 
 # (geonameid, name, lat, lon, feature code, cc, admin1, population)
 TOWNS = [
-    (1, "Kahului", 20.8893, -156.4729, "PPL", "US", "HI", 26337),
-    (2, "Wailuku", 20.8911, -156.5047, "PPLA2", "US", "HI", 15313),
-    (3, "Honolulu", 21.3069, -157.8583, "PPLA", "US", "HI", 350964),
-    (4, "Hilo", 19.7297, -155.0900, "PPL", "US", "HI", 43263),
+    (1, "Albufeira", 37.0891, -8.2479, "PPL", "PT", "09", 40828),
+    (2, "Loul\u00e9", 37.1377, -8.0197, "PPLA2", "PT", "09", 70622),
+    (3, "Faro", 37.0194, -7.9322, "PPLA", "PT", "09", 41355),
+    (4, "Sagres", 37.0086, -8.9403, "PPL", "PT", "09", 1909),
     (5, "San Francisco", 37.7749, -122.4194, "PPLA2", "US", "CA", 864816),
     (6, "Oakland", 37.8044, -122.2712, "PPLA2", "US", "CA", 419267),
     (7, "Los Angeles", 34.0522, -118.2437, "PPLA2", "US", "CA", 3971883),
@@ -59,11 +59,11 @@ TOWNS = [
     (26, "Quito", -0.2299, -78.5250, "PPLC", "EC", "18", 1399814),
     (27, "Singapore", 1.2897, 103.8501, "PPLC", "SG", "00", 3547809),
     (28, "Monaco", 43.7333, 7.4167, "PPLC", "MC", "", 32965),
-    (29, "Old Kahului", 20.8800, -156.4600, "PPLH", "US", "HI", 5000),
+    (29, "Old Albufeira", 37.0800, -8.2340, "PPLH", "PT", "09", 5000),
     (30, "Ushuaia", -54.8019, -68.3030, "PPLA", "AR", "23", 58028),
 ]
 
-REGIONS = {"US.HI": "Hawaii", "US.CA": "California", "US.NY": "New York",
+REGIONS = {"PT.09": "Algarve", "US.CA": "California", "US.NY": "New York",
            "GB.ENG": "England", "GB.SCT": "Scotland", "FR.11": "\u00cele-de-France",
            "FR.93": "Provence-Alpes-C\u00f4te d'Azur", "CH.ZH": "Zurich", "DE.16": "Berlin",
            "DE.02": "Bavaria", "JP.40": "Tokyo", "AU.02": "New South Wales",
@@ -71,24 +71,46 @@ REGIONS = {"US.HI": "Hawaii", "US.CA": "California", "US.NY": "New York",
            "SJ.21": "Svalbard", "ZA.11": "Western Cape", "BR.21": "Rio de Janeiro",
            "EC.18": "Pichincha", "AR.23": "Tierra del Fuego"}
 
+# The towns' time zones (GeoNames' column 18); a town not listed gets the
+# whole-hour zone of its longitude (longitude_zone).
+ZONES = {1: "Europe/Lisbon", 2: "Europe/Lisbon", 3: "Europe/Lisbon",
+         4: "Europe/Lisbon", 5: "America/Los_Angeles", 6: "America/Los_Angeles",
+         7: "America/Los_Angeles", 8: "America/New_York", 9: "Europe/London",
+         10: "Europe/London", 11: "Europe/Paris", 12: "Europe/Paris", 13: "Europe/Paris",
+         14: "Europe/Zurich", 15: "Europe/Berlin", 16: "Europe/Berlin", 17: "Asia/Tokyo",
+         18: "Australia/Sydney", 19: "Atlantic/Reykjavik", 20: "Pacific/Fiji",
+         21: "Pacific/Fiji", 22: "Pacific/Fiji", 23: "Arctic/Longyearbyen",
+         24: "Africa/Johannesburg", 25: "America/Sao_Paulo", 26: "America/Guayaquil",
+         27: "Asia/Singapore", 28: "Europe/Monaco", 29: "Europe/Lisbon",
+         30: "America/Argentina/Ushuaia"}
+
 COUNTRIES = {"US": "United States", "GB": "United Kingdom", "FR": "France",
              "CH": "Switzerland", "DE": "Germany", "JP": "Japan", "AU": "Australia",
              "IS": "Iceland", "FJ": "Fiji", "SJ": "Svalbard and Jan Mayen",
              "ZA": "South Africa", "BR": "Brazil", "EC": "Ecuador", "SG": "Singapore",
-             "MC": "Monaco", "AR": "Argentina"}
+             "MC": "Monaco", "AR": "Argentina", "PT": "Portugal"}
 
 
-def cities_text(towns=TOWNS):
-    """cities1000.txt as GeoNames writes it (19 tab-separated columns)."""
+def longitude_zone(lon):
+    """The whole-hour time zone of a longitude ("Etc/GMT+10" is UTC-10:00)."""
+    hours = int(round(-lon / 15.0))
+    return "Etc/GMT" if hours == 0 else "Etc/GMT%+d" % hours
+
+
+def cities_text(towns=TOWNS, zones=None):
+    """cities1000.txt as GeoNames writes it (19 tab-separated columns). zones: {geonameid:
+    time zone} (default ZONES; longitude_zone for the others)."""
+    zones = ZONES if zones is None else zones
     lines = []
     for geonameid, name, lat, lon, code, cc, admin1, population in towns:
         ascii_name = name.encode("ascii", "replace").decode("ascii")
         lines.append("\t".join([str(geonameid), name, ascii_name, "", "%.5f" % lat,
                                 "%.5f" % lon, "P", code, cc, "", admin1, "", "", "",
-                                str(population), "", "10", "Etc/UTC", "2024-01-01"]))
+                                str(population), "", "10",
+                                zones.get(geonameid) or longitude_zone(lon), "2024-01-01"]))
     # A line that is not a town, and a broken one.
     lines.append("\t".join(["99", "Mount Nowhere", "Mount Nowhere", "", "10.0", "10.0", "T",
-                            "MT", "US", "", "HI", "", "", "", "0", "", "", "", ""]))
+                            "MT", "US", "", "CA", "", "", "", "0", "", "", "", ""]))
     lines.append("not a town")
     return "\n".join(lines) + "\n"
 
@@ -194,7 +216,7 @@ class BuildTest(support.TempBaseMixin, unittest.TestCase):
             names = set(index.names)
             # Parts of towns and places that are no more are left out.
             self.assertNotIn("Paris 06 Luxembourg", names)
-            self.assertNotIn("Old Kahului", names)
+            self.assertNotIn("Old Albufeira", names)
             self.assertNotIn("Mount Nowhere", names)
             self.assertIn("Z\u00fcrich", names)
             self.assertEqual(places.read_meta(out)["format"], str(places.PLACES_FORMAT))
@@ -234,7 +256,7 @@ class BuildTest(support.TempBaseMixin, unittest.TestCase):
         places.release()
         with mock.patch("sys.stderr", io.StringIO()):
             self.assertIsNone(places.shared())
-        self.assertEqual(places.place_columns(20.9, -156.5)["place_km"], None)
+        self.assertEqual(places.place_columns(37.1, -8.25)["place_km"], None)
         state = places.status()
         self.assertIn("cannot be used", state["error"])
         # Without the downloaded files it cannot be built again here.
@@ -262,8 +284,8 @@ class BuildTest(support.TempBaseMixin, unittest.TestCase):
         # A few towns in a region the file does not list are fine (the real
         # files have some).
         self.assertIsNone(places.check_names(
-            [("A", 0, 0, "US", "HI", 1)] * 9 + [("B", 0, 0, "US", "XX", 1)],
-            {"US": "United States"}, {"US.HI": "Hawaii"}))
+            [("A", 0, 0, "PT", "09", 1)] * 9 + [("B", 0, 0, "PT", "XX", 1)],
+            {"PT": "Portugal"}, {"PT.09": "Algarve"}))
 
     def test_an_index_that_cannot_be_written_is_a_places_error(self):
         folder = write_geonames(self.base.join("geo"))
@@ -302,19 +324,19 @@ class LookupTest(support.TempBaseMixin, unittest.TestCase):
             self.assertAlmostEqual(found[1], expected[1], places=6)
 
     def test_a_town_names_the_place(self):
-        columns = places.place_columns(20.8800, -156.4600)
-        self.assertEqual(columns["place_city"], "Kahului")
-        self.assertEqual(columns["place_region"], "Hawaii")
-        self.assertEqual(columns["place_country"], "United States")
-        self.assertEqual(columns["place_cc"], "US")
+        columns = places.place_columns(37.0800, -8.2340)
+        self.assertEqual(columns["place_city"], "Albufeira")
+        self.assertEqual(columns["place_region"], "Algarve")
+        self.assertEqual(columns["place_country"], "Portugal")
+        self.assertEqual(columns["place_cc"], "PT")
         self.assertAlmostEqual(columns["place_km"], 1.6, delta=0.2)
 
     def test_far_from_a_town_only_region_and_country(self):
-        # About 90 km off the coast of Hawaii's Big Island, nearest Hilo.
-        columns = places.place_columns(20.3, -154.6)
+        # About 90 km off the coast of the Algarve, nearest Sagres.
+        columns = places.place_columns(36.3, -9.5)
         self.assertEqual(columns["place_city"], "")
-        self.assertEqual(columns["place_region"], "Hawaii")
-        self.assertEqual(columns["place_country"], "United States")
+        self.assertEqual(columns["place_region"], "Algarve")
+        self.assertEqual(columns["place_country"], "Portugal")
         self.assertGreater(columns["place_km"], places.CITY_KM)
 
     def test_no_town_anywhere_near(self):
@@ -344,7 +366,7 @@ class LookupTest(support.TempBaseMixin, unittest.TestCase):
         os.remove(places.places_db_path())
         places.release()
         self.assertIsNone(places.shared())
-        self.assertEqual(places.place_columns(20.88, -156.46), places.empty_columns())
+        self.assertEqual(places.place_columns(37.08, -8.234), places.empty_columns())
 
     def test_lookup_speed(self):
         rng = random.Random(3)
@@ -572,14 +594,14 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
         return self.conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
 
     def test_without_place_names(self):
-        self.add("a.jpg", 20.88, -156.46)
+        self.add("a.jpg", 37.08, -8.234)
         self.assertIsNone(places.label_pictures(self.conn, jobs.JobContext("t")))
 
     def test_labels_pictures_not_looked_up(self):
         install_places()
-        maui = self.add("maui.jpg", 20.88, -156.46)
+        town = self.add("town.jpg", 37.08, -8.234)
         sea = self.add("sea.jpg", 0.0, -140.0)
-        coast = self.add("coast.jpg", 20.3, -154.6)
+        coast = self.add("coast.jpg", 36.3, -9.5)
         nowhere = self.add("no-gps.jpg", None, None)
         gone = self.add("gone.jpg", 48.85, 2.35, missing_since=5.0)
         other = self.add("paris.jpg", 48.85, 2.35, library_id="lib_other001")
@@ -587,9 +609,9 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
         summary = places.label_pictures(self.conn, ctx, ["lib_trips001"])
         self.assertEqual(summary, {"checked": 3, "named": 1, "region_only": 1, "far": 1,
                                    "aborted": False})
-        row = self.row(maui)
+        row = self.row(town)
         self.assertEqual((row["place_city"], row["place_region"], row["place_country"],
-                          row["place_cc"]), ("Kahului", "Hawaii", "United States", "US"))
+                          row["place_cc"]), ("Albufeira", "Algarve", "Portugal", "PT"))
         self.assertGreater(row["updated"], 1.0)
         self.assertEqual(self.row(sea)["place_km"], -1)
         self.assertEqual(self.row(coast)["place_city"], "")
@@ -599,10 +621,10 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
         # Done once: nothing left to do.
         self.assertEqual(places.label_pictures(self.conn, ctx, ["lib_trips001"])["checked"], 0)
         # redo looks at every one again.
-        self.conn.execute("UPDATE images SET place_city = 'Nowhere' WHERE id = ?", (maui,))
+        self.conn.execute("UPDATE images SET place_city = 'Nowhere' WHERE id = ?", (town,))
         self.conn.commit()
         self.assertEqual(places.label_pictures(self.conn, ctx, redo=True)["checked"], 4)
-        self.assertEqual(self.row(maui)["place_city"], "Kahului")
+        self.assertEqual(self.row(town)["place_city"], "Albufeira")
         self.assertEqual(self.row(other)["place_city"], "Paris")
         self.assertEqual(places.status(self.conn)["pictures"],
                          {"located": 4, "named": 2, "region_only": 1, "far": 1, "pending": 0})
@@ -610,7 +632,7 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
     def test_a_pause_does_not_lock_other_writers_out(self):
         install_places()
         for n in range(50):
-            self.add("%d.jpg" % n, 20.88, -156.46 + n * 0.001)
+            self.add("%d.jpg" % n, 37.08, -8.234 + n * 0.001)
 
         class Pausing(jobs.JobContext):
             steps = 0
@@ -645,7 +667,7 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
             "SELECT COUNT(*) FROM images WHERE place_km IS NULL").fetchone()[0], 0)
 
     def test_the_towns_are_loaded_only_when_needed(self):
-        self.add("a.jpg", 20.88, -156.46)
+        self.add("a.jpg", 37.08, -8.234)
         # No place names: nothing to do, and nothing is loaded.
         with mock.patch.object(places, "shared") as shared:
             self.assertIsNone(places.label_pictures(self.conn, jobs.JobContext("t")))
@@ -661,7 +683,7 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
     def test_stopping(self):
         install_places()
         for n in range(5):
-            self.add("%d.jpg" % n, 20.88, -156.46)
+            self.add("%d.jpg" % n, 37.08, -8.234)
         ctx = jobs.JobContext("t")
         ctx.request_stop()
         summary = places.label_pictures(self.conn, ctx)
@@ -670,33 +692,33 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
 
     def test_the_search_records_have_the_place(self):
         install_places()
-        maui = self.add("maui.jpg", 20.88, -156.46)
-        coast = self.add("coast.jpg", 20.3, -154.6)
+        town = self.add("town.jpg", 37.08, -8.234)
+        coast = self.add("coast.jpg", 36.3, -9.5)
         sea = self.add("sea.jpg", 0.0, -140.0)
         places.label_pictures(self.conn, jobs.JobContext("t"))
         config = common.load_config()
         records = {record["i"]: record for record in search_index.build_records(
             self.conn, config, ["lib_trips001"])}
-        self.assertEqual({key: records[maui][key] for key in ("ci", "rg", "co", "cc", "km")},
-                         {"ci": "Kahului", "rg": "Hawaii", "co": "United States", "cc": "US",
+        self.assertEqual({key: records[town][key] for key in ("ci", "rg", "co", "cc", "km")},
+                         {"ci": "Albufeira", "rg": "Algarve", "co": "Portugal", "cc": "PT",
                           "km": 2})
         self.assertNotIn("ci", records[coast])
         self.assertNotIn("km", records[coast])
-        self.assertEqual(records[coast]["co"], "United States")
+        self.assertEqual(records[coast]["co"], "Portugal")
         self.assertFalse({"ci", "rg", "co", "cc", "km"} & set(records[sea]))
         # An export: only with its Location option.
         for location in (False, True):
             exported = {record["i"]: record for record in search_index.build_records(
                 self.conn, config, ["lib_trips001"], for_export=True,
                 export_options={"location": location})}
-            self.assertEqual("co" in exported[maui], location)
-            self.assertEqual("ci" in exported[maui], location)
+            self.assertEqual("co" in exported[town], location)
+            self.assertEqual("ci" in exported[town], location)
 
     def test_the_job(self):
         source = write_geonames(self.base.join("source"))
         server = FakeGeoNames(source)
         self.addCleanup(server.close)
-        maui = self.add("maui.jpg", 20.88, -156.46)
+        town = self.add("town.jpg", 37.08, -8.234)
         config = common.load_config()
         ctx = jobs.JobContext("t")
         with self.assertRaises(jobs.JobError):
@@ -705,14 +727,14 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
             summary = jobs.run_places(ctx, self.conn, config, {"download": True})
         self.assertEqual(summary["index"]["cities"], len(USED))
         self.assertEqual(summary["places"]["named"], 1)
-        self.assertEqual(self.row(maui)["place_city"], "Kahului")
+        self.assertEqual(self.row(town)["place_city"], "Albufeira")
         self.assertIsNone(places._shared)
-        self.conn.execute("UPDATE images SET place_city = 'X' WHERE id = ?", (maui,))
+        self.conn.execute("UPDATE images SET place_city = 'X' WHERE id = ?", (town,))
         self.conn.commit()
         self.assertEqual(jobs.run_places(ctx, self.conn, config, {})["places"]["checked"], 0)
         self.assertEqual(jobs.run_places(ctx, self.conn, config, {"redo": True})
                          ["places"]["checked"], 1)
-        self.assertEqual(self.row(maui)["place_city"], "Kahului")
+        self.assertEqual(self.row(town)["place_city"], "Albufeira")
         self.assertIn("places", jobs.RUNNERS)
 
     def test_the_job_looks_up_every_library(self):
@@ -721,7 +743,7 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
         install_places()
         config = common.load_config()
         config["libraries"][1]["enabled"] = False
-        trips = self.add("maui.jpg", 20.88, -156.46)
+        trips = self.add("town.jpg", 37.08, -8.234)
         other = self.add("paris.jpg", 48.85, 2.35, library_id="lib_other001")
         gone = self.add("old.jpg", 48.85, 2.35, library_id="lib_gone0001")
         self.assertEqual(places.status(self.conn)["pictures"]["pending"], 3)
@@ -729,13 +751,13 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual(summary["places"]["checked"], 3)
         self.assertEqual(places.status(self.conn)["pictures"]["pending"], 0)
         self.assertEqual([self.row(image_id)["place_city"] for image_id in (trips, other, gone)],
-                         ["Kahului", "Paris", "Paris"])
+                         ["Albufeira", "Paris", "Paris"])
 
     def test_an_index_of_another_version_is_built_again(self):
         install_places()
-        maui = self.add("maui.jpg", 20.88, -156.46)
+        town = self.add("town.jpg", 37.08, -8.234)
         self.conn.execute("UPDATE images SET place_km = 5, place_city = 'Old' WHERE id = ?",
-                          (maui,))
+                          (town,))
         self.conn.commit()
         outdated = sqlite3.connect(places.places_db_path())
         outdated.execute("UPDATE meta SET value = '0' WHERE key = 'format'")
@@ -753,7 +775,7 @@ class LabelTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual(places.read_meta()["format"], str(places.PLACES_FORMAT))
         # Every picture is looked up again with the new index.
         self.assertEqual(summary["places"]["checked"], 1)
-        self.assertEqual(self.row(maui)["place_city"], "Kahului")
+        self.assertEqual(self.row(town)["place_city"], "Albufeira")
         # Nothing to do when it is fine.
         self.assertIsNone(places.rebuild_if_needed())
 
@@ -784,8 +806,8 @@ class CommandLineTest(support.TempBaseMixin, unittest.TestCase):
         output = io.StringIO()
         with mock.patch("sys.stdout", output):
             self.assertEqual(make_places.main(["--from", source]), 0)
-            self.assertEqual(make_places.main(["--lookup", "20.88", "-156.46"]), 0)
-        self.assertIn("Kahului, Hawaii, United States", output.getvalue())
+            self.assertEqual(make_places.main(["--lookup", "37.08", "-8.234"]), 0)
+        self.assertIn("Albufeira, Algarve, Portugal", output.getvalue())
         conn = db.connect()
         try:
             row = conn.execute("SELECT place_city, place_country FROM images").fetchone()
@@ -828,7 +850,7 @@ class SchemaTest(support.TempBaseMixin, unittest.TestCase):
                 func(conn)
         conn.execute("PRAGMA user_version=3")
         conn.execute("INSERT INTO images (library_id, path, name, size, mtime, lat, lon) "
-                     "VALUES ('lib_x', 'a.jpg', 'a.jpg', 1, 1, 20.88, -156.46)")
+                     "VALUES ('lib_x', 'a.jpg', 'a.jpg', 1, 1, 37.08, -8.234)")
         conn.commit()
         conn.close()
         self.base.write_config([])

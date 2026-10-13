@@ -27,6 +27,18 @@ Descriptions are never thrown away by accident:
   library (a new copy is shown when another copy is shown there: the owner
   kept that one), and a shown image stays shown.
 
+Camera RAW files (.dng, .arw, .cr2, ...; raw_photos.py) are listed too
+(config.json "raw"). One with a picture of the same name in its folder
+(of the same shot: raw_photos.same_shot), or else of the same camera and
+second (by the camera's clock), is that picture's RAW original, not a
+picture of its own: the picture's exif column keeps the RAW file's facts
+("raw") and gets the EXIF facts only the RAW file has; a picture read
+again keeps them (_with_raw). A RAW file with no such picture is indexed
+on its own, by its largest preview ("index_alone"); one that later goes
+with a picture is no longer one (marked missing as excluded; its
+description, edit and marks go to the picture when it has none, and the
+picture is hidden when it was).
+
 Videos are indexed too when ffmpeg and ffprobe are there and the library's
 "videos" setting is on (see videos.py): their poster frame takes the place
 of a photo's picture (thumbnail, preview, dHash) and a contact sheet of a
@@ -43,11 +55,16 @@ once (redate_videos). Without ffmpeg, videos are listed but not read
 After the scan, the GPS check (gps_check.py) sets aside GPS positions that
 cannot be where a picture was taken (a stale fix, or one the pictures taken
 around the same time contradict), and the places of the pictures without a
-usable position are estimated again (place_estimates.py).
+usable position are estimated again (place_estimates.py). Then pictures
+whose camera's clock is not the local time of where they were taken (a
+dashcam that ignores daylight saving, a phone on the time of the airport
+it left) get the local time of their place (local_times.py).
 
 Then the describe step (describe.py) runs for images without a description,
 and, when search by meaning is set up (config.json "embedding"), the embed
 step (embeddings.py) for pictures whose meaning vector is missing or stale.
+When People is on (config.json "people"), the faces step (people.py) looks
+for the faces in the pictures not looked at yet.
 
 Usage:
     python scan.py [--library NAME_OR_ID ...] [--no-scan] [--no-describe]
@@ -88,14 +105,18 @@ import describe
 import embeddings
 import gps_check
 import image_edits
+import imageinfo
 import images
 import jobs
 import llm
+import local_times
 import looks
 import not_duplicates
 import opening_views
+import people
 import places
 import prompts
+import raw_photos
 import tracks
 import videos
 
@@ -134,7 +155,9 @@ class LibraryWalk:
     ignore pattern excludes; rel_path is relative to the root and uses "/".
     Ignored folders are not entered at all (see common.should_prune_dir).
     Symlinks and junctions -- to folders or files -- are not followed; they
-    are listed in links instead.
+    are listed in links instead. With raws, camera RAW files are listed too
+    (raw_photos.py), except those with a picture of the same name in their
+    folder (raw_photos.pair_names), which go in raw_pairs instead.
 
     When the helper module has walk_library(root) and it returns an iterator
     (the os.walk contract), that is used together with common.stat_path.
@@ -148,12 +171,16 @@ class LibraryWalk:
         links       [rel_path] of linked folders and files that were skipped
         stopped     True if ctx asked to stop part-way through
         complete    True when every folder was listed
+        raw_pairs   {picture's rel_path: (RAW file's rel_path, size, mtime)}
     """
 
-    def __init__(self, root, patterns, helper=None, ctx=None, label="", videos=False):
+    def __init__(self, root, patterns, helper=None, ctx=None, label="", videos=False,
+                 raws=False):
         self.root = root
         self.patterns = list(patterns or [])
         self.videos = bool(videos)
+        self.raws = bool(raws)
+        self.raw_pairs = {}
         self.helper = helper
         self.ctx = ctx
         self.label = label or root
@@ -212,6 +239,32 @@ class LibraryWalk:
         second lens's file; names: the folder's), which is part of that video."""
         return self.videos and videos.is_companion(name, names)
 
+    def _listed(self, name):
+        return common.is_media_file(name, self.videos, self.raws)
+
+    def _raw_siblings(self, prefix, files):
+        """{RAW file's name: picture's name} of a folder's RAW files that have a picture
+        of the same name there (files: the names of its files; prefix: its rel_path
+        and "/")."""
+        if not self.raws or not any(common.is_raw_file(name) for name in files):
+            return {}
+        kept = [name for name in files if not common.matches_ignore(prefix + name,
+                                                                    self.patterns)]
+        raw_names = [name for name in kept if common.is_raw_file(name)]
+        if not raw_names:
+            return {}
+        return raw_photos.pair_names(raw_names, [name for name in kept
+                                                 if common.is_image_file(name)])
+
+    def _raw_pair(self, prefix, name, siblings, stat):
+        """True for a RAW file with a picture of the same name (siblings, see
+        _raw_siblings): kept in raw_pairs, not listed."""
+        picture = siblings.get(name)
+        if picture is None:
+            return False
+        self.raw_pairs[prefix + picture] = (prefix + name, stat.st_size, stat.st_mtime)
+        return True
+
     def _scandir_walk(self):
         if not self.root or not os.path.isdir(self.root):
             self.reachable = False
@@ -231,6 +284,11 @@ class LibraryWalk:
                 continue
             subdirs = []
             names = [entry.name for entry in entries]
+            prefix = rel_dir + "/" if rel_dir else ""
+            siblings = self._raw_siblings(prefix, [
+                entry.name for entry in entries
+                if common.is_media_file(entry.name, raws=self.raws)
+                and not _is_folder(entry)])
             for entry in entries:
                 rel = rel_dir + "/" + entry.name if rel_dir else entry.name
                 try:
@@ -239,7 +297,7 @@ class LibraryWalk:
                     is_dir = entry.is_dir(follow_symlinks=not link)
                     if is_dir and common.should_prune_dir(rel, self.patterns):
                         continue
-                    if not is_dir and (not common.is_media_file(entry.name, self.videos)
+                    if not is_dir and (not self._listed(entry.name)
                                        or common.matches_ignore(rel, self.patterns)
                                        or self._companion(entry.name, names)):
                         continue
@@ -256,6 +314,8 @@ class LibraryWalk:
                         stat = entry.stat(follow_symlinks=False)
                 except OSError as error:
                     self._error(rel, error)
+                    continue
+                if self._raw_pair(prefix, entry.name, siblings, stat):
                     continue
                 self.files += 1
                 yield rel, stat.st_size, stat.st_mtime, getattr(stat, "st_ctime", 0.0)
@@ -286,15 +346,18 @@ class LibraryWalk:
                 prefix = rel_dir + "/" if rel_dir else ""
                 dirnames[:] = [name for name in dirnames
                                if not common.should_prune_dir(prefix + name, self.patterns)]
+                siblings = self._raw_siblings(prefix, filenames)
                 for filename in sorted(filenames):
                     rel = prefix + filename
-                    if (not common.is_media_file(filename, self.videos)
+                    if (not self._listed(filename)
                             or common.matches_ignore(rel, self.patterns)
                             or self._companion(filename, filenames)):
                         continue
                     stat = common.stat_path(self.helper, os.path.join(dirpath, filename))
                     if stat is None:
                         self._error(rel, "cannot read the file's size and time")
+                        continue
+                    if self._raw_pair(prefix, filename, siblings, stat):
                         continue
                     self.files += 1
                     yield rel, stat.st_size, stat.st_mtime, getattr(stat, "st_ctime", 0.0)
@@ -305,9 +368,17 @@ class LibraryWalk:
             self._error("", error)
 
 
-def walk_library(root, patterns, helper=None, ctx=None, label="", videos=False):
-    """Return a LibraryWalk over a library root (see LibraryWalk); videos: list videos too."""
-    return LibraryWalk(root, patterns, helper, ctx, label, videos)
+def _is_folder(entry):
+    try:
+        return entry.is_dir(follow_symlinks=False)
+    except OSError:
+        return False
+
+
+def walk_library(root, patterns, helper=None, ctx=None, label="", videos=False, raws=False):
+    """Return a LibraryWalk over a library root (see LibraryWalk); videos: list videos too;
+    raws: camera RAW files too."""
+    return LibraryWalk(root, patterns, helper, ctx, label, videos, raws)
 
 
 def excluded_by_ignores(path, patterns):
@@ -466,10 +537,14 @@ def _update_row(conn, image_id, values, extra=""):
 
     A file read again (its lat and lon among the values): a position the
     GPS check set aside stays aside while the file gives it, and any other
-    is the check's to decide again (gps_check.file_read_again).
+    is the check's to decide again (gps_check.file_read_again). Its time
+    (taken_at among the values) is its camera's again: the local time of
+    its place is worked out again (local_times.file_read_again).
     """
     if "lat" in values:
         gps_check.file_read_again(conn, image_id, values)
+    if "taken_at" in values:
+        local_times.file_read_again(conn, image_id)
     columns = sorted(values)
     assignments = ", ".join("%s = ?" % column for column in columns)
     if extra:
@@ -536,11 +611,12 @@ def _delete_preview(previews, library_id, image_id, ctx):
     videos.delete_proxies(library_id, [image_id])
 
 
-def _store_pano(previews, library_id, image_id, pano, ctx, rel):
+def _store_pano(previews, library_id, image_id, pano, ctx, rel, wide=False):
     """After a new preview was written: write its pano, or remove an older one.
 
-    pano is the read_image() result's pano (None when the picture is not a
-    360 photo). Returns True if a pano was written. A pano that cannot be
+    pano is the read_image() result's pano (None when the picture is neither
+    a 360 photo nor a wide one, see images.gets_pano; wide: it is a wide
+    one's). Returns True if a pano was written. A pano that cannot be
     written is removed rather than left showing older content; the server
     makes it again when it is asked for.
     """
@@ -554,8 +630,9 @@ def _store_pano(previews, library_id, image_id, pano, ctx, rel):
             previews.delete_pano(library_id, image_id)
         except OSError:
             pass
-        ctx.log("Could not save the 360-degree panorama of %s: %s"
-                % (rel, _error_text(error)), "warn")
+        ctx.log("Could not save the %s of %s: %s"
+                % ("larger picture" if wide else "360-degree panorama", rel,
+                   _error_text(error)), "warn")
     return False
 
 
@@ -633,6 +710,63 @@ def _metadata(result):
     return values
 
 
+def _json_dict(text):
+    """A JSON object from a column, or {}."""
+    try:
+        value = json.loads(text or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _exif_json(exif):
+    try:
+        return json.dumps(exif, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return "{}"
+
+
+def _exif_columns(exif, name, mtime):
+    """The columns a picture's EXIF gives (taken_at, taken_source, tz_offset, camera,
+    lat, lon and the place columns), as a scan works them out (imageinfo.exif_metadata)."""
+    values = imageinfo.exif_metadata(exif, name, mtime)
+    values.update(places.place_columns(values["lat"], values["lon"]))
+    return values
+
+
+def _changed_columns(old_exif, new_exif, name, mtime):
+    """The columns that change when a picture's EXIF goes from old_exif to new_exif:
+    only those (so a time or a position the owner, the GPS check or the local times
+    set stays, unless the EXIF itself says otherwise now)."""
+    before = imageinfo.exif_metadata(old_exif, name, mtime)
+    after = imageinfo.exif_metadata(new_exif, name, mtime)
+    values = {}
+    for group in (("taken_at", "taken_source", "tz_offset"), ("camera",), ("lat", "lon")):
+        if any(before[key] != after[key] for key in group):
+            values.update((key, after[key]) for key in group)
+    if "lat" in values:
+        values.update(places.place_columns(values["lat"], values["lon"]))
+    return values
+
+
+def _with_raw(values, stored_exif, name, mtime):
+    """values (_metadata of a picture read again) with what it took from its RAW
+    original before (the "raw" in stored_exif, its exif column until now): merged
+    again (raw_photos.merge) and the columns worked out from that; values as they
+    are for a picture without one."""
+    entry = raw_photos.paired_record(_json_dict(stored_exif)) if stored_exif else None
+    if entry is None:
+        return values
+    merged, filled, own_gps = raw_photos.merge(_json_dict(values.get("exif")),
+                                               entry.get("exif"))
+    merged["raw"] = raw_photos.record(entry["path"], entry.get("size"), entry.get("mtime"),
+                                      entry.get("how") or "name", entry.get("exif"), filled,
+                                      own_gps, entry.get("format") or "")
+    values["exif"] = _exif_json(merged)
+    values.update(_exif_columns(merged, name, mtime))
+    return values
+
+
 _DESCRIPTION_COLUMNS = ("info", "described", "prompt_ver", "provenance", "hidden",
                         "describe_attempts", "describe_error")
 _EMPTY_DESCRIPTION = {"info": "", "described": 0, "prompt_ver": 0, "provenance": "",
@@ -640,8 +774,15 @@ _EMPTY_DESCRIPTION = {"info": "", "described": 0, "prompt_ver": 0, "provenance":
 
 _ROW_SQL = """
     SELECT id, path, size, mtime, content_hash, dhash, width, height, described,
-           hidden, has_preview, missing_since, media
+           hidden, has_preview, missing_since, media, exif LIKE '%"raw":%' AS has_raw
     FROM images WHERE library_id = ?"""
+# The present pictures of a library with a RAW original (or a RAW file of their
+# own): their exif holds "raw" (see raw_photos.record).
+_RAW_ROWS_SQL = """
+    SELECT id, path, name, mtime, exif, media, missing_since FROM images
+    WHERE library_id = ? AND missing_since IS NULL AND exif LIKE '%"raw":%'"""
+_PICTURE_SQL = ("SELECT id, path, name, mtime, exif, media, missing_since FROM images "
+                "WHERE library_id = ? AND path = ?")
 
 _SOURCE_COLUMNS = ("id, library_id, path, media, " + ", ".join(_DESCRIPTION_COLUMNS)
                    + ", missing_since")
@@ -720,6 +861,10 @@ class LibraryScan:
         self.videos_on = common.library_videos(library)
         self.video = video if video is not None else videos.setup()
         self.video_read = video_options(self.video, library)
+        # Camera RAW files (raw_photos.settings), and the rel_paths of those
+        # listed in this walk (with a picture or not).
+        self.raw = raw_photos.settings(self.video.config)
+        self.raw_listed = set()
         self.allow_mass_removal = allow_mass_removal
         self.purge_after_days = purge_after_days
         self.now = time.time() if now is None else now
@@ -763,6 +908,7 @@ class LibraryScan:
             "failed": 0, "skipped_failed": 0, "unsupported": 0, "read_errors": 0,
             "missing": 0, "protected": 0, "links": 0, "excluded": 0, "guarded": 0,
             "removed_moved": 0, "purged": 0, "errors": [], "videos_skipped": 0,
+            "raw_paired": 0, "raw_alone": 0, "raw_unpaired": 0, "raw_skipped": 0,
         }
 
     # -- bookkeeping --------------------------------------------------------
@@ -829,12 +975,19 @@ class LibraryScan:
         self.timer = _CommitTimer(self.conn, self.thumbs)
         self._load()
         walk = walk_library(self.root, self.patterns, self.helper, ctx, self.label,
-                            videos=self.videos_on)
+                            videos=self.videos_on, raws=self.raw["enabled"])
         ctx.stage("scan")
         entries = list(walk)
+        # RAW files without a picture of their name come after the pictures
+        # (one may be a picture's by camera and time, see _raws).
+        raw_entries = [entry for entry in entries if common.is_raw_file(entry[0])]
+        if raw_entries:
+            entries = [entry for entry in entries if not common.is_raw_file(entry[0])]
+        self.raw_listed = ({entry[0] for entry in raw_entries}
+                           | {pair[0] for pair in walk.raw_pairs.values()})
         self.walked = {entry[0] for entry in entries}
         self.helper_walk = walk.helper_walk
-        self.summary["files"] = len(entries)
+        self.summary["files"] = len(entries) + len(raw_entries)
         self.summary["links"] = len(walk.links)
         if not walk.reachable:
             self.summary["offline"] = True
@@ -849,11 +1002,13 @@ class LibraryScan:
                     "library of its own to index it."
                     % (len(walk.links), ", ".join(walk.links[:5]),
                        ", ..." if len(walk.links) > 5 else ""), "warn")
-        ctx.set_total(len(entries))
+        ctx.set_total(len(entries) + len(raw_entries))
         try:
             stopped = walk.stopped or _parallel_reads(
                 self.threads, self._to_read(entries), self._read, self._handle,
                 self._should_stop, ctx, self.flush)
+            if not stopped and not self.went_offline:
+                stopped = self._raws(walk, raw_entries)
             self.commit()
             if stopped or self.went_offline:
                 self.summary["aborted"] = not self.went_offline
@@ -878,6 +1033,9 @@ class LibraryScan:
         tracks_said = self.track_tally.line(self.label)
         if tracks_said:
             ctx.log(tracks_said)
+        raws_said = self._raw_line()
+        if raws_said:
+            ctx.log(raws_said)
         ctx.log(self._summary_line())
         return self.summary
 
@@ -1086,6 +1244,11 @@ class LibraryScan:
             if old_key != new_key:
                 self.rekeyed[old_key] = new_key
             if self._same_content(row, metadata, size, mtime):
+                if row["has_raw"]:
+                    # (Its RAW original stays, see _with_raw.)
+                    found = self.conn.execute("SELECT exif FROM images WHERE id = ?",
+                                              (image_id,)).fetchone()
+                    _with_raw(values, found[0] if found else "", rel.rsplit("/", 1)[-1], mtime)
                 self.summary["updated"] += 1
                 self._note("updated", "Updated " + rel
                            + (" (description kept)" if row["described"] else ""))
@@ -1132,7 +1295,7 @@ class LibraryScan:
                              % (rel, _error_text(error)), "warn")
             else:
                 _store_pano(self.previews, self.library_id, image_id, result.get("pano"),
-                            self.ctx, rel)
+                            self.ctx, rel, wide=not result.get("projection"))
                 if result.get("media") == videos.MEDIA_VIDEO or row is not None:
                     _store_sheet(self.previews, self.library_id, image_id,
                                  result.get("sheet"), self.ctx, rel)
@@ -1184,6 +1347,283 @@ class LibraryScan:
         if not moved and self.any_edits:
             self._adopt_edit(image_id, rel, metadata["content_hash"])
         return image_id
+
+    # -- camera RAW files -----------------------------------------------------
+
+    def _raw_excluded(self, row):
+        """True for the row of a RAW file that is listed but no picture of its own now
+        (it goes with a picture, or RAW files alone are not indexed), or of any RAW
+        file while RAW files are off."""
+        if not common.is_raw_file(row["path"]):
+            return False
+        return not self.raw["enabled"] or row["path"] in self.raw_listed
+
+    def _raw_line(self):
+        """The log line of what happened to RAW files in this scan, or ""."""
+        summary = self.summary
+        parts = []
+        if summary["raw_paired"]:
+            parts.append("%d now with their picture" % summary["raw_paired"])
+        if summary["raw_alone"]:
+            parts.append("%d read as pictures of their own" % summary["raw_alone"])
+        if summary["raw_unpaired"]:
+            parts.append("%d no longer with their picture" % summary["raw_unpaired"])
+        if summary["raw_skipped"]:
+            parts.append("%d without a picture left out (RAW files alone are off)"
+                         % summary["raw_skipped"])
+        if not parts:
+            return ""
+        return "RAW files in %s: %s." % (self.label, ", ".join(parts))
+
+    def _paired_rows(self):
+        """{image id: (row, exif)} of this library's present pictures with a RAW original."""
+        found = {}
+        for row in self.conn.execute(_RAW_ROWS_SQL, (self.library_id,)):
+            exif = _json_dict(row["exif"])
+            if raw_photos.paired_record(exif) is not None:
+                found[row["id"]] = (row, exif)
+        return found
+
+    def _capture_index(self):
+        """{raw_photos.capture_key: [(image id, its RAW entry or None)]} of this library's
+        present pictures (not videos, not RAW files) listed in this walk, by their own
+        EXIF. (A picture not listed was moved, renamed or deleted: its row is marked
+        missing at the end of the scan, and a RAW file paired with it would go too.)"""
+        index = collections.defaultdict(list)
+        for row in self.conn.execute(
+                "SELECT id, path, name, exif FROM images WHERE library_id = ? AND "
+                "missing_since IS NULL AND media = 'image' AND camera <> ''",
+                (self.library_id,)):
+            if common.is_raw_file(row["name"]) or row["path"] not in self.walked:
+                continue
+            exif = _json_dict(row["exif"])
+            key = raw_photos.capture_key(raw_photos.own_exif(exif))
+            if key is not None:
+                index[key].append((row["id"], raw_photos.paired_record(exif)))
+        return index
+
+    def _read_raw(self, rel):
+        """Worker thread: the cleaned EXIF of a RAW file. Returns (exif, error); a RAW
+        file that is damaged or of a kind not known gives {} (exif None: it cannot be
+        read now)."""
+        full = os.path.join(self.root, *rel.split("/"))
+        try:
+            return raw_photos.exif_dict(raw_photos.read_file(full, self.read_helper)), None
+        except (raw_photos.RawError, ValueError) as error:
+            return {}, error
+        except OSError as error:
+            return None, error
+
+    def _set_exif(self, picture, old_exif, new_exif):
+        """Write a picture's new exif and the columns that change with it (no commit)."""
+        values = _changed_columns(old_exif, new_exif, picture["name"], picture["mtime"])
+        values["exif"] = _exif_json(new_exif)
+        values["updated"] = time.time()
+        _update_row(self.conn, picture["id"], values)
+        self._wrote()
+
+    def _pair(self, picture, rel, size, mtime, how, raw_exif):
+        """Make a RAW file a picture's RAW original (how: "name" or "time")."""
+        exif = _json_dict(picture["exif"])
+        merged, filled, own_gps = raw_photos.merge(exif, raw_exif)
+        merged["raw"] = raw_photos.record(rel, size, mtime, how, raw_exif, filled, own_gps)
+        self._set_exif(picture, exif, merged)
+        self.summary["raw_paired"] += 1
+        self._note("RAW", "%s goes with %s (by %s)"
+                   % (rel, picture["path"], "name" if how == "name" else "camera and time"))
+        self._absorb(rel, picture["id"])
+
+    def _unpair(self, picture, exif):
+        """Take a picture's RAW original away: its own EXIF again."""
+        self._set_exif(picture, exif, raw_photos.own_exif(exif))
+        self.summary["raw_unpaired"] += 1
+
+    def _absorb(self, rel, picture_id):
+        """A RAW file indexed on its own before that now goes with a picture: the picture
+        gets its description (when it has none), the owner's edit and marks (copies:
+        the RAW file's row keeps them, in case it is on its own again), and is hidden
+        when the RAW file was (the shot stays out of sight). The row itself is marked
+        missing by _finish (_raw_excluded)."""
+        row = self.rows.get(rel)
+        if row is None or row["missing_since"] is not None or row["id"] == picture_id:
+            return
+        source = self.conn.execute("SELECT " + _SOURCE_COLUMNS + " FROM images WHERE id = ?",
+                                   (row["id"],)).fetchone()
+        if source is not None and source["described"]:
+            self.conn.execute(
+                "UPDATE images SET info = ?, described = 1, prompt_ver = ?, provenance = ?, "
+                "describe_attempts = 0, describe_error = '' WHERE id = ? AND described = 0",
+                (source["info"], source["prompt_ver"], source["provenance"], picture_id))
+        if source is not None and source["hidden"]:
+            self.conn.execute("UPDATE images SET hidden = 1 WHERE id = ?", (picture_id,))
+        if row["id"] in self.edited:
+            image_edits.give(self.conn, row["id"], [picture_id], copy=True)
+            albums.give(self.conn, row["id"], [picture_id], copy=True)
+        self._wrote()
+
+    def _raws(self, walk, raw_entries):
+        """Pair the RAW files listed with their pictures, read the others as pictures of
+        their own (index_alone), and give pictures whose RAW file is gone their own
+        EXIF again. Returns True if it stopped early.
+
+        A RAW file with a picture of its name (walk.raw_pairs) goes with that
+        picture, unless they cannot be one shot (raw_photos.same_shot: another
+        camera maker, another time); one without goes with the one picture
+        listed of the same camera taken in the same second
+        (raw_photos.capture_key) that has no RAW original yet. Only RAW files
+        new or changed since they were paired or read are read (for their
+        EXIF); when this scan added pictures, those on their own are looked at
+        again by the EXIF kept with them.
+        """
+        if not raw_entries and not walk.raw_pairs and not any(
+                row["has_raw"] for row in self.rows.values()):
+            return False        # (no RAW file here, nor any before)
+        if not self.raw["enabled"]:
+            if walk.complete:
+                for picture, exif in self._paired_rows().values():
+                    self._unpair(picture, exif)
+            return False
+        paired = self._paired_rows()
+        by_path = {raw_photos.paired_record(exif)["path"]: image_id
+                   for image_id, (_row, exif) in paired.items()}
+        kept = set()            # ids of the pictures whose RAW original stays as it is
+        by_name = []            # (picture, rel, size, mtime) of RAW files to pair by name
+        candidates = []
+        for picture_rel, (rel, size, mtime) in sorted(walk.raw_pairs.items()):
+            picture = self.conn.execute(_PICTURE_SQL, (self.library_id, picture_rel)).fetchone()
+            if (picture is None or picture["missing_since"] is not None
+                    or picture["media"] != "image"):
+                # Its picture could not be read: on its own, or by camera and time.
+                candidates.append((rel, size, mtime, 0.0))
+                continue
+            found = paired.get(picture["id"])
+            entry_now = raw_photos.paired_record(found[1]) if found is not None else None
+            if entry_now is not None and raw_photos.same_file(entry_now, rel, size, mtime):
+                if raw_photos.same_shot(raw_photos.own_exif(found[1]), entry_now.get("exif")):
+                    kept.add(picture["id"])
+                    self._absorb(rel, picture["id"])
+                    continue
+                # (Its picture was read again and is another shot now: the
+                # picture gets its own EXIF back, the RAW file is looked at.)
+                self._note("RAW", "%s no longer goes with %s (another camera, or another "
+                                  "time)" % (rel, picture["path"]))
+                candidates.append((rel, size, mtime, 0.0))
+                continue
+            by_name.append((picture, rel, size, mtime))
+        name_ids = {item[0]["id"] for item in by_name}
+        candidates.extend(raw_entries)
+        alone, to_read, stored = [], [], []
+        for entry in candidates:
+            rel, size, mtime = entry[:3]
+            image_id = by_path.get(rel)
+            entry_now = raw_photos.paired_record(paired[image_id][1]) if image_id else None
+            if (entry_now is not None and entry_now.get("how") == "time"
+                    and image_id not in kept and image_id not in name_ids
+                    and paired[image_id][0]["path"] in self.walked
+                    and raw_photos.same_file(entry_now, rel, size, mtime)):
+                kept.add(image_id)      # (with its picture by camera and time)
+                self._absorb(rel, image_id)
+                self.ctx.step(item=rel, quick=True)
+                continue
+            row = self.rows.get(rel)
+            if (row is not None and row["size"] == size
+                    and abs(row["mtime"] - mtime) < MTIME_TOLERANCE):
+                # On its own, as it was (looked at again when pictures came).
+                (stored if self.new_content else alone).append(entry)
+                continue
+            if _failed_before(self.failures, rel, size, mtime) and not self.new_content:
+                alone.append(entry)     # (it cannot be shown: _to_read skips it)
+                continue
+            to_read.append(entry)
+        taken = kept | name_ids
+        index = []
+
+        def match(raw_exif, rel):
+            """The one picture of the RAW file's camera and second, or None."""
+            if not index:
+                index.append(self._capture_index())
+            found = [image_id for image_id, entry in index[0].get(
+                raw_photos.capture_key(raw_exif), ())
+                     if image_id not in taken and (entry is None or entry["path"] == rel)]
+            return found[0] if len(found) == 1 else None
+
+        def by_time(entry, raw_exif):
+            """Pair a RAW file with its picture by camera and time; True when it was."""
+            image_id = match(raw_exif, entry[0])
+            if image_id is None:
+                return False
+            picture = self.conn.execute("SELECT id, path, name, mtime, exif FROM images "
+                                        "WHERE id = ?", (image_id,)).fetchone()
+            self._pair(picture, entry[0], entry[1], entry[2], "time", raw_exif)
+            taken.add(image_id)
+            self.ctx.step(item=entry[0], quick=True)
+            return True
+
+        def handle(item, outcome):
+            how, entry = item
+            raw_exif, error = outcome
+            rel = entry[1] if how == "name" else entry[0]
+            if raw_exif is None:
+                # Not readable now (a share that went away): left as it was.
+                self.ctx.log("Could not read %s: %s" % (rel, _error_text(error)), "warn")
+                if how == "name":
+                    if entry[0]["id"] in paired:
+                        kept.add(entry[0]["id"])
+                elif by_path.get(rel) in paired:
+                    kept.add(by_path[rel])
+                elif rel in self.rows:
+                    alone.append(entry)
+                return
+            if error is not None:
+                self.ctx.log("Could not read the EXIF of %s: %s" % (rel, _error_text(error)),
+                             "warn")
+            if how == "name":
+                picture = entry[0]
+                exif = _json_dict(picture["exif"])
+                if raw_photos.same_shot(raw_photos.own_exif(exif), raw_exif):
+                    self._pair(picture, rel, entry[2], entry[3], "name", raw_exif)
+                    return
+                # The same name, but not the same shot (another camera, or
+                # another time): by camera and time, or on its own.
+                self._note("RAW", "%s does not go with %s (another camera, or another time)"
+                           % (rel, picture["path"]))
+                if raw_photos.paired_record(exif) is not None:
+                    self._unpair(picture, exif)
+                entry = (rel, entry[2], entry[3], 0.0)
+            if not by_time(entry, raw_exif):
+                alone.append(entry)
+
+        def read(item):
+            how, entry = item
+            return self._read_raw(entry[1] if how == "name" else entry[0])
+
+        items = [("name", item) for item in by_name] + [("time", entry) for entry in to_read]
+        if _parallel_reads(self.threads, items, read, handle, self._should_stop, self.ctx,
+                           self.flush):
+            return True
+        for entry in stored:
+            found = self.conn.execute("SELECT exif FROM images WHERE id = ?",
+                                      (self.rows[entry[0]]["id"],)).fetchone()
+            if not by_time(entry, raw_photos.own_exif(_json_dict(found[0] if found else ""))):
+                alone.append(entry)
+        # Pictures whose RAW file is gone (or is another's now) get their own EXIF back
+        # (only after a complete walk: it may be in a folder that could not be listed).
+        if walk.complete:
+            for image_id, (picture, exif) in paired.items():
+                if (image_id not in kept and image_id not in taken
+                        and picture["path"] in self.walked):
+                    self._unpair(picture, exif)
+        if not self.raw["index_alone"]:
+            self.summary["raw_skipped"] = sum(1 for entry in alone if entry[0] not in self.rows)
+            for entry in alone:
+                self.ctx.step(item=entry[0], quick=True)
+            return False
+        self.walked.update(entry[0] for entry in alone)
+        added = self.summary["added"] + self.summary["changed"]
+        stopped = _parallel_reads(self.threads, self._to_read(alone), self._read, self._handle,
+                                  self._should_stop, self.ctx, self.flush)
+        self.summary["raw_alone"] = self.summary["added"] + self.summary["changed"] - added
+        return stopped
 
     # -- the owner's edits ---------------------------------------------------
 
@@ -1369,7 +1809,8 @@ class LibraryScan:
         # are no longer part of the library; nor are its videos once they
         # were turned off.
         excluded = [row for row in to_mark if excluded_by_ignores(row["path"], self.patterns)
-                    or (not self.videos_on and row["media"] == videos.MEDIA_VIDEO)]
+                    or (not self.videos_on and row["media"] == videos.MEDIA_VIDEO)
+                    or self._raw_excluded(row)]
         # Files whose content was listed at another path in this walk moved.
         excluded_ids = {row["id"] for row in excluded}
         moved = [row for row in to_mark if row["id"] not in excluded_ids
@@ -1380,14 +1821,22 @@ class LibraryScan:
         if excluded:
             self._set_missing([row["id"] for row in excluded], self.now)
             self.summary["excluded"] = len(excluded)
+            raw_rows = sum(1 for row in excluded
+                           if not excluded_by_ignores(row["path"], self.patterns)
+                           and self._raw_excluded(row))
             turned_off = sum(1 for row in excluded
-                             if not excluded_by_ignores(row["path"], self.patterns))
+                             if not excluded_by_ignores(row["path"], self.patterns)) - raw_rows
             if turned_off:
                 ctx.log("%d video(s) in %s are no longer indexed (videos are off for this "
                         "library); they were marked missing." % (turned_off, self.label))
-            if len(excluded) > turned_off:
+            if raw_rows:
+                ctx.log("%d RAW file(s) in %s are no longer pictures of their own (each goes "
+                        "with its picture now, or RAW files are off); they were marked "
+                        "missing." % (raw_rows, self.label))
+            if len(excluded) > turned_off + raw_rows:
                 ctx.log("%d file(s) in %s are now excluded by ignore patterns; they were "
-                        "marked missing." % (len(excluded) - turned_off, self.label))
+                        "marked missing." % (len(excluded) - turned_off - raw_rows,
+                                             self.label))
             for row in excluded:
                 if row["id"] in self.edited:
                     self._share_edit(row)
@@ -1517,6 +1966,7 @@ class LibraryScan:
         if rows:
             self.delete_rows([row["id"] for row in rows])
             looks.forget_unreferenced(self.conn)    # (looks no row needs any more)
+            people.forget_unreferenced(self.conn)   # (and faces)
             self.summary["purged"] = len(rows)
             self.ctx.log("Removed %d file(s) that have been missing for more than %g days."
                          % (len(rows), days))
@@ -1627,7 +2077,8 @@ def _restitch_ids(conn, library_id):
 _BACKFILL_SQL = """
     SELECT id, path, size, mtime, content_hash, dhash, width, height, has_preview,
            projection, described, media,
-           CASE WHEN media = 'video' THEN exif ELSE '' END AS video_exif
+           CASE WHEN media = 'video' THEN exif ELSE '' END AS video_exif,
+           CASE WHEN exif LIKE '%"raw":%' THEN exif ELSE '' END AS raw_exif
     FROM images WHERE library_id = ? AND missing_since IS NULL ORDER BY id"""
 
 
@@ -1651,6 +2102,9 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     photos their panorama preview, front-view thumbnail and dHash; so are
     360 photos with a preview but no pano (stored before panos were made;
     only those larger than their preview get one, see images.has_pano),
+    and so are wide photos with a preview but no pano (stored before they
+    got one: images.wide_pano_size; of one complete otherwise only the pano
+    is stored, so its preview, thumbnail and dHash stay as they were),
     and unstitched 360 photos stitched by an older version or with other
     pole fill settings (see _restitch_ids; their descriptions are kept,
     their looks are made again by the next looks run: looks.forget).
@@ -1664,7 +2118,8 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     otherwise are read again (redate_videos), and the GPS tracks of videos
     whose track was never read (read_tracks). Returns a summary dict:
     {needed, filled, failed, changed, unsupported, aborted, panoramas,
-    panos, restitched, redated (redate_videos's, unless it stopped), tracks
+    panos, wide (the wide photos among them), restitched, redated
+    (redate_videos's, unless it stopped), tracks
     (read_tracks's, unless it stopped)}.
     """
     own_thumbs = thumbs is None
@@ -1857,7 +2312,7 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
     patterns = common.ignore_patterns(library)
     want_previews = bool(library.get("previews", True))
     summary = {"needed": 0, "filled": 0, "failed": 0, "changed": 0, "unsupported": 0,
-               "aborted": False, "panoramas": 0, "panos": 0, "restitched": 0}
+               "aborted": False, "panoramas": 0, "panos": 0, "wide": 0, "restitched": 0}
     redescribe = []
     tally = _TrackTally()
     on_disk, panos_on_disk, sheets_on_disk = previews.stored_sets(library_id)
@@ -1867,6 +2322,7 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
     stitch_key, restitch = _restitch_ids(conn, library_id)
     pending_before = len(restitch)
     needed = []
+    pano_only = set()           # complete wide photos read again for their pano only
     for row in conn.execute(_BACKFILL_SQL, (library_id,)).fetchall():
         has_preview = bool(row["has_preview"])
         if has_preview and row["id"] not in on_disk:
@@ -1877,22 +2333,28 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
         is_video = row["media"] == videos.MEDIA_VIDEO
         if is_video and not read_videos:
             continue
-        if (row["content_hash"] and row["dhash"] and row["width"] > 0 and row["height"] > 0
-                and (has_preview or not want_previews)
-                and row["projection"] != images.PROJECTION_UNKNOWN
-                and row["id"] not in restitch
-                and not (want_previews and has_preview and not is_video
-                         and row["projection"] in images.PROJECTIONS_360
-                         and images.has_pano(row["width"], row["height"])
-                         and row["id"] not in panos_on_disk)
-                and not (is_video and want_previews and has_preview
-                         and (row["id"] not in sheets_on_disk
-                              or _sheet_outdated(row, video.frames)))):
+        complete = (row["content_hash"] and row["dhash"] and row["width"] > 0
+                    and row["height"] > 0 and (has_preview or not want_previews)
+                    and row["projection"] != images.PROJECTION_UNKNOWN
+                    and row["id"] not in restitch
+                    and not (is_video and want_previews and has_preview
+                             and (row["id"] not in sheets_on_disk
+                                  or _sheet_outdated(row, video.frames))))
+        no_pano = (want_previews and has_preview
+                   and images.gets_pano(row["width"], row["height"], row["projection"],
+                                        row["media"])
+                   and row["id"] not in panos_on_disk)
+        if complete and not no_pano:
             continue
         if (excluded_by_ignores(row["path"], patterns)
                 or _failed_before(failures, row["path"], row["size"], row["mtime"])):
             continue
         needed.append(row)
+        if complete and not row["projection"] and not is_video:
+            # A wide photo stored before wide photos got a larger picture: only that
+            # is stored (the preview made from this read would differ a little from
+            # the one it has, and so would its thumbnail and dHash).
+            pano_only.add(row["id"])
     # (Pending rows left alone here -- missing, ignored now, or unreadable
     # before -- stay pending until they can be read.)
     conn.commit()
@@ -1946,10 +2408,17 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
         elif row["content_hash"] and row["content_hash"] != result["content_hash"]:
             # Changed since it was scanned; the next scan picks it up.
             summary["changed"] += 1
+        elif row["id"] in pano_only and not result.get("projection"):
+            if _store_pano(previews, library_id, row["id"], result.get("pano"), ctx,
+                           row["path"], wide=True):
+                summary["panos"] += 1
+                summary["wide"] += 1
+            summary["filled"] += 1
         else:
             if not row["content_hash"] and result["content_hash"]:
                 rekeyed[not_duplicates.unit_key(row["id"], "")] = result["content_hash"]
-            values = _metadata(result)
+            values = _with_raw(_metadata(result), row["raw_exif"],
+                               row["path"].rsplit("/", 1)[-1], row["mtime"])
             values["updated"] = time.time()
             preview = result["preview"] if want_previews else None
             if preview is not None:
@@ -1963,8 +2432,10 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
                             % (row["path"], _error_text(error)), "warn")
                 else:
                     if _store_pano(previews, library_id, row["id"], result.get("pano"), ctx,
-                                   row["path"]):
+                                   row["path"], wide=not result.get("projection")):
                         summary["panos"] += 1
+                        if not result.get("projection"):
+                            summary["wide"] += 1
                     if result.get("media") == videos.MEDIA_VIDEO:
                         _store_sheet(previews, library_id, row["id"], result.get("sheet"),
                                      ctx, row["path"])
@@ -2006,10 +2477,14 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
     if tracks_said:
         ctx.log(tracks_said)
     if summary["panoramas"]:
-        made = (" (%d with a large panorama for the 360 view)" % summary["panos"]
+        made = (" (%d with a large panorama for the 360 view)"
+                % (summary["panos"] - summary["wide"])
                 if want_previews else "")
         ctx.log("%d 360-degree photo(s) recognised in %s%s."
                 % (summary["panoramas"], common.library_label(library), made))
+    if summary["wide"]:
+        ctx.log("%d wide photo(s) in %s got a larger picture for the pan view."
+                % (summary["wide"], common.library_label(library)))
     if redescribe:
         # Their descriptions were made from the two raw fisheye circles.
         ctx.log("%d described image(s) turned out to be unstitched 360-degree photos (%s%s); "
@@ -2034,21 +2509,25 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
     limit and endpoint_name are passed on to describe.describe_pending.
     conn is an index.db connection to use (default: one opened and closed
     here). Unless the run stopped (or embed_vectors is False), the embed
-    step (embeddings.after_run) follows when search by meaning is set up.
+    step (embeddings.after_run) follows when search by meaning is set up,
+    then (after a scan) the faces step (people.after_run) when People is on.
     Looks (looks.py) are not made here (a job for the image model of its
     own): when they are set up, the log says how many pictures wait.
     After the scan (also one that was stopped) the GPS check
-    (gps_check.run) looks at the positions of every library's pictures. Returns
+    (gps_check.run) looks at the positions of every library's pictures, and
+    the local times (local_times.run_safely) follow. Returns
     {"libraries": [scan summaries], "gps_check": its summary (when it
-    ran), "describe": describe summary or None, "embed": embed summary or
-    None, "looks_pending": pictures without looks and "views_pending": 360
-    photos whose opening view is due (both None when looks are off),
+    ran), "local_times": theirs (when they ran), "describe": describe
+    summary or None, "embed": embed summary or None, "faces": faces summary
+    or None, "looks_pending": pictures without looks and "views_pending":
+    360 photos whose opening view is due (both None when looks are off),
     "stopped": bool}.
     """
     libraries = describe.selected_libraries(config, library_ids)
     summary = {"libraries": [], "describe": None, "embed": None, "looks_pending": None,
                "views_pending": None,
                "stopped": False}
+    summary["faces"] = None         # (the faces step, people.after_run)
     threads = reader_threads(config)
     video = videos.setup(config)
     own_conn = conn is None
@@ -2094,6 +2573,11 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
             checked = gps_check.run_safely(conn, config, ctx)
             if checked is not None:
                 summary["gps_check"] = checked
+            # The local time of each picture's place, by the positions the
+            # check kept (it runs again when times change).
+            localised = local_times.run_safely(conn, config, ctx)
+            if localised is not None:
+                summary["local_times"] = localised
         if describe_images and not summary["stopped"] and not ctx.should_stop():
             summary["describe"] = describe.describe_pending(
                 conn, config, ctx, helper=helper,
@@ -2110,6 +2594,14 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
                 conn, config, ctx, library_ids=[library["id"] for library in libraries
                                                 if not jobs.library_removed(ctx, library["id"])])
             if summary["embed"] is not None and summary["embed"]["stopped"]:
+                summary["stopped"] = True
+        if scan_images and not summary["stopped"]:
+            # The faces of the new pictures (people.py), when People is on.
+            summary["faces"] = people.after_run(
+                conn, config, ctx, [library["id"] for library in libraries
+                                    if not jobs.library_removed(ctx, library["id"])],
+                helper=helper)
+            if summary["faces"] is not None and summary["faces"]["stopped"]:
                 summary["stopped"] = True
         if scan_images and not summary["stopped"]:
             summary["looks_pending"], summary["views_pending"] = looks_waiting(

@@ -428,7 +428,9 @@ def choose(scores, yaws, margin=MARGIN):
 def store_auto(conn, key, yaw, pitch, made_from, now=None):
     """Keep the automatic view (yaw, pitch) of a content key, worked out from made_from
     (auto_key()). Returns True when the view the picture opens at changed (no owner's
-    view hides it). No commit."""
+    view hides it): a picture without a view opens at the front, so a first view at
+    the front changes nothing (its thumbnail, cut from the original by the scan, stays).
+    No commit."""
     stamp = time.time() if now is None else now
     ensure_table(conn)
     before = _load_keys(conn, [key]).get(key)
@@ -437,11 +439,24 @@ def store_auto(conn, key, yaw, pitch, made_from, now=None):
                  "updated = ? WHERE content_key = ?", (yaw, pitch, made_from, stamp, key))
     owner = before is not None and before["owner_yaw"] is not None
     old = (before["auto_yaw"], before["auto_pitch"]) if before is not None else (None, None)
-    changed = not owner and (old[0] is None or abs(old[0] - yaw) > 0.05
-                             or abs(old[1] - pitch) > 0.05)
+    changed = not owner and not _same_view(old, (yaw, pitch))
     if changed:
         touch(conn, key, stamp)
     return changed
+
+
+def _at_front(yaw, pitch):
+    """True for no view (yaw None) or one within FRONT_SLACK of the front."""
+    return yaw is None or (abs(yaw) < FRONT_SLACK and abs(pitch or 0.0) < FRONT_SLACK)
+
+
+def _same_view(old, new):
+    """True when two automatic views ((yaw, pitch); (None, None): none) show the same:
+    both the front (as thumbnail_view and record_value count it), or within 0.05
+    degrees of each other."""
+    if _at_front(*old) or _at_front(*new):
+        return _at_front(*old) and _at_front(*new)
+    return abs(old[0] - new[0]) <= 0.05 and abs((old[1] or 0.0) - new[1]) <= 0.05
 
 
 def forget_unreferenced(conn):

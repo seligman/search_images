@@ -1,3 +1,4 @@
 Pillow
 Flask
 pillow-heif  # optional: only needed to scan libraries that contain HEIC images
+tzdata  # optional: time zones where the system has none (Windows), for local times

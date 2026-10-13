@@ -501,6 +501,14 @@ def library_drives(conn, library_id, config=None):
             config = {}
     chosen = settings(config)
     rows = conn.execute(_ROWS_SQL, (library_id,)).fetchall()
+    # Clips follow each other by their camera's clock: a clip given the local
+    # time of its place (local_times.py) goes by the clock it was recorded
+    # with, so a drive across a time zone border stays one drive.
+    import local_times
+    clocks = local_times.camera_times(conn, [row["id"] for row in rows])
+    if clocks:
+        rows = [dict(row, taken_at=clocks[row["id"]][0]) if row["id"] in clocks else row
+                for row in rows]
     digest = hashlib.sha1(("%d %d\n" % (chosen["slack"], chosen["min_clips"])).encode("ascii"))
     for row in rows:
         digest.update(("%d|%s|%s|%r|%s|%s|%s|%d|%s\n" % (
