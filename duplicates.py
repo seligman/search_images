@@ -141,6 +141,8 @@ def _member(record, facts):
     }
     if record.get("p"):
         member["p"] = record["p"]
+    if record.get("ov"):
+        member["ov"] = record["ov"]     # (its thumbnail's view, see SITE.thumbUrl)
     # The owner's marks (albums.py): a favorite, its rating, how many albums.
     if record.get("fav"):
         member["favorite"] = True
@@ -486,7 +488,7 @@ def build_stacks(conn, config, library_ids, records=None):
 _SAME_COLUMNS = "id, library_id, content_hash, media, projection, width, height, hidden"
 # The keys of a search record that _member reads.
 _MEMBER_KEYS = ("i", "l", "n", "f", "t", "w", "hgt", "ts", "dk", "cm", "sh", "q", "ty", "p",
-                "fav", "rt", "al")
+                "fav", "rt", "al", "ov")
 
 
 def _look_items(conn, library_ids, records):

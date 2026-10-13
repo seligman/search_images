@@ -35,7 +35,10 @@ import image_edits
 import imageinfo
 import jobs
 import looks
+import opening_views
+import place_estimates
 import search_index
+import tracks
 import videos
 import world_map
 
@@ -211,27 +214,33 @@ def projection_of(row):
     return projection if projection in imageinfo.PROJECTIONS_360 else ""
 
 
-def place_of(row):
+def place_of(row, estimate=None):
     """The place names of a row (places.py) as /api/image sends them, or None.
 
     {"city" ("" when no town is near enough), "region", "country", "cc",
-    "km" (how far the town is, when there is one), "estimated": true (only
-    for a place without a position: the GPS check set it aside and the
-    pictures taken around the same time gave the place, see gps_check.py)}.
+    "km" (how far the town is, when there is one)}. A picture without a
+    place of its own has its estimate's (estimate: its place_estimates
+    row, see place_estimates.py), with "source" ("copy", "time", "area" or
+    "owner") and "estimated": true (not for the owner's own place).
     """
     if not row["place_country"]:
-        return None
+        if not place_estimates.usable(row, estimate) or not estimate["place_country"]:
+            return None
+        place = {"city": estimate["place_city"], "region": estimate["place_region"],
+                 "country": estimate["place_country"], "cc": estimate["place_cc"],
+                 "source": estimate["source"]}
+        if estimate["source"] != "owner":
+            place["estimated"] = True
+        return place
     place = {"city": row["place_city"], "region": row["place_region"],
              "country": row["place_country"], "cc": row["place_cc"]}
-    if row["lat"] is None:
-        place["estimated"] = True
     km = finite(row["place_km"])
     if place["city"] and km is not None and km >= 0:
         place["km"] = km
     return place
 
 
-def detail_record(row, library_name, edit=None, for_admin=False, marks=None):
+def detail_record(row, library_name, edit=None, for_admin=False, marks=None, estimate=None):
     """Build the full metadata record used by the detail page.
 
     info is the description as shown and searched: the model's with the
@@ -239,7 +248,12 @@ def detail_record(row, library_name, edit=None, for_admin=False, marks=None):
     also edited, whether there is one, model_info, the model's own
     description, and edits, the edit itself (image_edits.view). marks
     are the owner's {"favorite", "rating", "albums": [{id, name}]}
-    (albums.py), sent as they are.
+    (albums.py), sent as they are. A 360 video's level track (which way
+    was up in its panorama over time, see insta360.level_track) is sent
+    once, as "level", while the "level_horizon" setting is on.
+    estimate is the picture's place
+    estimate (a place_estimates row, or None): its place when the picture
+    has none of its own (place_of).
     """
     exif = load_json(row["exif"], {})
     model_info = load_json(row["info"], None)
@@ -261,7 +275,7 @@ def detail_record(row, library_name, edit=None, for_admin=False, marks=None):
         "camera": row["camera"],
         "lat": finite(row["lat"]),
         "lon": finite(row["lon"]),
-        "place": place_of(row),
+        "place": place_of(row, estimate),
         "hidden": bool(row["hidden"]),
         "info": image_edits.apply(model_info, edit),
         "described": bool(row["described"]),
@@ -275,7 +289,16 @@ def detail_record(row, library_name, edit=None, for_admin=False, marks=None):
         record["media"] = videos.MEDIA_VIDEO
         record["duration"] = finite(row["duration"])
         facts = record["exif"].get("video")
-        record["video"] = facts if isinstance(facts, dict) else {}
+        facts = dict(facts) if isinstance(facts, dict) else {}
+        # A 360 video's level track goes out once, as "level", and only
+        # while levelling is on (the viewer turns each frame with it).
+        level = videos.level_of(facts) if projection_of(row) else None
+        facts.pop("level", None)
+        if isinstance(record["exif"].get("video"), dict):
+            record["exif"]["video"] = facts
+        record["video"] = facts
+        if level:
+            record["level"] = level
         record["info"] = videos.effective_info(record["info"], row["media"])
     else:
         record["media"] = "image"
@@ -699,10 +722,31 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
 
     @app.route("/api/locations")
     def api_locations():
+        """[{id, lat, lon}] of the located pictures, then the estimated positions
+        (place_estimates.located) with "e": 1 and "r": their radius in km (the map's
+        hollow pins), and the owner's own places with "o": 1."""
         library_ids = list(visible_libraries(state.config()))
         rows = world_map.collect_located_images(get_conn(), library_ids)
-        return jsonify([{"id": i, "lat": lat, "lon": lon}
-                        for i, lat, lon in rows])
+        points = [{"id": i, "lat": lat, "lon": lon} for i, lat, lon in rows]
+        for image_id, lat, lon, radius, owner in place_estimates.located(get_conn(),
+                                                                        library_ids):
+            point = {"id": image_id, "lat": lat, "lon": lon}
+            if owner:
+                point["o"] = 1
+            else:
+                point["e"] = 1
+                if isinstance(radius, (int, float)) and math.isfinite(radius):
+                    point["r"] = round(radius, 3)
+            points.append(point)
+        return jsonify(points)
+
+    @app.route("/api/routes")
+    def api_routes():
+        """{"routes": the routes of the drives (and other videos with a GPS track) of the
+        enabled libraries, their hidden clips left out (tracks.routes)}."""
+        config = state.config()
+        return jsonify({"routes": tracks.routes(get_conn(), config,
+                                                list(visible_libraries(config)))})
 
     @app.route("/tile/<int:zoom>/<int:x>/<int:y>.jpg")
     def tile(zoom, x, y):
@@ -847,14 +891,25 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             return jsonify({"error": "not found"}), 404
         names = visible_libraries(state.config())
         edit = image_edits.load(get_conn(), image_id)
+        estimate = place_estimates.for_picture(get_conn(), image_id)
         record = detail_record(row, names[row["library_id"]], edit, for_admin=is_admin(),
-                               marks=picture_marks_view(get_conn(), image_id))
+                               marks=picture_marks_view(get_conn(), image_id),
+                               estimate=estimate)
+        # Where an estimated place comes from (place_estimates.view: the admin
+        # also gets its position, the pictures it came from and the choice).
+        record["place_estimate"] = place_estimates.view(get_conn(), row, estimate,
+                                                        admin=is_admin())
         if is_admin():
             # The GPS check of the picture: why its position was set aside.
             record["location_check"] = gps_check.picture_view(get_conn(), row)
         elif row["lat"] is None and gps_check.is_ignored(get_conn(), image_id):
             # A position set aside is nobody else's business, not even raw.
             record["exif"].pop("GPS", None)
+        if record["projection"]:
+            # Where its 360 view opens (opening_views.py; the admin is also
+            # told whether it is the one set with "Open here").
+            record["opening_view"] = opening_views.detail(get_conn(), image_id,
+                                                          row["content_hash"], owner=is_admin())
         if record["media"] == videos.MEDIA_VIDEO:
             # /video/<id> sends a playable (H.264) copy when there is one
             # (for a 360 video also its LRV, or an original browsers play).
@@ -863,6 +918,8 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             if not record["playable_copy"] and row["projection"] == videos.PROJECTION_360:
                 record["playable_copy"] = videos.playable_360(
                     row, original_path(row)[0])[0] is not None
+            # Its GPS track (tracks.py): whether its position is the track's.
+            record["track"] = track_view(row)
             # (A drive never holds 360 videos: drives.clip_from_row leaves them out.)
             preview = drive_preview(row)
             if preview is not None:
@@ -874,6 +931,16 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
                     "copies": [clip.id for clip in clips if videos.existing_proxy(
                         row["library_id"], clip.id, clip.content_hash)]}
         return jsonify(record)
+
+    def track_view(row):
+        """{"fixes", "start", "end" (UTC, ISO), "position" (its position is the track's)} of
+        a video's kept GPS track, or None."""
+        found = tracks.for_rows(get_conn(), [row], state.config()).get(row["id"])
+        if found is None:
+            return None
+        return {"fixes": found.fixes, "start": tracks.iso_utc(found.start),
+                "end": tracks.iso_utc(found.end),
+                "position": tracks.is_position(found, row["lat"], row["lon"])}
 
     def drive_preview(row):
         """(Drive, path of its sped-up preview or None, speed) of a video row in a drive,
@@ -942,9 +1009,16 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         if images is None:
             return not_found()
         if row["media"] == videos.MEDIA_VIDEO:
-            # A video's preview is its poster frame (ffmpeg).
+            # A video's preview is its poster frame (ffmpeg); a 360 video's
+            # is turned level with the track the scan kept (reading it from
+            # the file again takes a while).
+            level = None
+            if row["projection"] == imageinfo.PROJECTION_DUAL_FISHEYE:
+                kept = get_conn().execute("SELECT exif FROM images WHERE id = ?",
+                                          (row["id"],)).fetchone()
+                level = videos.stored_level(kept[0]) if kept is not None else None
             try:
-                data = videos.poster_jpeg(videos.find_tools(state.config()), full)
+                data = videos.poster_jpeg(videos.find_tools(state.config()), full, level=level)
             except (videos.VideoReadError, images.ImageReadError) as error:
                 print("Could not make a poster of video %d: %s" % (row["id"], error))
                 return not_found()

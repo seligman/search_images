@@ -212,6 +212,23 @@ class SearchTextTest(unittest.TestCase):
                                                 media="video"),
                          "Mine.\nKind: video.")
 
+    def test_no_position_written_in_the_text_goes_in(self):
+        # A dashcam prints its position over its video and the model read it:
+        # the vector holds none (an export ships vectors whatever its
+        # location options are). The positions here are made up.
+        described = info("Dashcam clip", "A road at S 41.20000 W 150.30000 by the sea.",
+                         text="DASHCAM 2023/08/17 04:00:30 S:41.20000 W:150.30000 47MPH",
+                         scene="a coastal road at -41.2000, -150.3000")
+        text = embeddings.search_text(described)
+        for position in ("41.2", "150.3", "S:", "W:"):
+            self.assertNotIn(position, text)
+        self.assertIn("Text in the picture: DASHCAM 2023/08/17 04:00:30 47MPH", text)
+        self.assertIn("A road at by the sea.", text)
+        self.assertIn("Scene: a coastal road at", text)
+        # Other numbers stay.
+        self.assertIn("SPEED 47 KM 120.5", embeddings.search_text(
+            info("Sign", "A sign.", text="SPEED 47 KM 120.5")))
+
     def test_the_owner_edits_are_laid_over(self):
         described = info("Model title", "The model's words.", tags=["beach", "dog"])
         edit = {"title": "Rex at the beach", "description": None, "tags_add": ["rex"],

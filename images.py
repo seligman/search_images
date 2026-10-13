@@ -44,6 +44,7 @@ except ImportError:
 
 import common
 import imageinfo
+import insta360
 from imageinfo import (
     AVIF_BRANDS, HEIF_BRANDS, exif_metadata, parse_capture_date, sanitize_exif, sniff_mime,
 )
@@ -203,8 +204,8 @@ POLE_FILL_MAX = 30.0
 # Raise when dual_fisheye_to_equirect() makes different pictures: the scan's
 # back-fill stage then stitches the 360 photos stored before again (their
 # previews, panos, thumbnails and dHashes; never their descriptions). See
-# stitch_key().
-STITCH_VERSION = 2
+# stitch_key(). (3: 360 photos and videos are levelled, see insta360.py.)
+STITCH_VERSION = 3
 
 HEIF_MISSING = ("HEIC/HEIF images need pillow-heif; install it with: "
                 "python -m pip install pillow-heif")
@@ -914,10 +915,12 @@ def _fisheye_point(circle, back, rotation, mirror, half_fov):
 
 
 def stitch_options(config):
-    """{"nadir_fill_deg": .., "zenith_fill_deg": ..} from a config dict.
+    """{"nadir_fill_deg": .., "zenith_fill_deg": .., "level_horizon": ..} from a config dict.
 
     Missing or unusable values (not numbers, negative) take the defaults
     (NADIR_FILL_DEG, ZENITH_FILL_DEG); larger ones are cut to POLE_FILL_MAX.
+    level_horizon (insta360.level_option) says whether 360 photos and
+    videos are levelled with the camera's motion sensor.
     """
     options = {}
     for key, default in (("nadir_fill_deg", NADIR_FILL_DEG), ("zenith_fill_deg", ZENITH_FILL_DEG)):
@@ -926,6 +929,7 @@ def stitch_options(config):
                 or not math.isfinite(value) or value < 0):
             value = default
         options[key] = min(float(value), POLE_FILL_MAX)
+    options["level_horizon"] = insta360.level_option(config)
     return options
 
 
@@ -957,12 +961,14 @@ def stitch_settings():
 def stitch_key(options=None):
     """What the panoramas stitched from dual-fisheye frames depend on, as text.
 
-    STITCH_VERSION and the pole fills (options, default stitch_settings()):
-    when it changes, the scan's back-fill stage stitches the stored 360
-    photos again (see scan.backfill).
+    STITCH_VERSION, the pole fills and whether pictures are levelled
+    (options, default stitch_settings()): when it changes, the scan's
+    back-fill stage stitches the stored 360 photos (and videos) again (see
+    scan.backfill).
     """
     options = options or stitch_settings()
-    return "%d n%g z%g" % (STITCH_VERSION, options["nadir_fill_deg"], options["zenith_fill_deg"])
+    key = "%d n%g z%g" % (STITCH_VERSION, options["nadir_fill_deg"], options["zenith_fill_deg"])
+    return key if options.get("level_horizon", insta360.LEVEL_DEFAULT) else key + " flat"
 
 
 def _fisheye_source_edge(out_width, params=INSTA360_PARAMS):
@@ -1229,7 +1235,8 @@ def _fill_pole(panorama, degrees, bottom=True):
 
 
 def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARAMS,
-                             nadir_fill=None, zenith_fill=None, details=None):
+                             nadir_fill=None, zenith_fill=None, details=None, level=None,
+                             level_inverted=None):
     """Stitch a dual-fisheye frame into an equirectangular panorama.
 
     image holds the two lens circles side by side (see find_lens_circles()
@@ -1251,6 +1258,13 @@ def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARA
     what the stitch used: "circles" (find_lens_circles) and "gains" (the
     front and the back lens's, see _lens_gains; 1.0 without a blend), so
     a 360 video's player can stitch its frames the same way.
+
+    level is the direction of up in the stitched panorama when the
+    picture was taken (from the camera's motion sensor, see insta360.py):
+    the panorama is then turned to make it level (level_equirect, after the
+    pole fills, which cover what is below and above the camera);
+    level_inverted says whether the camera counts as upside down then (see
+    insta360.up_rotation; None: from level alone).
     """
     if image.mode != "RGB":
         image = to_rgb(image)
@@ -1325,6 +1339,8 @@ def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARA
         _fill_pole(panorama, nadir_fill, bottom=True)
     if zenith_fill:
         _fill_pole(panorama, zenith_fill, bottom=False)
+    if level is not None:
+        panorama = level_equirect(panorama, level, inverted=level_inverted)
     return panorama
 
 
@@ -1342,28 +1358,42 @@ def equirect_view(image, size, fov=FRONT_VIEW_FOV, yaw=0.0, pitch=0.0):
     mesh that cross the panorama's left/right edge sample it wrapped round,
     and cells near a pole are split until they are small.
     """
-    if image.mode not in ("L", "RGB"):
-        image = to_rgb(image)
     out_width, out_height = max(1, int(size[0])), max(1, int(size[1]))
-    src_width, src_height = image.size
     focal = (out_width / 2.0) / math.tan(math.radians(min(max(fov, 1.0), 170.0)) / 2.0)
     cos_yaw, sin_yaw = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
     cos_pitch, sin_pitch = math.cos(math.radians(pitch)), math.sin(math.radians(pitch))
-    directions = {}
 
     def direction(u, v):
-        """(longitude, latitude) in radians seen at output pixel corner u, v."""
+        x, y, z = u - out_width / 2.0, out_height / 2.0 - v, focal
+        y, z = y * cos_pitch + z * sin_pitch, z * cos_pitch - y * sin_pitch
+        x, z = x * cos_yaw + z * sin_yaw, z * cos_yaw - x * sin_yaw
+        return (math.atan2(x, z), math.atan2(y, math.hypot(x, z)))
+
+    return _remap_equirect(image, (out_width, out_height), direction)
+
+
+def _remap_equirect(image, size, direction):
+    """A picture of size whose pixels come from an equirectangular panorama:
+    direction(u, v) is the (longitude, latitude) in radians, 0, 0 being the
+    panorama's centre, seen at output pixel corner u, v. Cells of the mesh
+    that cross the panorama's left/right edge sample it wrapped round, and
+    cells whose corners lie far apart in longitude (near a pole) are split
+    until they are small."""
+    if image.mode not in ("L", "RGB"):
+        image = to_rgb(image)
+    out_width, out_height = size
+    src_width, src_height = image.size
+    directions = {}
+
+    def corner(u, v):
         if (u, v) not in directions:
-            x, y, z = u - out_width / 2.0, out_height / 2.0 - v, focal
-            y, z = y * cos_pitch + z * sin_pitch, z * cos_pitch - y * sin_pitch
-            x, z = x * cos_yaw + z * sin_yaw, z * cos_yaw - x * sin_yaw
-            directions[u, v] = (math.atan2(x, z), math.atan2(y, math.hypot(x, z)))
+            directions[u, v] = direction(u, v)
         return directions[u, v]
 
     cells = []
 
     def add_cell(x0, y0, x1, y1):
-        corners = [direction(x0, y0), direction(x0, y1), direction(x1, y1), direction(x1, y0)]
+        corners = [corner(x0, y0), corner(x0, y1), corner(x1, y1), corner(x1, y0)]
         # Longitudes as one continuous run (they may cross +-180 degrees).
         first = corners[0][0]
         longitudes = [lon + 2.0 * math.pi * round((first - lon) / (2.0 * math.pi))
@@ -1410,14 +1440,108 @@ def equirect_view(image, size, fov=FRONT_VIEW_FOV, yaw=0.0, pitch=0.0):
     return source.transform((out_width, out_height), _MESH, mesh, _BILINEAR)
 
 
-def front_view(equirect, width=THUMB_SIZE):
+# level_equirect() leaves a panorama as it is when up is closer to straight
+# up than this many degrees.
+LEVEL_MIN_DEG = 0.05
+
+
+def level_equirect(image, up, size=None, inverted=None):
+    """An equirectangular panorama turned so that the direction up (x, y, z: x to
+    the right, y up, z ahead, in the panorama as it is) points straight up.
+
+    The smallest turn that does it is used, so the middle of the panorama
+    still looks the way the camera did, only level -- for a camera upside
+    down (inverted; None: from up alone) the turn that keeps the heading of
+    its front (see insta360.up_rotation). size is the output (width,
+    height), default the panorama's own. Returns the image itself (or a
+    resized copy) when up is (nearly) straight up or not given.
+    """
+    out_width, out_height = size or image.size
+    up = up if up and all(math.isfinite(value) for value in up) else None
+    if up is None or insta360.tilt_degrees(up) < LEVEL_MIN_DEG:
+        if (out_width, out_height) == image.size:
+            return image
+        return image.resize((out_width, out_height), _LANCZOS, reducing_gap=2.0)
+    rotation = insta360.up_rotation(up, inverted)
+
+    def direction(u, v):
+        longitude = (float(u) / out_width - 0.5) * 2.0 * math.pi
+        latitude = (0.5 - float(v) / out_height) * math.pi
+        cos_lat = math.cos(latitude)
+        x, y, z = insta360.turn(rotation, (cos_lat * math.sin(longitude), math.sin(latitude),
+                                           cos_lat * math.cos(longitude)))
+        return (math.atan2(x, z), math.atan2(y, math.hypot(x, z)))
+
+    return _remap_equirect(image, (int(out_width), int(out_height)), direction)
+
+
+def front_view(equirect, width=THUMB_SIZE, yaw=0.0, pitch=0.0):
     """The thumbnail picture of a 360 photo: a FRONT_VIEW_FOV degree wide,
-    FRONT_VIEW_ASPECT perspective view of the panorama's centre, width
-    pixels wide. It is rendered at twice the size and scaled down, which
-    keeps fine detail from aliasing."""
+    FRONT_VIEW_ASPECT perspective view of the panorama's centre (or of the
+    direction yaw, pitch: degrees right and up, a 360 picture's opening
+    view, see opening_views.py), width pixels wide. It is rendered at
+    twice the size and scaled down, which keeps fine detail from
+    aliasing."""
     size = (int(width), max(1, int(round(width / FRONT_VIEW_ASPECT))))
-    view = equirect_view(equirect, (size[0] * 2, size[1] * 2))
+    view = equirect_view(equirect, (size[0] * 2, size[1] * 2), yaw=yaw, pitch=pitch)
     return view.resize(size, _LANCZOS, reducing_gap=2.0)
+
+
+# The views of a 360 photo the image embedding model compares with the
+# picture's own words to find the way it opens (opening_views.py): one every
+# HEADING_STEP degrees round the horizon, HEADING_FOV degrees wide, looking
+# HEADING_PITCH degrees down (more of what is near, less sky), HEADING_SIZE
+# pixels.
+HEADING_STEP = 45
+HEADING_FOV = 100.0
+HEADING_PITCH = -10.0
+HEADING_SIZE = (448, 336)
+HEADING_QUALITY = 88
+
+
+@contextlib.contextmanager
+def _panorama(data):
+    """An equirectangular panorama's bytes (a stored preview) decoded: yields
+    (RGB image, colour profile). Raises ImageReadError when it cannot be."""
+    try:
+        image = _open_image(data)
+        with image:
+            with _decoded(image, lambda w, h: (w, h), resize=False) as (rgb, _, icc):
+                yield rgb, icc
+    except ImageReadError:
+        raise
+    except Image.DecompressionBombError as error:
+        raise ImageReadError("image is too large to decode safely (%s)"
+                             % _error_text(error)) from error
+    except Exception as error:
+        raise ImageReadError("cannot decode image (%s)" % _error_text(error)) from error
+
+
+def heading_views(data):
+    """[(yaw in degrees, JPEG bytes)] of the views of a 360 picture's panorama (data:
+    its preview) at every HEADING_STEP degrees from -180, as the image model sees them
+    for its opening view (see HEADING_STEP). Raises ImageReadError."""
+    with _panorama(data) as (rgb, icc):
+        return [(yaw, _encode_jpeg(equirect_view(rgb, HEADING_SIZE, fov=HEADING_FOV, yaw=yaw,
+                                                 pitch=HEADING_PITCH), HEADING_QUALITY, icc))
+                for yaw in range(-180, 180, HEADING_STEP)]
+
+
+def view_thumbnail(data, yaw=0.0, pitch=0.0):
+    """The thumbnail (JPEG bytes) of a 360 picture whose panorama (data: its preview)
+    opens at yaw, pitch (degrees right and up; see front_view). Raises ImageReadError."""
+    with _panorama(data) as (rgb, icc):
+        return _encode_jpeg(front_view(rgb, THUMB_SIZE, yaw, pitch), THUMB_QUALITY, icc)
+
+
+def photo_level(data):
+    """Up in the stitched panorama of an unstitched 360 photo (its bytes) when it
+    was taken, from the camera's motion sensor (insta360.capture_up), or None:
+    also when levelling is off (stitch_settings) or the camera is not one
+    whose photos are levelled (insta360.PHOTO_CAMERAS)."""
+    if not stitch_settings()["level_horizon"]:
+        return None
+    return insta360.capture_up(data)
 
 
 def _image_xmp(image, data):
@@ -1473,7 +1597,8 @@ def _stitched_original(data, size_for, known=False):
                     return None             # not the frame the index saw
             elif detect_projection(rgb, exif, xmp, "") != PROJECTION_DUAL_FISHEYE:
                 return None
-            panorama = dual_fisheye_to_equirect(rgb, min(PREVIEW_EDGE, width))
+            panorama = dual_fisheye_to_equirect(rgb, min(PREVIEW_EDGE, width),
+                                                level=photo_level(data))
             target = size_for(*panorama.size)
             if panorama.size != target:
                 panorama = panorama.resize(target, _LANCZOS, reducing_gap=2.0)
@@ -1541,7 +1666,8 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
                 projection = detect_projection(working, exif, xmp, name) if maybe_360 else ""
                 if projection == PROJECTION_DUAL_FISHEYE:
                     # The panorama is as wide as the frame (never upscaled).
-                    working = dual_fisheye_to_equirect(working, min(stitch_edge, width))
+                    working = dual_fisheye_to_equirect(working, min(stitch_edge, width),
+                                                       level=photo_level(data))
                     height = max(1, int(round(width / 2.0)))
                 pano = None
                 if projection and pano_edge and has_pano(width, height):
@@ -1740,7 +1866,8 @@ def prepare_example_for_looks(data, max_edge=1024, max_pixels=None):
                     rgb, _, icc):
                 projection = detect_projection(rgb, exif, xmp, "")
                 if projection == PROJECTION_DUAL_FISHEYE:
-                    rgb = dual_fisheye_to_equirect(rgb, min(PREVIEW_EDGE, rgb.size[0]))
+                    rgb = dual_fisheye_to_equirect(rgb, min(PREVIEW_EDGE, rgb.size[0]),
+                                                   level=photo_level(data))
                 if projection:
                     preview = _fit_size(rgb.size, PREVIEW_EDGE)
                     if rgb.size != preview:

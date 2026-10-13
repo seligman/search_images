@@ -15,7 +15,9 @@ activities, scene, setting, time of day, event, colors, the kind of
 picture and the start of the text in it (and for the clip that carries
 a drive's own words, the drive's title, description and tags: see
 drives.cover_texts). Never file or folder names, library names, dates,
-places, GPS positions, cameras or who described the picture: a vector
+places, GPS positions (not even those written in its text, such as a
+dashcam's overlay: imageinfo.scrub_positions), cameras or who described
+the picture: a vector
 reveals nothing that the description does not show, so an export can
 ship vectors whatever its privacy options are (an export checks a
 clip's vector against the drive words it publishes, see fresh_vectors).
@@ -87,6 +89,7 @@ import common
 import db
 import drives
 import image_edits
+import imageinfo
 import llm
 import videos
 
@@ -449,8 +452,12 @@ def search_text(info, edit=None, media=None):
     add("Colors", _phrases(info.get("colors")))
     text = _text(info.get("text"))
     if text:
-        lines.append("Text in the picture: %s" % _cut(text, OCR_CHARS))
-    return "\n".join(lines)
+        lines.append("Text in the picture: %s" % _cut(imageinfo.scrub_positions(text),
+                                                      OCR_CHARS))
+    # (No GPS position written out either -- as a dashcam prints its own over
+    # its video, which the model read -- in any line: an export ships the
+    # vectors whatever its location options are.)
+    return imageinfo.scrub_positions("\n".join(lines))
 
 
 def text_hash(text, model, dims):

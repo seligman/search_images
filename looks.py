@@ -77,6 +77,12 @@ update() (the "image_embed" job, scan.py --embed-images) embeds the
 pictures without a vector, in batches, each batch committed (a stopped run
 keeps what it did); it is not run after scans by itself, as it needs the
 image model (a GPU job): the Manage page shows how many pictures wait.
+Then (unless "opening_views" is false) it works out where 360 photos with a
+title open (opening_views.py): views of each one's preview round the
+horizon (images.heading_views) and its words ("text_prefix" before them)
+are embedded, and the photo opens at the view that matches its words best
+-- once the model has shown, with the probe pictures and their words
+(PROBE_WORDS), that it matches words to pictures; its thumbnail follows.
 Vectors whose content no index row has any more are dropped (purge, also
 right after rows are deleted: forget_unreferenced): rows of a library that
 is offline stay in the index, so theirs stay too.
@@ -105,6 +111,7 @@ import db
 import embeddings
 import imageinfo
 import llm
+import opening_views
 import videos
 
 # Raise when the layout of image_vectors.db changes: an older file is then
@@ -128,6 +135,10 @@ DEFAULTS = {
     "model_file": "",
     "mmproj_file": "",
     "probe_check": True,
+    # Work out where 360 photos open (opening_views.py), and what their words
+    # are sent after (the model's query prompt).
+    "opening_views": True,
+    "text_prefix": "task: search result | query: ",
 }
 MAX_DIMS = 8192
 MIN_DIMS = 16
@@ -136,8 +147,14 @@ MIN_EDGE = 320
 MAX_EDGE = 2048
 # A probe picture this close (cosine) to its reference is made the same way.
 PROBE_SAME = 0.99
-# The probe pictures (drawn by _probe_bitmap): their names, in order.
+# The probe pictures (drawn by _probe_bitmap): their names, in order, and
+# words for each that a model which matches words to pictures finds closer
+# to it than to the others (see _words_match).
 PROBE_NAMES = ("gradient", "disc", "stripes")
+PROBE_WORDS = ("a smooth colour gradient", "a red circle",
+               "black and white diagonal stripes with a blue square")
+# The longest text_prefix kept.
+TEXT_PREFIX_LENGTH = 200
 PROBE_SIZE = (320, 240)
 # Pictures prepared at the same time while the model works on a batch.
 PREPARE_THREADS = 4
@@ -211,6 +228,10 @@ def settings(config):
     for key in ("model_file", "mmproj_file"):
         result[key] = common.unquote_path(raw.get(key))
     result["probe_check"] = raw.get("probe_check") is not False
+    result["opening_views"] = raw.get("opening_views") is not False
+    prefix = raw.get("text_prefix")
+    if isinstance(prefix, str) and len(prefix) <= TEXT_PREFIX_LENGTH:
+        result["text_prefix"] = prefix
     return result
 
 
@@ -690,6 +711,36 @@ def forget_unreferenced(conn):
         store.close()
 
 
+def forget(keys):
+    """Drop the vectors of some (content hash, kind) pairs from data/image_vectors.db
+    (when it exists): pictures that look different now (a 360 picture stitched
+    again), whose looks the next run makes again. Best effort; returns how many
+    were dropped."""
+    keys = sorted(set(keys))
+    if not keys:
+        return 0
+    try:
+        store = connect(create=False)
+    except sqlite3.Error:
+        return 0
+    if store is None:
+        return 0
+    try:
+        with store:
+            dropped = 0
+            for start in range(0, len(keys), ID_CHUNK):
+                dropped += store.executemany(
+                    "DELETE FROM image_vectors WHERE content_hash = ? AND kind = ?",
+                    keys[start:start + ID_CHUNK]).rowcount
+            if dropped:
+                _bump(store)
+        return max(0, dropped)
+    except sqlite3.Error:
+        return 0
+    finally:
+        store.close()
+
+
 def vectors_for(store, keys):
     """{(content hash, kind): vector bytes} of the stored vectors among keys."""
     wanted = list(set(keys))
@@ -742,11 +793,13 @@ def status(config):
 
 def counts(conn, config, library_ids, store=None):
     """{library id: {"pictures": present pictures, "embedded": with a vector, "pending":
-    without one}} for some libraries (pictures whose content hash is not known yet
-    are not counted: the next scan works it out). When the kept vectors were made
-    with other settings (status()["changed"]) every picture counts as pending."""
+    without one, "views": 360 photos whose opening view the next run works out
+    (views_pending; 0 when looks or opening views are off)}} for some libraries
+    (pictures whose content hash is not known yet are not counted: the next scan
+    works it out). When the kept vectors were made with other settings
+    (status()["changed"]) every picture counts as pending."""
     library_ids = list(library_ids)
-    result = {library_id: {"pictures": 0, "embedded": 0, "pending": 0}
+    result = {library_id: {"pictures": 0, "embedded": 0, "pending": 0, "views": 0}
               for library_id in library_ids}
     own = store is None
     if own:
@@ -772,6 +825,15 @@ def counts(conn, config, library_ids, store=None):
             entry["embedded"] += 1
         else:
             entry["pending"] += 1
+    options = settings(config)
+    if options["endpoint"] and options["opening_views"]:
+        try:
+            recipe_value = recipe(config, options)
+        except browser_model.ModelError:
+            recipe_value = None         # (cannot be told now: none counted)
+        if recipe_value is not None:
+            for row, _words, _key in views_pending(conn, options, library_ids, recipe_value):
+                result[row["library_id"]]["views"] += 1
     return result
 
 
@@ -790,7 +852,9 @@ class SizeError(ValueError):
 def _new_summary():
     return {"configured": False, "embedded": 0, "failed": 0, "up_to_date": 0, "pending": 0,
             "removed": 0, "offline": 0, "tokens": 0, "seconds": 0.0, "stopped": False,
-            "error": "", "changed": False, "rebuilt": 0, "probe": "", "dims": 0}
+            "error": "", "changed": False, "rebuilt": 0, "probe": "", "dims": 0,
+            "views": 0, "views_turned": 0, "views_failed": 0, "views_pending": 0,
+            "views_dropped": 0, "views_seconds": 0.0}
 
 
 def _served_check(reply, model_path):
@@ -904,11 +968,19 @@ def update(conn, config, ctx, library_ids=None, limit=None, servers=None, sleep=
     is committed. A picture without a stored preview whose library folder
     cannot be reached waits for a later run (offline).
 
+    Then the opening views of 360 photos are worked out (see the module
+    notes; also when every picture has its vector): views_pending were due,
+    views were worked out (views_turned of them face something other than
+    the front now), views_failed could not be (their preview cannot be read).
+    With "opening_views" off the automatic views are forgotten instead
+    (views_dropped: the pictures that open at the front again).
+
     Summary keys: configured, embedded, failed, up_to_date, pending,
     removed, offline, tokens, seconds, stopped, error, changed (the kept
     vectors need a rebuild), rebuilt (vectors thrown away for it), probe
     ("reference": stored as the reference now; "checked"; "off"; "mismatch":
-    the run stopped there; "" when nothing was embedded), dims.
+    the run stopped there; "" when nothing was embedded), dims, views,
+    views_turned, views_failed, views_pending, views_dropped.
     """
     summary = _new_summary()
     options = settings(config)
@@ -961,6 +1033,10 @@ def update(conn, config, ctx, library_ids=None, limit=None, servers=None, sleep=
             summary["rebuilt"] = reset(store, recipe_value, options["dims"])
             ctx.log(REBUILD_MISMATCH % summary["rebuilt"], "warn")
         summary["removed"] = purge(store, conn)
+        with conn:
+            opening_views.forget_unreferenced(conn)
+        if not options["opening_views"]:
+            summary["views_dropped"] = _drop_views(conn, ctx)
         have = stored_keys(store)
         todo, seen = [], set()
         for row in library_rows(conn, [library["id"] for library in libraries]):
@@ -979,25 +1055,31 @@ def update(conn, config, ctx, library_ids=None, limit=None, servers=None, sleep=
                                                  and row["has_preview"] != 1)]
         todo = _newest_first(todo, limit)
         summary["pending"] = len(todo)
-        if not todo:
+        views = views_pending(conn, options, [library["id"] for library in libraries],
+                              recipe_value)
+        summary["views_pending"] = len(views)
+        if not todo and not views:
             return summary
         roots = {library["id"]: common.library_root(library) for library in libraries}
         _run(store, endpoint, options, todo, ctx, summary, config, servers, sleep, helper,
-             roots, model_path, probe_value)
+             roots, model_path, probe_value, conn=conn, views=views)
     finally:
         store.close()
     return summary
 
 
 def _run(store, endpoint, options, todo, ctx, summary, config, servers, sleep, helper, roots,
-         model_path, probe_value):
-    """Embed todo (index rows) in batches (see update)."""
+         model_path, probe_value, conn=None, views=()):
+    """Embed todo (index rows) in batches, then work out the opening views of views
+    (views_pending; conn: the index.db connection) (see update)."""
     import cache
     import images
     import local_server
     started = time.monotonic()
-    ctx.stage("looks", total=len(todo))
-    ctx.log("Making the looks of %d picture(s) (%s)..." % (len(todo), endpoint["name"]))
+    timed = False       # (summary["seconds"]: the looks' own time, without the views')
+    if todo:
+        ctx.stage("looks", total=len(todo))
+        ctx.log("Making the looks of %d picture(s) (%s)..." % (len(todo), endpoint["name"]))
     lease = local_server.lease_for(ctx, config, [endpoint["name"]], manager=servers)
     previews = cache.PreviewStore()
     failures = []
@@ -1072,10 +1154,23 @@ def _run(store, endpoint, options, todo, ctx, summary, config, servers, sleep, h
                 write(store, rows, native, served)
                 summary["embedded"] += len(rows)
             ctx.step(len(batch))
+        # The looks' own line, before the opening views (which take their own time).
+        summary["seconds"] = round(time.monotonic() - started, 3)
+        timed = True
+        _log_made(ctx, summary, failures)
+        if views and conn is not None and not summary["stopped"] and not summary["error"]:
+            begun = time.monotonic()
+            _opening_views(conn, endpoint, options, views, ctx, summary, sleep, previews)
+            summary["views_seconds"] = round(time.monotonic() - begun, 3)
     finally:
         pool.shutdown(wait=True)
         lease.release()
-        summary["seconds"] = round(time.monotonic() - started, 3)
+        if not timed:
+            summary["seconds"] = round(time.monotonic() - started, 3)
+
+
+def _log_made(ctx, summary, failures):
+    """Log the pictures that could not be embedded and how long the looks took."""
     for image_id, error in failures[:FAILURE_LOG_LIMIT]:
         ctx.log("Picture %d could not be embedded: %s" % (image_id, error), "warn")
     if len(failures) > FAILURE_LOG_LIMIT:
@@ -1088,6 +1183,148 @@ def _run(store, endpoint, options, todo, ctx, summary, config, servers, sleep, h
         ctx.log("Made the looks of %d picture(s) in %.1f s (%.2f s a picture%s)%s." % (
             summary["embedded"], summary["seconds"], each, tokens,
             "; %d failed" % summary["failed"] if summary["failed"] else ""))
+
+
+def views_pending(conn, options, library_ids, recipe_value=""):
+    """The 360 photos whose opening view the run works out (opening_views.pending: a
+    view is worked out again for other words, another stitch, another model --
+    recipe_value, see recipe() -- or another text_prefix), or [] when
+    "opening_views" is off."""
+    if not options["opening_views"]:
+        return []
+    import images
+    return opening_views.pending(conn, library_ids, images.stitch_key(),
+                                 look_id(recipe_value) + "|" + options["text_prefix"])
+
+
+def _drop_views(conn, ctx):
+    """"opening_views" is off: forget the automatic opening views, and make the
+    thumbnails of the pictures that turned back to the front again. Returns how many
+    pictures that was."""
+    import cache
+    with conn:
+        ids = opening_views.drop_auto(conn)
+    if not ids:
+        return 0
+    previews = cache.PreviewStore()
+    with cache.ThumbStore() as thumbs:
+        for image_id in ids:
+            opening_views.remake_thumbnail(conn, image_id, previews, thumbs, commit=False)
+        thumbs.commit()
+    ctx.log("Opening views are off: %d 360 photo(s) open at the front again." % len(ids))
+    return len(ids)
+
+
+def _unit(vector):
+    length = math.sqrt(sum(value * value for value in vector))
+    return [value / length for value in vector] if length > 0 else list(vector)
+
+
+def _cosine(first, second):
+    return sum(a * b for a, b in zip(first, second))
+
+
+def _embed_words(endpoint, options, texts, ctx, sleep):
+    """The unit vectors of some words (options' text_prefix before each)."""
+    def on_retry(error, delay):
+        ctx.log("Looks: %s; trying again in %.0f s." % (error, delay), "warn")
+    reply = llm.embed_with_retries(endpoint, [options["text_prefix"] + text for text in texts],
+                                   model="", should_stop=ctx.should_stop, sleep=sleep,
+                                   on_retry=on_retry)
+    return [_unit(vector) for vector in reply["vectors"]]
+
+
+def _words_match(endpoint, options, ctx, sleep):
+    """True when the model matches words to pictures: each of PROBE_WORDS is closest to
+    its own probe picture. Raises ProviderError, images.ImageReadError."""
+    pictures = [jpeg for _name, jpeg in probe_pictures(options)]
+    seen = [_unit(vector) for vector in _embed(endpoint, pictures, ctx, sleep)["vectors"]]
+    words = _embed_words(endpoint, options, PROBE_WORDS, ctx, sleep)
+    if len(seen) != len(PROBE_NAMES) or len(words) != len(PROBE_WORDS):
+        return False
+    for index, word in enumerate(words):
+        scores = [_cosine(word, picture) for picture in seen]
+        if scores.index(max(scores)) != index:
+            return False
+    return True
+
+
+def _opening_views(conn, endpoint, options, views, ctx, summary, sleep, previews):
+    """Work out where the 360 photos of views (views_pending) open: their views
+    (images.heading_views) and words are embedded, opening_views.choose picks the view,
+    and the thumbnails of a picture whose view changed are made again. Stops (with the
+    summary's error) when the endpoint cannot be used."""
+    import cache
+    import images
+    try:
+        if not _words_match(endpoint, options, ctx, sleep):
+            ctx.log("Looks: the image model does not match words to pictures (the probe "
+                    "pictures and their words), so 360 photos keep opening at the front.",
+                    "warn")
+            return
+    except llm.ProviderError as error:
+        summary["stopped"] = ctx.should_stop()
+        if not summary["stopped"]:
+            ctx.log("Looks: the opening views of 360 photos cannot be worked out: %s"
+                    % llm.explain_error(error, endpoint), "warn")
+        return
+    except images.ImageReadError as error:
+        ctx.log("Looks: the probe pictures cannot be made: %s" % error, "warn")
+        return
+    ctx.stage("opening views", total=len(views))
+    thumbs = cache.ThumbStore()
+    try:
+        for row, text, key in views:
+            ctx.wait_if_paused()
+            if ctx.should_stop():
+                summary["stopped"] = True
+                break
+            try:
+                data = previews.read(row["library_id"], row["id"])
+                if not data:
+                    raise images.ImageReadError("its preview is missing")
+                shots = images.heading_views(data)
+            except (images.ImageReadError, OSError, ValueError) as error:
+                summary["views_failed"] += 1
+                ctx.log("Picture %d: its opening view cannot be worked out: %s"
+                        % (row["id"], common.redact(str(error))), "warn")
+                ctx.step()
+                continue
+            try:
+                seen = [_unit(vector) for vector in
+                        _embed(endpoint, [jpeg for _yaw, jpeg in shots], ctx, sleep)["vectors"]]
+                words = _embed_words(endpoint, options, [text], ctx, sleep)[0]
+            except llm.ProviderError as error:
+                if _per_item(error):
+                    summary["views_failed"] += 1
+                    ctx.step()
+                    continue
+                summary["stopped"] = ctx.should_stop()
+                if not summary["stopped"]:
+                    summary["error"] = llm.explain_error(error, endpoint)
+                    ctx.log(summary["error"], "error")
+                break
+            yaw = opening_views.choose([_cosine(words, vector) for vector in seen],
+                                       [yaw for yaw, _jpeg in shots])
+            content = opening_views.content_key(row["content_hash"], row["id"])
+            with conn:
+                changed = opening_views.store_auto(conn, content, yaw, 0.0, key)
+            if changed:
+                for image_id in opening_views.copies(conn, row["id"]):
+                    opening_views.remake_thumbnail(conn, image_id, previews, thumbs,
+                                                   commit=False)
+                thumbs.commit()
+            summary["views"] += 1
+            if yaw:
+                summary["views_turned"] += 1
+            ctx.step()
+    finally:
+        thumbs.close()
+    if summary["views"] or summary["views_failed"]:
+        ctx.log("Worked out where %d 360 photo(s) open: %d face what their words say, the "
+                "others the front%s." % (summary["views"], summary["views_turned"],
+                                         "; %d could not be" % summary["views_failed"]
+                                         if summary["views_failed"] else ""))
 
 
 def _mismatch(store, summary, ctx, message):

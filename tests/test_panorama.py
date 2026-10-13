@@ -663,13 +663,18 @@ class StitchSettingsTest(support.TempBaseMixin, unittest.TestCase):
 
     def test_options(self):
         defaults = {"nadir_fill_deg": images.NADIR_FILL_DEG,
-                    "zenith_fill_deg": images.ZENITH_FILL_DEG}
+                    "zenith_fill_deg": images.ZENITH_FILL_DEG, "level_horizon": True}
         self.assertEqual(images.stitch_options({}), defaults)
         self.assertEqual(images.stitch_options(None), defaults)
         for bad in ("10", True, -1, float("nan"), None, [5]):
             self.assertEqual(images.stitch_options({"nadir_fill_deg": bad}), defaults, bad)
         self.assertEqual(images.stitch_options({"nadir_fill_deg": 0, "zenith_fill_deg": 8}),
-                         {"nadir_fill_deg": 0.0, "zenith_fill_deg": 8.0})
+                         {"nadir_fill_deg": 0.0, "zenith_fill_deg": 8.0, "level_horizon": True})
+        # Levelling is off only when asked for (false), never by mistake.
+        self.assertIs(images.stitch_options({"level_horizon": False})["level_horizon"], False)
+        for value in (0, "no", None, [False]):
+            self.assertIs(images.stitch_options({"level_horizon": value})["level_horizon"],
+                          True, value)
         self.assertEqual(images.stitch_options({"nadir_fill_deg": 500})["nadir_fill_deg"],
                          images.POLE_FILL_MAX)
 
@@ -679,11 +684,15 @@ class StitchSettingsTest(support.TempBaseMixin, unittest.TestCase):
         self.assertTrue(default_key.startswith("%d " % images.STITCH_VERSION), default_key)
         self.base.write_config([], nadir_fill_deg=5, zenith_fill_deg=7.5)
         self.assertEqual(images.stitch_settings(),
-                         {"nadir_fill_deg": 5.0, "zenith_fill_deg": 7.5})
+                         {"nadir_fill_deg": 5.0, "zenith_fill_deg": 7.5, "level_horizon": True})
         self.assertNotEqual(images.stitch_key(), default_key)
         self.assertEqual(images.stitch_key({"nadir_fill_deg": images.NADIR_FILL_DEG,
                                             "zenith_fill_deg": images.ZENITH_FILL_DEG}),
                          default_key)
+        # Turning levelling off stitches them again too.
+        self.base.write_config([], level_horizon=False)
+        self.assertFalse(images.stitch_settings()["level_horizon"])
+        self.assertEqual(images.stitch_key(), default_key + " flat")
         # A broken config.json: the defaults, no error.
         self.base.write_file("config.json", "{not json")
         self.assertEqual(images.stitch_settings()["nadir_fill_deg"], images.NADIR_FILL_DEG)
@@ -692,7 +701,7 @@ class StitchSettingsTest(support.TempBaseMixin, unittest.TestCase):
         # On clean ground a fill only leaves a grey disc: it is off unless
         # config.json asks for it.
         self.assertEqual(images.stitch_settings(),
-                         {"nadir_fill_deg": 0.0, "zenith_fill_deg": 0.0})
+                         {"nadir_fill_deg": 0.0, "zenith_fill_deg": 0.0, "level_horizon": True})
         self.assertEqual(images.stitch_key(), "%d n0 z0" % images.STITCH_VERSION)
         # Photos stitched with the fill the default used to have get
         # another key, so they are stitched again (see scan._restitch_ids).
@@ -809,9 +818,9 @@ class ReadImage360Test(unittest.TestCase):
         calls = []
         real = images.dual_fisheye_to_equirect
 
-        def spy(image, out_width=images.PREVIEW_EDGE, params=params):
+        def spy(image, out_width=images.PREVIEW_EDGE, params=params, **kwargs):
             calls.append((image.size, out_width))
-            return real(image, out_width, params)
+            return real(image, out_width, params, **kwargs)
         with mock.patch.object(images, "dual_fisheye_to_equirect", spy):
             result = images.read_image(path, want_pano=True)
         # One decode at full size and one stitch at the pano's width: the

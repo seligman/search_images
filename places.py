@@ -49,6 +49,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import zipfile
@@ -108,6 +109,10 @@ COMMIT_ROWS = 500
 # its name; a few towns have a region code the region file does not list.)
 MAX_UNNAMED_COUNTRIES = 0.05
 MAX_UNNAMED_REGIONS = 0.2
+
+# Towns a name search (PlaceIndex.find_towns) lists at most.
+FIND_LIMIT = 8
+FIND_MIN_CHARS = 2
 
 _NAME_SPACE_RE = re.compile(r"[\s|]+")
 _CC_RE = re.compile(r"^[A-Z]{2}$")
@@ -612,6 +617,8 @@ class PlaceIndex:
             raise PlacesError("%s holds no towns." % path)
         self.path = path
         self._memo = {}
+        self._search = None             # (folded names, populations), made when first wanted
+        self._search_lock = threading.Lock()
 
     def __len__(self):
         return len(self.names)
@@ -655,6 +662,57 @@ class PlaceIndex:
                 "country": country, "cc": cc, "lat": math.degrees(self.lat[index]),
                 "lon": math.degrees(self.lon[index])}
 
+    def _search_lists(self):
+        """(folded names, populations) in town order, read once (see find_towns)."""
+        with self._search_lock:
+            if self._search is None:
+                try:
+                    conn = db.connect_readonly(self.path)
+                except db.DatabaseError as error:
+                    raise PlacesError(str(error))
+                try:
+                    population = array.array("i", (row[0] for row in conn.execute(
+                        "SELECT population FROM cities ORDER BY cell, id")))
+                except sqlite3.Error as error:
+                    raise PlacesError("Could not read %s: %s" % (self.path, error))
+                finally:
+                    conn.close()
+                self._search = ([fold(name) for name in self.names], population)
+            return self._search
+
+    def find_towns(self, text, limit=FIND_LIMIT):
+        """The towns whose names start with text, most people first (a name that is all of
+        text before the others): [town() dicts with "population"].
+
+        "Name, Region" (or "Name, Country") also wants the region or the
+        country (its name, or its code) to start with what follows the
+        comma. Case, accents and repeated spaces do not matter. Fewer than
+        FIND_MIN_CHARS letters find nothing.
+        """
+        parts = [fold(part) for part in str(text or "").split(",")]
+        parts = [part for part in parts if part]
+        if not parts or len(parts[0]) < FIND_MIN_CHARS:
+            return []
+        names, population = self._search_lists()
+        wanted, rest = parts[0], parts[1:]
+        found = []
+        for index, name in enumerate(names):
+            if not name.startswith(wanted):
+                continue
+            if rest:
+                town = self.town(index)
+                where = (fold(town["region"]), fold(town["country"]), town["cc"].casefold())
+                if not all(any(value.startswith(part) for value in where) for part in rest):
+                    continue
+            found.append((name != wanted, -population[index], self.names[index], index))
+        found.sort()
+        result = []
+        for _not_exact, people, _name, index in found[:max(0, int(limit))]:
+            town = self.town(index)
+            town["population"] = -people
+            result.append(town)
+        return result
+
     def columns(self, lat, lon):
         """The place columns (see the module notes) of a usable position."""
         key = (lat, lon)
@@ -674,6 +732,13 @@ class PlaceIndex:
             self._memo.clear()
         self._memo[key] = found
         return dict(found)
+
+
+def fold(text):
+    """A name as a search compares it: no accents, single spaces, any case."""
+    decomposed = unicodedata.normalize("NFKD", str(text or ""))
+    return " ".join("".join(char for char in decomposed
+                            if not unicodedata.combining(char)).casefold().split())
 
 
 def empty_columns():
@@ -805,7 +870,9 @@ def status(conn=None):
     pictures with a GPS position of every library -- what the places job
     looks up (when conn, an index.db connection, is given) -- and then
     also "gps_ignored", the present pictures whose position the GPS check
-    set aside (gps_check.py: they count nowhere else).
+    set aside (gps_check.py: they count nowhere else), and "estimates"
+    (place_estimates.status: the pictures without a position that have an
+    estimated place, or one the owner set).
     """
     result = {"available": False, "cities": 0, "built": None, "source": "", "error": "",
               "rebuild": False, "attribution_url": ATTRIBUTION_URL,
@@ -840,6 +907,8 @@ def status(conn=None):
         result["gps_ignored"] = conn.execute(
             "SELECT COUNT(*) FROM gps_checks AS g JOIN images AS i ON i.id = g.image_id "
             "WHERE g.ignored = 1 AND i.lat IS NULL AND i.missing_since IS NULL").fetchone()[0]
+        import place_estimates
+        result["estimates"] = place_estimates.status(conn)
     return result
 
 

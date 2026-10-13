@@ -56,6 +56,20 @@ def scripts_of(html):
     return re.findall(r'<script[^>]*\ssrc="([^"]+)"', html)
 
 
+def media_blocks(css):
+    """[(query, body)] of the @media blocks of a style sheet, in order (the query
+    with its spaces as written; comments left out)."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    found = []
+    for match in re.finditer(r"@media\s+([^{]+)\{", css):
+        depth, at = 1, match.end()
+        while depth and at < len(css):
+            depth += {"{": 1, "}": -1}.get(css[at], 0)
+            at += 1
+        found.append((match.group(1).strip(), css[match.end():at - 1]))
+    return found
+
+
 def run_node(*args, script=NODE_TESTS):
     result = subprocess.run([NODE, script] + list(args), cwd=support.REPO,
                             capture_output=True, timeout=300)
@@ -200,6 +214,36 @@ class PageScriptSourceTest(unittest.TestCase):
         self.assertRegex(app, r"var BLOCK_TILES = \d+;")
         self.assertIn("clear(block.node);", app)
 
+    def test_touch_targets_of_the_map_and_the_drive_strip(self):
+        # On a touch screen the map's toggles ("Show estimated places",
+        # "Show drive routes") and a drive's "Sped up" / "Full speed" are
+        # 40 px to the finger, as every other control.
+        css = read(STATIC, "style.css")
+        rules = {}
+        for query, body in media_blocks(css):
+            if query != "(pointer: coarse)":
+                continue
+            for selectors, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", body):
+                for selector in selectors.split(","):
+                    rules.setdefault(selector.strip(), []).append(declarations)
+        for selector in (".map-toggle", ".drive-mode"):
+            heights = [int(value) for declarations in rules.get(selector, [])
+                       for value in re.findall(r"min-height:\s*(\d+)px", declarations)]
+            self.assertTrue(heights and max(heights) >= 40, selector)
+
+    def test_a_small_pane_is_the_same_for_the_viewer_and_its_style(self):
+        # The viewer puts a drive's route map under the title in a small pane
+        # (COMPACT_QUERY), and style.css makes that map lower there.
+        code = read(STATIC, "viewer.js")
+        found = re.search(r'var COMPACT_QUERY = ((?:"[^"]*"\s*\+?\s*)+);', code)
+        query = "".join(re.findall(r'"([^"]*)"', found.group(1)))
+        css = read(STATIC, "style.css")
+        blocks = [body for media, body in media_blocks(css)
+                  if " ".join(media.split()) == query]
+        self.assertTrue(any(re.search(r"\.route-map-canvas\s*\{[^}]*height:\s*1[0-4]\dpx",
+                                      body) for body in blocks), query)
+        self.assertIn("compact: compactPane()", code)
+
 
 @unittest.skipIf(NODE is None, "Node.js is not installed")
 class PageScriptNodeTest(unittest.TestCase):
@@ -328,7 +372,8 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
     def test_search_page_loads_the_engine_and_the_viewer_first(self):
         html = self.page("/?q=beach&type=photo#id=3")
         self.assertEqual(scripts_of(html), ["/static/site.js", "/static/shell.js",
-                                            "/static/search-core.js", "/static/viewer.js",
+                                            "/static/search-core.js", "/static/routes.js",
+                                            "/static/viewer.js",
                                             "/static/app.js"])
         for element in ("query", "syntax-help", "sort", "group", "size", "facets",
                         "facet-list", "active-filters", "selection-bar", "index-banner",
@@ -341,7 +386,8 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
     def test_detail_page_uses_the_viewer(self):
         html = self.page("/detail?id=12&q=dog")
         self.assertEqual(scripts_of(html), ["/static/site.js", "/static/shell.js",
-                                            "/static/search-core.js", "/static/viewer.js",
+                                            "/static/search-core.js", "/static/routes.js",
+                                            "/static/viewer.js",
                                             "/static/detail.js"])
         for element in ("back", "detail-stage", "detail-tools", "detail-info",
                         "detail-message"):
@@ -351,7 +397,8 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
     def test_map_page_searches_too(self):
         html = self.page("/map?q=beach&view=10,20,3")
         self.assertEqual(scripts_of(html), ["/static/site.js", "/static/shell.js",
-                                            "/static/search-core.js", "/static/viewer.js",
+                                            "/static/search-core.js", "/static/routes.js",
+                                            "/static/viewer.js",
                                             "/static/map.js"])
         for element in ("map-search", "map-status", "map-canvas", "map-message", "map-panel",
                         "map-panel-title", "map-panel-grid", "map-panel-list", "map-panel-more",

@@ -678,10 +678,14 @@
                     "picture") + " whose description is new or changed, so search by " +
                     "meaning and More like this find them (" + meaningSetup.endpoint + ")"));
         }
-        if (looksInfo && looksSetup.configured && (looksInfo.pending || looksSetup.mismatch)) {
+        if (looksInfo && looksSetup.configured &&
+                (looksInfo.pending || looksInfo.views || looksSetup.mismatch)) {
             var rebuild = Boolean(looksSetup.changed || looksSetup.mismatch);
+            // (Only opening views of 360 photos to work out: said so.)
+            var looksCount = rebuild ? fmt.number(looksInfo.pictures) : looksInfo.pending
+                ? fmt.number(looksInfo.pending) : fmt.plural(looksInfo.views, "opening view");
             actions.appendChild(jobButton((rebuild ? "Rebuild looks (" : "Update looks (") +
-                fmt.number(rebuild ? looksInfo.pictures : looksInfo.pending) + ")", "",
+                looksCount + ")", "",
                 "image_embed", rebuild ? {rebuild: true} : {}, lib.id + ":looks",
                 off || !looksSetup.ready, !looksSetup.ready ? looksSetup.problem :
                     looksSetup.mismatch ? "The image model makes other vectors of the probe " +
@@ -689,10 +693,14 @@
                     "attention off), throw away the reference and the kept looks and make " +
                     "them again" : rebuild ?
                     "The looks were made with other settings (another model, dims or picture " +
-                    "size): throw them all away and make them again" :
+                    "size): throw them all away and make them again" : !looksInfo.pending ?
+                    "Work out where " + fmt.plural(looksInfo.views, "described 360 photo") +
+                    " open (their words against views of them, " + looksSetup.endpoint + ")" :
                     "Make the image vectors of the " + fmt.plural(looksInfo.pending, "picture") +
                     " that have none, so Looks like this and search by an example picture " +
-                    "find them (" + looksSetup.endpoint + "; best on a GPU)"));
+                    "find them (" + looksSetup.endpoint + "; best on a GPU)" +
+                    (looksInfo.views ? "; and work out where " +
+                     fmt.plural(looksInfo.views, "described 360 photo") + " open" : "")));
         }
         if (lib.previews !== false) {
             actions.appendChild(jobButton("Build previews", "", "previews", {},
@@ -2562,12 +2570,21 @@
             // What each picture carries
             var details = {};
             var detailList = el("div", {className: "export-choices two"});
-            ["file_names", "folders", "location", "similar", "meaning",
-             "looks", "marks"].forEach(function (key) {
+            // (Estimated places and drive routes go only with the location.)
+            function estimatedAvailability() {
+                details.estimated_places.input.disabled = !details.location.input.checked;
+                details.routes.input.disabled = !details.location.input.checked;
+            }
+            ["file_names", "folders", "location", "estimated_places", "routes", "similar",
+             "meaning", "looks", "marks"].forEach(function (key) {
                 details[key] = check(R.OPTIONS[key].label, opts[key], R.OPTIONS[key].hint);
+                if (key === "location") {
+                    details[key].input.addEventListener("change", estimatedAvailability);
+                }
                 details[key].input.addEventListener("change", changed);
                 detailList.appendChild(details[key].node);
             });
+            estimatedAvailability();
             // Search by meaning in the browser: on (as saved) only when it can
             // go; otherwise off, with the reason (the saved choice is kept).
             var meaningReason = el("span", {className: "field-hint field-reason", hidden: true});
@@ -2813,6 +2830,14 @@
             if (drivesNote) {
                 holder.appendChild(el("p", {className: "muted", text: drivesNote}));
             }
+            var routesNote = R.routesText(counts);
+            if (routesNote) {
+                holder.appendChild(el("p", {className: "muted", text: routesNote}));
+            }
+            var overlayNote = R.overlayText(counts);
+            if (overlayNote) {
+                holder.appendChild(notice("warn", overlayNote));
+            }
             if (counts.unavailable) {
                 holder.appendChild(notice("error", "The folder of " + lib.name + " cannot be " +
                     "read right now (offline?), and " + fmt.plural(counts.unavailable,
@@ -2878,7 +2903,7 @@
                 el("a", {className: "export-thumb", href: SITE.detailUrl(item.id),
                          target: "_blank", rel: "noopener",
                          title: "Open \u201c" + name + "\u201d in a new tab"}, [
-                    el("img", {src: SITE.thumbUrl(item.id), alt: name, loading: "lazy"})
+                    el("img", {src: SITE.thumbUrl(item), alt: name, loading: "lazy"})
                 ]),
                 el("div", {className: "export-tile-title", text: name, title: name}),
                 el("div", {className: "export-tile-reasons", text: R.reasonWords(item.reasons)}),

@@ -42,7 +42,8 @@ once (redate_videos). Without ffmpeg, videos are listed but not read
 
 After the scan, the GPS check (gps_check.py) sets aside GPS positions that
 cannot be where a picture was taken (a stale fix, or one the pictures taken
-around the same time contradict).
+around the same time contradict), and the places of the pictures without a
+usable position are estimated again (place_estimates.py).
 
 Then the describe step (describe.py) runs for images without a description,
 and, when search by meaning is set up (config.json "embedding"), the embed
@@ -92,8 +93,10 @@ import jobs
 import llm
 import looks
 import not_duplicates
+import opening_views
 import places
 import prompts
+import tracks
 import videos
 
 COMMIT_ROWS = 100           # commit after this many written rows...
@@ -400,9 +403,10 @@ def _missing_decoder(error):
 
 
 def video_options(video, library):
-    """What _read_original needs to read a library's videos: {tools, sheet_edge, frames}."""
+    """What _read_original needs to read a library's videos: {tools, sheet_edge, frames,
+    tracks (read their GPS tracks: config "gps_tracks")}."""
     return {"tools": video.tools, "sheet_edge": video.sheet_edge(library),
-            "frames": video.frames}
+            "frames": video.frames, "tracks": tracks.settings(video.config)["enabled"]}
 
 
 def _read_original(root, rel, helper, want_previews, mtime, video=None):
@@ -410,7 +414,10 @@ def _read_original(root, rel, helper, want_previews, mtime, video=None):
 
     With previews, a 360-degree photo also gets its pano (see cache.PreviewStore).
     A video is read by videos.read_video() with video (video_options): its
-    poster is the preview and, with previews, it gets a contact sheet.
+    poster is the preview and, with previews, it gets a contact sheet; and
+    (unless a 360 video) its GPS track is read (tracks.apply_to_result: the
+    result gets "track", None for none; no "track" when the file could not
+    be read for it, so read_tracks tries again).
     Videos are read from the file itself (the helper's hooks are for
     pictures).
     """
@@ -418,10 +425,16 @@ def _read_original(root, rel, helper, want_previews, mtime, video=None):
     try:
         if common.is_video_file(rel):
             video = video or {}
-            return videos.read_video(full, video.get("tools"), want_preview=want_previews,
-                                     mtime=mtime, sheet_edge=video.get("sheet_edge")
-                                     or common.DEFAULT_MAX_IMAGE_EDGE,
-                                     frames=video.get("frames") or videos.DEFAULT_FRAMES), None
+            result = videos.read_video(full, video.get("tools"), want_preview=want_previews,
+                                       mtime=mtime, sheet_edge=video.get("sheet_edge")
+                                       or common.DEFAULT_MAX_IMAGE_EDGE,
+                                       frames=video.get("frames") or videos.DEFAULT_FRAMES)
+            if video.get("tracks") and result.get("projection") not in images.PROJECTIONS_360:
+                try:
+                    tracks.apply_to_result(result, tracks.read_track(full))
+                except OSError:
+                    pass        # (read_tracks tries again)
+            return result, None
         return images.read_image(full, helper, want_preview=want_previews, mtime=mtime,
                                  want_pano=want_previews), None
     except Exception as error:
@@ -463,6 +476,53 @@ def _update_row(conn, image_id, values, extra=""):
         assignments += ", " + extra
     conn.execute("UPDATE images SET %s WHERE id = ?" % assignments,
                  [values[column] for column in columns] + [image_id])
+
+
+def _store_track(conn, image_id, result, tally=None):
+    """Keep the GPS track read with a video (tracks.store; nothing when it was not read),
+    and count it in tally (a _TrackTally, optional)."""
+    if "track" in result:
+        facts = tracks.store(conn, gps_check.content_key(result["content_hash"], image_id),
+                             result["track"], result.get("duration"))
+        if tally is not None:
+            tally.add(facts, result.get("taken_at"))
+
+
+class _TrackTally:
+    """What the GPS tracks read with videos say, for the log (tracks_line): how many
+    videos were read, how many have a track, and the UTC offsets of their clocks by
+    the GPS time (tracks.clock_offset; None: off a whole quarter hour)."""
+
+    def __init__(self):
+        self.checked = 0
+        self.found = 0
+        self.offsets = collections.Counter()
+
+    def add(self, facts, taken_at):
+        self.checked += 1
+        if facts.fixes:
+            self.found += 1
+            self.offsets[tracks.clock_offset(facts.start, taken_at,
+                                             gps_check.local_seconds)[0]] += 1
+
+    def line(self, label):
+        """The log line, or "" when no video read had a track."""
+        if not self.found:
+            return ""
+        return tracks_line(label, self.found, self.checked, self.offsets)
+
+
+def tracks_line(label, found, checked, offsets, placed=0, failed=0):
+    """"GPS tracks: 12 of 14 video(s) read in Trip have one; by the GPS time their clocks
+    are at UTC+02:00 (12 videos)." (offsets: a Counter of tracks.clock_offset minutes)."""
+    text = "GPS tracks: %d of %d video(s) read in %s have one" % (found, checked, label)
+    if placed:
+        text += " (%d now have its position)" % placed
+    if offsets:
+        text += "; by the GPS time their clocks are at " + tracks.clock_words(offsets)
+    if failed:
+        text += "; %d could not be read (tried again next time)" % failed
+    return text + "."
 
 
 def _delete_preview(previews, library_id, image_id, ctx):
@@ -538,7 +598,8 @@ class _CommitTimer:
     def commit(self):
         # Thumbnails first: a committed row then always has its thumbnail, or
         # is read again on the next scan.
-        self.thumbs.commit()
+        if self.thumbs is not None:
+            self.thumbs.commit()
         self.conn.commit()
         self.pending = 0
         self.last = time.monotonic()
@@ -693,6 +754,7 @@ class LibraryScan:
         self.rekeyed = {}
         self.unsupported_logged = set()
         self.logged = collections.Counter()
+        self.track_tally = _TrackTally()
         self.timer = None
         self.summary = {
             "library_id": self.library_id, "name": self.label, "offline": False,
@@ -812,6 +874,10 @@ class LibraryScan:
             # wrong with the videos.)
             ctx.log("%d video(s) in %s were not read. %s" % (
                 self.summary["videos_skipped"], self.label, self.video.problem()))
+        # (What the GPS tracks of the videos read say about their clocks.)
+        tracks_said = self.track_tally.line(self.label)
+        if tracks_said:
+            ctx.log(tracks_said)
         ctx.log(self._summary_line())
         return self.summary
 
@@ -1049,7 +1115,10 @@ class LibraryScan:
         if rel in self.failures:
             self.conn.execute("DELETE FROM read_failures WHERE library_id = ? AND path = ?",
                               (self.library_id, rel))
-        self.thumbs.put(image_id, result["thumb"], commit=False)
+        _store_track(self.conn, image_id, result, self.track_tally)
+        # (A 360 picture's thumbnail shows its opening view.)
+        self.thumbs.put(image_id, opening_views.scanned_thumbnail(
+            self.conn, image_id, metadata["content_hash"], result), commit=False)
         self.thumb_ids.add(image_id)
         if preview is not None:
             try:
@@ -1583,7 +1652,8 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     360 photos with a preview but no pano (stored before panos were made;
     only those larger than their preview get one, see images.has_pano),
     and unstitched 360 photos stitched by an older version or with other
-    pole fill settings (see _restitch_ids; their descriptions are kept).
+    pole fill settings (see _restitch_ids; their descriptions are kept,
+    their looks are made again by the next looks run: looks.forget).
     Videos with a preview but no contact sheet, or one made for another
     "video_frames" setting, are read again for one (video is a
     videos.Setup, default: one for config.json; without ffmpeg videos are
@@ -1591,9 +1661,11 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     Rows of files the ignore patterns now exclude are left alone. It runs
     as stage "previews", can be stopped at any point and continues where
     it left off. Then the dates of the videos the current rules may date
-    otherwise are read again (redate_videos). Returns a summary dict:
+    otherwise are read again (redate_videos), and the GPS tracks of videos
+    whose track was never read (read_tracks). Returns a summary dict:
     {needed, filled, failed, changed, unsupported, aborted, panoramas,
-    panos, restitched, redated (redate_videos's, unless it stopped)}.
+    panos, restitched, redated (redate_videos's, unless it stopped), tracks
+    (read_tracks's, unless it stopped)}.
     """
     own_thumbs = thumbs is None
     thumbs = thumbs or cache.ThumbStore()
@@ -1603,6 +1675,8 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
         summary = _backfill(conn, library, ctx, helper, thumbs, previews, threads, video)
         if not summary["aborted"] and not ctx.should_stop():
             summary["redated"] = redate_videos(conn, library, ctx, video)
+        if not summary["aborted"] and not ctx.should_stop():
+            summary["tracks"] = read_tracks(conn, library, ctx, video, threads)
         return summary
     finally:
         if own_thumbs:
@@ -1686,6 +1760,97 @@ def redate_videos(conn, library, ctx, video):
     return summary
 
 
+def read_tracks(conn, library, ctx, video=None, threads=6):
+    """Read the GPS tracks (tracks.py) of a library's videos whose track was never read
+    (indexed before tracks were read, or when the file could not be read for it): only
+    the file's header and its GPS blocks are read, a few small reads per video, and no
+    program runs. A video with a track gets the position of its middle fix and its
+    clock's UTC offset when it has none (tracks.row_values); the log says how many have
+    a track and what offsets their clocks have by the GPS time. With "gps_tracks" off
+    in config.json (video.config) the positions tracks gave are taken away instead.
+    Videos with a kept track and no position (not one the GPS check set aside: tracks
+    that were off) get their track's position again. Files that cannot be read now are
+    tried again by the next run. Returns {"checked", "found", "placed", "failed",
+    "removed", "offsets": {"-08:00" (or "" for a clock off the GPS time): videos},
+    "aborted"}."""
+    video = video if video is not None else videos.setup()
+    summary = {"checked": 0, "found": 0, "placed": 0, "failed": 0, "removed": 0,
+               "offsets": {}, "aborted": False}
+    library_id = library["id"]
+    label = common.library_label(library)
+    if not tracks.settings(video.config)["enabled"]:
+        for row in tracks.position_rows(conn, library_id):
+            values = {"lat": None, "lon": None, "updated": time.time()}
+            values.update(places.empty_columns())
+            _update_row(conn, row["id"], values)
+            summary["removed"] += 1
+        conn.commit()
+        if summary["removed"]:
+            ctx.log("%d video(s) in %s no longer have the position of their GPS track "
+                    "(\"gps_tracks\" is off)." % (summary["removed"], label))
+        return summary
+    # Tracks kept while they were off (or of videos that lost their position
+    # another way, not by the GPS check): theirs again.
+    for row, facts in tracks.unplaced_rows(conn, library_id):
+        values = tracks.row_values(row, facts)
+        if values:
+            values["updated"] = time.time()
+            _update_row(conn, row["id"], values)
+            summary["placed"] += 1
+    conn.commit()
+    patterns = common.ignore_patterns(library)
+    rows = [row for row in tracks.candidates(conn, library_id)
+            if not excluded_by_ignores(row["path"], patterns)]
+    if not rows:
+        if summary["placed"]:
+            ctx.log("%d video(s) in %s have the position of their GPS track again."
+                    % (summary["placed"], label))
+        return summary
+    ctx.stage("tracks", total=len(rows))
+    ctx.log("Reading the GPS tracks of %d video(s) in %s" % (len(rows), label))
+    root = common.library_root(library)
+    offsets = collections.Counter()
+    timer = _CommitTimer(conn, None)
+
+    def read(row):
+        try:
+            return tracks.read_track(os.path.join(root, *row["path"].split("/"))), None
+        except OSError as error:
+            return None, error
+
+    def handle(row, outcome):
+        track, error = outcome
+        if error is not None:
+            summary["failed"] += 1
+        else:
+            facts = tracks.store(conn, tracks.content_key(row), track, row["duration"])
+            summary["checked"] += 1
+            if facts.fixes:
+                summary["found"] += 1
+                offsets[tracks.clock_offset(facts.start, row["taken_at"],
+                                            gps_check.local_seconds)[0]] += 1
+                values = tracks.row_values(row, facts)
+                if values:
+                    summary["placed"] += 1 if "lat" in values else 0
+                    values["updated"] = time.time()
+                    _update_row(conn, row["id"], values)
+            timer.wrote()
+        ctx.step(item=row["path"])
+
+    try:
+        summary["aborted"] = _parallel_reads(threads, rows, read, handle, ctx.should_stop, ctx,
+                                             timer.flush)
+    finally:
+        timer.commit()
+    tracks.prune(conn)
+    conn.commit()
+    summary["offsets"] = {("" if minutes is None else tracks.offset_text(minutes)): count
+                          for minutes, count in offsets.items()}
+    ctx.log(tracks_line(label, summary["found"], summary["checked"], offsets,
+                        summary["placed"], summary["failed"]))
+    return summary
+
+
 def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
     library_id = library["id"]
     root = common.library_root(library)
@@ -1694,6 +1859,7 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
     summary = {"needed": 0, "filled": 0, "failed": 0, "changed": 0, "unsupported": 0,
                "aborted": False, "panoramas": 0, "panos": 0, "restitched": 0}
     redescribe = []
+    tally = _TrackTally()
     on_disk, panos_on_disk, sheets_on_disk = previews.stored_sets(library_id)
     read_videos = video.tools is not None and common.library_videos(library)
     video_read = video_options(video, library)
@@ -1749,6 +1915,7 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
     timer = _CommitTimer(conn, thumbs)
     unsupported_logged = set()
     rekeyed = {}                # not_duplicates keys that change (see LibraryScan)
+    relook = []                 # (content hash, kind) of pictures stitched again
 
     def read(row):
         return _read_original(root, row["path"], read_helper, want_previews, row["mtime"],
@@ -1756,6 +1923,7 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
 
     def handle(row, outcome):
         result, error = outcome
+        stitched_again = row["id"] in restitch
         # A file that could not be read for now (a share that went away)
         # stays pending; one read, changed since, or bad for good is done.
         if row["id"] in restitch and not isinstance(error, images.SourceReadError):
@@ -1801,7 +1969,12 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
                         _store_sheet(previews, library_id, row["id"], result.get("sheet"),
                                      ctx, row["path"])
             _update_row(conn, row["id"], values)
-            thumbs.put(row["id"], result["thumb"], commit=False)
+            _store_track(conn, row["id"], result, tally)
+            thumbs.put(row["id"], opening_views.scanned_thumbnail(
+                conn, row["id"], result["content_hash"], result), commit=False)
+            if stitched_again and values["projection"] == images.PROJECTION_DUAL_FISHEYE:
+                # (Its looks were made of the panorama stitched before.)
+                relook.append((result["content_hash"], looks.kind_of(values)))
             summary["filled"] += 1
             if (values["projection"] in images.PROJECTIONS_360
                     and values["media"] != videos.MEDIA_VIDEO):
@@ -1819,6 +1992,9 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
         if pending_before:
             save_stitch_state(conn, library_id, stitch_key, restitch)
         timer.commit()
+        if relook and looks.forget(relook):
+            ctx.log("The looks of %d picture(s) stitched again are made again by the next "
+                    "Update looks." % len(set(relook)))
         if rekeyed:
             # Imported rows found their content hash: their pairs follow.
             try:
@@ -1826,6 +2002,9 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
             except OSError as error:
                 ctx.log("Could not update %s: %s" % (not_duplicates.FILE_NAME,
                                                      _error_text(error)), "warn")
+    tracks_said = tally.line(common.library_label(library))
+    if tracks_said:
+        ctx.log(tracks_said)
     if summary["panoramas"]:
         made = (" (%d with a large panorama for the 360 view)" % summary["panos"]
                 if want_previews else "")
@@ -1862,11 +2041,13 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
     (gps_check.run) looks at the positions of every library's pictures. Returns
     {"libraries": [scan summaries], "gps_check": its summary (when it
     ran), "describe": describe summary or None, "embed": embed summary or
-    None, "looks_pending": pictures without looks (None when looks are
-    off), "stopped": bool}.
+    None, "looks_pending": pictures without looks and "views_pending": 360
+    photos whose opening view is due (both None when looks are off),
+    "stopped": bool}.
     """
     libraries = describe.selected_libraries(config, library_ids)
     summary = {"libraries": [], "describe": None, "embed": None, "looks_pending": None,
+               "views_pending": None,
                "stopped": False}
     threads = reader_threads(config)
     video = videos.setup(config)
@@ -1931,8 +2112,8 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
             if summary["embed"] is not None and summary["embed"]["stopped"]:
                 summary["stopped"] = True
         if scan_images and not summary["stopped"]:
-            summary["looks_pending"] = looks_pending(conn, config, ctx, [
-                library["id"] for library in libraries])
+            summary["looks_pending"], summary["views_pending"] = looks_waiting(
+                conn, config, ctx, [library["id"] for library in libraries])
     finally:
         if own_conn:
             conn.close()
@@ -1944,17 +2125,28 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
 def looks_pending(conn, config, ctx, library_ids):
     """How many pictures of these libraries have no looks yet (logged when some do),
     or None when looks are not set up."""
+    return looks_waiting(conn, config, ctx, library_ids)[0]
+
+
+def looks_waiting(conn, config, ctx, library_ids):
+    """(pictures of these libraries without looks yet, 360 photos whose opening view
+    is due: see looks.counts), logged when some are; (None, None) when looks are not
+    set up."""
     if not looks.configured(config):
-        return None
+        return None, None
     try:
         counted = looks.counts(conn, config, library_ids)
     except (sqlite3.Error, OSError):
-        return None
+        return None, None
     pending = sum(entry["pending"] for entry in counted.values())
+    views = sum(entry.get("views", 0) for entry in counted.values())
     if pending:
         ctx.log("Looks: %d picture(s) have none yet: Update looks on the Manage page (or run "
                 "scan.py --embed-images) when the image model can run." % pending)
-    return pending
+    if views:
+        ctx.log("Opening views: %d 360 photo(s) wait for theirs: Update looks works them out "
+                "(scan.py --embed-images)." % views)
+    return pending, views
 
 
 def run_looks(config, ctx, library_ids, limit=None, rebuild=False, helper=None):

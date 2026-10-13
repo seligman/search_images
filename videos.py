@@ -68,6 +68,7 @@ import time
 
 import common
 import imageinfo
+import insta360
 
 # Frames on a contact sheet (the "video_frames" setting, 1 to MAX_FRAMES).
 DEFAULT_FRAMES = 4
@@ -1176,7 +1177,11 @@ def make_sheet(tools, path, info, edge, count=DEFAULT_FRAMES, poster_frame=None,
 # stitches each frame the same way (the lens geometry is kept in the facts:
 # "fisheye"). The videos of a camera whose lenses are not known here are read
 # as ordinary videos (the picture of one lens). An LRV and a second lens's
-# file are never indexed on their own (is_companion).
+# file are never indexed on their own (is_companion). The camera's motion
+# sensor says which way was up as it recorded (insta360.level_track, kept
+# in the facts as "level"): the poster and the sheet's frames are turned
+# level with it, and so is each frame the viewer shows (unless the
+# "level_horizon" setting is off).
 
 PROJECTION_360 = imageinfo.PROJECTION_DUAL_FISHEYE
 INSV_EXTENSION = ".insv"
@@ -1517,11 +1522,13 @@ class Video360:
     width x height the panorama's full size: twice a lens's width by its
     width (7680 x 3840 for two 3840 px lenses), as the original's stitched
     panorama would be. The lens circles and gains of the stitches are kept
-    for the player (fisheye()).
+    for the player (fisheye()). level is the video's level track
+    (insta360.level_track), or None: when levelling is on, each panorama
+    grab() makes is turned level for its time.
     """
 
     def __init__(self, tools, path, info, layout, camera, lrv=None, lrv_info=None,
-                 stream_width=0, second=None):
+                 stream_width=0, second=None, level=None):
         self.tools = tools
         self.path = path
         self.layout = layout
@@ -1541,6 +1548,7 @@ class Video360:
         self.frame_size = None
         self.circles = None
         self.gains = []
+        self.level = level
 
     def frame(self, seconds, edge):
         """The unstitched frame (both lenses side by side) at seconds, at most edge wide."""
@@ -1559,8 +1567,13 @@ class Video360:
         if frame is None:
             return None
         details = {}
+        up = inverted = None
+        if self.level and images.stitch_settings()["level_horizon"]:
+            up = insta360.up_at(self.level, seconds)
+            inverted = insta360.inverted_at(self.level, seconds)
         panorama = images.dual_fisheye_to_equirect(frame, min(int(edge), frame.size[0]),
-                                                   self.params, details=details)
+                                                   self.params, details=details, level=up,
+                                                   level_inverted=inverted)
         self.frame_size = frame.size
         self.circles = details.get("circles")
         if details.get("gains"):
@@ -1604,7 +1617,7 @@ class Video360:
         }
 
 
-def video_360(tools, path, data, info, model=None):
+def video_360(tools, path, data, info, model=None, level=None):
     """A Video360 for an .insv at path (data: ffprobe's JSON, info: its parse_probe()), or None.
 
     The camera is the one the trailer of the file (or of its LRV) names
@@ -1612,7 +1625,11 @@ def video_360(tools, path, data, info, model=None):
     (CAMERAS_360: the video is then read as an ordinary one). Its LRV
     (lrv_companion) is used when ffprobe reads it as a 2:1 video; else its
     own lenses (lens_layout: its streams, or it and its second lens's
-    file). None when neither will do.
+    file). None when neither will do. Its level track comes from the
+    motion samples at the end of the file (or of its LRV) -- which takes
+    a few seconds for a long video -- unless level gives it: a track kept
+    before (stored_level), or False for none (as when only its frames are
+    copied, not stitched).
     """
     model = insta360_model(path) if model is None else model
     _folder_names(os.path.dirname(path))        # (listed now, once, for both lookups)
@@ -1641,14 +1658,26 @@ def video_360(tools, path, data, info, model=None):
         return None
     sizes = _stream_sizes(data)
     stream_width = int(sizes[0][0] or 0) if sizes else 0
-    return Video360(tools, path, info, layout, camera, lrv, lrv_info, stream_width, second)
+    if level is False:
+        level = None
+    elif level is None:
+        fps = (info.get("video") or {}).get("fps")
+        for source in (path, lrv):
+            if source is not None and level is None:
+                level = insta360.level_track(source, camera["model"], info.get("duration"),
+                                             fps)
+    else:
+        level = insta360.checked_track(level)
+    return Video360(tools, path, info, layout, camera, lrv, lrv_info, stream_width, second,
+                    level)
 
 
 def _facts_360(v360, facts):
     """A 360 video's facts (exif "video"): the original's; how its lenses are stored
     ("lenses": its layout, "lrv" when only its LRV holds both); "lens_file", its
     second lens's file; its LRV ({name, codec, pix_fmt, container, width, height,
-    size, media_size: see media_data_size}); and the lens geometry."""
+    size, media_size: see media_data_size}); the lens geometry; and its level
+    track ("level", see insta360.level_track; kept whatever the setting)."""
     facts = dict(facts)
     facts["lenses"] = v360.layout or "lrv"
     if v360.second:
@@ -1667,6 +1696,8 @@ def _facts_360(v360, facts):
     geometry = v360.fisheye()
     if geometry is not None:
         facts["fisheye"] = geometry
+    if v360.level:
+        facts["level"] = v360.level
     return facts
 
 
@@ -1674,6 +1705,20 @@ def lrv_facts(exif_text):
     """The "lrv" facts of a 360 video's exif column ({} when it has no LRV)."""
     lrv = video_facts(exif_text).get("lrv")
     return lrv if isinstance(lrv, dict) else {}
+
+
+def stored_level(exif_text):
+    """The level track kept in a 360 video's exif column (its "video" facts), or
+    None (none kept: video_360 then reads the file's)."""
+    return insta360.checked_track(video_facts(exif_text).get("level"))
+
+
+def level_of(facts):
+    """The level track a viewer turns a 360 video's frames with (facts: its exif
+    "video" facts), or None: none kept, or the "level_horizon" setting is off."""
+    if not isinstance(facts, dict) or not insta360.level_enabled():
+        return None
+    return insta360.checked_track(facts.get("level"))
 
 
 def _read_360(v360, want_preview, preview_edge, sheet_edge, frames, want_sheet):
@@ -1840,44 +1885,46 @@ def _read_flat(tools, path, info, want_preview, preview_edge, sheet_edge, frames
     }
 
 
-def poster_jpeg(tools, path, edge=None):
+def poster_jpeg(tools, path, edge=None, level=None):
     """JPEG bytes of a video's poster at most edge pixels (default: the preview size).
 
-    A 360 video's is its stitched panorama (as its preview). Raises as
-    read_video does (images.SourceReadError when the file cannot be read).
+    A 360 video's is its stitched panorama (as its preview; level: its
+    level track when it is known, see video_360). Raises as read_video
+    does (images.SourceReadError when the file cannot be read).
     """
     images = _images()
     if tools is None:
         raise ToolsMissing()
     try:
-        info, grab = _frames_of(tools, path)
+        info, grab = _frames_of(tools, path, level)
         frame = poster(tools, path, info, int(edge or images.PREVIEW_EDGE), grab)
     except VideoReadError as error:
         raise _read_failure(error, path)
     return _jpeg(frame, images.PREVIEW_QUALITY)
 
 
-def _frames_of(tools, path):
-    """(info, grab) for poster() and make_sheet(): a 360 video's stitched frames, or
-    (parse_probe's result, None) for any other video."""
+def _frames_of(tools, path, level=None):
+    """(info, grab) for poster() and make_sheet(): a 360 video's stitched frames
+    (level: see video_360), or (parse_probe's result, None) for any other video."""
     data = probe(tools, path)
     info = parse_probe(data, os.path.basename(path))
-    v360 = video_360(tools, path, data, info) if is_360_video(path) else None
+    v360 = video_360(tools, path, data, info, level=level) if is_360_video(path) else None
     if v360 is not None:
         return v360.info, v360.grab
     return info, None
 
 
-def sheet_jpeg(tools, path, edge=common.DEFAULT_MAX_IMAGE_EDGE, frames=DEFAULT_FRAMES):
+def sheet_jpeg(tools, path, edge=common.DEFAULT_MAX_IMAGE_EDGE, frames=DEFAULT_FRAMES,
+               level=None):
     """(JPEG bytes, frames on it) of a video's contact sheet, made now (make_sheet).
 
     For when none was kept with the previews (a 360 video's frames are
-    stitched). Raises as read_video does.
+    stitched; level: see video_360). Raises as read_video does.
     """
     if tools is None:
         raise ToolsMissing()
     try:
-        info, grab = _frames_of(tools, path)
+        info, grab = _frames_of(tools, path, level)
         return make_sheet(tools, path, info, edge, frames, grab=grab)
     except VideoReadError as error:
         raise _read_failure(error, path)
@@ -2027,7 +2074,8 @@ def make_proxy(tools, source, target, height=720, crf=26, timeout=None):
     if timeout is None:
         # A generous limit: slow computers encode at about real time.
         timeout = max(REMUX_TIMEOUT, int(4 * (info.get("duration") or 0)) + 60)
-    v360 = video_360(tools, source, data, info) if is_360_video(source) else None
+    # (Its frames are copied, not stitched: no level track.)
+    v360 = video_360(tools, source, data, info, level=False) if is_360_video(source) else None
     if v360 is not None and v360.layout in ("streams", "files"):
         return _write_with(lambda temp: lens_proxy_command(
             tools, source, temp, height, crf, v360.layout, v360.camera["order"], v360.second),

@@ -54,6 +54,8 @@ import llm
 import local_server
 import looks
 import not_duplicates
+import opening_views
+import place_estimates
 import prompts
 import refine
 import search_index
@@ -1925,6 +1927,112 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                         "others": {str(other): keys(other)
                                    for other in others[:gps_check.OTHERS_MAX]},
                         "more": max(0, len(others) - gps_check.OTHERS_MAX)})
+
+    # -- where 360 pictures open (opening_views.py) -----------------------------------
+
+    @bp.route("/images/<int:image_id>/opening-view", methods=["POST"])
+    def set_opening_view(image_id):
+        """{yaw, pitch, fov?} (degrees: right of the panorama's middle, up, across the
+        view): a 360 picture opens there from now on ("Open here"), and so do its
+        copies; {clear: true}: forget it (the automatic view, or the front, again).
+        Their thumbnails show the new view. Answers {"id", "opening_view" (as
+        /api/image has it), "record" ({"ov": ...}, or {} for the front), "ids" (the
+        pictures it was set for: the copies too)}."""
+        data = body()
+        conn = get_conn()
+        try:
+            with conn:
+                if data.get("clear") is True:
+                    row = (opening_views.clear_owner(conn, image_id)
+                           if image_id <= IMAGE_ID_MAX else None)
+                else:
+                    row = (opening_views.set_owner(conn, image_id, data.get("yaw"),
+                                                   data.get("pitch"), data.get("fov"))
+                           if image_id <= IMAGE_ID_MAX else None)
+        except opening_views.ViewError as error:
+            raise AdminError(400, str(error), error.fields)
+        except sqlite3.OperationalError as error:
+            raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
+        if row is None:
+            raise AdminError(404, "There is no 360-degree picture %d." % image_id)
+        ids = opening_views.copies(conn, image_id)
+        thumbs = state.thumbs()
+        for picture_id in ids:
+            opening_views.remake_thumbnail(conn, picture_id, state.previews, thumbs,
+                                           commit=False)
+        thumbs.commit()
+        view = opening_views.detail(conn, image_id, row["content_hash"], owner=True)
+        value = opening_views.record_value(dict(view, owner=view["owner"]))
+        return jsonify({"id": image_id, "opening_view": view,
+                        "record": {"ov": value} if value is not None else {}, "ids": ids})
+    # -- estimated places (place_estimates.py) ---------------------------------------
+
+    @bp.route("/images/<int:image_id>/place", methods=["POST"])
+    def choose_place(image_id):
+        """{choice, lat?, lon?}: the owner's place for a picture without a usable position.
+
+        choice "accept" (the estimate becomes the owner's place), "set" (the
+        position lat, lon: a town picked from /places/towns, or one typed),
+        "reject" (no estimate) or "clear" (the estimates decide again); see
+        place_estimates.set_choice. The GPS check and the estimates run again
+        at once. Answers the picture's "place" and "place_estimate" (as
+        /api/image has them) and "record", the keys of its search record a
+        place changes (absent: none).
+        """
+        data = body()
+        choice = data.get("choice")
+        if choice not in ("accept", "set", "reject", "clear"):
+            raise AdminError(400, "Send choice: accept, set, reject or clear.",
+                             {"choice": "accept, set, reject or clear."})
+        lat, lon = data.get("lat"), data.get("lon")
+        if choice == "set" and not all(isinstance(value, (int, float))
+                                       and not isinstance(value, bool) for value in (lat, lon)):
+            raise AdminError(400, "Send the position as numbers: lat and lon.",
+                             {"lat": "A number.", "lon": "A number."})
+        if image_id > IMAGE_ID_MAX:
+            raise AdminError(404, "There is no picture %d." % image_id)
+        conn = get_conn()
+        config = state.config()
+        try:
+            with conn:
+                place_estimates.set_choice(conn, image_id, choice, lat, lon)
+            gps_check.run(conn, config)
+        except place_estimates.ChoiceError as error:
+            raise AdminError(error.status, str(error))
+        except sqlite3.OperationalError as error:
+            raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
+        import serve
+        row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+        estimate = place_estimates.for_picture(conn, image_id)
+        record = search_index.picture_record(conn, image_id,
+                                             image_edits.load(conn, image_id)) or {}
+        return jsonify({"id": image_id, "place": serve.place_of(row, estimate),
+                        "place_estimate": place_estimates.view(conn, row, estimate, admin=True),
+                        "record": {key: record[key] for key in gps_check.RECORD_KEYS
+                                   if key in record}})
+
+    @bp.route("/places/towns", methods=["GET"])
+    def find_towns():
+        """?q=: the towns whose names start with q (places.PlaceIndex.find_towns), for
+        setting a picture's place: {"towns": [{name, region, country, cc, lat, lon,
+        population}], "position": {lat, lon, place} when q is a position ("lat, lon"),
+        "available": whether there are place names}."""
+        import places
+        text = (request.args.get("q") or "")[:200]
+        index = places.shared()
+        answer = {"towns": [], "position": None, "available": index is not None}
+        position = place_estimates.parse_position(text)
+        if position is not None:
+            answer["position"] = {"lat": position[0], "lon": position[1],
+                                  "place": gps_check.place_text(
+                                      places.place_columns(position[0], position[1], index))
+                                  if index is not None else ""}
+        elif index is not None:
+            try:
+                answer["towns"] = index.find_towns(text)
+            except places.PlacesError as error:
+                raise AdminError(503, str(error))
+        return jsonify(answer)
 
     # -- favorites, ratings and albums (albums.py) --------------------------------
 

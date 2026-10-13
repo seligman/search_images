@@ -46,9 +46,15 @@ its value is empty, zero, or the "nothing" value noted below:
     rg   the town's region                co   its country
     cc   the country's ISO code ("US")    (place names: an export only
                                            with location)
-    pe   1 when the place is only estimated from the pictures taken
-         around the same time (the picture's own position was set aside,
-         see gps_check.py; the place names go out with location)
+    pe   1 when the place is only estimated (the picture has no usable
+         position of its own, see place_estimates.py): ci, rg, co and cc
+         are the estimate's (an export: only with location and
+         estimated_places)
+    ps   where a place without the picture's own position comes from:
+         "c" a copy of a located picture, "t" the pictures taken around
+         the same time, "a" the library's area (region and country only)
+         -- these with pe -- or "o" the owner (a place set or an estimate
+         accepted; an export: with location)
     gx   1 when the GPS check set the picture's position aside (server,
          for the admin only; never exported): it has no gp and no place
     w    displayed width                  hgt  displayed height
@@ -63,6 +69,11 @@ its value is empty, zero, or the "nothing" value noted below:
     fx   a 360 video's lens geometry, for the player that stitches its
          frames (videos.Video360.fisheye: lens circles, fov, turn, front,
          mirror, blend, gain, fill)
+    lv   1 when the player turns a 360 video's frames level: its full
+         record holds the level track ("level", see insta360.level_track;
+         an export's only with the video)
+    ov   where a 360 picture opens when not at the front: [yaw, pitch] or
+         [yaw, pitch, fov] in degrees (see opening_views.py)
     vt   a video's kind according to the AI model when it is not a photo
          ("screenshot" for a screen recording, ...): searched with the
          kind words, and an export's exclude_types look at it
@@ -122,8 +133,11 @@ import drives
 import gps_check
 import image_edits
 import imageinfo
+import insta360
 import looks
 import not_duplicates
+import opening_views
+import place_estimates
 import prompts
 import videos
 
@@ -323,16 +337,20 @@ def _load_info(text):
 
 
 def export_settings(export_options=None):
-    """The privacy switches of an export: {"file_names", "folders", "location", "marks"}
-    (all off by default).
+    """The privacy switches of an export: {"file_names", "folders", "location", "marks",
+    "estimated_places"} (all off by default).
 
     file_names: records keep the file name (n); folders: the folder (f);
-    location: the "has GPS" flag (gp), landmarks and the location guess;
-    marks: favorites, ratings and album places (fav, rt, al).
+    location: the "has GPS" flag (gp), landmarks and the location guess,
+    place names (and the owner's own places, ps "o"); estimated_places
+    (with location only): estimated places (pe); marks: favorites,
+    ratings and album places (fav, rt, al).
     """
     options = export_options if isinstance(export_options, dict) else {}
-    return {key: options.get(key) is True
-            for key in ("file_names", "folders", "location", "marks")}
+    result = {key: options.get(key) is True
+              for key in ("file_names", "folders", "location", "marks", "estimated_places")}
+    result["estimated_places"] = result["estimated_places"] and result["location"]
+    return result
 
 
 def add_marks(record, marks):
@@ -366,7 +384,7 @@ def _extended_words(info, location):
 
 
 def record_for_row(row, for_export=False, export_options=None, info=None, edit=None,
-                   owner=False, marks=None, gps_ignored=False):
+                   owner=False, marks=None, gps_ignored=False, estimate=None):
     """The compact search record of one images row (see the module notes for the keys).
 
     row needs the columns of _INDEX_COLUMNS; info is its parsed description
@@ -375,7 +393,9 @@ def record_for_row(row, for_export=False, export_options=None, info=None, edit=N
     admin, who is told which pictures are edited (ed) and whose position
     the GPS check set aside (gps_ignored: gx). marks: the picture's
     (favorite, rating, album ids) (albums.for_libraries); an export keeps
-    them only with its "marks" option.
+    them only with its "marks" option. estimate: its place_estimates row
+    (place_estimates.for_libraries), used when it has no place of its own
+    (pe, ps; an export: see export_settings).
     """
     options = export_settings(export_options) if for_export else None
     record = {"i": row["id"], "l": row["library_id"]}
@@ -445,8 +465,11 @@ def record_for_row(row, for_export=False, export_options=None, info=None, edit=N
                 and math.isfinite(lat) and math.isfinite(lon)):
             record["gp"] = 1
         add_place(record, row)
-        if record.get("co") and "gp" not in record:
-            record["pe"] = 1            # (a place without a position: an estimate)
+        if (not record.get("co") and estimate is not None
+                and place_estimates.usable(row, estimate)):
+            keys = place_estimates.place_record(estimate)
+            if not for_export or keys.get("ps") == "o" or options["estimated_places"]:
+                record.update(keys)
     if row["width"]:
         record["w"] = row["width"]
     if row["height"]:
@@ -502,6 +525,8 @@ def add_video(record, row):
         geometry = fisheye_record(facts.get("fisheye"))
         if geometry:
             record["fx"] = geometry
+            if videos.level_of(facts):
+                record["lv"] = 1
 
 
 def fisheye_record(geometry):
@@ -560,9 +585,12 @@ def picture_record(conn, image_id, edit=None):
                        % _INDEX_COLUMNS, (image_id,)).fetchone()
     if row is None:
         return None
-    return record_for_row(row, edit=edit, owner=True,
-                          marks=albums.picture_marks(conn, image_id),
-                          gps_ignored=gps_check.is_ignored(conn, image_id))
+    record = record_for_row(row, edit=edit, owner=True,
+                            marks=albums.picture_marks(conn, image_id),
+                            gps_ignored=gps_check.is_ignored(conn, image_id),
+                            estimate=place_estimates.for_picture(conn, image_id))
+    opening_views.annotate(conn, [record])
+    return record
 
 
 def record_tags(tags):
@@ -614,6 +642,7 @@ def build_records(conn, config, library_ids, for_export=False, export_options=No
              if not for_export or export_settings(export_options)["marks"] else {})
     # (Only the admin is told whose positions the GPS check set aside.)
     gps_ignored = gps_check.ignored_ids(conn, library_ids) if with_hidden else set()
+    estimates = place_estimates.for_libraries(conn, library_ids)
     kept_apart = not_duplicates.pairs()
     keys = {}                   # image id -> not_duplicates.unit_key (when needed)
     # library id -> [(id, dhash, content hash, trusted date taken, aspect ratio)]
@@ -622,7 +651,8 @@ def build_records(conn, config, library_ids, for_export=False, export_options=No
     for row in conn.execute(sql, library_ids):
         record = record_for_row(row, for_export, export_options, edit=edits.get(row["id"]),
                                 owner=with_hidden, marks=marks.get(row["id"]),
-                                gps_ignored=row["id"] in gps_ignored)
+                                gps_ignored=row["id"] in gps_ignored,
+                                estimate=estimates.get(row["id"]))
         records.append(record)
         if not row["hidden"]:
             # (No dHash: only exact copies of it are grouped.)
@@ -650,6 +680,8 @@ def build_records(conn, config, library_ids, for_export=False, export_options=No
     for library_id in library_ids:
         drives.annotate(records, drives.library_drives(conn, library_id, config or {}),
                         library_id, min_clips, owner=with_hidden)
+    # Where 360 pictures open (opening_views.py).
+    opening_views.annotate(conn, records)
     return records
 
 
@@ -1861,7 +1893,8 @@ def index_etag(conn, libraries, include_hidden, state=None, *, marks=None,
     missing: the owner's marks and albums, in a fixed order); config (keyword
     only) the configuration the records are built with (its drive settings);
     looks_state (keyword only) looks.store_key(), which the groups depend on
-    (worked out when not given).
+    (worked out when not given). Whether 360 videos are levelled (lv) counts
+    too.
     """
     if state is None:
         state = data_state(conn, libraries)
@@ -1876,6 +1909,7 @@ def index_etag(conn, libraries, include_hidden, state=None, *, marks=None,
     key.append(marks)
     key.append(drives_key(config))
     key.append(looks_state)
+    key.append(insta360.level_enabled())
     return hashlib.sha1(json.dumps(key, separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
 
 
@@ -1987,8 +2021,9 @@ class IndexService:
     def _library_records(self, conn, config, library_id, include_hidden, row):
         """[(image id, record JSON)] of one library, built again only when its state row changed."""
         key = (library_id, bool(include_hidden))
-        # (Drive descriptions and settings change the drives' records too.)
-        row = (row, json.dumps(drives_key(config)))
+        # (Drive descriptions and settings change the drives' records too,
+        # and so does the level_horizon setting a 360 video's lv.)
+        row = (row, json.dumps(drives_key(config)), insta360.level_enabled())
         with self._lock:
             found = self._libraries.get(key)
             if found is not None and found[0] == row:

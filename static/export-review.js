@@ -86,6 +86,22 @@ var EXPORT_REVIEW = (function () {
                          "pictures were taken, which may include your home. Titles and " +
                          "descriptions can still name a place a picture shows; read them " +
                          "in the review."},
+        estimated_places: {label: "Estimated places",
+                           hint: "With Location: the places estimated for pictures without " +
+                                 "a GPS position of their own (from a copy, the pictures " +
+                                 "taken around the same time or the library's area), marked " +
+                                 "as estimated, on the map as hollow pins. They can be wrong. " +
+                                 "Places you set yourself go with Location."},
+        routes_trim: {label: "Left out where drives start and end",
+                      hint: "Metres of every drive's route left out around where it " +
+                            "starts and where it ends (0 to 5,000; 500 by default)."},
+        routes: {label: "Drive routes",
+                 hint: "With Location: the routes of drives (the GPS tracks dashcams record " +
+                       "into their videos) on the map and in the viewer, and the positions " +
+                       "of their clips. The first and last 500 m of every drive (the " +
+                       "routes_trim option) are left out, so where drives start and end " +
+                       "(often your home) is not shown. Without it, clips keep their place " +
+                       "names but not their positions."},
         title: {label: "Site title",
                 hint: "Shown in the header and the browser tab."},
         credits: {label: "Footer line",
@@ -534,6 +550,55 @@ var EXPORT_REVIEW = (function () {
         return parts.join("; ") + ".";
     }
 
+    /* What goes out of the videos' GPS tracks (counts.routes of the preview:
+       {on, positions, withheld, routes}, see export.py's _Routes): the routes
+       and the clips' positions published or left out; "" when no picture to
+       publish has a position from a track. */
+    function routesText(counts) {
+        var found = counts && counts.routes;
+        if (!found || !found.positions) {
+            return "";
+        }
+        if (!found.on) {
+            return number(found.positions) + (found.positions === 1 ? " clip keeps its"
+                : " clips keep their") + " place names but not the position from " +
+                (found.positions === 1 ? "its" : "their") + " GPS track (Drive routes is off).";
+        }
+        var text = number(found.routes || 0) + (found.routes === 1 ? " drive route is"
+            : " drive routes are") + " published";
+        if (found.withheld) {
+            text += "; " + number(found.withheld) + (found.withheld === 1 ? " clip" : " clips") +
+                " near where a drive starts or ends keep only " +
+                (found.withheld === 1 ? "its" : "their") + " place names";
+        }
+        return text + ".";
+    }
+
+    /* A warning about the dashcam clips to publish (counts.routes of the
+       preview: {overlay, near}): their pictures show the position their
+       overlay prints, whatever the options; "" when there are none. */
+    function overlayText(counts) {
+        var found = counts && counts.routes;
+        if (!found || !found.overlay) {
+            return "";
+        }
+        var one = found.overlay === 1;
+        var text = number(found.overlay) + (one ? " dashcam clip is" : " dashcam clips are") +
+            " published (as " + (one ? "a video or its poster frame" : "videos or poster frames") +
+            "). A dashcam prints its GPS position over its video, so " +
+            (one ? "its picture shows it" : "their pictures show it") +
+            " whatever Location and Drive routes say (the positions in their texts are left " +
+            "out).";
+        if (found.near) {
+            text += " " + number(found.near) + (found.near === 1 ? " of them was" :
+                " of them were") + " filmed near where a drive starts or ends, or without a " +
+                "GPS fix (the overlay then shows the last position the camera had, often " +
+                "where the drive started): hide " + (found.near === 1 ? "it" : "them") +
+                " to keep that place private.";
+        }
+        return text;
+    }
+
     // "More like this" in the export: how many pictures it can go by meaning
     // for (counts.similar of the preview), or "" when the option is off.
     function similarText(counts, options) {
@@ -611,6 +676,12 @@ var EXPORT_REVIEW = (function () {
         (options.file_names ? shown : hidden).push("file name");
         (options.folders ? shown : hidden).push("folder");
         (options.location ? shown : hidden).push("location (GPS position and place names)");
+        if (options.location && options.estimated_places) {
+            shown.push("estimated place");
+        }
+        if (options.location && options.routes) {
+            shown.push("drive route (less where drives start and end)");
+        }
         if (options.marks) {
             // (Only said when on: most libraries have no marks.)
             shown.push("favorite star, rating and albums");
@@ -652,6 +723,8 @@ var EXPORT_REVIEW = (function () {
         sizeText: sizeText,
         videoText: videoText,
         drivesText: drivesText,
+        routesText: routesText,
+        overlayText: overlayText,
         similarText: similarText,
         meaningText: meaningText,
         looksText: looksText,

@@ -522,8 +522,10 @@ class UpdateTest(LooksFixture, unittest.TestCase):
                                       {"library_id": "lib_trips01", "rebuild": True})
         self.assertEqual((second["rebuilt"], second["embedded"]), (0, 1))
         counted = looks.counts(self.conn, self.config, ["lib_family1", "lib_trips01"])
-        self.assertEqual(counted["lib_family1"], {"pictures": 5, "embedded": 5, "pending": 0})
-        self.assertEqual(counted["lib_trips01"], {"pictures": 1, "embedded": 1, "pending": 0})
+        self.assertEqual(counted["lib_family1"],
+                         {"pictures": 5, "embedded": 5, "pending": 0, "views": 0})
+        self.assertEqual(counted["lib_trips01"],
+                         {"pictures": 1, "embedded": 1, "pending": 0, "views": 0})
 
     def test_other_settings_keep_the_looks_until_a_rebuild(self):
         self.update()
@@ -547,8 +549,9 @@ class UpdateTest(LooksFixture, unittest.TestCase):
         self.assertEqual(summary["embedded"], 1)
         self.assertEqual(self.stored()[0], {self.key(self.pano)})      # the newest first
         counted = looks.counts(self.conn, self.config, ["lib_family1", "lib_trips01"])
-        self.assertEqual(counted, {"lib_family1": {"pictures": 5, "embedded": 0, "pending": 5},
-                                   "lib_trips01": {"pictures": 1, "embedded": 1, "pending": 0}})
+        self.assertEqual(counted, {
+            "lib_family1": {"pictures": 5, "embedded": 0, "pending": 5, "views": 0},
+            "lib_trips01": {"pictures": 1, "embedded": 1, "pending": 0, "views": 0}})
         summary = self.update(Context(stop_after=2))
         self.assertTrue(summary["stopped"])
         self.assertEqual(summary["embedded"], 2)
@@ -850,7 +853,7 @@ class ServerTest(LooksFixture, unittest.TestCase):
                          (True, True, False, 1))
         views = {view["id"]: view for view in state["libraries"]}
         self.assertEqual(views["lib_trips01"]["looks"],
-                         {"pictures": 1, "embedded": 1, "pending": 0})
+                         {"pictures": 1, "embedded": 1, "pending": 0, "views": 0})
         self.assertEqual(views["lib_family1"]["looks"]["pending"], 5)
         response = self.client.post("/api/admin/jobs", headers=admin_headers, json={
             "kind": "image_embed", "library_id": "lib_family1",

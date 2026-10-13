@@ -148,7 +148,8 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(gps_check.settings(None), gps_check.DEFAULTS)
         self.assertEqual(gps_check.settings({"gps_check": "on"}), gps_check.DEFAULTS)
         self.assertTrue(gps_check.DEFAULTS["enabled"])
-        self.assertFalse(gps_check.DEFAULTS["estimate_places"])
+        # (Estimated places have settings of their own: test_place_estimates.)
+        self.assertNotIn("estimate_places", gps_check.DEFAULTS)
 
     def test_values_are_checked_and_held_to_their_ranges(self):
         options = gps_check.settings({"gps_check": {
@@ -157,8 +158,7 @@ class SettingsTest(unittest.TestCase):
             "estimate_places": True, "estimate_minutes": float("nan"), "other": 1}})
         self.assertEqual(options, {
             "enabled": False, "max_speed": 300, "window_hours": 72, "neighbours": 3,
-            "stale_minutes": 5, "repeat_hours": 0.5, "across_libraries": True,
-            "estimate_places": True, "estimate_minutes": 30})
+            "stale_minutes": 5, "repeat_hours": 0.5, "across_libraries": True})
         self.assertEqual(gps_check.settings({"gps_check": {"enabled": "false"}})["enabled"],
                          True)
         self.assertEqual(gps_check.settings({"gps_check": {"neighbours": True}})["neighbours"],
@@ -393,21 +393,22 @@ class TravelRuleTest(unittest.TestCase):
         self.assertEqual(findings(rows + [wrong, row(FAR, "14:03", camera=CAMERA, offset="")],
                                   enabled=False), {wrong["id"]: "owner"})
 
-    def test_estimated_places(self):
+    def test_the_clocks_and_references_for_estimates(self):
+        # (The estimates themselves: test_place_estimates.)
         rows = day_with_phone()
         home = row(FAR, "14:03", camera=CAMERA, offset="")
-        result = check(rows + [home], estimate_places=True)
-        coast = {"place_city": "Coralport", "place_region": "North Coast",
-                 "place_country": "Examplia", "place_cc": "XA", "place_km": 0.1}
-        self.assertEqual(result.estimates(lambda row: coast), {home["id"]: dict(
-            coast, place_km=None)})
-        # Neighbours that disagree (or are not known) give no estimate.
-        towns = iter([coast, dict(coast, place_city="Hillmere")] * 5)
-        self.assertEqual(result.estimates(lambda row: next(towns)), {})
-        self.assertEqual(result.estimates(lambda row: None), {})
-        # Only the pictures within estimate_minutes.
-        result = check(rows + [home], estimate_places=True, estimate_minutes=1)
-        self.assertEqual(result.estimates(lambda row: coast), {})
+        lost = row(None, "14:10", camera=CAMERA, offset="")
+        result = check(rows + [home, lost])
+        references = {reference.id for reference in result.references()}
+        self.assertEqual(references, {item["id"] for item in rows})
+        # A picture without a position is timed by the library's offsets.
+        lo, hi, mid, clock_only = result.timing(lost)
+        self.assertEqual((lo, hi, clock_only), (mid, mid, False))
+        self.assertEqual(mid, gps_check.local_seconds(taken("14:10")) + 600 * 60)
+        self.assertIsNone(result.timing(dict(lost, taken_source="mtime")))
+        self.assertIsNotNone(result.timing(dict(lost, taken_source="mtime"), trusted=True))
+        self.assertIsNone(result.group_of(lost["id"]))
+        self.assertIsNotNone(result.group_of(home["id"]))
 
 
 class IntrinsicRuleTest(unittest.TestCase):
@@ -557,6 +558,21 @@ class PassFixture(support.TempBaseMixin):
 
 class PassTest(PassFixture, unittest.TestCase):
 
+    def test_the_rows_say_which_dates_are_an_editors(self):
+        saved = self.insert(None, "15:00", camera="", offset="", exif=json.dumps(
+            {"DateTime": "2021:03:04 15:00:00", "Software": "Some Editor 2.1"}))
+        shot = self.insert(None, "15:00", camera="", offset="", exif=json.dumps(
+            {"DateTime": "2021:03:04 15:00:00", "DateTimeOriginal": "2021:03:04 14:00:00",
+             "Software": "Some Editor 2.1"}))
+        rows = {item["id"]: item for item in gps_check._load(self.conn, ["lib_trips001"])}
+        self.assertTrue(rows[saved]["saved_date"])
+        self.assertEqual(rows[saved]["software"], "Some Editor 2.1")
+        self.assertTrue(gps_check.export_date(rows[saved]))
+        # (A picture without a position that has its capture date: its EXIF is
+        # not even read.)
+        self.assertFalse(rows[shot]["saved_date"])
+        self.assertIsNone(rows[shot]["exif"])
+
     def test_an_ignored_position_is_cleared_and_kept_aside(self):
         phone = self.day()
         home = self.insert(FAR, "14:03", camera=CAMERA, offset="")
@@ -630,9 +646,10 @@ class PassTest(PassFixture, unittest.TestCase):
         summary = self.check_all()
         self.assertEqual(summary["ignored_by"], {"owner": 1})
         view = gps_check.picture_view(self.conn, self.picture(near_))
+        # (Its place is estimated from the phone's pictures around it.)
         self.assertEqual(view, {"ignored": True, "reason": "you chose to ignore it",
                                 "choice": "ignore", "place": "Coralport, North Coast, Examplia",
-                                "estimated": False})
+                                "estimated": True})
         # Choosing what the check decides anyway removes the choice.
         gps_check.set_choice(self.conn, self.config, near_, True)
         gps_check.set_choice(self.conn, self.config, home, False)
@@ -653,24 +670,26 @@ class PassTest(PassFixture, unittest.TestCase):
         self.assertEqual(self.picture(home)["place_city"], "Farhaven")
 
     def test_estimated_places(self):
+        # A position set aside: the place estimated from the pictures around it
+        # is kept apart (place_estimates.py), never in the picture's columns.
         self.day()
         home = self.insert(FAR, "14:03", camera=CAMERA, offset="")
-        config = dict(self.config, gps_check={"estimate_places": True})
-        summary = self.check_all(config=config)
-        self.assertEqual(summary["estimated"], 1)
+        summary = self.check_all()
+        self.assertEqual(summary["estimates"]["by_source"], {"time": 1})
         picture = self.picture(home)
         self.assertIsNone(picture["lat"])
-        self.assertEqual((picture["place_city"], picture["place_country"]),
-                         ("Coralport", "Examplia"))
-        self.assertIsNone(picture["place_km"])
+        self.assertEqual((picture["place_city"], picture["place_country"]), ("", ""))
         record = search_index.picture_record(self.conn, home)
-        self.assertEqual((record["ci"], record["pe"], record["gx"]), ("Coralport", 1, 1))
+        self.assertEqual((record["ci"], record["pe"], record["ps"], record["gx"]),
+                         ("Coralport", 1, "t", 1))
         self.assertNotIn("gp", record)
         self.assertNotIn("km", record)
         self.assertTrue(gps_check.picture_view(self.conn, picture)["estimated"])
-        # Turned off again: the estimate goes.
-        self.check_all()
-        self.assertEqual(self.picture(home)["place_city"], "")
+        # The older setting turns them off: the estimate goes.
+        summary = self.check_all(config=dict(self.config,
+                                             gps_check={"estimate_places": False}))
+        self.assertIsNone(search_index.picture_record(self.conn, home).get("ci"))
+        self.assertFalse(gps_check.picture_view(self.conn, self.picture(home))["estimated"])
 
     def test_a_file_read_again_is_checked_again(self):
         self.day()
@@ -699,7 +718,10 @@ class PassTest(PassFixture, unittest.TestCase):
         (theirs,) = [record for record in visitor_records if record["i"] == home]
         self.assertEqual(mine.get("gx"), 1)
         for record in (mine, theirs):
-            self.assertFalse({"gp", "ci", "rg", "co", "cc", "km", "pe"} & set(record), record)
+            # Not the position set aside, nor its place: only the place
+            # estimated from the pictures around it, marked as such.
+            self.assertFalse({"gp", "km"} & set(record), record)
+            self.assertEqual((record["co"], record["pe"]), ("Examplia", 1))
         self.assertNotIn("gx", theirs)
         self.assertEqual(sum(1 for record in admin_records if record.get("gx")), 1)
 
@@ -888,7 +910,9 @@ class AdminRouteTest(PassFixture, unittest.TestCase):
         self.assertIn("6,800 km away", detail["location_check"]["reason"])
         self.assertEqual(detail["location_check"]["place"], "Farhaven, Midlands, Testland")
         self.assertIsNone(detail["lat"])
-        self.assertIsNone(detail["place"])
+        # (Its place: only the one estimated from the pictures around it.)
+        self.assertEqual((detail["place"]["city"], detail["place"]["estimated"]),
+                         ("Coralport", True))
         # A visitor sees nothing of it, not even the file's GPS data.
         theirs = self.client.get("/api/image/%d" % home, environ_base=REMOTE)
         self.assertEqual(theirs.status_code, 200, theirs.get_data(as_text=True))
@@ -906,7 +930,8 @@ class AdminRouteTest(PassFixture, unittest.TestCase):
         self.assertEqual(self.picture(home)["lat"], FAR[0])
         answer = self.post(home, {"use": False}).get_json()
         self.assertTrue(answer["location_check"]["ignored"])
-        self.assertEqual(answer["record"], {"gx": 1})
+        self.assertEqual(answer["record"], {"gx": 1, "ci": "Coralport", "rg": "North Coast",
+                                            "co": "Examplia", "cc": "XA", "pe": 1, "ps": "t"})
         self.assertEqual(gps_check.choices(self.conn), {})
         self.assertEqual((answer["copies"], answer["others"], answer["more"]), (0, {}, 0))
         # A located picture's own pane: only the choice to ignore it.
@@ -1030,6 +1055,34 @@ class FalsePositiveTest(unittest.TestCase):
         # A camera's own file named by the time it was taken is not.
         named = dict(exported, id=next(_ids), software="")
         self.assertEqual(set(findings(day_with_phone() + [named])), {named["id"]})
+        # Nor is an editor's export dated only by EXIF DateTime (when it was
+        # saved: no DateTimeOriginal) with a Software tag.
+        saved = dict(exported, id=next(_ids), taken_source="exif",
+                     saved_date=True)
+        self.assertEqual(findings(day_with_phone() + [saved]), {})
+        self.assertEqual(set(findings(day_with_phone() + [dict(saved, saved_date=False)])),
+                         {saved["id"]})
+        # Without a position: its interval reaches 2 hours back too.
+        result = check(day_with_phone())
+        lo, hi, _mid, _clock_only = result.timing(dict(saved, lat=None, lon=None))
+        self.assertEqual(hi - lo, gps_check.EXPORT_SECONDS)
+        self.assertTrue(gps_check.export_date(saved))
+        self.assertFalse(gps_check.export_date(dict(saved, software="")))
+
+    def test_which_dates_are_an_editors(self):
+        facts = gps_check._facts_of(json.dumps({"DateTime": "2021:03:04 15:00:00",
+                                                "Software": "Some Editor 2.1"}))
+        self.assertEqual((facts["software"], facts["saved_date"]), ("Some Editor 2.1", True))
+        for exif in ({"DateTime": "2021:03:04 15:00:00",
+                      "DateTimeOriginal": "2021:03:04 14:00:00"},
+                     {"DateTime": "2021:03:04 15:00:00",
+                      "DateTimeDigitized": "2021:03:04 14:00:00"},
+                     {"DateTimeOriginal": "2021:03:04 14:00:00"}):
+            self.assertFalse(gps_check._facts_of(json.dumps(exif))["saved_date"], exif)
+        # (A blank DateTimeOriginal is none.)
+        self.assertTrue(gps_check._facts_of(json.dumps({
+            "DateTime": "2021:03:04 15:00:00",
+            "DateTimeOriginal": "0000:00:00 00:00:00"}))["saved_date"])
 
     def test_many_pictures_at_one_position_are_quick(self):
         # A time-lapse: thousands of shots seconds apart at one position

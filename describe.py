@@ -904,8 +904,11 @@ def video_for_llm(row, root, previews, max_edge=common.DEFAULT_MAX_IMAGE_EDGE,
     count = _stored_frames(row) if data is not None else None
     if data is None:
         full = os.path.join(root, *row["path"].split("/"))
+        # (A 360 video's frames are turned level with the track kept.)
+        level = (videos.stored_level(row["video_exif"]) if "video_exif" in row.keys()
+                 else None)
         data, count = videos.sheet_jpeg(videos.find_tools(), full, edge=max_edge,
-                                        frames=frames)
+                                        frames=frames, level=level)
     return images.prepare_for_llm(data, max_edge=max_edge), count
 
 

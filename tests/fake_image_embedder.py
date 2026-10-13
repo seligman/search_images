@@ -10,7 +10,10 @@ It speaks just enough of llama.cpp's server for looks.py:
 
 A picture's vector is made from its pixels (Pillow): the colours of a 4 x 4
 grid and its brightness, so pictures that look alike have close vectors and
-the same picture always has the same one. Every request is recorded.
+the same picture always has the same one. Words (an input that is text, as
+a model that embeds both sends them) get the vector of the picture
+server.words names for them (text -> JPEG bytes), else that of a grey
+picture -- or, with server.images_only, a 400. Every request is recorded.
 
     with fake_image_embedder.FakeImageEmbedder() as server:
         server.queue(fake_image_embedder.HttpError(503))   # one-off answers, in order
@@ -18,6 +21,7 @@ the same picture always has the same one. Every request is recorded.
         server.dims = 32             # another length from now on
         server.served = "your-model.gguf"  # the model's name in replies
         server.refuse = lambda jpeg: ...   # True: a batch holding that picture gets a 400
+        server.words["a red barn"] = jpeg  # words that look like that picture
 """
 
 import base64
@@ -31,6 +35,12 @@ from PIL import Image
 
 DIMS = 64
 MODEL = "fake-image-model"
+
+
+def _grey():
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (128, 128, 128)).save(buffer, "JPEG")
+    return buffer.getvalue()
 
 
 def picture_vector(jpeg, dims=DIMS, drift=False):
@@ -60,6 +70,9 @@ def pictures_of(item):
     return found
 
 
+GREY = _grey()
+
+
 class HttpError:
     """A queued answer: fail with this status (and optional body)."""
 
@@ -78,6 +91,8 @@ class FakeImageEmbedder:
         self.served = MODEL
         self.drift = False
         self.refuse = None
+        self.words = {}
+        self.images_only = False
         self.requests = []
         self.health = []
         self._queue = []
@@ -129,6 +144,11 @@ class FakeImageEmbedder:
         with self._lock:
             return [entry["payload"] for entry in self.requests
                     if entry["path"] == "/v1/embeddings"]
+
+    def texts(self):
+        """Every text sent to be embedded, in order."""
+        return [item for payload in self.embed_requests()
+                for item in payload.get("input") or [] if isinstance(item, str)]
 
     def pictures(self):
         """Every picture sent to be embedded (JPEG bytes), in order."""
@@ -189,6 +209,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         vectors = []
         for item in items:
+            if isinstance(item, str):
+                if owner.images_only:
+                    self._send_json(400, {"error": {"message": "this model embeds pictures"}})
+                    return
+                vectors.append(picture_vector(owner.words.get(item) or GREY, owner.dims,
+                                              owner.drift))
+                continue
             found = pictures_of(item) if isinstance(item, dict) else []
             if len(found) != 1:
                 self._send_json(400, {"error": {"message": "expected one picture per input"}})

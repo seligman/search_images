@@ -90,6 +90,9 @@ clips one after the other (its concat reader) and, when the clips have
 key frames often enough, decodes only those (-skip_frame nokey), which
 makes a sped-up copy many times quicker to make on the CPU.
 
+The routes of drives (the GPS tracks of their clips, one after the other)
+are tracks.py's (tracks.routes).
+
 Run "python drives.py" to list the drives of the libraries; --sheet FOLDER
 also writes their contact sheets (the 3 x 3 frames the model sees).
 

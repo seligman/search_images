@@ -500,7 +500,7 @@ var DUPLICATES_FORMAT = (function () {
     function memberCard(stack, member) {
         var best = member.id === stack.best;
         var name = pictureName(member);
-        var image = el("img", {alt: member.title || name, src: SITE.thumbUrl(member.id), loading: "lazy",
+        var image = el("img", {alt: member.title || name, src: SITE.thumbUrl(member), loading: "lazy",
                                draggable: false});
         image.decoding = "async";
         image.addEventListener("error", function () {

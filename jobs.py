@@ -1557,6 +1557,8 @@ def _scan_summary(result, params, offline_fails):
         summary["embed"] = result["embed"]
     if isinstance(result.get("looks_pending"), int):
         summary["looks_pending"] = result["looks_pending"]
+    if isinstance(result.get("views_pending"), int):
+        summary["views_pending"] = result["views_pending"]
     return summary
 
 

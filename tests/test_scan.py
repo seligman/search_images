@@ -1580,8 +1580,9 @@ class WritingTest(ScanTestCase):
         self.assertEqual((summary["added"], summary["removed_moved"]), (27, 27))
         library_wide = [sql for sql in statements
                         if "FROM images WHERE library_id" in " ".join(sql.split())]
-        # (Seven: the last one finds the videos whose dates may be read again.)
-        self.assertLessEqual(len(library_wide), 7, library_wide)
+        # (Eight: the last ones find the videos whose dates may be read again,
+        # and those whose GPS track was never read.)
+        self.assertLessEqual(len(library_wide), 8, library_wide)
         conn = real_connect()
         try:
             plan = " ".join(str(row[-1]) for row in conn.execute(

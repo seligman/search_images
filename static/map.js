@@ -24,6 +24,21 @@
    apart; while a tile loads, a coarser one that is
    already there stands in for it.
 
+   Estimated places (place_estimates.py: pictures without a GPS position
+   of their own, points with "e": 1) are drawn as hollow pins (a pin whose
+   pictures are all estimated), and only while "Show estimated places" is
+   on (the admin's default; others turn it on).
+
+   Drive routes (routes.js; the GPS tracks of videos, tracks.py) are drawn
+   as lines under the pins: the clips the search finds, broken where clips
+   are left out or missing, while "Show drive routes" is on (the default;
+   it shows only when there are routes). Their clips then have no pins of
+   their own (the line is where they are; with it off they are pins
+   again). The pointer over a line says the drive and the clip there; a
+   click (or a tap) opens the viewer on that clip, that far into it,
+   playing the whole drive. A clip of a drive opened from a pin plays the
+   whole drive too, as on the search page.
+
    The address holds the search (as on the search page) and the map's
    view ("view=lat,lon,zoom"), so a reload, a link or "Back to the map"
    shows the same place (a view that shows none of the search's pictures
@@ -190,6 +205,8 @@ var MAP = (function () {
                                                 width);
                                 group.y = (group.y * group.count + other.y * other.count) / total;
                                 group.count = total;
+                                group.estimated = (group.estimated || 0) +
+                                    (other.estimated || 0);
                                 group.ids = group.ids.concat(other.ids);
                                 group.r = pinRadius(total);
                                 other.dead = true;
@@ -209,10 +226,12 @@ var MAP = (function () {
         return groups;
     }
 
-    /* The pins of points ([{id, lat, lon}]) on a world width pixels wide:
-       [{x, y, count, ids, r}] in world pixels (x in [0, width)), ordered
-       top to bottom. The same points and width always give the same pins,
-       wherever the map is panned to. options: cell, gap (pixels). */
+    /* The pins of points ([{id, lat, lon}; "e": 1 for an estimated place])
+       on a world width pixels wide: [{x, y, count, ids, r, estimated (how
+       many of its points are estimated)}] in world pixels (x in [0,
+       width)), ordered top to bottom. The same points and width always
+       give the same pins, wherever the map is panned to. options: cell,
+       gap (pixels). */
     function cluster(points, width, options) {
         options = options || {};
         var cell = options.cell || CELL;
@@ -228,18 +247,21 @@ var MAP = (function () {
             var key = (Math.floor(at.x / cell) % cols) + ":" + Math.floor(at.y / cell);
             var group = cells[key];
             if (!group) {
-                group = {sx: 0, sy: 0, ref: at.x, ids: []};
+                group = {sx: 0, sy: 0, ref: at.x, ids: [], estimated: 0};
                 cells[key] = group;
                 groups.push(group);
             }
             group.sx += nearestCopy(at.x, group.ref, width);
             group.sy += at.y;
             group.ids.push(point.id);
+            if (point.e) {
+                group.estimated += 1;
+            }
         });
         groups = groups.map(function (group) {
             var count = group.ids.length;
             return {x: wrapX(group.sx / count, width), y: group.sy / count, count: count,
-                    ids: group.ids, r: pinRadius(count)};
+                    ids: group.ids, r: pinRadius(count), estimated: group.estimated};
         });
         groups = mergeTouching(groups, width, gap);
         groups.sort(function (a, b) {
@@ -534,6 +556,44 @@ var MAP = (function () {
 
         var search = SITE.searchState.read();
         var adminOn = Boolean(SITE.capabilities.admin) && !SITE.capabilities.static;
+        // "Show estimated places": the admin's default is on (kept for the
+        // session when changed).
+        var ESTIMATED_KEY = "searchImages.mapEstimated";
+        var estimatedBox = document.getElementById("map-estimated");
+        var estimatedToggle = document.getElementById("map-estimated-toggle");
+        var showEstimated = adminOn;
+        try {
+            var keptChoice = window.sessionStorage.getItem(ESTIMATED_KEY);
+            if (keptChoice === "1" || keptChoice === "0") {
+                showEstimated = keptChoice === "1";
+            }
+        } catch (error) {
+            // (No storage: the default.)
+        }
+        var estimatedIds = {};          // ids of the estimated points
+        // "Show drive routes" (on by default; kept for the session when changed).
+        var ROUTES_KEY = "searchImages.mapRoutes";
+        var routesBox = document.getElementById("map-routes");
+        var routesToggle = document.getElementById("map-routes-toggle");
+        var routeTip = document.getElementById("map-route-tip");
+        var showRoutes = true;
+        try {
+            var keptRoutes = window.sessionStorage.getItem(ROUTES_KEY);
+            if (keptRoutes === "1" || keptRoutes === "0") {
+                showRoutes = keptRoutes === "1";
+            }
+        } catch (error) {
+            // (No storage: the default.)
+        }
+        var allRoutes = null;           // ROUTES.prepare's routes, once loaded
+        var routeLines = [];            // the lines of the search's clips
+        var routeCount = 0;             // the routes they are of
+        var onRoutes = {};              // ids of the clips drawn as lines: no pins
+        var pinLocations = [];          // the located pictures with pins
+        var routesVersion = 0;
+        var routeCache = {zoom: -1, version: -1, lines: []};
+        var routesDrawn = [];           // the lines drawn last, with screen positions
+        var hoverRoute = null;          // the place on a line under the mouse
         // (SITE.searchState.read has checked the value already.)
         var startView = parseView(search.view);
         // The view is still the one from the address (until the pictures
@@ -793,7 +853,7 @@ var MAP = (function () {
         function groupsNow() {
             if (groupsCache.zoom !== view.zoom || groupsCache.version !== locationsVersion) {
                 groupsCache = {zoom: view.zoom, version: locationsVersion,
-                               groups: cluster(locations, width())};
+                               groups: cluster(pinLocations, width())};
                 markPicked();
             }
             return groupsCache.groups;
@@ -824,12 +884,25 @@ var MAP = (function () {
                 }
                 ctx.beginPath();
                 ctx.arc(pin.sx, pin.sy, pin.r, 0, Math.PI * 2);
-                ctx.fillStyle = group.count === 1 ? "rgba(214, 58, 58, 0.95)"
+                var color = group.count === 1 ? "rgba(214, 58, 58, 0.95)"
                     : "rgba(31, 103, 214, 0.95)";
-                ctx.fill();
-                ctx.lineWidth = 2;
-                ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
-                ctx.stroke();
+                if (group.estimated && group.estimated === group.count) {
+                    // Only estimated places: a hollow pin.
+                    ctx.fillStyle = "rgba(12, 17, 24, 0.35)";
+                    ctx.fill();
+                    ctx.lineWidth = 4;
+                    ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+                    ctx.stroke();
+                    ctx.lineWidth = 2.5;
+                    ctx.strokeStyle = color;
+                    ctx.stroke();
+                } else {
+                    ctx.fillStyle = color;
+                    ctx.fill();
+                    ctx.lineWidth = 2;
+                    ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+                    ctx.stroke();
+                }
                 if (group.count > 1) {
                     ctx.fillStyle = "#ffffff";
                     ctx.fillText(countLabel(group.count), pin.sx, pin.sy + 0.5);
@@ -837,6 +910,170 @@ var MAP = (function () {
             });
             ctx.restore();
             pins = list;
+        }
+
+        /* Routes */
+
+        // The lines of the routes (ROUTES.lines) of the clips the search found.
+        function applyRoutes() {
+            routeLines = [];
+            routeCount = 0;
+            onRoutes = {};
+            if (allRoutes && typeof ROUTES !== "undefined") {
+                allRoutes.routes.forEach(function (route) {
+                    var found = ROUTES.lines(route, function (id) {
+                        return rank[id] !== undefined;
+                    });
+                    found.forEach(function (line) {
+                        routeLines.push(line);
+                        line.forEach(function (point) {
+                            onRoutes[point.clip] = true;
+                        });
+                    });
+                    routeCount += found.length ? 1 : 0;
+                });
+            }
+            pinLocations = locations.filter(function (point) {
+                return !(showRoutes && onRoutes[point.id]);
+            });
+            if (routesBox) {
+                routesBox.hidden = !routeLines.length;
+            }
+            routesVersion += 1;
+            setHoverRoute(null);
+        }
+
+        // The lines in world pixels at this zoom (each point the copy of the
+        // world nearest the one before it).
+        function projectedRoutes() {
+            if (routeCache.zoom !== view.zoom || routeCache.version !== routesVersion) {
+                var w = width();
+                routeCache = {zoom: view.zoom, version: routesVersion,
+                              lines: routeLines.map(function (line) {
+                                  var before = null;
+                                  return line.map(function (point) {
+                                      var at = project(point.lat, point.lon, w);
+                                      var x = before === null ? at.x : nearestCopy(at.x, before, w);
+                                      before = x;
+                                      return {x: x, y: at.y, point: point};
+                                  });
+                              })};
+            }
+            return routeCache.lines;
+        }
+
+        function drawRoutes(at) {
+            routesDrawn = [];
+            if (!showRoutes || !routeLines.length) {
+                return;
+            }
+            var middle = at.left + view.w / 2;
+            routesDrawn = projectedRoutes().map(function (line) {
+                var shift = nearestCopy(line[0].x, middle, at.w) - line[0].x - at.left;
+                return line.map(function (entry) {
+                    return {sx: entry.x + shift, sy: entry.y - at.top, clip: entry.point.clip,
+                            at: entry.point.at};
+                });
+            });
+            ctx.save();
+            ctx.lineCap = "round";
+            ctx.lineJoin = "round";
+            function stroke(lines, lineWidth, colour) {
+                ctx.lineWidth = lineWidth;
+                ctx.strokeStyle = colour;
+                lines.forEach(function (line) {
+                    ctx.beginPath();
+                    line.forEach(function (point, index) {
+                        if (index) {
+                            ctx.lineTo(point.sx, point.sy);
+                        } else {
+                            ctx.moveTo(point.sx, point.sy);
+                        }
+                    });
+                    if (line.length === 1) {
+                        ctx.lineTo(line[0].sx + 0.1, line[0].sy);
+                    }
+                    ctx.stroke();
+                });
+            }
+            stroke(routesDrawn, 5.5, ROUTES.HALO);
+            stroke(routesDrawn, 3, ROUTES.LINE);
+            if (hoverRoute) {
+                // The clip under the pointer, brighter, and the place on it.
+                stroke(routesDrawn.map(function (line) {
+                    return line.filter(function (point) {
+                        return point.clip === hoverRoute.clip;
+                    });
+                }).filter(function (line) {
+                    return line.length;
+                }), 6, "rgba(255, 235, 180, 0.98)");
+                ctx.beginPath();
+                ctx.arc(hoverRoute.sx, hoverRoute.sy, 5, 0, Math.PI * 2);
+                ctx.fillStyle = "rgba(214, 58, 58, 0.98)";
+                ctx.fill();
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = "#ffffff";
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        // The place on a route line at a screen point, or null.
+        function routeAt(x, y, slack) {
+            if (!routesDrawn.length || typeof ROUTES === "undefined") {
+                return null;
+            }
+            return ROUTES.nearest(routesDrawn, x, y, slack + 2);
+        }
+
+        // "Drive \u00b7 clip 3 of 12 \u00b7 0:41" (the clip's place in its drive as the
+        // search page shows it, and the time into it) of a place on a route.
+        function routeWords(hit) {
+            var rec = indexById[hit.clip];
+            var drive = driveOf(hit.clip);
+            var title = (drive && drive.text !== null && indexById[drive.text] &&
+                         indexById[drive.text].dvt) || "Drive";
+            var parts = [title];
+            if (drive) {
+                parts.push("clip " + (drive.clips.indexOf(hit.clip) + 1) + " of " +
+                           drive.clips.length);
+            } else if (rec && rec.t) {
+                parts.push(rec.t);
+            }
+            var seconds = Math.max(0, Math.round(hit.at));
+            parts.push(Math.floor(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") +
+                       (seconds % 60) + " in");
+            return parts.join(" \u00b7 ");
+        }
+
+        function setHoverRoute(hit) {
+            var before = hoverRoute;
+            hoverRoute = hit;
+            if (routeTip) {
+                routeTip.hidden = !hit;
+                if (hit) {
+                    routeTip.textContent = routeWords(hit) + " \u2014 click to play from here";
+                    routeTip.style.left = Math.round(Math.min(hit.sx + 14,
+                                                              Math.max(0, view.w - 260))) + "px";
+                    routeTip.style.top = Math.round(Math.max(0, hit.sy - 36)) + "px";
+                }
+            }
+            if (before !== hit && (before || hit)) {
+                scheduleDraw();
+            }
+        }
+
+        // The viewer on the clip at a place on a route, that far into it.
+        function openRoute(hit) {
+            var rec = indexById[hit.clip];
+            if (!rec) {
+                return;
+            }
+            var drive = driveOf(hit.clip);
+            var ids = drive ? drive.clips : [hit.clip];
+            closePanel(false);
+            showViewer(ids, Math.max(0, ids.indexOf(hit.clip)),
+                       {id: hit.clip, seconds: hit.at});
         }
 
         var dirty = false;
@@ -856,6 +1093,7 @@ var MAP = (function () {
             ctx.fillRect(0, 0, view.w, view.h);
             var at = corner();
             drawTiles(at);
+            drawRoutes(at);
             drawPins(at);
             drawTarget();
         }
@@ -987,11 +1225,17 @@ var MAP = (function () {
                 return;
             }
             var count = locations.length;
+            var estimated = locations.filter(function (point) {
+                return point.e;
+            }).length;
             if (count) {
-                statusBar.textContent = filtered() && matchCount > count
+                statusBar.textContent = (filtered() && matchCount > count
                     ? fmt.number(count) + " of " + fmt.plural(matchCount, "matching picture") +
                       " have a location"
-                    : fmt.plural(count, "picture") + " with a location";
+                    : fmt.plural(count, "picture") + " with a location") +
+                    (estimated ? " (" + fmt.number(estimated) + " estimated)" : "") +
+                    (routeCount && showRoutes ? " \u00b7 " + fmt.plural(routeCount, "drive route")
+                        : "");
                 showMessage(null);
                 return;
             }
@@ -1083,6 +1327,11 @@ var MAP = (function () {
             var date = VIEWER.format.shortDate(rec.dk);
             if (date) {
                 text.appendChild(el("span", {className: "map-panel-date", text: date}));
+            }
+            if (estimatedIds[id]) {
+                link.classList.add("is-estimated");
+                text.appendChild(el("span", {className: "map-panel-date",
+                                             text: "Estimated place"}));
             }
             link.appendChild(text);
             link.addEventListener("click", function (event) {
@@ -1237,10 +1486,38 @@ var MAP = (function () {
             if (!selection) {
                 return;
             }
-            var ids = selection.ids;
+            showViewer(selection.ids, index, null);
+        }
+
+        /* The drive of a clip as the viewer plays it (its driveOf): the
+           clips of its drive the search may show, in order, or null. */
+        function driveOf(id) {
+            var rec = indexById[id];
+            if (!rec || rec.dv === undefined || rec.dv === null || !searchIndex) {
+                return null;
+            }
+            var clips = searchIndex.driveClips(rec.dv, visibility());
+            if (clips.length < 2 || clips.indexOf(id) < 0) {
+                return null;
+            }
+            var text = null;
+            clips.forEach(function (clipId) {
+                var clip = indexById[clipId];
+                if (text === null && clip && (clip.dvt || clip.dvd ||
+                                              (clip.dvg && clip.dvg.length))) {
+                    text = clipId;
+                }
+            });
+            return {key: rec.dv, clips: clips, text: text, matched: {}, folded: false};
+        }
+
+        // The viewer on ids from index (startAt: VIEWER.open's).
+        function showViewer(ids, index, startAt) {
             var opened = VIEWER.open({
                 ids: ids,
                 index: index,
+                startAt: startAt,
+                driveOf: driveOf,
                 get: function (id) {
                     return indexById[id] || null;
                 },
@@ -1340,6 +1617,12 @@ var MAP = (function () {
             var hit = hitPin(pins, x, y, slack);
             if (hit) {
                 openPanel(hit.group, false);
+                return;
+            }
+            var onRoute = routeAt(x, y, slack);
+            if (onRoute) {
+                setHoverRoute(null);
+                openRoute(onRoute);
             } else {
                 closePanel(false);
             }
@@ -1369,9 +1652,17 @@ var MAP = (function () {
             var p = rectPoint(event);
             if (!drag) {
                 if (event.target === canvas) {
-                    canvas.classList.toggle("over-pin", Boolean(hitPin(pins, p.x, p.y, MOUSE_SLACK)));
+                    var overPin = Boolean(hitPin(pins, p.x, p.y, MOUSE_SLACK));
+                    var overRoute = overPin ? null : routeAt(p.x, p.y, MOUSE_SLACK);
+                    canvas.classList.toggle("over-pin", overPin || Boolean(overRoute));
+                    setHoverRoute(overRoute);
+                } else if (hoverRoute) {
+                    setHoverRoute(null);
                 }
                 return;
+            }
+            if (hoverRoute) {
+                setHoverRoute(null);
             }
             if (Math.abs(p.x - drag.downX) + Math.abs(p.y - drag.downY) > 3) {
                 drag.moved = true;
@@ -1623,10 +1914,10 @@ var MAP = (function () {
             }
         }
 
-        // Some pin has its middle on the screen.
+        // Some picture (a pin, or a clip on a route) has its middle on the screen.
         function pinsInSight() {
             var at = corner();
-            return screenPins(groupsNow(), at.left, at.top, view.w, view.h, at.w)
+            return screenPins(cluster(locations, at.w), at.left, at.top, view.w, view.h, at.w)
                 .some(function (pin) {
                     return pin.sx >= 0 && pin.sx <= view.w && pin.sy >= 0 && pin.sy <= view.h;
                 });
@@ -1646,9 +1937,22 @@ var MAP = (function () {
                 rank[id] = index;
             });
             matchCount = found.total;
+            estimatedIds = {};
+            var anyEstimated = false;
             locations = (allLocations || []).filter(function (point) {
+                if (point && point.e) {
+                    estimatedIds[point.id] = true;
+                    anyEstimated = anyEstimated || rank[point.id] !== undefined;
+                    if (!showEstimated) {
+                        return false;
+                    }
+                }
                 return rank[point.id] !== undefined && validPoint(point);
             });
+            if (estimatedBox) {
+                estimatedBox.hidden = !anyEstimated;
+            }
+            applyRoutes();
             locationsVersion += 1;
             closePanel(false);
             var summary = searchSummary();
@@ -1700,9 +2004,58 @@ var MAP = (function () {
                     allLocations = loaded;
                     loadState = "ready";
                     applySearch(false);
+                    if (allRoutes === null && SITE.loadRoutes && typeof ROUTES !== "undefined") {
+                        SITE.loadRoutes(function (list) {
+                            if (list) {
+                                allRoutes = ROUTES.prepare(list);
+                                applySearch(false);
+                            }
+                        });
+                    }
                 });
             });
         }
+
+        if (estimatedToggle) {
+            estimatedToggle.checked = showEstimated;
+            estimatedToggle.addEventListener("change", function () {
+                showEstimated = estimatedToggle.checked;
+                try {
+                    window.sessionStorage.setItem(ESTIMATED_KEY, showEstimated ? "1" : "0");
+                } catch (error) {
+                    // (No storage: for this page only.)
+                }
+                if (loadState === "ready") {
+                    if (selection && selection.point) {
+                        startPin = selection.point;
+                    }
+                    applySearch(false);
+                }
+            });
+        }
+
+        if (routesToggle) {
+            routesToggle.checked = showRoutes;
+            routesToggle.addEventListener("change", function () {
+                showRoutes = routesToggle.checked;
+                try {
+                    window.sessionStorage.setItem(ROUTES_KEY, showRoutes ? "1" : "0");
+                } catch (error) {
+                    // (No storage: for this page only.)
+                }
+                setHoverRoute(null);
+                if (loadState === "ready") {
+                    // (Their clips' pins come or go.)
+                    if (selection && selection.point) {
+                        startPin = selection.point;
+                    }
+                    applySearch(false);
+                }
+            });
+        }
+        canvas.addEventListener("mouseleave", function () {
+            setHoverRoute(null);
+        });
 
         function init() {
             resize();

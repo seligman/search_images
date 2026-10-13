@@ -106,6 +106,28 @@
             text += " The GPS check ignored the position of " +
                 fmt.plural(data.gps_ignored, "picture") + " (search is:gps-ignored).";
         }
+        var estimates = data.estimates || {};
+        if (estimates.estimated) {
+            // (place_estimates.py: pictures without a position of their own)
+            var sources = [];
+            if (estimates.copy) {
+                sources.push(fmt.number(estimates.copy) + " from a copy");
+            }
+            if (estimates.time) {
+                sources.push(fmt.number(estimates.time) + " from pictures taken around the " +
+                             "same time");
+            }
+            if (estimates.area) {
+                sources.push(fmt.number(estimates.area) + " from the library's area (region " +
+                             "only)");
+            }
+            text += " " + fmt.plural(estimates.estimated, "picture") + " without a position " +
+                (estimates.estimated === 1 ? "has" : "have") + " an estimated place: " +
+                sources.join(", ") + " (search is:place-estimated).";
+        }
+        if (estimates.owner) {
+            text += " You set the place of " + fmt.plural(estimates.owner, "picture") + ".";
+        }
         return text;
     }
 

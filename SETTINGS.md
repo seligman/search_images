@@ -42,6 +42,7 @@ The same variable is honored by every script.
     "image_embedding": { ... },
     "nadir_fill_deg": 0,
     "zenith_fill_deg": 0,
+    "level_horizon": true,
     "ffmpeg": "",
     "video_frames": 4,
     "video_sheet_check": true,
@@ -49,6 +50,8 @@ The same variable is honored by every script.
     "drives": { "slack": 20, "min_clips": 3 },
     "drive_previews": { "enabled": false, "speed": 60, "height": 720 },
     "gps_check": { "enabled": true },
+    "place_estimates": { "enabled": true },
+    "gps_tracks": { "enabled": true },
     "libraries": [ { ... }, { ... } ]
 }
 ```
@@ -554,7 +557,9 @@ like into a look vector, kept in `data/image_vectors.db`.
     "batch": 8,
     "model_file": "",
     "mmproj_file": "",
-    "probe_check": true
+    "probe_check": true,
+    "opening_views": true,
+    "text_prefix": "task: search result | query: "
 }
 ```
 
@@ -605,6 +610,20 @@ server is started for it with its `auto_start`).
   was right and the reference was not (made on a server that was not), the
   Manage page offers **Rebuild looks**, which throws away the reference
   and the kept looks and makes them again. `false` skips the check.
+- `opening_views` - `true` (the default): **Update looks** also works out
+  where described 360 photos open (see "Where 360 pictures open" in the
+  README): the model embeds views of each photo every 45 degrees round
+  the horizon and the photo's title with the first sentence of its
+  description, and the photo opens at the view nearest its words when that
+  beats the front by enough. A model that does not match words to pictures
+  (checked first with the probe pictures and words for them) leaves the
+  photos at the front. `false`: no views are worked out, and the next run
+  forgets those it made (the photos open at the front again; views chosen
+  with **Open here** stay).
+- `text_prefix` - what the photo's words are sent after (at most 200
+  characters): EmbeddingGemma's query prompt by default; another model may
+  want another (or `""`). The views are worked out again when it changes,
+  as when the model, a photo's words or its stitch change.
 
 The looks are tied to a recipe: the model and projector files, `dims`,
 `max_edge` and the way pictures are prepared. When it changes, the kept
@@ -670,6 +689,22 @@ again (their previews, panoramas and thumbnails; descriptions are kept).
 The fills apply to 360-degree videos too: to their posters and contact
 sheets (made again the same way), and to the viewer, which fills the
 poles of each frame as it plays.
+
+## level_horizon
+
+360-degree videos of an Insta360 X4 or ONE R, and the unstitched 360
+photos of a ONE R, are levelled with the camera's motion sensor: the
+panorama is turned so that its horizon stays level however the camera
+was held (only the tilt is taken out; the middle of the panorama still
+looks where the camera looked). It applies to the posters, contact sheets
+and stitched photos, and to the viewer, which turns each frame of a 360
+video as it plays (where the viewer's own **Level** button can turn it
+off for one browser). On by default; set `"level_horizon": false` to see
+everything as the camera did. After a change, the next scan stitches the
+360 photos and videos in the index again (descriptions are kept; their
+looks are made again by the next Update looks), and the viewer and
+published sites no longer get the level tracks (an export publishes a
+video's track with the video, when this is on).
 
 ## Videos: ffmpeg, video_frames, video_sheet_check, video_proxies
 
@@ -782,9 +817,7 @@ location** in the viewer at once). All keys are optional:
     "neighbours": 4,
     "stale_minutes": 5,
     "repeat_hours": 1,
-    "across_libraries": true,
-    "estimate_places": false,
-    "estimate_minutes": 30
+    "across_libraries": true
 }
 ```
 
@@ -820,14 +853,78 @@ location** in the viewer at once). All keys are optional:
 - `across_libraries` - pictures of all libraries are neighbours of each
   other (default `true`: a phone in one library vouches for a camera in
   another). Set `false` when your libraries hold the pictures of people
-  who travel apart.
-- `estimate_places` - give a picture whose position was set aside the
-  place that the pictures taken within `estimate_minutes` (1 to 240,
-  default 30) agree on, when they all name the same town (default
-  `false`). It has no position (it is not on the map); the viewer says
-  "estimated from pictures taken around the same time". Searches by place
-  find it, and an export publishes it only when it publishes locations,
-  like every place name.
+  who travel apart. The place estimates follow it too.
+
+Older versions had `estimate_places` and `estimate_minutes` here; they
+now stand in for `place_estimates`' `enabled` and `window_minutes` when
+those are not given.
+
+## place_estimates
+
+Places estimated for pictures without a GPS position of their own (no
+position in the file, or one the GPS check set aside), from a copy of a
+located picture, the pictures taken around the same time or the
+library's area (see README, "Estimated places"). They are worked out
+again after every GPS check, so a change here takes effect with the next
+scan (or **Build previews**, **Add place names**, an export with
+locations, or a choice in the viewer). All keys are optional:
+
+```
+"place_estimates": {
+    "enabled": true,
+    "window_minutes": 30,
+    "max_spread_km": 2,
+    "library_area": true
+}
+```
+
+- `enabled` - `false` turns the estimates off (the places you set or
+  accepted in the viewer stay).
+- `window_minutes` - how far in time (1 to 240, default 30) a located
+  picture may be from the picture to count; on one side only, the nearest
+  must be within half of it.
+- `max_spread_km` - how far apart (0.1 to 50, default 2) the located
+  pictures before and after it may be, how far off their own positions
+  may be by their own account, and how far the camera may have moved
+  since the nearest one on one side (by the speed of the shots there, at
+  least walking pace, and after two minutes at least 50 km/h) or between
+  a copy and the picture that looks like it: further apart, and there is
+  no estimate (a drive, a flight); further off, and the picture gets the
+  nearest shot's town without a position (the region beyond 10 km,
+  nothing beyond 25 km). Larger values place more pictures, and more of
+  them wrongly.
+- `library_area` - a picture that gets no place otherwise gets its
+  library's region (no position, never on the map) when at least 95% of
+  the library's located pictures (and at least 20) are within 100 km of
+  each other and name one region (or country), and the picture was taken
+  within 3 hours of them with no located picture somewhere else taken
+  nearer in time -- or it has no date to go by and the located pictures
+  are at least a tenth of the library's (default `true`). Set `false`
+  when a library mixes trips.
+
+## gps_tracks
+
+The GPS tracks dashcams (and other cameras) record into their videos:
+one fix a second, as Novatek-style `freeGPS` blocks (an NMEA sentence, or
+binary fields in a layout exiftool documents) or NMEA sentences in a text
+track (see README, "Routes"). A scan reads them with each new or changed
+video, and the videos indexed before; a clip with a track gets the
+position of its middle fix and, when its file names no time zone, the UTC
+offset its clock has by the GPS time (lent only to the same camera's
+pictures); drives get routes on the map and in the viewer. Optional:
+
+```
+"gps_tracks": {
+    "enabled": true
+}
+```
+
+- `enabled` - `false` stops reading tracks, and the next scan takes away
+  the positions they gave (the tracks read are kept: with `true` again
+  the positions come back without reading the videos again). Routes are
+  no longer shown, nor exported.
+
+`"gps_tracks": false` means the same as `{"enabled": false}`.
 
 ## libraries
 
@@ -921,7 +1018,24 @@ A list of folders to scan. Each library is one object:
     (extended metadata); default `false`. Titles and descriptions are
     published as written either way (with your own edits to the title,
     description and tags in place of the model's), and can name a place a
-    picture shows.
+    picture shows. Places you set or accepted in the viewer go with it
+    like GPS positions.
+  - `estimated_places` - with `location`, `true` also publishes the places
+    estimated for pictures without a GPS position of their own (marked as
+    estimated; hollow pins on the map); default `false` (see "Estimated
+    places" in the README).
+  - `routes` - with `location`, `true` also publishes the routes of drives
+    and the positions video clips have from their GPS tracks (see
+    `gps_tracks`); default `false`. Without it such clips keep their place
+    names but not their positions (and so do places estimated from a
+    track, also when you accepted them). The positions a dashcam's clips
+    write out in their texts (as its overlay prints them) are never
+    published.
+  - `routes_trim` - metres of every route left out around where its drive
+    starts and where it ends (0 to 5000, default 500; the drives of every
+    library), with the positions of the clips and estimated places there:
+    a drive often starts and ends at home. A line that passes that near is
+    cut there too.
   - `file_names`, `folders` - `true` publishes file names or folder names
     (searchable); default `false`.
   - `exclude_types` - picture types left out; default

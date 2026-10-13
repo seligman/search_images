@@ -1208,6 +1208,9 @@ function fakeGl(log, maxTexture) {
         },
         texImage2D: function () {
             log.uploads.push(arguments[arguments.length - 1]);
+        },
+        uniformMatrix3fv: function (where, transpose, value) {
+            (log.matrices = log.matrices || []).push(Array.prototype.slice.call(value));
         }
     };
     return new Proxy(gl, {get: function (target, name) {
@@ -2234,6 +2237,220 @@ test("a 360 video whose lens lies sideways plays flat turned upright", function 
     });
 });
 
+test("a 360 video's level track: up between samples and the turn of the view", function () {
+    var f = VIEWER.format;
+    var track = [[1.0, 0, 1, 0], [3.0, 1, 0, 0]];
+    assert.deepStrictEqual(f.levelUp(track, 0), [0, 1, 0]);
+    assert.deepStrictEqual(f.levelUp(track, 9), [1, 0, 0]);
+    var middle = f.levelUp(track, 2.5);
+    // (As insta360.up_at gives it.)
+    assert.ok(Math.abs(middle[0] - 0.9486832980505138) < 1e-12, String(middle));
+    assert.ok(Math.abs(middle[1] - 0.31622776601683794) < 1e-12, String(middle));
+    assert.deepStrictEqual(f.levelUp(null, 1), [0, 1, 0]);
+    assert.deepStrictEqual(f.levelUp([[0, 0, 0, 0]], 1), [0, 1, 0]);
+    // The turn insta360.up_rotation makes, column by column: up (0.3, 0.9,
+    // -0.2) made a unit vector.
+    var length = Math.sqrt(0.09 + 0.81 + 0.04);
+    var m = f.levelMatrix([0.3 / length, 0.9 / length, -0.2 / length]);
+    var python = [0.950347084207, -0.309426373878, 0.033101943862, 0.309426373878,
+                  0.928279121633, -0.206284249252, 0.033101943862, 0.206284249252,
+                  0.977932037426];
+    m.forEach(function (value, index) {
+        assert.ok(Math.abs(value - python[index]) < 1e-9, index + ": " + value);
+    });
+    // Straight up turns nothing; upside down is half a turn about the
+    // forward axis (the front keeps its heading) -- about the side one when
+    // a track marks it upright.
+    assert.deepStrictEqual(f.levelMatrix([0, 1, 0]), [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+    assert.deepStrictEqual(f.levelMatrix([0, -1, 0]).map(function (value) {
+        return value + 0;       // (-0 is 0 here)
+    }), [-1, 0, 0, 0, -1, 0, 0, 0, 1]);
+    assert.deepStrictEqual(f.levelMatrix([0, -1, 0], false), [1, 0, 0, 0, -1, 0, 0, 0, -1]);
+    // As insta360.up_rotation turns a camera upside down: up (0.1, -0.9, 0.2).
+    length = Math.sqrt(0.01 + 0.81 + 0.04);
+    var down = [0.1 / length, -0.9 / length, 0.2 / length];
+    var inverted = [-0.994098991766, -0.107832773203, 0.011802016468, 0.107832773203,
+                    -0.970494958831, 0.215665546407, -0.011802016468, 0.215665546407,
+                    0.976395967065];
+    [f.levelMatrix(down), f.levelMatrix(down, true)].forEach(function (turned) {
+        turned.forEach(function (value, index) {
+            assert.ok(Math.abs(value - inverted[index]) < 1e-9, index + ": " + value);
+        });
+    });
+    // A track marks the samples of a camera upside down (to the next sample).
+    var marked = [[1, 0, 1, 0], [2, 0, -1, 0, 1], [3, 0.1, -0.99, 0, 1], [4, 0, 1, 0]];
+    assert.deepStrictEqual([0, 1.5, 2, 3.9, 4, 9].map(function (t) {
+        return f.levelInverted(marked, t);
+    }), [false, false, true, true, false, false]);
+    assert.strictEqual(f.levelInverted(null, 1), false);
+    // The shader turns the view with it.
+    assert.ok(/uniform mat3 u_level;/.test(f.fisheyeShader));
+    assert.ok(/vec3 s = u_level \* vec3\(d\.x, d\.y, -d\.z\);/.test(f.fisheyeShader));
+});
+
+test("a 360 video with a level track waits for it, then turns each frame level", function () {
+    var rec = Object.assign({}, V360_REC, {lv: 1});
+    var track = [[0, 0.5, Math.sqrt(0.75), 0], [10, 0, 1, 0]];
+    return onFakePage({webgl: true, fetch: true}, function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(rec, V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        var video = stage.video;
+        var controls = childWithClass(page.box, "stage-controls");
+        var level = controls.children[3];
+        assert.strictEqual(level.textContent, "Level");
+        assert.strictEqual(level.getAttribute("aria-label"), "Level horizon");
+        assert.strictEqual(level.hidden, false);
+        assert.strictEqual(level.getAttribute("aria-pressed"), "true");
+        video.videoWidth = 1664;
+        video.videoHeight = 832;
+        video.readyState = 4;
+        video.duration = 10;
+        video.paused = false;
+        video.fire("play");
+        // (The poster stays until the full record brings the track.)
+        assert.strictEqual(page.log.uploads.length, 1);
+        stage.videoDetail({id: 21, playable_copy: true, level: track});
+        assert.strictEqual(page.log.uploads.length, 2);
+        var last = page.log.matrices[page.log.matrices.length - 1];
+        var want = VIEWER.format.levelMatrix(VIEWER.format.levelUp(track, 0));
+        assert.deepStrictEqual(last, want);
+        // Later frames are turned for their own time (the browser's frame time).
+        video.currentTime = 5;
+        video.paused = true;
+        video.fire("seeked");
+        last = page.log.matrices[page.log.matrices.length - 1];
+        assert.deepStrictEqual(last, VIEWER.format.levelMatrix(VIEWER.format.levelUp(track, 5)));
+        // "Level" off: the frames as the camera saw them; on again.
+        level.fire("click");
+        assert.strictEqual(level.getAttribute("aria-pressed"), "false");
+        assert.deepStrictEqual(page.log.matrices[page.log.matrices.length - 1],
+                               [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        level.fire("click");
+        assert.strictEqual(level.getAttribute("aria-pressed"), "true");
+        assert.deepStrictEqual(page.log.matrices[page.log.matrices.length - 1],
+                               VIEWER.format.levelMatrix(VIEWER.format.levelUp(track, 5)));
+        // An export's details (no id, no playable copy) bring it too; another
+        // picture's do not.
+        stage.show(rec, V360_URLS);
+        page.log.images[1].finish(2048, 1024);
+        stage.videoDetail({id: 99, level: [[0, 1, 0, 0]]});
+        assert.strictEqual(stage.levelTrack, null);
+        stage.videoDetail({taken_at: "2019-05-14", level: track});
+        assert.strictEqual(stage.levelTrack, track);
+        stage.destroy();
+    });
+});
+
+test("Level before a 360 video has played: its own frame is drawn, which Level turns", function () {
+    var rec = Object.assign({}, V360_REC, {lv: 1});
+    var track = [[0, 0.5, Math.sqrt(0.75), 0], [10, 0, 1, 0]];
+    return onFakePage({webgl: true, fetch: true}, function (viewer, page) {
+        var states = [];
+        var stage = new viewer.Stage(page.box, {onState: function (state) {
+            states.push(state);
+        }});
+        stage.show(rec, V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        stage.videoDetail({id: 21, level: track});
+        var video = stage.video;
+        var level = childWithClass(page.box, "stage-controls").children[3];
+        // (Only the poster so far: it is level already, and nothing more of
+        // the video is loaded for it.)
+        assert.strictEqual(page.log.uploads.length, 1);
+        assert.strictEqual(video.preload, "metadata");
+        assert.strictEqual(states[states.length - 1].unlevelled, false);
+        // Not loaded yet: Level asks for more than the metadata, and the
+        // frame is drawn, as the camera saw it, once it is there.
+        level.fire("click");
+        assert.strictEqual(level.getAttribute("aria-pressed"), "false");
+        assert.strictEqual(video.preload, "auto");
+        assert.strictEqual(page.log.uploads.length, 1);
+        video.videoWidth = 1664;
+        video.videoHeight = 832;
+        video.readyState = 2;
+        video.fire("loadeddata");
+        assert.strictEqual(page.log.uploads.length, 2);
+        assert.deepStrictEqual(page.log.matrices[page.log.matrices.length - 1],
+                               [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        // (Shown so, "Open here" would keep a view of the camera's panorama.)
+        assert.strictEqual(states[states.length - 1].unlevelled, true);
+        // On again: turned level, still at its first frame.
+        level.fire("click");
+        assert.deepStrictEqual(page.log.matrices[page.log.matrices.length - 1],
+                               VIEWER.format.levelMatrix(VIEWER.format.levelUp(track, 0)));
+        assert.strictEqual(states[states.length - 1].unlevelled, false);
+        stage.destroy();
+    });
+});
+
+test("Level remembered off: a 360 video shows its own first frame, not its level poster", function () {
+    var rec = Object.assign({}, V360_REC, {lv: 1});
+    return onFakePage({webgl: true, fetch: true}, function (viewer, page) {
+        page.window.localStorage = {getItem: function (key) {
+            return key === "viewer.levelHorizon" ? "off" : null;
+        }, setItem: function () {}};
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(rec, V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        var video = stage.video;
+        var level = childWithClass(page.box, "stage-controls").children[3];
+        assert.strictEqual(level.getAttribute("aria-pressed"), "false");
+        assert.strictEqual(video.preload, "auto");
+        video.videoWidth = 1664;
+        video.videoHeight = 832;
+        video.readyState = 2;
+        video.fire("loadeddata");
+        // (No need to wait for the track to show it unturned.)
+        assert.strictEqual(page.log.uploads.length, 2);
+        assert.deepStrictEqual(page.log.matrices[page.log.matrices.length - 1],
+                               [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        stage.destroy();
+    });
+});
+
+test("a 360 video whose level track does not come plays as the camera saw it", function () {
+    var rec = Object.assign({}, V360_REC, {lv: 1});
+    return onFakePage({webgl: true, fetch: true}, function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(rec, V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        var video = stage.video;
+        video.videoWidth = 1664;
+        video.videoHeight = 832;
+        video.readyState = 4;
+        video.paused = true;
+        video.fire("seeked");
+        assert.strictEqual(page.log.uploads.length, 1);
+        // A while later (the full record failed): the frame, unturned.
+        page.runTimers();
+        assert.strictEqual(page.log.uploads.length, 2);
+        assert.deepStrictEqual(page.log.matrices[page.log.matrices.length - 1],
+                               [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        // A record without a track has no "Level" and does not wait.
+        stage.show(V360_REC, V360_URLS);
+        page.log.images[1].finish(2048, 1024);
+        var level = childWithClass(page.box, "stage-controls").children[3];
+        assert.strictEqual(level.hidden, true);
+        stage.video.videoWidth = 1664;
+        stage.video.videoHeight = 832;
+        stage.video.readyState = 4;
+        stage.video.fire("seeked");
+        assert.strictEqual(page.log.uploads.length, 4);
+        stage.destroy();
+    });
+});
+
+test("a 360 video's full record with a level track says so in its compact record", function () {
+    var detail = {id: 21, library_id: "lib_x", name: "VID_1.insv", path: "VID_1.insv",
+                  width: 7680, height: 3840, projection: "dual_fisheye", media: "video",
+                  duration: 12.5, video: {codec: "hevc", lrv: {codec: "h264"}, fisheye: FISHEYE},
+                  level: [[0, 0, 1, 0], [12.5, 0.1, 0.995, 0]], info: null};
+    assert.strictEqual(SITE.compactRecord(detail).lv, 1);
+    delete detail.level;
+    assert.strictEqual(SITE.compactRecord(detail).lv, undefined);
+});
+
 test("one stage: a drive, a 360 video whose full record comes early, then a video", function () {
     // (The full record of each goes where it belongs: Stage.videoDetail.)
     var v360 = Object.assign({}, V360_REC);
@@ -2471,6 +2688,77 @@ test("in the viewer a drive plays as one and the pane follows its clips", functi
         assert.strictEqual(byClass(page.document.body, "drive-strip").length, 0);
         assert.strictEqual(lightboxVideo(page), null);
         page.key("Escape");
+    });
+});
+
+/* The route of a drive (routes.js, SITE.loadRoutes): a small map in the pane
+   that follows the clip that plays, the speed there on the strip, and the
+   moment the map's route opened it at (startAt). The positions are made up. */
+test("in the viewer a drive's route shows in the pane, with the speed on the strip", function () {
+    var records = {};
+    DRIVE_CLIPS.forEach(function (rec) {
+        records[rec.i] = rec;
+    });
+    var savedRoutes = global.ROUTES;
+    var realLoad = SITE.loadRoutes;
+    var asked = 0;
+    global.ROUTES = require(path.join(STATIC, "routes.js"));
+    SITE.loadRoutes = function (callback) {
+        asked += 1;
+        // Clips 31 and 32 east along a road (40 to 60 and 60 to 80 km/h); 33
+        // has no track.
+        callback([{d: 31, l: "lib", c: [
+            {i: 31, o: 0, p: "[[0,-4120000,-15030000,40],[600,0,1000,60]]"},
+            {i: 32, o: 60, p: "[[0,-4120000,-15029000,60],[600,0,1000,80]]"}]}]);
+    };
+    function restore() {
+        SITE.loadRoutes = realLoad;
+        if (savedRoutes === undefined) {
+            delete global.ROUTES;
+        } else {
+            global.ROUTES = savedRoutes;
+        }
+    }
+    return onLightboxPage(videoPage(), function (viewer, page) {
+        // Opened as the map opens a place on a route: 30 s into clip 32.
+        assert.ok(viewer.open({ids: [31, 32, 33], index: 1, get: function (id) {
+            return records[id] || null;
+        }, driveOf: function () {
+            return {key: 31, clips: [31, 32, 33], matched: {}, text: 31, folded: false};
+        }, startAt: {id: 32, seconds: 30}}));
+        assert.strictEqual(asked, 1);
+        var strip = byClass(page.document.body, "drive-strip")[0];
+        var label = byClass(strip, "drive-label")[0];
+        assert.ok(/^Clip 2 of 3 \u00b7 1:30 \/ /.test(label.textContent), label.textContent);
+        assert.ok(/ \u00b7 70 km\/h$/.test(label.textContent), label.textContent);
+        var maps = byClass(page.document.body, "route-map");
+        assert.strictEqual(maps.length, 1);
+        assert.strictEqual(maps[0].hidden, false);
+        var pane = byClass(page.document.body, "viewer-info")[0];
+        assert.ok(pane.contains(maps[0]), "in the pane");
+        // The next clip has no track: no speed, and the map stays (the
+        // drive's route), the same node.
+        lightboxVideo(page).fire("ended");
+        assert.ok(/^Clip 3 of 3/.test(label.textContent), label.textContent);
+        assert.ok(!/km\/h/.test(label.textContent), label.textContent);
+        var again = byClass(page.document.body, "route-map");
+        assert.deepStrictEqual(again, maps);
+        assert.strictEqual(asked, 1);
+        page.key("Escape");
+        // Another drive later: the routes are not asked for again.
+        assert.ok(viewer.open({ids: [31], index: 0, get: function (id) {
+            return records[id] || null;
+        }, driveOf: function () {
+            return {key: 31, clips: [31, 32, 33], matched: {}, text: 31, folded: false};
+        }}));
+        assert.strictEqual(asked, 1);
+        assert.ok(/^Clip 1 of 3 \u00b7 0:00 \/ .* \u00b7 40 km\/h$/.test(
+            byClass(byClass(page.document.body, "drive-strip")[0], "drive-label")[0]
+                .textContent));
+        page.key("Escape");
+    }).then(restore, function (error) {
+        restore();
+        throw error;
     });
 });
 
@@ -2846,12 +3134,23 @@ test("the looks job is named and summed up, and a scan says how many wait", func
     assert.strictEqual(jobs.title(job), "Rebuild looks: Family");
     assert.strictEqual(jobs.summary(job), "12 pictures given looks · 1 could not be " +
                        "· 2 wait for their folder");
+    // (Where 360 photos open, worked out by the same job.)
+    job.summary.views = 3;
+    job.summary.views_turned = 2;
+    assert.ok(/3 360 photos given an opening view \(2 facing their subject\)/.test(
+        jobs.summary(job)), jobs.summary(job));
+    job.summary = {embedded: 0, views_dropped: 1};
+    assert.ok(/1 360 photo back at the front/.test(jobs.summary(job)), jobs.summary(job));
     var scanned = {kind: "scan", library_id: "lib_a", library: "Family", state: "done",
                    summary: {libraries: [{files: 40, added: 3}], looks_pending: 3}};
     assert.ok(/3 pictures without looks yet/.test(jobs.summary(scanned)),
               jobs.summary(scanned));
     scanned.summary.looks_pending = 0;
     assert.ok(!/looks/.test(jobs.summary(scanned)), jobs.summary(scanned));
+    // (And the 360 photos whose opening view the looks job works out.)
+    scanned.summary.views_pending = 2;
+    assert.ok(/2 360 photos waiting for an opening view/.test(jobs.summary(scanned)),
+              jobs.summary(scanned));
 });
 
 /* ---------- Records made by the server (tests/test_ui_scripts.py) ------------- */
@@ -2868,6 +3167,590 @@ function compareFile(file) {
              });
     });
 }
+
+/* ---------- Where 360 pictures open; the phone's information sheet ---------- */
+
+test("a 360 picture's opening view, as the 360 view turns it and back", function () {
+    var radians = Math.PI / 180;
+    var front = format.openingView(null);
+    assert.deepStrictEqual(front, {yaw: 0, pitch: 0, fov: 75 * radians});
+    assert.deepStrictEqual(format.openingView({i: 1, p: "360"}), front);
+    // 90 degrees right of the middle: the view turns the other way (panoLookup).
+    var right = format.openingView({ov: [90, 10]});
+    near(right.yaw, -Math.PI / 2, "yaw");
+    near(right.pitch, 10 * radians, "pitch");
+    var tangents = format.panoTangents(right.fov, 1600, 900);
+    near(format.panoLookup(right.yaw, 0, 0, 0, tangents).u, 0.75, "u of 90 degrees right");
+    // Wrapped, limited, and a zoom of its own when it has one.
+    near(format.openingView({ov: [270, 0]}).yaw, Math.PI / 2, "270 is 90 left");
+    near(format.openingView({ov: [0, 120]}).pitch, Math.PI / 2 - 0.01, "pitch limit");
+    near(format.openingView({ov: [0, 0, 50]}).fov, 50 * radians, "fov");
+    near(format.openingView({ov: [0, 0, 5]}).fov, format.MIN_FOV, "fov limit");
+    assert.deepStrictEqual(format.openingView({ov: ["a", null]}), front);
+    // Kept as the owner's view: degrees again.
+    assert.deepStrictEqual(format.viewDegrees(format.openingView({ov: [-120.5, -5.25, 60]})),
+                           {yaw: -120.5, pitch: -5.25, fov: 60});
+    assert.deepStrictEqual(format.viewDegrees({yaw: -Math.PI, pitch: 0, fov: 75 * radians}),
+                           {yaw: -180, pitch: 0, fov: 75});
+    assert.ok(format.sameView(right, format.openingView({ov: [90.01, 10]})));
+    assert.ok(format.sameView({yaw: Math.PI, pitch: 0, fov: 1}, {yaw: -Math.PI, pitch: 0,
+                                                                 fov: 1}));
+    assert.ok(!format.sameView(right, front));
+});
+
+test("a 360 photo opens at its opening view, and Reset returns there", function () {
+    return onFakePage({webgl: true}, function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        var rec = Object.assign({}, PANO_REC, {ov: [-60, 5]});
+        stage.show(rec, PANO_URLS);
+        page.log.images[0].finish(2048, 1024);
+        assert.strictEqual(stage.mode, "pano");
+        assert.ok(format.sameView(stage.view, format.openingView(rec)));
+        assert.strictEqual(stage.isMoved(), false);
+        stage.view = format.panoDrag(stage.view, 120, 30, 800, 600);
+        assert.strictEqual(stage.isMoved(), true);
+        stage.reset();
+        assert.ok(format.sameView(stage.view, format.openingView(rec)));
+        // A new view chosen ("Open here" changes rec.ov): Reset goes there.
+        rec.ov = [10, 0];
+        assert.strictEqual(stage.isMoved(), true);
+        stage.reset();
+        near(stage.view.yaw, -10 * Math.PI / 180, "yaw");
+        // Another picture without one opens at the front.
+        stage.show(PANO_REC, PANO_URLS);
+        assert.deepStrictEqual(stage.view, format.openingView(null));
+        stage.destroy();
+    });
+});
+
+test("a 360 picture's opening view travels in its records and thumbnail address", function () {
+    var detail = {id: 7, library_id: "lib_x", name: "p.jpg", path: "p.jpg",
+                  projection: "equirectangular",
+                  opening_view: {yaw: -120.04, pitch: 4.06, fov: null, owner: true}};
+    assert.deepStrictEqual(SITE.compactRecord(detail).ov, [-120, 4.1]);
+    detail.opening_view = {yaw: 30, pitch: 0, fov: 50};
+    assert.deepStrictEqual(SITE.compactRecord(detail).ov, [30, 0, 50]);
+    detail.opening_view = {yaw: 0.2, pitch: -0.1, fov: null};
+    assert.ok(!("ov" in SITE.compactRecord(detail)));
+    detail.opening_view = {yaw: "x", pitch: 0};
+    assert.ok(!("ov" in SITE.compactRecord(detail)));
+    // (Not a 360 picture: no view.)
+    assert.ok(!("ov" in SITE.compactRecord({id: 8, library_id: "lib_x", name: "f.jpg",
+                                            path: "f.jpg", opening_view: {yaw: 30, pitch: 0}})));
+    // Another view, another thumbnail address (the browser does not keep the old one).
+    assert.strictEqual(SITE.thumbUrl({i: 7, ov: [-120, 4.1]}), "/thumb/7?v=-120_4.1");
+    assert.strictEqual(SITE.thumbUrl({i: 7}), "/thumb/7");
+    assert.strictEqual(SITE.thumbUrl(7), "/thumb/7");
+    // (The pages that know pictures by "id", and published sites, too.)
+    assert.strictEqual(SITE.thumbUrl({id: 7, ov: [30, 0]}), "/thumb/7?v=30_0");
+    var site = loadSite({mode: "static", page: "search"}, "https:");
+    assert.strictEqual(site.thumbUrl({i: "x7", ov: [30, 0, 50]}), "thumbs/x7.jpg?v=30_0_50");
+    assert.strictEqual(site.thumbUrl({i: "x7"}), "thumbs/x7.jpg");
+});
+
+test("Open here keeps the view shown as the picture's opening view", function () {
+    var sent = [];
+    var toasts = [];
+    var shell = {
+        admin: function (url, body) {
+            sent.push([url, body]);
+            return Promise.resolve(body.clear ? {record: {}, ids: [5], opening_view: {
+                yaw: 0, pitch: 0, fov: null, owner: false, auto: null}}
+                : {record: {ov: [body.yaw, body.pitch]}, ids: [5, 6],
+                   opening_view: {yaw: body.yaw, pitch: body.pitch, fov: null, owner: true}});
+        },
+        toast: function (text) {
+            toasts.push(text);
+        }
+    };
+    return onLightboxPage({}, function (viewer, page) {
+        page.window.SHELL = shell;
+        global.SHELL = shell;
+        var rec = {i: 5, p: "360"};
+        var stage = {view: format.openingView({ov: [45, -10, 60]})};
+        var button = new page.box.constructor("button");
+        var replies = [];
+        return viewer.keepOpeningView(rec, stage, button, false, function (reply) {
+            replies.push(reply);
+        }).then(function () {
+            assert.deepStrictEqual(sent[0], ["/images/5/opening-view",
+                                             {yaw: 45, pitch: -10, fov: 60}]);
+            assert.deepStrictEqual(rec.ov, [45, -10]);
+            assert.strictEqual(button.disabled, false);
+            assert.deepStrictEqual(replies[0].ids, [5, 6]);
+            assert.ok(/opens here from now on/.test(toasts[0]), toasts[0]);
+            return viewer.keepOpeningView(rec, stage, button, true);
+        }).then(function () {
+            assert.deepStrictEqual(sent[1][1], {clear: true});
+            assert.ok(!("ov" in rec));
+            delete global.SHELL;
+        });
+    });
+});
+
+test("on a phone the information pane is a sheet the handle opens further", function () {
+    var records = {10: {i: 10, w: 400, hgt: 300, t: "Cat"}, 11: {i: 11, w: 300, hgt: 400,
+                                                                 t: "Dog"}};
+    return onLightboxPage({}, function (viewer, page) {
+        var narrow = true;
+        page.window.matchMedia = function (query) {
+            return {matches: narrow && /orientation: portrait/.test(query)};
+        };
+        assert.ok(viewer.open({ids: [10, 11], index: 0, get: function (id) {
+            return records[id] || null;
+        }}));
+        var root = byClass(page.document.body, "viewer")[0];
+        var sheet = byClass(root, "viewer-info")[0];
+        var handle = byClass(sheet, "viewer-sheet-handle")[0];
+        var body = byClass(sheet, "viewer-info-body")[0];
+        // The handle, then the information (drawn into the body: it scrolls).
+        assert.strictEqual(sheet.children[0], handle);
+        assert.ok(/Cat/.test(textOf(body)), textOf(body));
+        assert.strictEqual(handle.getAttribute("aria-expanded"), "false");
+        // Open (this page is wide enough to open with it), then the handle
+        // tapped: most of the screen.
+        assert.ok(root.classList.contains("info-open"));
+        handle.fire("click");
+        assert.ok(root.classList.contains("sheet-full"));
+        assert.strictEqual(handle.getAttribute("aria-expanded"), "true");
+        assert.strictEqual(handle.getAttribute("aria-label"), "Show less information");
+        // The next picture: still full; its information in the body.
+        page.key("ArrowRight");
+        assert.ok(/Dog/.test(textOf(body)), textOf(body));
+        assert.ok(root.classList.contains("sheet-full"));
+        // Tapped again: back to its peek height; the arrow keys on the handle too.
+        handle.fire("click");
+        assert.ok(!root.classList.contains("sheet-full"));
+        var up = page.key("ArrowUp", handle);
+        assert.strictEqual(up.prevented, false);      // (the handle's own key)
+        handle.listeners.keydown.forEach(function (listener) {
+            listener({key: "ArrowUp", preventDefault: function () {}});
+        });
+        assert.ok(root.classList.contains("sheet-full"));
+        // Closed (i): no longer full; opened again at the peek height.
+        page.key("i");
+        assert.ok(!root.classList.contains("info-open"));
+        assert.ok(!root.classList.contains("sheet-full"));
+        page.key("i");
+        assert.ok(!root.classList.contains("sheet-full"));
+        // Down from the peek height closes it.
+        handle.listeners.keydown.forEach(function (listener) {
+            listener({key: "ArrowDown", preventDefault: function () {}});
+        });
+        assert.ok(!root.classList.contains("info-open"));
+        page.key("Escape");
+    });
+});
+
+test("the sheet opens at its peek height again: after the viewer closed, after an edit", function () {
+    var records = {10: {i: 10, w: 400, hgt: 300, t: "Cat"}, 11: {i: 11, w: 300, hgt: 400,
+                                                                 t: "Dog"}};
+    var asked = [];
+    var shell = {admin: function (url) {
+        return new Promise(function (resolve, reject) {
+            asked.push({url: url, reject: reject});
+        });
+    }, toast: function () {}};
+    var wasAdmin = SITE.capabilities.admin;
+    function restore() {
+        SITE.capabilities.admin = wasAdmin;
+        delete global.SHELL;
+    }
+    return onLightboxPage({}, function (viewer, page) {
+        SITE.capabilities.admin = true;
+        global.SHELL = page.window.SHELL = shell;
+        page.window.matchMedia = function (query) {
+            return {matches: /orientation: portrait/.test(query)};
+        };
+        function get(id) {
+            return records[id] || null;
+        }
+        assert.ok(viewer.open({ids: [10, 11], index: 0, get: get}));
+        var root = byClass(page.document.body, "viewer")[0];
+        var handle = byClass(root, "viewer-sheet-handle")[0];
+        var body = byClass(root, "viewer-info-body")[0];
+        handle.fire("click");
+        assert.ok(root.classList.contains("sheet-full"));
+        // Closed while full (the close button, Escape, the phone's back):
+        // the next picture opens with the picture above the peek height.
+        viewer.close();
+        assert.ok(!root.classList.contains("sheet-full"));
+        assert.strictEqual(handle.getAttribute("aria-expanded"), "false");
+        assert.ok(viewer.open({ids: [10, 11], index: 1, get: get}));
+        assert.ok(root.classList.contains("info-open"));
+        assert.ok(!root.classList.contains("sheet-full"));
+        // The edit form: a box to type in makes the sheet full ...
+        byClass(body, "info-edit-button")[0].fire("click");
+        assert.strictEqual(asked[0].url, "/images/11/edits");
+        body.listeners.focusin.forEach(function (listener) {
+            listener({target: {tagName: "TEXTAREA"}});
+        });
+        assert.ok(root.classList.contains("sheet-full"));
+        // ... and the form done (saved, cancelled, or not loaded), the peek again.
+        asked[0].reject(new Error("gone"));
+        return settle().then(function () {
+            assert.ok(!root.classList.contains("sheet-full"));
+            // (Made full by hand, it stays full after the form.)
+            handle.fire("click");
+            byClass(body, "info-edit-button")[0].fire("click");
+            body.listeners.focusin.forEach(function (listener) {
+                listener({target: {tagName: "INPUT"}});
+            });
+            asked[1].reject(new Error("gone"));
+            return settle();
+        }).then(function () {
+            assert.ok(root.classList.contains("sheet-full"));
+            page.key("Escape");
+            restore();
+        }, function (error) {
+            restore();
+            throw error;
+        });
+    });
+});
+
+test("dragging the sheet's handle: up to most of the screen, far down to close", function () {
+    var records = {10: {i: 10, w: 400, hgt: 300, t: "Cat"}};
+    return onLightboxPage({}, function (viewer, page) {
+        page.window.matchMedia = function () {
+            return {matches: true};
+        };
+        assert.ok(viewer.open({ids: [10], index: 0, get: function (id) {
+            return records[id] || null;
+        }}));
+        var root = byClass(page.document.body, "viewer")[0];
+        var sheet = byClass(root, "viewer-info")[0];
+        var main = byClass(root, "viewer-main")[0];
+        var handle = byClass(sheet, "viewer-sheet-handle")[0];
+        var heights = {root: 844, main: 504, sheet: 340};
+        function rect(height) {
+            return function () {
+                return {height: heights[height]};
+            };
+        }
+        root.getBoundingClientRect = rect("root");
+        main.getBoundingClientRect = rect("main");
+        sheet.getBoundingClientRect = rect("sheet");
+        handle.setPointerCapture = function () {};
+        function drag(from, to) {
+            ["pointerdown", "pointermove", "pointerup"].forEach(function (name, index) {
+                handle.listeners[name].forEach(function (listener) {
+                    listener({pointerId: 1, button: 0, clientY: index ? to : from});
+                });
+            });
+        }
+        assert.ok(root.classList.contains("info-open"));
+        // Up a long way: full, and the page's own height stays the peek's.
+        drag(520, 200);
+        assert.ok(root.classList.contains("sheet-full"));
+        assert.strictEqual(sheet.style.height, "");
+        // The tap that browsers send after a drag changes nothing.
+        handle.fire("click");
+        assert.ok(root.classList.contains("sheet-full"));
+        // Down a little from full: back to the peek height.
+        heights.sheet = 726;
+        drag(140, 500);
+        assert.ok(!root.classList.contains("sheet-full"));
+        assert.ok(root.classList.contains("info-open"));
+        handle.fire("click");     // (the drag's own click)
+        // Far down from the peek height: closed.
+        heights.sheet = 340;
+        drag(520, 800);
+        assert.ok(!root.classList.contains("info-open"));
+        page.key("Escape");
+    });
+});
+
+test("on a wide screen the sheet's handle does nothing", function () {
+    var records = {10: {i: 10, w: 400, hgt: 300, t: "Cat"}};
+    return onLightboxPage({}, function (viewer, page) {
+        page.window.matchMedia = function () {
+            return {matches: false};
+        };
+        assert.ok(viewer.open({ids: [10], index: 0, get: function (id) {
+            return records[id] || null;
+        }}));
+        var root = byClass(page.document.body, "viewer")[0];
+        var handle = byClass(root, "viewer-sheet-handle")[0];
+        handle.listeners.pointerdown.forEach(function (listener) {
+            listener({pointerId: 1, button: 0, clientY: 500});
+        });
+        handle.listeners.pointermove.forEach(function (listener) {
+            listener({pointerId: 1, clientY: 100});
+        });
+        assert.ok(!root.classList.contains("sheet-dragging"));
+        page.key("Escape");
+    });
+});
+
+/* The admin's place form ("Change place..." of an estimated place, see
+   place_estimates.py) in the viewer on a phone: Esc is the form's own, and
+   the sheet the form made full is back at its peek height when the form
+   closes or a town is picked. body(viewer, page, sent): the viewer open on
+   picture 40 (its place estimated), page.runTimers() runs the timers that
+   wait. Every place here is made up. */
+function onPlacePage(body) {
+    var records = {40: {i: 40, w: 400, hgt: 300, t: "Boat", ci: "Coralport", rg: "North Coast",
+                        co: "Examplia", cc: "XA", pe: 1, ps: "t"},
+                   41: {i: 41, w: 300, hgt: 400, t: "Dog"}};
+    var sent = [];
+    var shell = {admin: function (url, data) {
+        sent.push([url, data === undefined ? null : JSON.parse(JSON.stringify(data))]);
+        if (/^\/places\/towns/.test(url)) {
+            return Promise.resolve({available: true, position: null, towns: [
+                {name: "Coralport", region: "North Coast", country: "Examplia", cc: "XA",
+                 lat: 5, lon: -150}]});
+        }
+        return Promise.resolve({id: 40, record: {ci: "Coralport", rg: "North Coast",
+                                                 co: "Examplia", cc: "XA", ps: "o"},
+                                place: {city: "Coralport", source: "owner"},
+                                place_estimate: {source: "owner", reason: "set by you",
+                                                 radius_km: null, choice: "set",
+                                                 place: "Coralport", lat: 5, lon: -150,
+                                                 ids: []}});
+    }, toast: function () {}};
+    var saved = {capabilities: SITE.capabilities, loadRecord: SITE.loadRecord,
+                 shell: global.SHELL};
+    function restore() {
+        SITE.capabilities = saved.capabilities;
+        SITE.loadRecord = saved.loadRecord;
+        if (saved.shell === undefined) {
+            delete global.SHELL;
+        } else {
+            global.SHELL = saved.shell;
+        }
+    }
+    SITE.capabilities = {admin: true, static: false};
+    SITE.loadRecord = function (id, callback) {
+        callback({id: id, lat: null, lon: null, place_estimate: id !== 40 ? null : {
+            source: "time", reason: "estimated from pictures taken around the same time",
+            radius_km: 0.4, place: "Coralport", lat: 5, lon: -150, ids: [1], choice: ""}});
+    };
+    global.SHELL = shell;
+    return onLightboxPage({}, function (viewer, page) {
+        page.window.SHELL = shell;
+        var timers = [];
+        page.window.setTimeout = function (callback) {
+            timers.push(callback);
+            return timers.length;
+        };
+        page.runTimers = function () {
+            while (timers.length) {
+                timers.shift()();
+            }
+        };
+        // A phone held upright (with a touch screen).
+        page.window.matchMedia = function (query) {
+            return {matches: /orientation: portrait|max-width: 899px|pointer: coarse/.test(query)};
+        };
+        assert.ok(viewer.open({ids: [40, 41], index: 0, get: function (id) {
+            return records[id] || null;
+        }}));
+        return body(viewer, page, sent);
+    }).then(function (value) {
+        restore();
+        return value;
+    }, function (error) {
+        restore();
+        throw error;
+    });
+}
+
+test("in the viewer Esc in the place form closes the form, not the viewer; the sheet its peek again", function () {
+    return onPlacePage(function (viewer, page) {
+        var root = byClass(page.document.body, "viewer")[0];
+        var body = byClass(root, "viewer-info-body")[0];
+        var handle = byClass(root, "viewer-sheet-handle")[0];
+        var scrolled = [];
+        page.box.constructor.prototype.scrollIntoView = function (options) {
+            scrolled.push([this.className, options.block]);
+        };
+        var opener = byClass(body, "info-place-set")[0];
+        assert.ok(opener, "no Change place...");
+        opener.fire("click");
+        var form = byClass(body, "info-place-form")[0];
+        var input = byClass(form, "input")[0];
+        assert.strictEqual(page.document.activeElement, input);
+        // On a touch screen the form goes to the top of the sheet (the
+        // keyboard about to open covers the rest).
+        assert.deepStrictEqual(scrolled, [["info-place-form", "start"]]);
+        // Its box to type in makes the sheet full (the pane's focusin) ...
+        body.listeners.focusin.forEach(function (listener) {
+            listener({target: input});
+        });
+        assert.ok(root.classList.contains("sheet-full"));
+        // ... Esc there is not the viewer's (which listens first) ...
+        var event = page.key("Escape", input);
+        assert.strictEqual(event.prevented, false);
+        assert.strictEqual(root.hidden, false, "the viewer closed");
+        // ... but the form's: it closes, the sheet is back at its peek
+        // height, and the focus on its opener.
+        form.listeners.keydown.forEach(function (listener) {
+            listener(event);
+        });
+        assert.strictEqual(byClass(body, "info-place-form").length, 0);
+        assert.ok(!root.classList.contains("sheet-full"));
+        assert.strictEqual(handle.getAttribute("aria-expanded"), "false");
+        assert.strictEqual(opener.hidden, false);
+        assert.strictEqual(page.document.activeElement, opener);
+        // ... which is brought into sight in the smaller sheet.
+        var last = scrolled[scrolled.length - 1];
+        assert.ok(/info-place-set/.test(last[0]), JSON.stringify(scrolled));
+        assert.strictEqual(last[1], "nearest");
+        // Esc elsewhere still closes the viewer.
+        page.key("Escape");
+        assert.strictEqual(root.hidden, true);
+    });
+});
+
+test("in the viewer a town picked in the place form leaves the sheet at its peek", function () {
+    return onPlacePage(function (viewer, page, sent) {
+        var root = byClass(page.document.body, "viewer")[0];
+        var body = byClass(root, "viewer-info-body")[0];
+        byClass(body, "info-place-set")[0].fire("click");
+        var form = byClass(body, "info-place-form")[0];
+        var input = byClass(form, "input")[0];
+        body.listeners.focusin.forEach(function (listener) {
+            listener({target: input});
+        });
+        assert.ok(root.classList.contains("sheet-full"));
+        input.value = "cora";
+        input.listeners.input.forEach(function (listener) {
+            listener({type: "input"});
+        });
+        page.runTimers();
+        // (This page finds the pane's nodes by their classes: ".a" and ".a .b".)
+        var proto = page.box.constructor.prototype;
+        proto.querySelector = function (selector) {
+            var names = selector.replace(/\./g, "").split(" ");
+            var found = byClass(this, names[names.length - 1]).filter(function (node) {
+                return names.length < 2 || byClass(this, names[0]).some(function (outer) {
+                    return outer.contains(node);
+                });
+            }, this);
+            return found[0] || null;
+        };
+        var scrolled = [];
+        proto.scrollIntoView = function (options) {
+            scrolled.push([this.className, options.block]);
+        };
+        return settle().then(function () {
+            assert.deepStrictEqual(sent[0], ["/places/towns?q=cora", null]);
+            var choice = byClass(form, "info-place-choice")[0];
+            assert.ok(choice, "no town");
+            choice.fire("click");
+            return settle();
+        }).then(function () {
+            assert.deepStrictEqual(sent[1], ["/images/40/place",
+                                             {choice: "set", lat: 5, lon: -150}]);
+            assert.ok(!root.classList.contains("sheet-full"));
+            // The focus on the first of the choices now ("Clear"), and those
+            // at the top of the sheet, where they stay as it goes back to its
+            // peek height (and above the toast that says it is done).
+            assert.strictEqual(page.document.activeElement.textContent, "Clear");
+            assert.deepStrictEqual(scrolled[scrolled.length - 1], ["info-place-estimate",
+                                                                   "start"]);
+            // The next picture opens with the picture above the peek too.
+            byClass(root, "viewer-next")[0].fire("click");
+            assert.ok(/Dog/.test(textOf(body)), textOf(body));
+            assert.ok(!root.classList.contains("sheet-full"));
+            page.key("Escape");
+        });
+    });
+});
+
+/* A drive's route map on a phone: drawn when the pane opens (it had no room
+   while closed), under the clip's title with the drive's words after the
+   clip's facts, and laid out again when the phone turns. */
+test("on a phone a drive's route map is drawn when the pane opens, under the title", function () {
+    var records = {};
+    DRIVE_CLIPS.forEach(function (rec) {
+        records[rec.i] = rec;
+    });
+    var savedRoutes = global.ROUTES;
+    var realLoad = SITE.loadRoutes;
+    global.ROUTES = require(path.join(STATIC, "routes.js"));
+    var realSchedule = ROUTES.MiniMap.prototype.schedule;
+    var scheduled = 0;
+    ROUTES.MiniMap.prototype.schedule = function () {
+        scheduled += 1;
+        return realSchedule.call(this);
+    };
+    SITE.loadRoutes = function (callback) {
+        callback([{d: 31, l: "lib", c: [
+            {i: 31, o: 0, p: "[[0,-4120000,-15030000,40],[600,0,1000,60]]"},
+            {i: 32, o: 60, p: "[[0,-4120000,-15029000,60],[600,0,1000,80]]"}]}]);
+    };
+    function restore() {
+        SITE.loadRoutes = realLoad;
+        ROUTES.MiniMap.prototype.schedule = realSchedule;
+        if (savedRoutes === undefined) {
+            delete global.ROUTES;
+        } else {
+            global.ROUTES = savedRoutes;
+        }
+    }
+    return onLightboxPage(videoPage(), function (viewer, page) {
+        var timers = [];
+        page.window.setTimeout = function (callback) {
+            timers.push(callback);
+            return timers.length;
+        };
+        var resized = [];
+        page.window.addEventListener = function (name, listener) {
+            if (name === "resize") {
+                resized.push(listener);
+            }
+        };
+        var screen = {narrow: true};
+        page.window.matchMedia = function (query) {
+            return {matches: screen.narrow && /max-width: 899px/.test(query)};
+        };
+        // (A phone: the pane starts closed.)
+        page.window.innerWidth = 390;
+        assert.ok(viewer.open({ids: [31, 32, 33], index: 0, get: function (id) {
+            return records[id] || null;
+        }, driveOf: function () {
+            return {key: 31, clips: [31, 32, 33], matched: {}, text: 31, folded: false};
+        }}));
+        var root = byClass(page.document.body, "viewer")[0];
+        var body = byClass(root, "viewer-info-body")[0];
+        assert.ok(!root.classList.contains("info-open"));
+        var map = byClass(body, "route-map")[0];
+        assert.ok(map, "no route map");
+        // Under the title, before the clip's facts; the drive's own words after them.
+        function order() {
+            return body.children.map(function (child) {
+                return String(child.className).split(" ").filter(function (name) {
+                    return /^(info-head|route-map|info-facts|info-drive)$/.test(name);
+                })[0] || "";
+            }).filter(Boolean);
+        }
+        assert.deepStrictEqual(order(), ["info-head", "route-map", "info-facts", "info-drive"]);
+        // The pane opened: the map is drawn, though nothing plays.
+        var before = scheduled;
+        page.key("i");
+        assert.ok(root.classList.contains("info-open"));
+        while (timers.length) {
+            timers.shift()();
+        }
+        assert.ok(scheduled > before, "not drawn when the pane opened");
+        // Turned (a wide pane now): laid out as on a large screen, drawn again.
+        before = scheduled;
+        screen.narrow = false;
+        resized.forEach(function (listener) {
+            listener({type: "resize"});
+        });
+        assert.deepStrictEqual(order(), ["info-head", "info-drive", "info-facts"]);
+        var drive = byClass(body, "info-drive")[0];
+        assert.ok(drive.contains(map), "the map is not in the drive's section");
+        assert.ok(scheduled > before, "not drawn again when turned");
+        page.key("Escape");
+    }).then(restore, function (error) {
+        restore();
+        throw error;
+    });
+});
 
 var at = process.argv.indexOf("--compare");
 if (at >= 0) {

@@ -26,7 +26,11 @@ SETTINGS.md), for example to 6, to turn it on. It is off by default, as on clean
 greys the ground. Thumbnails show a normal-looking view of the front of
 the scene. Each 360-degree photo larger than its 2048 px preview also gets
 a panorama up to 4096 px wide (made from the full-size original) so the
-360 view stays sharp.
+360 view stays sharp. Unstitched photos of an Insta360 ONE R are levelled
+as they are stitched: the camera's motion sensor says which way was up
+when the photo was taken, and the panorama is turned so its horizon is
+level (see [Level horizons](#level-horizons); `level_horizon` turns it
+off).
 
 Coming from an older version? Read [Upgrading from an older
 version](#upgrading-from-an-older-version) first.
@@ -240,9 +244,10 @@ most of a library seems to have vanished at once, nothing is marked; run
 intended.
 
 When a new version stitches unstitched 360-degree photos differently (or
-`nadir_fill_deg` or `zenith_fill_deg` changes), the next scan stitches the
-ones in the index again: their previews, panoramas and thumbnails are made
-anew, their descriptions are kept. A scan stopped part way carries on with
+`nadir_fill_deg`, `zenith_fill_deg` or `level_horizon` changes), the next
+scan stitches the ones in the index again (and the 360-degree videos):
+their previews, panoramas and thumbnails are made anew, their descriptions
+are kept. A scan stopped part way carries on with
 the rest the next time.
 
 ### From the command line
@@ -498,10 +503,77 @@ describe run describes it again). `"drives"` in `config.json` changes the
   (private information, sensitive) or a clip of the drive is hidden; the
   review step says how many keep theirs. It has no sped-up previews.
 
+#### Routes (a dashcam's GPS)
+
+Many dashcams record the fixes of their GPS receiver into their videos,
+one a second (the position, speed and time their overlay prints over the
+picture). A scan reads them with the video -- only the small blocks that
+hold them, which the camera lists, so a clip on a share costs a fraction
+of a second, and no program runs (other videos: their first 4 MB, looked
+through once) -- and keeps each clip's **track**, simplified so that the
+place at any moment of the clip is still known to within 10 m (a minute
+of driving takes about a hundred bytes). Videos indexed before are read
+the same way by the next scan. Read are Novatek-style `freeGPS` blocks
+(with an NMEA RMC sentence, or the same fields as numbers in one of the
+layouts exiftool documents; other cameras' blocks -- encrypted ones, other
+layouts -- are not) and NMEA RMC sentences in a text (subtitle) track;
+fixes the camera marked as not valid, impossible dates, glitches (a time
+or a position far from the fixes around it) and repeats are left out.
+
+- A clip with a track gets the position of its middle fix: its place
+  names, `has:gps` and a pin on the map, like a photo with GPS (the viewer
+  says "from the video's GPS track"). When its file names no time zone (a
+  dashcam's clock knows none), it gets the UTC offset its clock has by the
+  GPS time (`-08:00`), when that is a whole quarter hour (give or take a
+  minute); its time stays the camera's clock. The scan's log says what
+  offsets the clocks have. That offset is the camera's clock's -- a
+  dashcam's often ignores daylight saving -- so only the same camera's
+  pictures (and the clips of its folder) go by it, never the library's
+  other pictures.
+- The GPS check times such a clip by its GPS time and counts its position
+  as a strong one; a clip without a fix in a folder of clips whose clocks
+  keep time (the camera was still looking for satellites, or stood in a
+  garage) is timed by their clock. The points of a track, every 10
+  seconds, count as pictures taken there and then for the [estimated
+  places](#estimated-places): a picture taken on the way is placed by the
+  track, and a clip without a fix where the car stood.
+- The text the AI model read off a dashcam's overlay is never taken as a
+  position: when the camera has no fix it goes on printing the last one it
+  had (for minutes, in a garage), and the model misreads digits.
+- A drive has a **route**: the tracks of its clips one after the other,
+  with a gap where clips are missing (a hole) or have no fix. The **Map**
+  draws the routes of the clips the search finds as lines while **Show
+  drive routes** is on; the pointer over a line says the drive, the clip
+  and how far into it, and a click (or a tap) plays the drive from there.
+  The **viewer** shows a drive's route in a small map in its pane (on a
+  phone right under the clip's title, in sight with the video), with a
+  dot where the clip that plays is, and the speed there on the strip
+  ("Clip 12 of 65 · 11:04 / 1:04:30 · 52 km/h"); neither while the clip
+  had no fix (before the first, after the last). Both need nothing but the
+  map's tiles, so they work offline and in an export.
+- Routes and the clips' positions are location data. Other computers see
+  them as they see positions (never those of hidden clips); an export
+  publishes them only with **Location** and **Drive routes**, and leaves
+  out every point within 500 m of where a drive (of any library) starts or
+  ends (see [Publishing a library](#publishing-a-library)). It never
+  publishes the positions written in a dashcam clip's texts. What the
+  overlay prints over the clip's picture it cannot take out: the review
+  says how many clips are filmed near where a drive starts or ends, or
+  have no fix (their overlay then shows the last position the camera had,
+  often where the drive started) -- hide those to keep that place
+  private.
+- `"gps_tracks": {"enabled": false}` in `config.json` stops reading
+  tracks, and the next scan takes away the positions they gave (they come
+  back when it is on again).
+
 To list the drives found, without changing anything (`--sheet FOLDER` also
 writes the 3 x 3 sheets the model sees):
 
     python drives.py [--library NAME] [--sheet FOLDER]
+
+To see the GPS track read from videos, without changing anything:
+
+    python tracks.py path/to/clip.mp4 [--fixes]
 
 To see what is read from one video, without changing anything:
 
@@ -551,9 +623,9 @@ camera the file does not name.
   the graphics card (WebGL), with the same lens model and seam blend as the
   poster, so nothing is converted or stored. Drag to look around while it
   plays; the bar under the view has play and pause, the time, a bar to move
-  in the video and the sound. Without WebGL (or in an export opened from
-  disk, where browsers do not let the 360 view read the video) it plays
-  flat: the circle of the front lens.
+  in the video, **Level** (see below) and the sound. Without WebGL (or in
+  an export opened from disk, where browsers do not let the 360 view read
+  the video) it plays flat: the circle of the front lens.
 - A 360 video without its LRV plays once `video_proxies` is on and
   **Make playable copies** has run: its copy holds both lenses side by side
   (as an LRV does), at the `height` of that setting. Until then the viewer
@@ -562,12 +634,50 @@ camera the file does not name.
 - An export with videos included publishes the LRV (or that copy), without
   its metadata, up to `max_video_mb` (an LRV counts as what its copy keeps:
   not the camera's data at its end); the site's viewer plays it on the
-  sphere the same way (from a web server). Without it, the site shows the
-  poster in the 360 view.
+  sphere the same way (from a web server), levelled as below. Without it,
+  the site shows the poster in the 360 view.
 
-The stitch is not levelled with the camera's motion sensors: a video
-filmed with the camera tilted or upside down looks tilted, as the camera
-saw it.
+#### Level horizons
+
+A camera held tilted, low on a stick or flat over something makes a
+panorama whose horizon is a wave and whose trees lean. The X4 and the ONE
+R record their motion sensor (accelerometer and gyroscope, about 500 to
+1000 readings a second) at the end of each video and photo, and that says
+which way was up at every moment:
+
+- Reading a 360 video works out the direction of up in its panorama over
+  the video's time (its "level track": the accelerometer, which feels
+  gravity, averaged over 4 seconds after the gyroscope's turns are taken
+  out, so the camera's own jolts do not count and quick turns are
+  followed). Only the tilt is taken out: the middle of the panorama still
+  looks where the camera looked (a camera upside down, as on a hanging
+  mount, keeps the heading of its front). A timelapse (TimeShift) plays
+  far faster than it was recorded: the camera notes when each of its
+  frames was taken, and each is levelled for that moment. Where the
+  readings stop before the video ends, the turn fades out rather than
+  holding a tilt that may no longer be right. The track is kept with the
+  video's facts: up to about 15 KB per minute of hand-held video, a few
+  hundred bytes for one on a tripod.
+- Its poster and contact sheet are turned level with it, so the
+  thumbnail, the AI model and "Looks like this" see a level picture (a
+  picture stitched again has its looks made again by the next **Update
+  looks**).
+- The viewer turns every frame level as it plays (a small turn per frame
+  on the graphics card, at the frame's own time). **Level** among the
+  controls turns that off and on (remembered in the browser); it shows
+  only for videos that have a track.
+- Unstitched ONE R photos (`.insp`) are levelled with the sensor's
+  readings at the moment they were taken (also those taken in quick
+  succession, whose files name the moment of the photo before). The X4
+  levels the 360 photos it stitches itself, so those are shown as they
+  are.
+- A published 360 video takes its level track along (which way was up
+  over time: no place or date).
+
+The setting `level_horizon` (on by default) turns all of this off: the
+next scan stitches the posters and photos again as the camera saw them,
+and the viewer plays the frames that way. Cameras whose sensor axes are
+not known here are not levelled.
 
 ## Searching
 
@@ -641,8 +751,18 @@ the page header or the filters.
   searches for all of them (see [Search by meaning](#search-by-meaning)).
   360-degree photos can be looked around in by dragging (the flat
   panorama when the browser cannot show that), and so can 360-degree
-  videos while they play.
+  videos while they play; they open facing what they show (see [Where 360
+  pictures open](#where-360-pictures-open)), and **Reset the view** (`0`)
+  returns there.
   "Details page" opens the same on a page of its own, to link to.
+- **On a phone** the information pane is a sheet at the bottom: opened
+  (`i`), it shows the title and the key facts, and the picture (with a
+  video's controls, a drive's strip) fits in the space above it. Drag its
+  handle up (or tap it) for the rest, down to close it; the handle also
+  takes the up and down arrow keys. A phone held sideways shows a narrower
+  pane beside the picture instead, closed until you open it. On touch
+  screens the controls are at least 40 pixels to the finger (links within
+  a sentence and the timeline's bars aside).
 - **The address** holds the search, the filters, the sort order and the open
   picture, so links, reloads and the Back button bring the same view back.
 - **Keyboard**: `/` jumps to the search box, `Esc` clears it or closes the
@@ -688,7 +808,12 @@ the page header or the filters.
   (ringed while the map has the keyboard focus), and `Esc` closes the list.
   The address keeps the search, the map's place and the open list, so links
   and reloads show the same view (after a new search the map fits its
-  pictures); a static export with the map works the same way. The map uses
+  pictures); a static export with the map works the same way. Estimated
+  places are hollow pins, shown while **Show estimated places** is on (see
+  [Estimated places](#estimated-places)). The routes of drives are lines,
+  while **Show drive routes** is on: point at one to see the clip there,
+  click it to play the drive from there (see [Routes](#routes-a-dashcams-gps)).
+  The map uses
   a small bundled world image; run `python make_tiles.py` once for a
   detailed one (see [Other tools](#other-tools)).
 - While some pictures are not described yet, a note above the results says
@@ -745,6 +870,7 @@ about it.
 - `before:2019-06`, `after:2019` - taken before June 2019, or from 2020 on
   (`YYYY`, `YYYY-MM` or `YYYY-MM-DD`)
 - `has:text`, `has:gps` - with text in the picture, with a GPS position
+  (also a video's from its GPS track)
   (also `has:people`, `has:animals`)
 - `on:today` - taken on this day in earlier years; `on:05-14` - on May 14
   of any year; `on:2019-05-14` - on that day (dates from the camera or the
@@ -766,6 +892,8 @@ about it.
 - `is:gps-ignored` - pictures whose GPS position the GPS check set aside
   (on this computer only; see [the GPS
   check](#positions-that-cannot-be-right-the-gps-check))
+- `is:place-estimated` - pictures without a GPS position of their own whose
+  place is estimated (see [Estimated places](#estimated-places))
 - `lib:name` - only the pictures of one library
 - `is:favorite` - your favorites; `rating:4` - rated 4 stars,
   `rating:>=4` (or `rating:4+`) 4 or 5 stars, `rating:<3` 1 or 2,
@@ -1151,11 +1279,136 @@ decides anyway removes it. `is:gps-ignored` lists the pictures whose
 position is set aside. Other computers are not shown the position or
 the place (but the original file, which they can download, still holds
 its GPS data), and exports never hold them. The settings are
-`gps_check` in config.json (see SETTINGS.md): it can be turned off, and
-it can give a picture whose position was set aside the place that the
-pictures taken around the same time agree on (off by default; shown as
-"estimated from pictures taken around the same time", and exported only
-with locations, like any place name).
+`gps_check` in config.json (see SETTINGS.md): it can be turned off. A
+picture whose position was set aside may get an estimated place instead
+(see [Estimated places](#estimated-places)).
+
+### Estimated places
+
+Many pictures have no GPS position of their own: cameras without a GPS
+receiver, phones that saved a picture without its location, positions the
+GPS check set aside. After every GPS check (so after every scan, and at
+once when you decide about a place) such a picture gets an **estimated
+place** when the index tells where it most likely was:
+
+- **a copy of a located picture**: the same file, a picture taken in the
+  same second by a camera of the same model, one with the same dHash taken
+  within 2 minutes, or one that looks the same (with looks, see [Looks
+  like this](#looks-like-this-and-search-by-a-picture)) taken within 10
+  minutes -- not when the camera may have gone more than 2 km in the time
+  between them (by the speed its GPS states, or that of its shots just
+  before and after: shots of the clouds from an aeroplane look alike);
+- **the pictures taken around the same time**: located pictures (any
+  library's, unless the GPS check's `across_libraries` is off) taken
+  within 30 minutes of it, by the GPS check's clocks (time zones and all;
+  a picture whose time zone is uncertain needs the whole range to fit).
+  A position whose own accuracy is worse than 2 km (a phone's coarse fix
+  on an aeroplane) places nothing. With one before it and one after it
+  that are at most 2 km apart, the place between them; with pictures on
+  one side only, the nearest -- when it was taken within 15 minutes and
+  it and the next shots on that side (at least two) are within 2 km of
+  each other. Two sides further apart (a drive, a flight) give no place.
+  How far off it may be counts how far the camera may have gone since the
+  nearest shot: at the speed of those shots (or their GPS's), at least
+  walking pace, and after the first two minutes at least 50 km/h (it may
+  have boarded a car, a boat or a helicopter). When that is more than 2
+  km, the picture gets the nearest shot's town without a position (no
+  pin; the region only beyond 10 km, nothing beyond 25 km);
+- **the library's area** (region only, never a pin): when at least 95% of
+  a library's located pictures (and at least 20) are within 100 km of each
+  other and name one region (or one country), a picture of that library
+  that got no place otherwise gets "Tuscany, Italy (estimated from the
+  library)" -- when it was taken within 3 hours of those pictures (any
+  time zone its clock may have had) and no located picture taken nearer
+  in time is somewhere else (not at the airport on the way there, nor on
+  the plane), or when it has no date to go by (no date, one an app gave
+  it when it exported it) and the located pictures are at least a tenth
+  of the library's: a few located pictures in a large library say little
+  about the rest.
+
+Only capture dates the GPS check trusts count (the camera's, a video's
+own, a date in a file name; not the date a program saved a file: one in
+the name an app gave its export, or EXIF DateTime alone with a Software
+tag, as an editor writes it). A date from the file's time counts only
+when the files around it in its folder kept theirs: at least two pictures
+of the folder with a camera date whose files were written within an hour
+of it all have file times within 2 minutes of their camera dates (a
+camcorder's clips copied from its card together with its photos, say).
+Pictures downloaded or exported by an app get the time of the copy, so
+they do not borrow places that way. The estimates take a camera's clock
+to be right: a camera without GPS whose clock is an hour off (one that
+ignores daylight saving) gets the places where the others were an hour
+earlier or later.
+
+Tried on about 1,800 located pictures whose positions were hidden (a tenth
+at a time, three times over) and estimated again: 61% got an estimate
+(two in five of those from a copy, such as a photo's JPEG beside its
+HEIC); of those with a position, 99.6% in the right town, none more than
+1.5 km off and 99.5% within the distance they say they may be off; those
+without one (2 to 25 km off by then) all named the right town. An
+estimate always says what it is.
+
+An estimated place is kept apart from the picture's own data: `has:gps`
+still means a GPS position in the file, and the file is never changed.
+(A town or region without a position is searched and shown, but has no
+pin.)
+It is searched like any place (`place:`, the Place filter) and shown as
+"Lucca, Tuscany, Italy" followed by where it comes from ("estimated from
+pictures taken around the same time", or "estimated from a video's GPS
+track" when those are the points of a dashcam's track): tap or point at
+that for the details ("... one taken 4 minutes earlier, one 2 minutes
+later, 310 m apart. It may be off by about 400 m."). The map shows
+estimated positions as hollow pins while **Show estimated places** is on
+(on by default on this computer; other computers and exports turn it on).
+`is:place-estimated` lists the pictures with an estimated place, and the
+Manage page's place names count them.
+
+On this computer the viewer offers **Accept** (the estimate becomes the
+picture's own place: no longer marked as estimated, a pin like any
+other), **Change place...** (type the start of a town's name -- "Lucca",
+"Paris, Texas" -- and pick it, or type a position as `lat, lon`) and
+**Reject** (the picture has no place); **Set place...** among the
+picture's actions gives a place to a picture that has none. Your choice
+follows the picture (by its content, also when it is moved or renamed)
+and survives every scan; **Clear** or **Estimate again** lets the
+estimates decide again. A place you set is never a GPS position
+(`has:gps` stays false) and is not used to estimate other pictures. The
+settings are `place_estimates` in config.json (see SETTINGS.md); an
+export publishes estimated places only when it publishes locations and
+**Estimated places** is ticked, places you set with locations -- one you
+accepted from an estimate that came from a dashcam's GPS track only as
+the track's positions go (with **Drive routes**, and not near where a
+drive starts or ends).
+
+### Where 360 pictures open
+
+A 360-degree photo or video opens in the viewer (and shows in its
+thumbnail) facing its opening view:
+
+- **Open here** (in the viewer's bar and on the details page, on this
+  computer): the picture opens at the view shown, with its zoom, from now
+  on, and so do its copies; the thumbnails show that view too.
+  **Automatic opening view** (among the picture's actions) forgets it again.
+- Otherwise, with [looks](#looks-like-this-and-search-by-a-picture) set up,
+  **Update looks** also works out where each described 360 photo opens:
+  the image model compares the photo's title and the first sentence of its
+  description with views of it every 45 degrees round the horizon, and the
+  photo opens at the view that matches its words best -- when that view is
+  clearly better than the front (judged by eye on 85 360 photos, three in
+  four opened at a good view this way, against half at the front; about
+  one photo in three faced its subject better, one in twenty worse). It is
+  worked out again when the words, the stitch of the photo or the model
+  change, and needs a model that matches words to pictures (such as
+  EmbeddingGemma 2; a check with the probe pictures and words for them
+  says so first). `"opening_views": false` in
+  [image_embedding](SETTINGS.md#image_embedding) turns this off (the next
+  run forgets the views it made).
+- Everything else opens at the front: the way the camera's front lens
+  looked (videos too: their poster is only one moment of them).
+
+The views belong to the picture's content (a moved or copied file keeps
+its view) and are kept in the database; published sites open their 360
+pictures at the same views (they show no more than the picture itself).
 
 ### Searching from other computers
 
@@ -1323,7 +1576,8 @@ On the Manage page, **Export...** on a library opens a dialog:
    hidden details removed) or thumbnails only; what to leave out
    (screenshots, documents, scans, videos, pictures flagged as private or
    sensitive, pictures not checked yet); whether to also publish file
-   names, folder names or locations, and whether "More like this" goes
+   names, folder names or locations (and, with locations, estimated
+   places and drive routes), and whether "More like this" goes
    by meaning and "Looks like this" goes along (both on by default); and
    the site's title, a footer line, the
    output folder, a zip file and search-engine indexing. The line at the
@@ -1400,11 +1654,36 @@ options.
   (`--file-names`), folder names (`--folders`), and GPS positions with the
   map (`--location`, which also adds the AI model's separate landmark and
   place-guess fields, and the place names: then the pages credit GeoNames
-  at their foot, the map in a corner). Without it, GPS positions written
+  at their foot, the map in a corner; `--estimated-places` adds the
+  estimated places, see [Estimated places](#estimated-places); `--routes`
+  the routes of drives and the positions their clips have from their GPS
+  tracks, see below). Without it,
+  GPS positions written
   out in the text in a picture or in its title or description (a
   dashcam prints its position on its video, `N:12.34567 E:65.43210`, and
   the model reads it) are taken out of them too; the frames themselves
   still show what the camera printed. Hidden pictures are never published.
+- The positions dashcam clips have from their GPS tracks, and the routes
+  of drives (see [Routes](#routes-a-dashcams-gps)), go out only with
+  `--location` and `--routes` (**Location** and **Drive routes**): then
+  `data/routes.js` holds the tracks of the published clips (rounded as
+  positions are), which the map draws and the viewer follows. Every point
+  within 500 m of where a drive starts or ends is left out (a route that
+  passes that near is cut there), so that a home is not shown; `--routes-trim
+  M` (or `"routes_trim"` in the library's saved export options, 0 to 5,000)
+  changes the 500 m (where the drives of every library start and end). A
+  clip whose position is left out keeps its place names, and so does one
+  without the option; a place estimated from a track (with **Estimated
+  places**), or one you accepted from such an estimate, goes the same way.
+  The positions a dashcam clip's title, description and text (and its
+  drive's) write out, as its overlay prints them, are never published --
+  with or without the routes: a clip without a fix prints the last
+  position it had, often where the drive started. The review says how
+  many routes go, how many clips keep only their place names, and how
+  many clips to publish are a dashcam's: their pictures show what the
+  overlay prints, whatever the options, so it warns about those filmed
+  near where a drive starts or ends (or without a fix) -- hide them to
+  leave them out.
 - `--album NAME` (an album's name or id; **Which pictures** in the
   dialog) publishes only the pictures of that manual album that are in
   the library, still left out by the rules above when they say so; the
@@ -1558,7 +1837,8 @@ Everything is kept in `config.json`: the endpoints, the libraries and a few
 general settings. The Settings and Manage pages edit most of it, and so
 does `python settings.py`; [SETTINGS.md](SETTINGS.md) describes every field,
 including those only a text editor changes (`reader_threads`,
-`purge_after_days`, `nadir_fill_deg` and `zenith_fill_deg`).
+`purge_after_days`, `nadir_fill_deg`, `zenith_fill_deg` and
+`level_horizon`).
 
 `settings.py` writes nothing until you choose **Save and exit**. If
 `config.json` was changed in the meantime (on the Manage or Settings page,
@@ -1574,8 +1854,10 @@ private:
 
 - `index.db` - the database: file names, folders, dates, camera, EXIF and
   GPS data, the descriptions, your own titles, descriptions and tags
-  (kept apart from the model's), your favorites, ratings and albums, and
-  the positions the GPS check set aside (with your choices).
+  (kept apart from the model's), your favorites, ratings and albums, the
+  positions the GPS check set aside (with your choices), the estimated
+  places, the GPS tracks read from videos (where a dashcam drove: see
+  [Routes](#routes-a-dashcams-gps)) and where 360 pictures open.
 - `thumbs.db` and `previews/` - thumbnails, and 2048 px previews, 360
   panoramas and the contact sheets of videos (about 0.5 MB per picture).
 - `proxies/` - playable copies of videos (only with `video_proxies`).
@@ -1666,14 +1948,24 @@ writes the missing or damaged ones.
 - `videos.py` - videos: what ffprobe says, posters, contact sheets,
   copies without metadata and playable copies (ffmpeg); 360-degree videos
   (their LRV, stitched frames, the lens geometry the viewer uses)
+- `insta360.py` - the data Insta360 cameras write at the end of their
+  files, and the level tracks of 360 videos and photos made from their
+  motion sensor (see [Level horizons](#level-horizons))
+- `opening_views.py` - where 360-degree pictures open (see [Where 360
+  pictures open](#where-360-pictures-open))
 - `drives.py` - drives: runs of video clips recorded one after the other,
   their descriptions and their sped-up previews (see [Drives](#drives))
+- `tracks.py` - the GPS tracks of videos (a dashcam's) and the routes of
+  drives (see [Routes](#routes-a-dashcams-gps))
 - `places.py` - place names: the GeoNames download, the place index and
   the nearest town of a GPS position (`static/place-names.js` is their
   part of the Manage page)
 - `gps_check.py` - the GPS check: positions that cannot be where a
   picture was taken are set aside (see [the GPS
   check](#positions-that-cannot-be-right-the-gps-check))
+- `place_estimates.py` - estimated places for pictures without a usable
+  position, and your own places (see [Estimated
+  places](#estimated-places))
 - `example_helper.py` - the hooks a helper module can have
 - `search_index.py` - the compact search records the search page downloads
   and searches in the browser, and the groups of near-duplicate pictures
@@ -1689,6 +1981,7 @@ writes the missing or damaged ones.
   by every page; `site.js` is where the pages get their data, from the
   server or from a static export; `search-core.js` is the search engine and
   `viewer.js` the picture viewer, both shared with a static export;
+  `routes.js` draws drive routes, for the map and the viewer;
   `embed-engine.js` and `embed-kernel.js` run the embedding model in a
   published site (only there, and only once a search needs it);
   `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
@@ -1791,6 +2084,36 @@ Other changes to be aware of:
   first scan after upgrading, now with the seams blended: only their
   previews, panoramas and thumbnails change. The soft fill over a tripod or
   a hand at the bottom is off unless you set `nadir_fill_deg`.
+- 360-degree videos and ONE R photos are levelled now (see [Level
+  horizons](#level-horizons)): the first scan after upgrading reads the
+  360 videos and unstitched 360 photos again for their level tracks and
+  makes their posters, contact sheets, previews and thumbnails anew
+  (descriptions are kept; describe them again if you want descriptions of
+  the level pictures). Their looks are made again by the next **Update
+  looks**.
+- 360-degree pictures can open facing their subject now (see [Where 360
+  pictures open](#where-360-pictures-open)): with looks set up, the next
+  **Update looks** works it out for the described 360 photos (a few
+  seconds a photo on a CPU) and makes their thumbnails again (the Manage
+  page offers it, with the number of photos waiting for a view). The views are
+  kept in a table of their own in `index.db` (the database's version does
+  not change).
+- Dashcam videos' GPS tracks are read now (see [Routes (a dashcam's
+  GPS)](#routes-a-dashcams-gps)): the first scan after upgrading reads the
+  track of every video indexed before -- a few small reads a video, no
+  ffmpeg (a fraction of a second a video on a network share).
+  Clips with a track get a position, place names and their clock's UTC
+  offset, and drives their routes. The tracks are kept in a table of their
+  own in `index.db` (the database's version does not change).
+- Pictures without a position get an estimated place now (see [Estimated
+  places](#estimated-places)): the GPS check of every scan works them out,
+  the first one for all of them (the search index then sees those pictures
+  as changed). They are kept in tables of their own; a picture's own
+  position and place do not change. An export publishes neither estimated
+  places nor routes unless its new options say so.
+- A GPS position written in a picture's text (a dashcam's overlay, read by
+  the model) is now left out of its meaning vector, so the next **Update
+  meaning search** (or scan) makes the vectors of those pictures again.
 - `config.json` is now written with non-ASCII characters escaped (`\u00fc`),
   and read as UTF-8. A file saved in the system's encoding still loads, with a
   warning.

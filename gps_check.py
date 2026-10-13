@@ -63,8 +63,25 @@ contradicts it (a phone that kept the time zone of the day before after
 a flight): its interval then also spans 2 hours either side of the
 longitude's. A date taken from the name of a file a program wrote (no
 capture date of its own, but a Software tag: an app's export, named when
-it was exported) is the latest the picture may have been taken; its
-interval reaches 2 hours earlier.
+it was exported), or from EXIF DateTime alone with a Software tag (what an
+editor writes when it saves a picture; no DateTimeOriginal), is the latest
+the picture may have been taken (export_date); its interval reaches 2
+hours earlier.
+
+A video with a GPS track (tracks.py: a dashcam's) whose position is its
+track's (its middle fix) is checked as a picture whose GPS time is that
+of its start (tracks.gps_facts): it is timed by its GPS times (from its
+start to its last fix, the middle one most likely), its stated accuracy
+is how far its furthest fix is from the middle one, and the frozen rule
+leaves it out (a drive on the same road meets the same place at the same
+speed again). A video without a camera name and without a track is timed
+(gps_clock) when the videos of its folder with a track show that their
+clock keeps time. The UTC offset a track gives its video (tracks.py) is
+that camera's clock's -- a dashcam's often ignores daylight saving -- not
+the time zone of the place: only the same camera's pictures (without a
+camera name, the videos of the same folder) borrow it, never the
+library's other pictures (clock_key). Such videos' tracks are references
+for the place estimates too (see Check.references).
 
 Some positions are weak: never a reference for others, and set aside
 when more than half of the pictures compared contradict them, even if
@@ -92,11 +109,12 @@ it follows the picture when it moves), applies to every copy of the shot
 without a choice of its own follows the others) and survives every
 scan; choosing what the check decides anyway removes it.
 
-Optionally (estimate_places, off by default) an ignored picture gets the
-place of the pictures taken within estimate_minutes of it when they all
-agree on one: its place_* columns are filled, without a position, and it
-is labelled as estimated wherever it is shown (search records: pe);
-an export holds it only with its Location option, like any place name.
+After each run, the place estimates (place_estimates.update) are worked
+out from its verdicts: a picture whose position is set aside, or that has
+none, may get a place estimated from a copy of it, the pictures taken
+around the same time or its library's area; it is kept apart from the
+picture's own lat, lon and place columns. The check's clocks (Check.timing)
+and its references (Check.references) are what those estimates go by.
 
 Settings: config.json "gps_check" (see settings() and SETTINGS.md).
 
@@ -124,8 +142,6 @@ DEFAULTS = {
     "stale_minutes": 5,         # a GPS fix older than this is stale
     "repeat_hours": 1,          # the same position this long: a camera's last known one
     "across_libraries": True,   # pictures of other libraries count as neighbours
-    "estimate_places": False,   # give ignored pictures the place their neighbours agree on
-    "estimate_minutes": 30,     # ... taken within this many minutes
 }
 RANGES = {
     "max_speed": (300, 5000),
@@ -133,9 +149,8 @@ RANGES = {
     "neighbours": (2, 9),
     "stale_minutes": (1, 240),
     "repeat_hours": (0.25, 72),
-    "estimate_minutes": (1, 240),
 }
-_BOOLEANS = ("enabled", "across_libraries", "estimate_places")
+_BOOLEANS = ("enabled", "across_libraries")
 
 # Capture dates good enough to time a picture (images.taken_source): from
 # the camera, the file name or the video's own date; never the file's time.
@@ -171,7 +186,7 @@ METRES_PER_SECOND_MAKES = frozenset(("apple",))
 
 CHOICES = ("use", "ignore")
 # The keys of a search record (search_index) a position changes.
-RECORD_KEYS = ("gp", "ci", "rg", "co", "cc", "km", "pe", "gx")
+RECORD_KEYS = ("gp", "ci", "rg", "co", "cc", "km", "pe", "ps", "gx")
 REASON_KINDS = ("void", "stale", "frozen", "travel")
 OTHERS_MAX = 500            # the choice route sends at most this many changed records
 
@@ -192,8 +207,9 @@ def _number(value, default, low, high, whole):
 
 def settings(config):
     """config.json "gps_check" checked, with defaults: {"enabled", "max_speed",
-    "window_hours", "neighbours", "stale_minutes", "repeat_hours", "across_libraries",
-    "estimate_places", "estimate_minutes"} (see DEFAULTS; numbers held to RANGES)."""
+    "window_hours", "neighbours", "stale_minutes", "repeat_hours", "across_libraries"}
+    (see DEFAULTS; numbers held to RANGES). Its older "estimate_places" and
+    "estimate_minutes" belong to the place estimates now (place_estimates.settings)."""
     stored = config.get("gps_check") if isinstance(config, dict) else None
     stored = stored if isinstance(stored, dict) else {}
     result = dict(DEFAULTS)
@@ -453,6 +469,7 @@ copy     True when that choice is not the picture's own but its copies'
 class _Item:
     __slots__ = ("id", "library", "camera", "local", "offset", "doubtful", "lat", "lon", "gps",
                  "speed", "hash", "dhash", "choice", "copy", "timed", "fix", "gps_offset",
+                 "clock",
                  "early", "finding", "weak", "lo", "hi", "mid", "clock_only", "tolerance",
                  "group", "spot", "key", "voter", "row")
 
@@ -496,13 +513,147 @@ def _offsets_near(entries, local, reach):
     return found
 
 
+Reference = collections.namedtuple(
+    "Reference", "id library camera lat lon lo hi mid clock_only group tolerance track speed",
+    defaults=(False, None))
+Reference.__doc__ = """A picture whose position the check keeps and counts on (Check.references).
+
+lat, lon     its position; tolerance how far off it may be (km: 1 km and
+             the accuracy it states)
+lo, hi, mid  the earliest, latest and likeliest UTC (seconds since 1970) it
+             was taken at (see the module notes); clock_only True when no
+             time zone was known anywhere near: then they are its camera's
+             clock as it is, comparable only with others timed that way
+group        the same value for copies of one shot
+track        True for a video's position from its GPS track, and for the
+             points of that track (TRACK_STEP seconds apart, each a group of
+             its own: where the video's camera was then)
+speed        the speed its GPS data states (km/h, speed_kmh), or None
+"""
+
+# Seconds between the points of a video's GPS track that count as references.
+TRACK_STEP = 10
+
+
+def timed_row(row):
+    """True when a picture's capture date is good enough to time it (TRUSTED_SOURCES;
+    not a video without a camera name: mostly a copy a program made, dated then --
+    unless it has a GPS track (tracks.py), or its folder's videos with one show that
+    their clock keeps time: "track" and "gps_clock" of rows _load gives)."""
+    return (local_seconds(row.get("taken_at")) is not None
+            and row.get("taken_source") in TRUSTED_SOURCES
+            and not (row.get("media") == "video" and not row.get("camera")
+                     and not row.get("track") and not row.get("gps_clock")))
+
+
+def export_date(row):
+    """True when a picture's date is when a program saved it rather than when it was
+    taken: a date from a file name, or from EXIF DateTime alone (no DateTimeOriginal
+    nor DateTimeDigitized: what an editor writes when it saves; "saved_date" of the
+    rows _load gives), with a Software tag (an app's export, an editor's). It is the
+    latest the picture may have been taken (EXPORT_SECONDS)."""
+    return bool(row.get("software")) and (
+        row.get("taken_source") == "filename"
+        or (row.get("taken_source") == "exif" and bool(row.get("saved_date"))))
+
+
+def gps_clock(row):
+    """True when a picture's clock is known by a GPS track's time (a video with a track,
+    or one whose folder's videos with one show their clock keeps time; see _load):
+    its UTC offset is its camera's clock's (a dashcam's often ignores daylight
+    saving), not the time zone of where it was, so it is lent only to the same
+    camera's pictures (clock_key), never to the library's other pictures."""
+    return row.get("track") is not None or bool(row.get("gps_clock"))
+
+
+def clock_key(row):
+    """What a picture's UTC offset is shared under with the pictures of the same camera
+    (camera_key; a video timed by GPS tracks without a camera name: its folder's)."""
+    camera = camera_key(row.get("camera"))
+    if not camera and gps_clock(row):
+        return ("folder", row.get("library_id"), (row.get("path") or "").rpartition("/")[0])
+    return camera
+
+
+def _on_track(item):
+    """The kept track (tracks.Facts) of an item whose position is that track's, or None."""
+    track = item.row.get("track") if item.row else None
+    if track is None:
+        return None
+    import tracks
+    return track if tracks.is_position(track, item.lat, item.lon) else None
+
+
 class Check:
     """The verdicts of evaluate(): verdicts {image id: Verdict} (pictures with a position)."""
 
-    def __init__(self, verdicts, items, options):
+    def __init__(self, verdicts, items, options, zones=None):
         self.verdicts = verdicts
         self._items = items
         self._options = options
+        self._zones = zones
+        self._by_id = {item.id: item for item in items}
+
+    def group_of(self, image_id):
+        """The copy group of a picture with a timed position (see Reference), or None."""
+        item = self._by_id.get(image_id)
+        return item.group if item is not None and item.timed else None
+
+    def references(self):
+        """The pictures whose positions count as references for others, as References
+        (in no order): timed, not set aside, not weak (or the owner said "use"). A video
+        whose position is its GPS track's gives the points of its track instead
+        (tracks.samples, every TRACK_STEP seconds, and its middle fix: each where the
+        camera was at that moment, BASE_TOLERANCE_KM off at most)."""
+        found = []
+        for item in self._items:
+            if not item.voter or self.verdicts[item.id].ignored:
+                continue
+            track = _on_track(item)
+            if track is None:
+                found.append(Reference(item.id, item.library, item.camera, item.lat, item.lon,
+                                       item.lo, item.hi, item.mid, item.clock_only, item.group,
+                                       item.tolerance, False, item.speed))
+                continue
+            # (A track's middle fix: where the camera was at that moment, as
+            # its other points are.)
+            found.append(Reference(item.id, item.library, item.camera, item.lat, item.lon,
+                                   item.mid, item.mid, item.mid, False, item.group,
+                                   BASE_TOLERANCE_KM, True, item.speed))
+            import tracks
+            for index, (utc, lat, lon) in enumerate(tracks.samples(track, TRACK_STEP)):
+                if abs(utc - item.mid) >= 1:
+                    found.append(Reference(item.id, item.library, item.camera, lat, lon, utc,
+                                           utc, utc, False, ("track", item.id, index),
+                                           BASE_TOLERANCE_KM, True))
+        return found
+
+    def timing(self, row, trusted=False):
+        """When a picture (a row as evaluate() takes them) was taken by this check's
+        clocks: (lo, hi, mid, clock_only) as a Reference has them, or None when its
+        capture date cannot time it (see timed_row; trusted: its date is known to be
+        good, whatever its source). The time zones are those evaluate() found: the
+        picture's own offset, its camera's within the hour, its library's within 36
+        hours (or any library's), else its clock as it is."""
+        item = self._by_id.get(row.get("id"))
+        if item is not None and item.timed:
+            return item.lo, item.hi, item.mid, item.clock_only
+        local = local_seconds(row.get("taken_at"))
+        if local is None or not (trusted or timed_row(row)) or self._zones is None:
+            return None
+        probe = _Item()
+        probe.library = row.get("library_id")
+        probe.camera = camera_key(row.get("camera"))
+        probe.clock = clock_key(row)
+        probe.local = local
+        probe.offset = offset_minutes(row.get("tz_offset"))
+        probe.doubtful = False
+        probe.gps_offset = None
+        probe.finding = None
+        probe.lon = None
+        probe.early = EXPORT_SECONDS if export_date(row) else 0
+        _time_interval(probe, self._zones, self._options)
+        return probe.lo, probe.hi, probe.mid, probe.clock_only
 
     def copies(self, image_id):
         """The ids of the pictures with a position that are copies of one shot with
@@ -513,52 +664,6 @@ class Check:
         group = found[0].group
         return [image_id] + sorted(item.id for item in self._items
                                    if item.group == group and item.id != image_id)
-
-    def estimates(self, place_of):
-        """{image id: place columns} for ignored pictures whose neighbours agree on a place.
-
-        The pictures taken within estimate_minutes of an ignored one whose
-        positions are kept and count as references (not weak, not copies of
-        it; other libraries only with across_libraries) are asked
-        place_of(row) -> place columns (or None when unknown); when there is
-        at least one and all name the same town, region and country, that
-        is the estimate (place_km None: no distance is claimed).
-        """
-        reach = self._options["estimate_minutes"] * 60.0
-        across = self._options["across_libraries"]
-        kept = sorted((item.mid, n) for n, item in enumerate(self._items)
-                      if item.voter and not self.verdicts[item.id].ignored)
-        mids = [mid for mid, _n in kept]
-        labels = {}
-        result = {}
-        for item in self._items:
-            if not self.verdicts[item.id].ignored or item.mid is None:
-                continue
-            start = bisect.bisect_left(mids, item.mid - reach)
-            names = set()
-            unknown = False
-            for index in range(start, len(kept)):
-                if mids[index] > item.mid + reach:
-                    break
-                other = self._items[kept[index][1]]
-                if (other.group == item.group or other.clock_only != item.clock_only
-                        or (not across and other.library != item.library)):
-                    continue
-                if other.id not in labels:
-                    columns = place_of(other.row)
-                    labels[other.id] = (None if not columns or not columns.get("place_country")
-                                        else tuple(columns.get(key) or "" for key in (
-                                            "place_city", "place_region", "place_country",
-                                            "place_cc")))
-                if labels[other.id] is None:
-                    unknown = True
-                    break
-                names.add(labels[other.id])
-            if len(names) == 1 and not unknown:
-                city, region, country, cc = names.pop()
-                result[item.id] = {"place_city": city, "place_region": region,
-                                   "place_country": country, "place_cc": cc, "place_km": None}
-        return result
 
 
 def evaluate(rows, options):
@@ -578,13 +683,13 @@ def evaluate(rows, options):
     camera_offsets = collections.defaultdict(list)
     for row in rows:
         local = local_seconds(row.get("taken_at"))
-        timed = (local is not None and row.get("taken_source") in TRUSTED_SOURCES
-                 # A video without a camera name is mostly a copy made by a
-                 # program, dated when it was made.
-                 and not (row.get("media") == "video" and not row.get("camera")))
+        timed = timed_row(row)
         offset = offset_minutes(row.get("tz_offset")) if timed else None
         library = row.get("library_id")
         camera = camera_key(row.get("camera"))
+        clock = clock_key(row)
+        # (A clock known by a GPS track speaks for its camera only.)
+        local_zone = not gps_clock(row)
         lat, lon = row.get("lat"), row.get("lon")
         positioned = world_map.valid_position(lat, lon)
         gps = row.get("gps") if positioned and isinstance(row.get("gps"), dict) else {}
@@ -592,8 +697,9 @@ def evaluate(rows, options):
         doubtful = (offset is not None and positioned
                     and doubtful_offset(offset, float(lon), gps, local, fix, stale_limit))
         if offset is not None and not doubtful:
-            library_offsets[library].append((local, offset))
-            camera_offsets[(library, camera)].append((local, offset))
+            if local_zone:
+                library_offsets[library].append((local, offset))
+            camera_offsets[(library, clock)].append((local, offset))
         if not positioned:
             continue
         item = _Item()
@@ -601,6 +707,7 @@ def evaluate(rows, options):
         item.id = row["id"]
         item.library = library
         item.camera = camera
+        item.clock = clock
         item.local = local if timed else None
         item.offset = offset
         item.doubtful = doubtful
@@ -618,12 +725,12 @@ def evaluate(rows, options):
             quarter, off_by = _quarter(local - fix)
             if abs(off_by) <= CLOCK_SLACK and OFFSET_RANGE[0] <= quarter <= OFFSET_RANGE[1]:
                 item.gps_offset = int(quarter // 60)
-                camera_offsets[(library, camera)].append((local, item.gps_offset))
-                library_offsets[library].append((local, item.gps_offset))
+                camera_offsets[(library, clock)].append((local, item.gps_offset))
+                if local_zone:
+                    library_offsets[library].append((local, item.gps_offset))
         # A date from the name of a file a program wrote is when it was
         # written: the picture may have been taken before.
-        item.early = (EXPORT_SECONDS if timed and row.get("taken_source") == "filename"
-                      and row.get("software") else 0)
+        item.early = EXPORT_SECONDS if timed and export_date(row) else 0
         item.finding = None
         item.weak = False
         item.mid = item.lo = item.hi = None
@@ -644,6 +751,13 @@ def evaluate(rows, options):
     timed = [item for item in items if item.timed]
     for item in timed:
         _time_interval(item, zones, options)
+        track = _on_track(item)
+        if track is not None:
+            # (A video's GPS track says when it was recorded, in UTC, and
+            # its position is its middle fix.)
+            item.lo, item.hi = track.start, max(track.start, track.end)
+            item.mid = track.start + track.at
+            item.clock_only = False
     _copy_groups(timed)
     _shared_choices(timed)
     if options["enabled"]:
@@ -658,7 +772,7 @@ def evaluate(rows, options):
         ignored = item.choice == "ignore" or (item.choice != "use" and item.finding is not None)
         verdicts[item.id] = Verdict(ignored, item.finding, item.weak, item.choice,
                                     item.copy and item.choice is not None)
-    return Check(verdicts, items, options)
+    return Check(verdicts, items, options, zones)
 
 
 def _candidate_offsets(item, zones, options):
@@ -667,7 +781,7 @@ def _candidate_offsets(item, zones, options):
     (or any library's), and with an offset in doubt that one and the longitude's."""
     library_offsets, every_offset, camera_offsets = zones
     offsets = set()
-    borrowed = _nearest_offset(camera_offsets.get((item.library, item.camera), ()),
+    borrowed = _nearest_offset(camera_offsets.get((item.library, item.clock), ()),
                                item.local, CAMERA_OFFSET_SECONDS)
     if borrowed is not None:
         offsets.add(borrowed)
@@ -726,10 +840,13 @@ def _intrinsic(items, zones, stale_limit, options):
         item.finding = {"kind": "stale", "minutes": int(round(age / 60.0))}
         if len(offsets) != 1:
             item.finding["least"] = True
-    # Frozen: one moving fix given to pictures minutes apart.
+    # Frozen: one moving fix given to pictures minutes apart. (Not a video's
+    # position from its GPS track: a fix of its own time, which a drive on
+    # the same road may meet again.)
     moving = collections.defaultdict(list)
     for item in items:
-        if item.local is not None and item.speed is not None and item.speed >= FROZEN_SPEED:
+        if (item.local is not None and item.speed is not None and item.speed >= FROZEN_SPEED
+                and _on_track(item) is None):
             moving[(item.spot, round(item.speed, 3))].append(item)
     for (_spot, speed), group in moving.items():
         if len(group) < 2:
@@ -752,7 +869,7 @@ def _time_interval(item, zones, options):
     elif item.gps_offset is not None and item.finding is None:
         offsets.add(item.gps_offset)
     elif not item.doubtful:
-        borrowed = _nearest_offset(camera_offsets.get((item.library, item.camera), ()),
+        borrowed = _nearest_offset(camera_offsets.get((item.library, item.clock), ()),
                                    item.local, CAMERA_OFFSET_SECONDS)
         if borrowed is not None:
             offsets.add(borrowed)
@@ -1056,8 +1173,8 @@ def picture_view(conn, row, index=None):
     is set aside, "reason": why, in words ("" when the check finds nothing),
     "choice": the owner's that applies ("use", "ignore" or "": its own, or
     its copies'), "place": the place of the position set aside ("" when it
-    is not, or there are no place names), "estimated": its place is
-    estimated}.
+    is not, or there are no place names), "estimated": a place is estimated
+    for it (place_estimates.py)}.
     """
     check = conn.execute("SELECT lat, lon, ignored, reason FROM gps_checks WHERE image_id = ?",
                          (row["id"],)).fetchone()
@@ -1084,8 +1201,12 @@ def picture_view(conn, row, index=None):
         index = index if index is not None else places.shared()
         if index is not None:
             place = place_text(places.place_columns(check["lat"], check["lon"], index))
+    estimated = False
+    if ignored:
+        import place_estimates
+        estimated = place_estimates.usable(row, place_estimates.for_picture(conn, row["id"]))
     return {"ignored": ignored, "reason": reason, "choice": choice, "place": place,
-            "estimated": bool(ignored and row["place_country"])}
+            "estimated": estimated}
 
 
 def file_read_again(conn, image_id, values):
@@ -1118,8 +1239,12 @@ def file_read_again(conn, image_id, values):
 _ROWS_SQL = """
     SELECT i.id, i.library_id, i.taken_at, i.taken_source, i.tz_offset, i.camera, i.media,
         i.content_hash, i.dhash, i.lat, i.lon, i.place_city, i.place_region, i.place_country,
-        i.place_cc, i.place_km,
-        CASE WHEN i.lat IS NOT NULL OR g.image_id IS NOT NULL THEN i.exif END AS exif,
+        i.place_cc, i.place_km, i.path, i.mtime, i.duration, i.projection,
+        CASE WHEN i.lat IS NOT NULL OR g.image_id IS NOT NULL OR i.taken_source = 'filename'
+            OR (i.taken_source = 'exif' AND i.exif LIKE '%%"Software"%%'
+                AND i.exif NOT LIKE '%%"DateTimeOriginal"%%'
+                AND i.exif NOT LIKE '%%"DateTimeDigitized"%%')
+            THEN i.exif END AS exif,
         g.image_id AS checked, g.lat AS raw_lat, g.lon AS raw_lon, g.ignored AS was_ignored,
         g.reason AS old_reason
     FROM images AS i LEFT JOIN gps_checks AS g ON g.image_id = i.id
@@ -1128,10 +1253,14 @@ _ROWS_SQL = """
 _PLACE_COLUMNS = ("place_city", "place_region", "place_country", "place_cc", "place_km")
 
 
+def _date_tag(value):
+    return isinstance(value, str) and bool(value.strip(" 0:"))
+
+
 def _facts_of(exif_text):
     """{"gps": the GPS dict of an images.exif text (or None), "software": its Software
-    tag (or "")}."""
-    facts = {"gps": None, "software": ""}
+    tag (or ""), "saved_date": True when its only date is DateTime (see export_date)}."""
+    facts = {"gps": None, "software": "", "saved_date": False}
     if not exif_text:
         return facts
     try:
@@ -1143,6 +1272,9 @@ def _facts_of(exif_text):
             facts["gps"] = exif["GPS"]
         if isinstance(exif.get("Software"), str):
             facts["software"] = exif["Software"].strip()
+        facts["saved_date"] = (_date_tag(exif.get("DateTime"))
+                               and not _date_tag(exif.get("DateTimeOriginal"))
+                               and not _date_tag(exif.get("DateTimeDigitized")))
     return facts
 
 
@@ -1151,8 +1283,17 @@ def _library_ids(config):
             if isinstance(library, dict) and library.get("id")]
 
 
-def _load(conn, library_ids):
-    """The rows evaluate() wants (with the database facts run() needs beside them)."""
+def _load(conn, library_ids, config=None):
+    """The rows evaluate() wants (with the database facts run() needs beside them).
+
+    A video with a GPS track (tracks.py; unless config's "gps_tracks" is off)
+    gets "track" (its tracks.Facts) and, when its position is the track's,
+    the GPS facts of its track (tracks.gps_facts: a fix at its start, in
+    UTC). A video without a camera name and without a track gets "gps_clock"
+    when videos of its folder with one show that their clock keeps time
+    (tracks.clock_offset: a whole quarter hour from the GPS time).
+    """
+    import tracks
     owner = choices(conn)
     rows = []
     for row in conn.execute(_ROWS_SQL % ",".join("?" * len(library_ids)), library_ids):
@@ -1161,9 +1302,27 @@ def _load(conn, library_ids):
         if row["lat"] is None and row["checked"] is not None and row["was_ignored"]:
             # Set aside: the position the file gives is kept in gps_checks.
             item["lat"], item["lon"] = row["raw_lat"], row["raw_lon"]
-        item.update(_facts_of(row["exif"] if item["lat"] is not None else None))
+        # (The GPS data counts only with a position: see evaluate. A date from
+        # a file name, or from EXIF DateTime alone, needs the Software tag: an
+        # app's or an editor's export is dated when it was saved, export_date.)
+        item.update(_facts_of(row["exif"]))
         item["choice"] = owner.get(content_key(row["content_hash"], row["id"]))
         rows.append(item)
+    found = tracks.for_rows(conn, rows, config)
+    proven = set()
+    for item in rows:
+        track = found.get(item["id"])
+        if track is None:
+            continue
+        item["track"] = track
+        if item["gps"] is None and tracks.is_position(track, item["lat"], item["lon"]):
+            item["gps"] = tracks.gps_facts(track)
+        if tracks.clock_offset(track.start, item["taken_at"], local_seconds)[0] is not None:
+            proven.add((item["library_id"], (item["path"] or "").rpartition("/")[0]))
+    for item in rows:
+        if (item["media"] == "video" and not item["camera"] and "track" not in item
+                and (item["library_id"], (item["path"] or "").rpartition("/")[0]) in proven):
+            item["gps_clock"] = True
     return rows
 
 
@@ -1201,8 +1360,6 @@ def summary_text(summary):
         changes.append("{:,} newly ignored".format(summary["newly_ignored"]))
     if summary["restored"]:
         changes.append("{:,} used again".format(summary["restored"]))
-    if summary["estimated"]:
-        changes.append("{:,} with an estimated place".format(summary["estimated"]))
     if changes:
         text += "; " + ", ".join(changes)
     text += "."
@@ -1211,7 +1368,7 @@ def summary_text(summary):
     return text
 
 
-def run(conn, config, ctx=None, now=None, library_ids=None, changed=None):
+def run(conn, config, ctx=None, now=None, library_ids=None, changed=None, estimates=True):
     """Check the GPS positions of the present pictures and set aside those that cannot be right.
 
     Every library of config is looked at (enabled or not; library_ids
@@ -1220,17 +1377,21 @@ def run(conn, config, ctx=None, now=None, library_ids=None, changed=None):
     row and lose their lat, lon and place columns; positions the check
     (or the owner) no longer sets aside get them back (the place again
     from the place names, or left to be looked up when there are none).
-    Everything is written in one transaction. ctx (optional) is told the
-    summary; changed (a set, optional) gets the ids of the pictures whose
-    position or place changed. Returns {"checked", "ignored", "ignored_by":
-    {kind: count}, "newly_ignored", "restored", "estimated", "seconds"}.
+    Everything is written in one transaction. Then (unless estimates is
+    False) the place estimates are worked out again from this check
+    (place_estimates.update, in a transaction of its own). ctx (optional)
+    is told the summaries; changed (a set, optional) gets the ids of the
+    pictures whose position, place or estimated place changed. Returns
+    {"checked", "ignored", "ignored_by": {kind: count}, "newly_ignored",
+    "restored", "seconds", "estimates": place_estimates.update's summary
+    (None when it was not run)}.
     """
     started = time.perf_counter()
     options = settings(config)
     if library_ids is None:
         library_ids = _library_ids(config)
     summary = {"checked": 0, "ignored": 0, "ignored_by": {}, "newly_ignored": 0,
-               "restored": 0, "estimated": 0, "seconds": 0.0}
+               "restored": 0, "seconds": 0.0, "estimates": None}
     if not library_ids:
         return summary
     now = time.time() if now is None else now
@@ -1238,13 +1399,8 @@ def run(conn, config, ctx=None, now=None, library_ids=None, changed=None):
         conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        rows = _load(conn, list(library_ids))
+        rows = _load(conn, list(library_ids), config)
         check = evaluate(rows, options)
-        estimates = {}
-        if options["estimate_places"]:
-            estimates = check.estimates(
-                lambda row: {key: row[key] for key in _PLACE_COLUMNS}
-                if row["shown_lat"] is not None and row["place_km"] is not None else None)
         index = None
         counts = collections.Counter()
         for row in rows:
@@ -1274,9 +1430,9 @@ def run(conn, config, ctx=None, now=None, library_ids=None, changed=None):
                 conn.execute("DELETE FROM gps_checks WHERE image_id = ?", (row["id"],))
             shown = row["shown_lat"] is not None
             if verdict.ignored:
-                place = estimates.get(row["id"]) or places.empty_columns()
-                if place.get("place_country"):
-                    summary["estimated"] += 1
+                # (No place of its own: an estimated one is kept apart, see
+                # place_estimates.)
+                place = places.empty_columns()
                 if shown:
                     summary["newly_ignored"] += 1
                 if shown or any(row[key] != place[key] for key in _PLACE_COLUMNS):
@@ -1308,6 +1464,10 @@ def run(conn, config, ctx=None, now=None, library_ids=None, changed=None):
     summary["seconds"] = round(time.perf_counter() - started, 3)
     if summary["checked"]:
         _log(ctx, summary_text(summary))
+    if estimates:
+        import place_estimates
+        summary["estimates"] = place_estimates.update(conn, config, rows, check, ctx, now,
+                                                      changed)
     return summary
 
 
@@ -1336,7 +1496,7 @@ def set_choice(conn, config, image_id, use, now=None):
     library_ids = _library_ids(config)
     if not library_ids:
         return []
-    rows = _load(conn, library_ids)
+    rows = _load(conn, library_ids, config)
     check = evaluate(rows, settings(config))
     ids = check.copies(image_id)
     by_id = {row["id"]: row for row in rows}

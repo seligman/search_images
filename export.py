@@ -8,12 +8,13 @@ web-size pictures. It can be copied to any static web host, or opened from
 disk by double-clicking index.html.
 
     index.html  detail.html  [map.html]
-    assets/     style.css shell.js site.js search-core.js viewer.js app.js
-                detail.js [map.js] [embed-engine.js embed-kernel.js]
+    assets/     style.css shell.js site.js search-core.js routes.js viewer.js
+                app.js detail.js [map.js] [embed-engine.js embed-kernel.js]
     data/       manifest.js  window.SEARCH_DATA_MANIFEST = {...}
                 index-NNN.js  SEARCH_DATA.push([records])
                 detail-NNN.js SEARCH_DATA.detail({picture id: details})
                 [locations.js SEARCH_DATA.locations([{id, lat, lon}])]
+                [routes.js SEARCH_DATA.routes([{d, l, c: [{i, o, p, t}]}])]
                 [vectors-NNN.js SEARCH_VECTORS.push({dims, ids, data, model})]
                 [looks-NNN.js SEARCH_LOOKS.push({dims, ids, data, model})]
                 [meaning/model.js meaning/w-NNN.js meaning/LICENSE.txt]
@@ -66,6 +67,22 @@ from the export. Every picture written is cleaned of its metadata (EXIF,
 XMP, IPTC, comments, text chunks, data after the image); a colour profile
 and, for an original JPEG, the orientation are kept.
 
+The positions videos get from their GPS tracks (tracks.py: a dashcam's
+clips) and the routes of drives go out only with the location and
+"routes" options both on, and never within routes_trim metres (default
+500) of where a drive of any library starts or ends (tracks.privacy_zones:
+a home): data/routes.js then holds the tracks of the published clips
+(tracks.routes, trimmed), which the map draws and the viewer follows.
+Without them such a clip keeps its place names but not its position, and
+so does a place estimated from a track (place_estimates: its detail's
+"track"; also when the owner accepted it). The positions written in the
+title, description and text of a dashcam's clips (tracks.related_ids: the
+videos with a track, the clips of their drives and the videos of their
+folders), and in their drives', never go out: a dashcam prints its
+position over its video -- one without a fix the last it had, often where
+the drive started -- and the model reads it. Their pictures show it all
+the same: the review counts them (counts.routes "overlay" and "near").
+
 An export can be limited to one manual album of the owner's (the album
 option, an album id; see albums.py): only the album's pictures of the
 library are candidates, and the privacy rules above still apply to them.
@@ -106,7 +123,8 @@ Used by the job runner (Manage page), "serve.py package" and its own
 command line:
 
     python export.py --library NAME [--out DIR] [--images web|original|none]
-                     [--location] [--file-names] [--folders]
+                     [--location [--estimated-places] [--routes [--routes-trim M]]]
+                     [--file-names] [--folders]
                      [--include-screenshots] [--include-documents]
                      [--include-undescribed] [--include-private]
                      [--include-sensitive] [--zip] [--album NAME] [--marks]
@@ -158,9 +176,11 @@ import imageinfo
 import jobs
 import library_ops
 import looks
+import place_estimates
 import places
 import prompts
 import search_index
+import tracks
 import videos
 import world_map
 
@@ -196,8 +216,8 @@ PLACES_CREDIT = ('Place names: <a href="%s">GeoNames</a> (<a href="%s" rel="lice
                                      html.escape(places.LICENSE_URL)))
 MAX_ID_LIST = 100000
 # Scripts and the style sheet every export carries (map.js only with the map).
-ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "viewer.js", "app.js",
-          "detail.js")
+ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "routes.js", "viewer.js",
+          "app.js", "detail.js")
 MAP_ASSETS = ("map.js",)
 # (file in the export, template)
 PAGES = (("index.html", "page.html"), ("detail.html", "detail.html"))
@@ -269,6 +289,12 @@ DEFAULT_OPTIONS = {
     "title": "",                    # "" = the library's name
     "images": "web",                # "web" (2048 px) | "original" | "none" (thumbnails only)
     "location": False,              # GPS positions, place names, the map, landmark/place-guess
+    "estimated_places": False,      # with location: places estimated for pictures without a
+                                    # position (place_estimates.py; the owner's own places go
+                                    # with location)
+    "routes": False,                # with location: drives' routes and the positions of clips
+                                    # from their GPS tracks (tracks.py)
+    "routes_trim": tracks.DEFAULT_TRIM_METRES,  # metres left out where a drive starts or ends
     "file_names": False,
     "folders": False,
     "exclude_types": ["screenshot", "document"],    # photo types left out
@@ -291,7 +317,7 @@ DEFAULT_OPTIONS = {
 }
 _BOOLEAN_OPTIONS = ("location", "file_names", "folders", "exclude_private", "exclude_sensitive",
                     "exclude_undescribed", "zip", "allow_indexing", "similar", "meaning",
-                    "looks", "marks")
+                    "looks", "marks", "estimated_places", "routes")
 # Where the query model goes (in data/), and the scripts that run it (in assets/).
 MEANING_FOLDER = "meaning"
 MEANING_ASSETS = ("embed-kernel.js", "embed-engine.js")
@@ -469,6 +495,12 @@ def validate_options(options, base=None):
                 errors[key] = "must be one of %s" % ", ".join(VIDEO_MODES)
             else:
                 result[key] = value
+        elif key == "routes_trim":
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or not tracks.TRIM_RANGE[0] <= value <= tracks.TRIM_RANGE[1]):
+                errors[key] = "must be a whole number of metres from %d to %d" % tracks.TRIM_RANGE
+            else:
+                result[key] = value
         elif key == "max_video_mb":
             if (isinstance(value, bool) or not isinstance(value, int)
                     or not MAX_VIDEO_MB[0] <= value <= MAX_VIDEO_MB[1]):
@@ -542,6 +574,10 @@ def options_summary(options):
         summary["videos"] = options["videos"]
     if options["marks"]:
         summary["marks"] = True
+    if options["location"] and options["estimated_places"]:
+        summary["estimated_places"] = True
+    if options["location"] and options["routes"]:
+        summary["routes"] = True
     return summary
 
 
@@ -1610,6 +1646,8 @@ def select_records(conn, config, library, options):
             item = {"id": image_id, "reason": (flags or [reason or "included"])[0],
                     "reasons": flags, "title": record.get("t") or "",
                     "excluded": reason is not None}
+            if record.get("ov"):
+                item["ov"] = record["ov"]   # (its thumbnail's view, see SITE.thumbUrl)
             if new_flags:
                 item["new_flags"] = new_flags
             flagged.append(item)
@@ -1931,7 +1969,13 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
     a look vector, "missing": how many do not}, "drives": the drives among the
     pictures to publish, see drives.export_texts: {"drives", "described" (those
     that keep their own description), "private", "sensitive" (those whose
-    description the options leave out)}},
+    description the options leave out)}, "routes": what goes of the videos' GPS
+    tracks (_Routes): {"on" (location and routes), "positions" (pictures to
+    publish whose position is their track's), "withheld" (of those, the ones
+    that keep only their place names), "routes" (routes published),
+    "overlay" (a dashcam's clips to publish: their pictures may show the
+    position their overlay prints), "near" (of those, the ones filmed near
+    where a drive starts or ends, or without a fix)}},
     "flagged": [{id, reason, reasons, title, excluded, bytes
     (what the picture adds to the export), parts (the same by kind, as in
     size_parts), needs_folder, new_flags (see select_records), and for a
@@ -1961,6 +2005,15 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
                                            drives.settings(config)["min_clips"],
                                            drives.clip_texts(conn, library_id, config),
                                            drives.clip_places(conn, library_id, config))
+    track_routes = _Routes(conn, config, library_id, options)
+    chosen_rows = [rows[record["i"]] for record in chosen if record["i"] in rows]
+    counts["routes"] = {
+        "on": track_routes.on,
+        "positions": sum(1 for row in chosen_rows if row["id"] in track_routes.from_track),
+        "withheld": track_routes.withheld(chosen_rows),
+        "routes": len(track_routes.routes([row["id"] for row in chosen_rows])),
+        "overlay": sum(1 for row in chosen_rows if row["id"] in track_routes.related),
+        "near": sum(1 for row in chosen_rows if track_routes.near_end(row))}
     vectors = _vector_sizes(conn, library_id, options,
                             {record["i"] for record in chosen} | flagged_ids,
                             carried=_carried((record["i"], record) for record in published))
@@ -2085,7 +2138,10 @@ def detail_entry(row, record):
     The date taken (the day only) and how it was found (the camera or the
     file name; a date from the file's time is never exported), and the
     camera settings (exposure, aperture, ISO, focal length, lens model):
-    no times, places, serial numbers, software, owner or copyright.
+    no times, places, serial numbers, software, owner or copyright. A 360
+    video published with its video (record lv, see Export.records) also
+    gets its level track ("level": which way was up in its panorama over
+    the video's time, see insta360.level_track), for the player.
     """
     entry = {}
     if record.get("dk"):
@@ -2112,9 +2168,14 @@ def detail_entry(row, record):
                 details[key] = " ".join(value.split())[:100]
     if details:
         entry["exif"] = details
-    # Only when it adds something: the camera settings, or a note that the
-    # date comes from the file name (the viewer says so).
-    if details or entry.get("taken_source") == "filename":
+    level = None
+    if record.get("lv") and isinstance(exif, dict):
+        level = videos.level_of(exif.get("video"))
+        if level:
+            entry["level"] = level
+    # Only when it adds something: the camera settings, the level track, or
+    # a note that the date comes from the file name (the viewer says so).
+    if details or level or entry.get("taken_source") == "filename":
         return entry
     return None
 
@@ -2125,6 +2186,128 @@ def _location(row):
     if not world_map.valid_position(lat, lon):
         return None
     return round(lat, LOCATION_DECIMALS), round(lon, LOCATION_DECIMALS)
+
+
+def _estimated_location(row, record, estimate):
+    """The map point ({lat, lon, and "e": 1 with "r", or "o": 1}) of a picture's estimated
+    place or the owner's own (a place_estimates row), or None: only when its record
+    holds that place (search_index.record_for_row: the picture has no place of its
+    own and the export's options allow it) and it has a position (an area has none)."""
+    if (estimate is None or record.get("ps") not in ("c", "t", "o") or record.get("gp")
+            or not world_map.valid_position(estimate.get("lat"), estimate.get("lon"))):
+        return None
+    point = {"lat": round(estimate["lat"], LOCATION_DECIMALS),
+             "lon": round(estimate["lon"], LOCATION_DECIMALS)}
+    if record["ps"] == "o":
+        point["o"] = 1
+    else:
+        point["e"] = 1
+        radius = estimate.get("radius_km")
+        if isinstance(radius, (int, float)) and math.isfinite(radius):
+            point["r"] = round(radius, 3)
+    return point
+
+
+# The record keys of a picture's own text (search_index's _TEXT_FIELDS).
+RECORD_TEXT_KEYS = (("t", "title"), ("d", "description"), ("o", "text"), ("sc", "scene"))
+
+
+def _scrub_positions(record, keys):
+    """A record without the GPS positions written out in its texts (keys: (record key,
+    field) pairs; imageinfo.scrub_positions). In place."""
+    for key, _field in keys:
+        if isinstance(record.get(key), str):
+            record[key] = imageinfo.scrub_positions(record[key])
+
+
+class _Routes:
+    """What an export publishes of the GPS tracks (tracks.py): with the location and
+    routes options (and gps_tracks on), the routes of its library's clips and the
+    positions their tracks gave them (or places estimated from them), less what is
+    within routes_trim metres of where a drive of any library starts or ends
+    (tracks.privacy_zones); otherwise none of them. related: the ids of the library's
+    dashcam clips (tracks.related_ids), whose texts never hold a position."""
+
+    def __init__(self, conn, config, library_id, options):
+        self.conn = conn
+        self.config = config
+        self.library_id = library_id
+        self.on = bool(options["location"] and options["routes"]
+                       and tracks.settings(config)["enabled"])
+        self.metres = options["routes_trim"]
+        rows = conn.execute("SELECT id, content_hash, media, lat, lon FROM images "
+                            "WHERE library_id = ? AND media = 'video' "
+                            "AND missing_since IS NULL", (library_id,)).fetchall()
+        self.found = tracks.for_rows(conn, rows)
+        self.from_track = {row["id"] for row in rows if tracks.is_position(
+            self.found.get(row["id"]), row["lat"], row["lon"])}
+        self.related = tracks.related_ids(conn, config, library_id)
+        # (Where the drives of every library start and end: a place estimated
+        # from another library's track, or a copy of a clip, is near them too.)
+        self._zones = None
+
+    @property
+    def zones(self):
+        if self._zones is None:
+            self._zones = (tracks.privacy_zones(self.conn, self.config)
+                           if self.on or self.related else [])
+        return self._zones
+
+    def near_end(self, row):
+        """True when a dashcam's clip (related) may show where a drive starts or ends in
+        its picture (its overlay): it has no fix (it prints the last one it had), or its
+        track passes within routes_trim (at least tracks.DEFAULT_TRIM_METRES) of where
+        a drive starts or ends."""
+        if row["id"] not in self.related:
+            return False
+        facts = self.found.get(row["id"])
+        if facts is None:
+            return True
+        metres = max(self.metres, tracks.DEFAULT_TRIM_METRES)
+        return any(not tracks.outside(lat, lon, self.zones, metres)
+                   for _at, lat, lon, _speed in facts.points)
+
+    def position(self, row):
+        """True when a picture's own position may go out: any but a track's, and a
+        track's only when routes go and it is outside the zones."""
+        if row["id"] not in self.from_track:
+            return True
+        return self.on and tracks.outside(row["lat"], row["lon"], self.zones, self.metres)
+
+    def estimate(self, estimate_row):
+        """True when the position of a place estimate (or the owner's place) may go out:
+        one from a track (its detail's "track", an accepted one's too) as position()."""
+        try:
+            detail = json.loads(estimate_row.get("detail") or "{}")
+        except ValueError:
+            detail = {}
+        if not isinstance(detail, dict) or not detail.get("track"):
+            return True
+        return self.on and tracks.outside(estimate_row["lat"], estimate_row["lon"], self.zones,
+                                          self.metres)
+
+    def withheld(self, rows):
+        """How many of rows (pictures to publish) keep their place names but not the
+        position their track gave them."""
+        return sum(1 for row in rows if not self.position(row))
+
+    def routes(self, ids):
+        """The trimmed routes of the clips ids (image ids) for routes.js: [route] with
+        database ids (the caller gives them export ids)."""
+        if not self.on:
+            return []
+        found = []
+        for route in tracks.routes(self.conn, self.config, [self.library_id], ids=set(ids)):
+            route = tracks.trim_route(route, self.zones, self.metres)
+            if route is None:
+                continue
+            for clip in route["c"]:
+                # (Rounded as the export's positions are.)
+                clip["p"] = tracks.encode_points([
+                    (at, round(lat, LOCATION_DECIMALS), round(lon, LOCATION_DECIMALS), speed)
+                    for at, lat, lon, speed in tracks.decode(clip["p"])])
+            found.append(route)
+        return found
 
 
 # ---------------------------------------------------------------------------
@@ -2498,6 +2681,8 @@ class _Export:
         self.meaning_status = None
         # The albums the manifest lists (the marks option, see album_numbers).
         self.published_albums = []
+        # What goes out of the videos' GPS tracks (see _Routes; made with the records).
+        self.track_routes = None
 
     # -- set up ---------------------------------------------------------------
 
@@ -2943,6 +3128,24 @@ class _Export:
         drives.export_texts(records, self.options, drives.settings(self.config)["min_clips"],
                             drives.clip_texts(self.conn, self.library_id, self.config),
                             drives.clip_places(self.conn, self.library_id, self.config))
+        # A position from a video's GPS track goes out only with the routes, and
+        # never near where a drive starts or ends (_Routes): else its place
+        # names stay, without the position. A dashcam's clips (and their
+        # drives) never have a position in their texts: the overlay of one
+        # without a fix prints the last it had, often where the drive started.
+        self.track_routes = _Routes(self.conn, self.config, self.library_id, self.options)
+        dashcam_drives = set()
+        for picture in pictures:
+            if not self.track_routes.position(picture.row):
+                picture.record.pop("gp", None)
+                picture.record.pop("km", None)
+            if picture.row["id"] in self.track_routes.related:
+                _scrub_positions(picture.record, RECORD_TEXT_KEYS)
+                if picture.record.get("dv") is not None:
+                    dashcam_drives.add(picture.record["dv"])
+        for record in records:
+            if record.get("dv") in dashcam_drives:
+                _scrub_positions(record, drives.TEXT_KEYS)
         days = collections.defaultdict(list)
         for picture in pictures:
             day = picture.record.get("dk")
@@ -2983,6 +3186,9 @@ class _Export:
                 if codec:
                     # (What the site's player gets: a playable copy is H.264.)
                     record["vc"] = codec[:20]
+            else:
+                # (The level track goes out with a 360 video, see detail_entry.)
+                record.pop("lv", None)
         records.sort(key=lambda record: record["i"])
         return records
 
@@ -3152,14 +3358,35 @@ class _Export:
             manifest["albums"] = self.published_albums
         if self.options["location"]:
             points = []
+            estimates = place_estimates.for_libraries(self.conn, [self.library_id])
+            routes = self.track_routes or _Routes(self.conn, self.config, self.library_id,
+                                                  self.options)
             for picture in pictures:
                 where = _location(picture.row)
                 if where is not None:
-                    points.append({"id": picture.xid, "lat": where[0], "lon": where[1]})
+                    if routes.position(picture.row):
+                        points.append({"id": picture.xid, "lat": where[0], "lon": where[1]})
+                    continue
+                estimate = estimates.get(picture.row["id"])
+                point = _estimated_location(picture.row, picture.record, estimate)
+                if point is not None and routes.estimate(estimate):
+                    point["id"] = picture.xid
+                    points.append(point)
             points.sort(key=lambda point: point["id"])
             files["data/locations.js"] = "SEARCH_DATA.locations([\n%s\n]);\n" % ",\n".join(
                 _js_json(point) for point in points)
             manifest["locations"] = "locations.js"
+            xids = {picture.row["id"]: picture.xid for picture in pictures}
+            published = routes.routes(xids)
+            if published:
+                for route in published:
+                    route["d"] = xids[route["d"]]
+                    route["l"] = self.export_id
+                    for clip in route["c"]:
+                        clip["i"] = xids[clip["i"]]
+                files["data/routes.js"] = "SEARCH_DATA.routes([\n%s\n]);\n" % ",\n".join(
+                    _js_json(route) for route in published)
+                manifest["routes"] = "routes.js"
         manifest["versions"] = {rel[len("data/"):]: _version(text.encode("ascii"))
                                 for rel, text in sorted(files.items())}
         if meaning is not None:
@@ -3715,9 +3942,12 @@ def _cli_options(args, library):
     options = {}
     if args.images:
         options["images"] = args.images
-    for name in ("location", "file_names", "folders", "zip", "marks"):
+    for name in ("location", "file_names", "folders", "zip", "marks", "estimated_places",
+                 "routes"):
         if getattr(args, name, False):
             options[name] = True
+    if getattr(args, "routes_trim", None) is not None:
+        options["routes_trim"] = args.routes_trim
     if args.videos:
         options["videos"] = args.videos
     for name in ("undescribed", "private", "sensitive"):
@@ -3883,6 +4113,17 @@ def main(argv=None):
                              "either way, except that without it GPS positions written "
                              "out in them or in the text in the picture, as a dashcam "
                              "prints them, are taken out)")
+    parser.add_argument("--estimated-places", action="store_true",
+                        help="with --location: also the places estimated for pictures "
+                             "without a GPS position of their own (marked as estimated; "
+                             "see place_estimates.py)")
+    parser.add_argument("--routes", action="store_true",
+                        help="with --location: also the routes of drives and the positions "
+                             "of clips from their GPS tracks (dashcams; see tracks.py), less "
+                             "where each drive starts and ends")
+    parser.add_argument("--routes-trim", type=int, metavar="M",
+                        help="metres left out of every route where a drive starts and ends "
+                             "(default %d)" % tracks.DEFAULT_TRIM_METRES)
     parser.add_argument("--file-names", action="store_true", help="include file names")
     parser.add_argument("--folders", action="store_true", help="include folder names")
     parser.add_argument("--include-screenshots", action="store_true",

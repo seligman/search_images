@@ -11,11 +11,14 @@
 <div id="map-bar">
 <a id="map-back" href="#">Back to search</a>
 <span id="map-search"></span>
+<label id="map-estimated" class="map-toggle" hidden><input type="checkbox" id="map-estimated-toggle"> Show estimated places</label>
+<label id="map-routes" class="map-toggle" hidden><input type="checkbox" id="map-routes-toggle"> Show drive routes</label>
 <span id="map-status" aria-live="polite"></span>
 </div>
 <div id="map-stage">
 <canvas id="map-canvas" tabindex="0" role="application" aria-roledescription="map" aria-label="Map of the pictures. Arrow keys move it, plus and minus zoom, Enter lists the pictures of the pin nearest the middle."></canvas>
 <span id="map-target" class="visually-hidden" aria-live="polite"></span>
+<div id="map-route-tip" hidden></div>
 <div id="map-zoom">
 <button id="zoom-in" type="button" aria-label="Zoom in" title="Zoom in (+)">+</button>
 <button id="zoom-out" type="button" aria-label="Zoom out" title="Zoom out (-)">&#8722;</button>
@@ -39,6 +42,7 @@
 <script src="__ASSET_PREFIX__site.js"></script>
 <script src="__ASSET_PREFIX__shell.js"></script>
 <script src="__ASSET_PREFIX__search-core.js"></script>
+<script src="__ASSET_PREFIX__routes.js"></script>
 <script src="__ASSET_PREFIX__viewer.js"></script>
 <script src="__ASSET_PREFIX__map.js"></script>
 </body>
