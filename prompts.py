@@ -25,11 +25,52 @@ import hashlib
 import json
 import re
 
+import sheet_talk
+
 # Raise this whenever the prompt or the schema changes in a way that makes
-# older descriptions worth redoing. Re-describing is always something the
-# user asks for (scan.py --redescribe-stale); the hash of the prompt and
-# schema is recorded with every description, but does not decide staleness.
-PROMPT_VER = 5
+# older descriptions worth redoing, and say in CURRENT_SINCE which ones.
+# Re-describing is always something the user asks for (scan.py
+# --redescribe-stale); the hash of the prompt and schema is recorded with
+# every description, but does not decide staleness.
+PROMPT_VER = 6
+
+# The oldest version whose descriptions are still up to date, by what was
+# described: version 6 changed only what a video is told (video_note: the
+# title and description are about what happens in the video, never about
+# its frames), so pictures (and drives) described by version 5 are as good
+# as new ones, and only videos described before version 6 are out of date.
+CURRENT_SINCE = {"image": 5, "video": 6, "drive": 5}
+
+# The SQL condition (on the images table) of a description from a prompt
+# that is out of date: CURRENT_SINCE by its media.
+STALE_SQL = "prompt_ver < (CASE WHEN media = 'video' THEN %d ELSE %d END)" % (
+    CURRENT_SINCE["video"], CURRENT_SINCE["image"])
+
+# The SQL condition of a current video description that talks about its
+# contact sheet ("four frames show ...") and was not asked again: it is out
+# of date too (see sheet_talk; db.connect registers the SQL function).
+SHEET_SQL = ("(CASE WHEN media = 'video' AND prompt_ver >= %d THEN %s(info, provenance) "
+             "ELSE 0 END)" % (CURRENT_SINCE["video"], sheet_talk.SQL_FUNCTION))
+
+
+def stale_sql(config=None):
+    """The SQL condition (on the images table) of an out-of-date description.
+
+    STALE_SQL, or a video description with sheet talk (SHEET_SQL) unless
+    config turns that check off ("video_sheet_check": false). Only for
+    connections that db.connect opened (they know the SQL function).
+    """
+    if not sheet_talk.enabled(config):
+        return STALE_SQL
+    return "(%s OR %s)" % (STALE_SQL, SHEET_SQL)
+
+
+def is_stale(prompt_ver, kind="image"):
+    """True when a description made by prompt version prompt_ver is out of date for kind
+    ("image", "video" -- a row's media -- or "drive"; see CURRENT_SINCE). (A video's or
+    a drive's description with sheet talk is out of date too: stale_sql, drives.pending.)"""
+    current = CURRENT_SINCE.get(kind or "image", CURRENT_SINCE["image"])
+    return not isinstance(prompt_ver, int) or prompt_ver < current
 
 PROFILES = ("core", "extended")
 DEFAULT_PROFILE = "core"
@@ -267,14 +308,17 @@ def user_text(library, taken_at=None, projection="", video=None):
     describe step does not pass it (no EXIF data leaves the machine), but
     callers that want to may. projection ("equirectangular" or
     "dual_fisheye") adds projection_note() for a 360-degree photo. video
-    ((frames, seconds)) adds video_note() for a video's contact sheet.
+    ((frames, seconds)) adds video_note() for a video's contact sheet (and
+    for a 360 video, projection_note(video=True) after it).
     """
     parts = [USER_TEXT]
-    note = projection_note(projection)
-    if note:
+    note = projection_note(projection, video=bool(video))
+    if note and not video:
         parts.append(note)
     if video:
         parts.append(video_note(*video))
+        if note:
+            parts.append(note)          # (a 360 video's frames)
     notes = library.get("context_notes") if isinstance(library, dict) else None
     if isinstance(notes, str) and notes.strip():
         notes = notes.strip()[:NOTES_LENGTH]
@@ -420,29 +464,48 @@ def search_terms(info, name="", path="", taken_at="", projection=""):
     return " ".join(part.strip() for part in parts if part and part.strip()).lower()
 
 
+# What the model is told about every video (video_note): what is described
+# is the video, and its kind is that of what it shows. (Models otherwise
+# describe the sheet itself: "four sequential video frames ...", and call
+# a dashcam's video a screenshot for the time and speed it prints.)
+VIDEO_TERMS = ("The title and the description are about the video itself; they never "
+               "mention frames, panels, a grid or a collage. Its photo_type is that of what "
+               "it shows: photo for a video filmed with a camera, even one that prints the "
+               "date, time, speed or position on it; screenshot only for a recording of a "
+               "screen.")
+
+
 def video_note(frames, seconds=None):
-    """A sentence to add to the prompt for a video's contact sheet (see videos.py).
+    """The sentences to add to the prompt for a video's contact sheet (see videos.py).
 
     A video is sent as one picture holding frames frames from it, in a grid
     (one frame when its length is not known). The JSON asked for is the
-    same; the description should say what happens.
+    same; the title and description say what happens in the video, and
+    never mention the frames or the grid (VIDEO_TERMS).
     """
     whole = int(round(seconds)) if isinstance(seconds, (int, float)) and seconds > 0 else 0
     length = ("a video of %d second%s" % (whole, "" if whole == 1 else "s")
               if whole else "a video")
     if not frames or frames <= 1:
-        return "This picture is a frame from %s: describe what the video shows." % length
-    return ("This picture holds %d frames, in order (left to right, top to bottom), from %s: "
-            "describe what happens in the video, not the grid of frames." % (frames, length))
+        return ("This picture is a frame from %s. Describe the video: what it shows and "
+                "what happens in it. %s" % (length, VIDEO_TERMS))
+    return ("This picture holds %d frames, in order (left to right, top to bottom), from %s. "
+            "Describe the video itself, as one scene: what happens in it, who and what is "
+            "in it, and where. %s" % (frames, length, VIDEO_TERMS))
 
 
-def projection_note(projection):
+def projection_note(projection, video=False):
     """A sentence to add to the prompt for a 360-degree photo ("" otherwise).
 
     360 photos are sent as equirectangular panoramas (see images.py), whose
     bent lines and stretched top and bottom are not part of the scene.
+    video: the frames of a 360 video's contact sheet are such panoramas.
     """
     if projection in ("equirectangular", "dual_fisheye"):
+        if video:
+            return ("It is a 360-degree video: each of its frames here is a 360-degree view "
+                    "shown as an equirectangular panorama. Describe the scene and what "
+                    "happens in it, not the projection or the distortion.")
         return ("This is a 360-degree photo shown as an equirectangular panorama: "
                 "describe the scene, not the projection or the distortion.")
     return ""

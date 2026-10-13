@@ -29,7 +29,8 @@ TEMPLATES = os.path.join(support.REPO, "templates")
 PAGES = (("/", "page.html", "app.js"), ("/detail", "detail.html", "detail.js"),
          ("/map", "map.html", "map.js"), ("/manage", "manage.html", "manage.js"),
          ("/settings", "settings.html", "settings.js"),
-         ("/duplicates", "duplicates.html", "duplicates.js"))
+         ("/duplicates", "duplicates.html", "duplicates.js"),
+         ("/albums", "albums.html", "albums.js"))
 # Element ids the scripts create themselves (not in a template).
 CREATED_IDS = {"shell-header", "shell-toasts", "shell-library", "shell-job",
                "no-endpoint-notice", "no-ffmpeg-notice", "meaning-notice",
@@ -209,7 +210,8 @@ class ExportPageTest(support.TempBaseMixin, unittest.TestCase):
         # without location, the map).
         for name in ("manage.html", "settings.html", "manage.js", "settings.js",
                      "assets/manage.js", "assets/settings.js", "map.html", "assets/map.js",
-                     "duplicates.html", "assets/duplicates.js", "assets/duplicates.css"):
+                     "duplicates.html", "assets/duplicates.js", "assets/duplicates.css",
+                     "albums.html", "assets/albums.js", "assets/albums.css"):
             self.assertFalse(os.path.exists(os.path.join(output, name)), name)
 
 

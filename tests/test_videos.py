@@ -159,6 +159,85 @@ class ParseTest(unittest.TestCase):
                                   "VID_20190514_142301.mp4")
         self.assertEqual(info["taken_source"], "video")
 
+    def test_a_camera_that_writes_its_own_clock_as_utc(self):
+        # A dashcam names a clip by its clock (local time) and writes the same
+        # clock's time as the creation time, marked as UTC, when the clip
+        # ended. The name's time is taken, whatever this computer's time zone.
+        def read(name, format_tags, duration=60.0, stream_tags=None):
+            data = fake_ffmpeg.probe_json(duration=duration, format_tags=format_tags,
+                                          stream_tags=stream_tags or {})
+            if "creation_time" not in format_tags:
+                del data["format"]["tags"]["creation_time"]
+            info = videos.parse_probe(data, name)
+            return info["taken_at"], info["taken_source"], info["tz_offset"]
+
+        def utc_offset(when):
+            # This computer's UTC offset (seconds) at a local time.
+            seconds = videos.time.mktime(when.timetuple())
+            return (when - datetime.datetime(1970, 1, 1)).total_seconds() - seconds
+
+        name = "20230817_142005_0412_N_A.MP4"
+        start = datetime.datetime(2023, 8, 17, 14, 20, 5)
+        # (Where this computer keeps UTC, the usual rules take the name too.)
+        source = "video" if utc_offset(start) else "filename"
+        ended = {"creation_time": "2023-08-17T14:21:05.000000Z"}
+        self.assertEqual(read(name, ended), ("2023-08-17T14:20:05", source, ""))
+        # Dated by its start, or a little before it (the clock and the name
+        # are a second or two apart): the same.
+        for created in ("2023-08-17T14:20:05Z", "2023-08-17T14:18:30Z"):
+            self.assertEqual(read(name, {"creation_time": created})[0], "2023-08-17T14:20:05",
+                             created)
+        # Only the stream says when: the same.
+        self.assertEqual(read(name, {}, stream_tags=ended)[0], "2023-08-17T14:20:05")
+        # A clip of three minutes dated by its end: still its clock.
+        self.assertEqual(read(name, {"creation_time": "2023-08-17T14:23:06Z"}, 181.0)[:2],
+                         ("2023-08-17T14:20:05", source))
+        if not utc_offset(start):
+            return
+        # Further from the name than that: an ordinary UTC creation time.
+        far = {"creation_time": "2023-08-17T14:26:00Z"}
+        self.assertEqual(read(name, far)[1:], ("video", ""))
+        self.assertNotEqual(read(name, far)[0], "2023-08-17T14:20:05")
+        # A phone writes real UTC: its time converts to the name's, which the
+        # usual rules take (from the name, as before).
+        utc = datetime.datetime.fromtimestamp(videos.time.mktime(start.timetuple()),
+                                              datetime.timezone.utc)
+        phone = {"creation_time": utc.strftime("%Y-%m-%dT%H:%M:%S.000000Z")}
+        self.assertEqual(read("VID_20230817_142005.mp4", phone),
+                         ("2023-08-17T14:20:05", "filename", ""))
+        # A phone's own tags, or a name in UTC (Pixel), are never a camera's
+        # clock: the creation time stays UTC, as before.
+        android = dict(ended, **{"com.android.version": "13"})
+        self.assertEqual(read("VID_20230817_142005.mp4", android)[1:], ("video", ""))
+        self.assertNotEqual(read("VID_20230817_142005.mp4", android)[0], "2023-08-17T14:20:05")
+        self.assertNotEqual(read("PXL_20230817_142005123.mp4", ended)[0],
+                            "2023-08-17T14:20:05")
+        # A name with a date only says too little.
+        self.assertNotEqual(read("VID-20230817-WA0001.mp4", {
+            "creation_time": "2023-08-17T00:00:30Z"})[0], "2023-08-17T00:00:00")
+        # The QuickTime date still comes first.
+        quicktime = dict(ended, **{"com.apple.quicktime.creationdate":
+                                   "2023-08-17T09:00:00-0700"})
+        self.assertEqual(read(name, quicktime), ("2023-08-17T09:00:00", "video", "-07:00"))
+
+    def test_rows_dated_by_a_camera_clock_read_as_utc_are_found(self):
+        # What an older version stored for such a clip: the creation time
+        # turned into this computer's time. clock_candidate finds it again.
+        name = "20230817_142005_0412_N_A.MP4"
+        clock = datetime.datetime(2023, 8, 17, 14, 21, 5)
+        stored = videos._utc_to_local(clock)
+        if stored == clock:
+            self.skipTest("this computer keeps UTC: such dates were never off")
+        stored = imageinfo.format_datetime(stored)
+        self.assertTrue(videos.clock_candidate(name, stored, 60.0))
+        # Not without a time in the name, nor for a name in UTC, nor for a
+        # date that already is the name's, nor far from it.
+        self.assertFalse(videos.clock_candidate("clip.mp4", stored, 60.0))
+        self.assertFalse(videos.clock_candidate("PXL_20230817_142005123.mp4", stored, 60.0))
+        self.assertFalse(videos.clock_candidate(name, "2023-08-17T14:20:05", 60.0))
+        self.assertFalse(videos.clock_candidate(name, "2023-08-18T02:00:00", 60.0))
+        self.assertFalse(videos.clock_candidate(name, "", 60.0))
+
     def test_a_creation_time_after_the_file_was_written_is_no_recording_time(self):
         # An app that converted the video wrote when it did so.
         created = "2024-02-10T15:20:00Z"

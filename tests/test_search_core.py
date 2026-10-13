@@ -76,6 +76,16 @@ class SearchCoreNodeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, "\n" + output)
         self.assertRegex(output, r"(\d+) of \1 passed")
 
+    def test_favorites_ratings_and_albums(self):
+        # tests/js/albums_test.js: is:favorite, rating:, album:, their facets and
+        # the album order (search-core.js), and the address and records (site.js).
+        result = subprocess.run([NODE, os.path.join(support.REPO, "tests", "js",
+                                                    "albums_test.js")],
+                                cwd=support.REPO, capture_output=True, timeout=600)
+        output = (result.stdout + result.stderr).decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, "\n" + output)
+        self.assertRegex(output, r"(\d+) of \1 passed")
+
 
 if __name__ == "__main__":
     unittest.main()

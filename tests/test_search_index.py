@@ -318,6 +318,40 @@ class RecordTest(IndexFixture, unittest.TestCase):
         names_only = self.records(for_export=True, export_options={"file_names": "yes"})
         self.assertNotIn("n", names_only[image_id])        # only true counts
 
+    def test_an_export_without_the_location_has_no_positions_in_the_text(self):
+        # A dashcam prints its position over the video, and the model reads it
+        # into the text in the picture (and sometimes the description).
+        info = dict(V5_INFO, text="2023/08/17 14:20:05 N:12.34567 E:65.43210 45 KM/H",
+                    description="A road at 12.34567, -65.43210 in the rain.",
+                    title="Road near N 12.34567")
+        image_id = insert_image(self.conn, "lib_family1", "clip.jpg", described=1,
+                                prompt_ver=5, info=info)
+        record = self.records(for_export=True)[image_id]
+        self.assertEqual(record["o"], "2023/08/17 14:20:05 45 KM/H")
+        self.assertEqual(record["d"], "A road at in the rain.")
+        self.assertEqual(record["t"], "Road near")
+        # With the location, and on the server, as written.
+        record = self.records(for_export=True, export_options={"location": True})[image_id]
+        self.assertEqual(record["o"], info["text"])
+        self.assertEqual(self.records()[image_id]["d"], info["description"])
+
+    def test_positions_written_out_in_text(self):
+        scrub = imageinfo.scrub_positions
+        degree = "\u00b0"
+        for text, left in (
+                ("N:12.34567 E:65.43210", ""),
+                ("12.34567N 65.43210E", ""),
+                ("12" + degree + " 20' 44.4\" N, 65" + degree + " 25' 55.6\" E", ""),
+                ("lat 12.34567 lon -65.43210 here", "here"),
+                ("At 12.34567, -65.43210.", "At ."),
+                ("SPEED 45\nS:1.2345 W:65.4321", "SPEED 45"),
+                # Not positions: prices, versions, short numbers, words.
+                ("Total 12.99, 3.49", "Total 12.99, 3.49"),
+                ("Version 1.2.3 of SUNSET 1.234", "Version 1.2.3 of SUNSET 1.234"),
+                ("Route E 4 north, 12.5 km", "Route E 4 north, 12.5 km"),
+                ("", ""), (None, None)):
+            self.assertEqual(scrub(text), left, text)
+
     def test_coordinates_never_appear(self):
         insert_image(self.conn, "lib_family1", "a.jpg", lat=12.3456, lon=-65.4321)
         _status, body, _headers = search_index.IndexService(watch=False).respond(
@@ -1169,7 +1203,8 @@ class IndexRouteTest(IndexFixture, unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, "application/json")
         payload = self.payload(response)
-        self.assertEqual(set(payload), {"version", "generated", "libraries", "records"})
+        self.assertEqual(set(payload), {"version", "generated", "libraries", "albums",
+                                        "records"})
         self.assertEqual(payload["version"], search_index.INDEX_VERSION)
         self.assertEqual(payload["libraries"], [{"id": "lib_family1", "name": "Family"},
                                                 {"id": "lib_other001", "name": "Other"}])

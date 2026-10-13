@@ -23,7 +23,6 @@ import sqlite3
 
 import common
 import prompts
-from prompts import PROMPT_VER
 
 TIER = "refine"
 DEFAULT_PHOTO_TYPES = ("screenshot", "document", "scan")
@@ -145,9 +144,10 @@ def matches(info, wanted):
 
 
 def is_refined(provenance, prompt_ver):
-    """True for a description refined with the current prompt version."""
+    """True for a description refined with a prompt version that is current (for
+    pictures: refine never takes videos)."""
     return (isinstance(provenance, dict) and provenance.get("tier") == TIER
-            and isinstance(prompt_ver, int) and prompt_ver >= PROMPT_VER)
+            and isinstance(prompt_ver, int) and not prompts.is_stale(prompt_ver, "image"))
 
 
 _json1 = []
@@ -178,7 +178,7 @@ def _where(wanted):
            " AND NOT (prompt_ver >= ? AND IFNULL(CASE WHEN json_valid(provenance) THEN "
            "json_extract(provenance, '$.tier') END, '') = ?)"
            % (",".join("?" * len(photo)), ",".join("?" * len(document))))
-    return sql, list(photo) + list(document) + [PROMPT_VER, TIER]
+    return sql, list(photo) + list(document) + [prompts.CURRENT_SINCE["image"], TIER]
 
 
 def _python_filter(rows, wanted):

@@ -119,7 +119,16 @@ var EXPORT_REVIEW = (function () {
                 hint: "Each picture's look vector (about 350 bytes), made by the image " +
                       "model from the picture itself, so \u201cLooks like this\u201d finds " +
                       "pictures that look alike. Searching by an example picture needs " +
-                      "the server's image model: published sites do not have it."}
+                      "the server's image model: published sites do not have it."},
+        album: {label: "The pictures of",
+                hint: "Choose what to publish: put the pictures in an album (a manual " +
+                      "one) on the search page, then pick it here. The checks below still " +
+                      "apply to them."},
+        marks: {label: "Favorites, ratings and albums",
+                hint: "Which pictures are your favorites, their star ratings, and the " +
+                      "names of your albums (with the searches of smart albums), so " +
+                      "is:favorite, rating: and album: work in the site. Off: none of it " +
+                      "is published, not even the name of the album chosen above."}
     };
 
     // The picture types the dialog offers to leave out (others stay as saved).
@@ -438,10 +447,16 @@ var EXPORT_REVIEW = (function () {
         var total = Number(counts.total) || 0;
         var exported = Number(counts.exported) || 0;
         if (!total) {
-            return "This library has no pictures to publish yet.";
+            return counts.album ? "The album has no pictures in this library."
+                : "This library has no pictures to publish yet.";
         }
         if (!exported) {
             return "No picture would be published: every one is left out.";
+        }
+        if (counts.album && counts.album.name) {
+            return number(exported) + " of the " + number(total) + (total === 1 ? " picture"
+                : " pictures") + " of the album \u201c" + counts.album.name + "\u201d will be " +
+                "published.";
         }
         return number(exported) + " of " + number(total) + (total === 1 ? " picture" :
             " pictures") + " will be published.";
@@ -494,6 +509,29 @@ var EXPORT_REVIEW = (function () {
         return parts.join("; ") + "." + (counts.included ? " The AI model saw only a few " +
             "still frames of each video and never heard its sound: watch the videos you " +
             "publish." : "");
+    }
+
+    /* The drives among the pictures to publish (counts.drives of the preview:
+       {drives, described, private, sensitive}, see drives.export_texts): how
+       many keep their own description, and how many lose it to the options;
+       "" when none has one. */
+    function drivesText(counts) {
+        var drives = counts && counts.drives;
+        var left = drives ? (drives["private"] || 0) + (drives.sensitive || 0) : 0;
+        if (!drives || !drives.drives || (!drives.described && !left)) {
+            return "";
+        }
+        var parts = [number(drives.described || 0) + " of " + number(drives.drives) +
+                     (drives.drives === 1 ? " drive is" : " drives are") +
+                     " published with " + (drives.drives === 1 ? "its" : "their") +
+                     " own description"];
+        if (drives["private"]) {
+            parts.push(number(drives["private"]) + " without it (private information)");
+        }
+        if (drives.sensitive) {
+            parts.push(number(drives.sensitive) + " without it (sensitive)");
+        }
+        return parts.join("; ") + ".";
     }
 
     // "More like this" in the export: how many pictures it can go by meaning
@@ -573,6 +611,10 @@ var EXPORT_REVIEW = (function () {
         (options.file_names ? shown : hidden).push("file name");
         (options.folders ? shown : hidden).push("folder");
         (options.location ? shown : hidden).push("location (GPS position and place names)");
+        if (options.marks) {
+            // (Only said when on: most libraries have no marks.)
+            shown.push("favorite star, rating and albums");
+        }
         var text = "Published with each picture: its " + shown.slice(0, -1).join(", ") +
             " and " + shown[shown.length - 1] + ".";
         if (hidden.length) {
@@ -582,10 +624,16 @@ var EXPORT_REVIEW = (function () {
         return text;
     }
 
-    // Only this computer can open the site it serves (export.serve_command).
-    function serveCommand(folder) {
-        return "python -m http.server --bind 127.0.0.1 --directory \"" +
-            String(folder || "") + "\"";
+    /* The command that tries an export on this computer (export.serve_command:
+       only this computer can open the site it serves; videos can be moved
+       in, which python -m http.server does not allow): the summary's own
+       (serve, with the program's whole path), else run in the program's
+       folder. */
+    function serveCommand(folder, summary) {
+        if (summary && typeof summary.serve === "string" && summary.serve) {
+            return summary.serve;
+        }
+        return "python export.py --serve \"" + String(folder || "") + "\"";
     }
 
     return {
@@ -603,6 +651,7 @@ var EXPORT_REVIEW = (function () {
         headline: headline,
         sizeText: sizeText,
         videoText: videoText,
+        drivesText: drivesText,
         similarText: similarText,
         meaningText: meaningText,
         looksText: looksText,

@@ -1,7 +1,8 @@
-"""Tests for prompts.py (prompt v5, schema, search text) and describe.parse_reply."""
+"""Tests for prompts.py (prompt v6, schema, search text) and describe.parse_reply."""
 
 import copy
 import json
+import sqlite3
 import unittest
 
 import support  # noqa: F401  (puts the repository on sys.path)
@@ -169,6 +170,53 @@ class PromptTest(unittest.TestCase):
         self.assertLess(len(long_notes), prompts.NOTES_LENGTH + 200)
         self.assertIn("May 2019", prompts.user_text(None, "2019-05-14T10:00:00"))
         self.assertEqual(prompts.user_text(None, "garbage"), "Describe this image.")
+
+    def test_videos_are_described_as_videos(self):
+        # The model is told about the video, never about the sheet of frames
+        # it sees ("four sequential video frames ..."), and that a camera's
+        # video is a photo even with a time or speed printed on it.
+        for frames in (4, 1):
+            note = prompts.video_note(frames, 24.4)
+            self.assertIn("a video of 24 seconds", note)
+            self.assertIn("never mention frames, panels, a grid or a collage", note)
+            self.assertIn("photo for a video filmed with a camera", note)
+            self.assertIn("screenshot only for a recording of a screen", note)
+            self.assertNotIn("not the grid of frames", note)
+            self.assertTrue(note.isascii())
+        self.assertIn("This picture holds 4 frames, in order", prompts.video_note(4, 24.4))
+        self.assertIn("what happens in it", prompts.video_note(4, None))
+        self.assertIn("a video.", prompts.video_note(1))
+        text = prompts.user_text(None, video=(4, 30.0))
+        self.assertTrue(text.startswith("Describe this image.\n\n" + prompts.video_note(4, 30)))
+        # A 360 video: the panorama note says it is one, in the same words.
+        text = prompts.user_text(None, projection="dual_fisheye", video=(4, 30.0))
+        note = prompts.projection_note("dual_fisheye", video=True)
+        self.assertTrue(text.endswith(note))
+        self.assertIn("It is a 360-degree video", note)
+        self.assertIn("what happens in it", note)
+        self.assertNotIn("360-degree photo", text)
+
+    def test_versions_and_what_is_out_of_date(self):
+        # Version 6 changed only what videos are told: the pictures described
+        # by version 5 (and drives) are up to date, videos are not.
+        self.assertEqual(prompts.PROMPT_VER, 6)
+        self.assertEqual(prompts.CURRENT_SINCE, {"image": 5, "video": 6, "drive": 5})
+        self.assertFalse(prompts.is_stale(5, "image"))
+        self.assertFalse(prompts.is_stale(5))
+        self.assertTrue(prompts.is_stale(4, "image"))
+        self.assertTrue(prompts.is_stale(5, "video"))
+        self.assertFalse(prompts.is_stale(6, "video"))
+        self.assertFalse(prompts.is_stale(5, "drive"))
+        self.assertTrue(prompts.is_stale(None, "image"))
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE images (media TEXT, prompt_ver INTEGER)")
+        conn.executemany("INSERT INTO images VALUES (?, ?)",
+                         [("image", 4), ("image", 5), ("image", 6), ("video", 4),
+                          ("video", 5), ("video", 6)])
+        stale = conn.execute("SELECT media, prompt_ver FROM images WHERE " +
+                             prompts.STALE_SQL + " ORDER BY media, prompt_ver").fetchall()
+        conn.close()
+        self.assertEqual(stale, [("image", 4), ("video", 4), ("video", 5)])
 
     def test_no_personal_or_provider_specific_text(self):
         for profile in prompts.PROFILES:

@@ -13,7 +13,9 @@
    the page must load the index on its second try, "vectors": how many
    pictures have a meaning vector (the similar option), "meaning": {query,
    id, dims} (the export ships its query model: the page embeds the query
-   with it) or {query, state: "off"} (the page's self-check fails)}.
+   with it) or {query, state: "off"} (the page's self-check fails), "albums":
+   the names of the albums the manifest lists (the marks option), in
+   order}. A query with "with_albums" searches with those albums.
    Prints one line per test and exits with status 1 when any test fails.
 */
 "use strict";
@@ -228,7 +230,11 @@ test("every address of a record is a file of the export", function () {
 
 test("searches find the expected pictures", function () {
     (expected.queries || []).forEach(function (entry) {
-        var result = SearchCore.search(data.records, entry.query, entry.options || {});
+        var options = entry.options || {};
+        if (entry.with_albums) {
+            options.albums = data.albums;
+        }
+        var result = SearchCore.search(data.records, entry.query, options);
         var label = JSON.stringify(entry.query) + " " + JSON.stringify(entry.options || {});
         if (entry.count !== undefined) {
             assert.strictEqual(result.items.length, entry.count, label);
@@ -251,6 +257,19 @@ test("searches find the expected pictures", function () {
         assert.deepStrictEqual(titles, entry.titles.slice().sort(), label);
     });
 });
+
+if (expected.albums !== undefined) {
+    test("the albums of the manifest are those published", function () {
+        assert.deepStrictEqual(data.albums.map(function (album) {
+            return album.name;
+        }), expected.albums);
+        data.albums.forEach(function (album) {
+            (album.items || []).forEach(function (id) {
+                assert.ok(XID.test(id), id);
+            });
+        });
+    });
+}
 
 test("details come from the detail shards", function () {
     var details = expected.details || {};

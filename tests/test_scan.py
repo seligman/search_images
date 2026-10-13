@@ -1580,7 +1580,8 @@ class WritingTest(ScanTestCase):
         self.assertEqual((summary["added"], summary["removed_moved"]), (27, 27))
         library_wide = [sql for sql in statements
                         if "FROM images WHERE library_id" in " ".join(sql.split())]
-        self.assertLessEqual(len(library_wide), 6, library_wide)
+        # (Seven: the last one finds the videos whose dates may be read again.)
+        self.assertLessEqual(len(library_wide), 7, library_wide)
         conn = real_connect()
         try:
             plan = " ".join(str(row[-1]) for row in conn.execute(
@@ -1693,7 +1694,8 @@ class PanoramaScanTest(ScanTestCase):
         self.write("pano.jpg", imagegen.jpeg_with_xmp(imagegen.equirect_image((800, 400)),
                                                       imagegen.gpano_xmp()))
         self.write("wide.jpg", imagegen.jpeg_bytes(imagegen.equirect_image((800, 400))))
-        # RAW files and 360 videos are not indexed.
+        # RAW files are not indexed, and the .insv is a video that cannot be
+        # read (64 bytes; 360 videos are read in test_video360).
         self.write("IMG_20190514_142301_00_002.dng", b"II*\x00" + b"\x00" * 64)
         self.write("VID_20190514_142301_00_003.insv", b"\x00" * 64)
         self.configure([support.library("Family", self.folder, id=self.LIBRARY)])

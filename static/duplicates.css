@@ -72,9 +72,16 @@ body.is-working #dup-list {
     font-size: 18px;
 }
 
-.dup-library {
+.dup-library,
+.dup-span {
     font-size: 13px;
     color: var(--text-muted);
+}
+
+/* "In a stack of 5 on the search page" ("Same picture, any date"). */
+.dup-stacked {
+    font-size: 12px;
+    color: var(--info-text);
 }
 
 .dup-stack-actions {
@@ -191,6 +198,13 @@ body.is-working #dup-list {
     color: var(--info-text);
 }
 
+/* The owner's marks of a picture (a favorite, its rating, its albums). */
+.dup-marks {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--warn-text);
+}
+
 .dup-title {
     margin: 0;
     font-size: 13px;
@@ -261,6 +275,25 @@ body.is-working #dup-list {
 }
 
 @media (max-width: 600px) {
+    /* The four kinds two by two. */
+    .dup-tools .segmented {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        width: 100%;
+    }
+
+    .dup-tools .segmented button + button {
+        border-left: none;
+    }
+
+    .dup-tools .segmented button:nth-child(even) {
+        border-left: 1px solid var(--border-strong);
+    }
+
+    .dup-tools .segmented button:nth-child(n+3) {
+        border-top: 1px solid var(--border-strong);
+    }
+
     .dup-stack {
         padding: 12px 10px 10px;
     }

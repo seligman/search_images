@@ -30,8 +30,19 @@ Descriptions are never thrown away by accident:
 Videos are indexed too when ffmpeg and ffprobe are there and the library's
 "videos" setting is on (see videos.py): their poster frame takes the place
 of a photo's picture (thumbnail, preview, dHash) and a contact sheet of a
-few frames is kept for describing. Without ffmpeg, videos are listed but
-not read (those already indexed are kept as they are).
+few frames is kept for describing. Insta360 360-degree videos (.insv) are
+read from their low-resolution copy (LRV_..., never indexed itself) or their
+two lenses (streams, or two files: the second is never indexed itself),
+their frames stitched as 360 photos are; one is read again when its LRV or
+second lens's file comes or goes (videos.companions_changed). The dates
+of videos an older version may have dated hours off (a dashcam's clock
+written as if it were UTC, see videos.local_clock_time) are read again
+once (redate_videos). Without ffmpeg, videos are listed but not read
+(those already indexed are kept as they are).
+
+After the scan, the GPS check (gps_check.py) sets aside GPS positions that
+cannot be where a picture was taken (a stale fix, or one the pictures taken
+around the same time contradict).
 
 Then the describe step (describe.py) runs for images without a description,
 and, when search by meaning is set up (config.json "embedding"), the embed
@@ -68,11 +79,13 @@ import sqlite3
 import sys
 import time
 
+import albums
 import cache
 import common
 import db
 import describe
 import embeddings
+import gps_check
 import image_edits
 import images
 import jobs
@@ -80,6 +93,7 @@ import llm
 import looks
 import not_duplicates
 import places
+import prompts
 import videos
 
 COMMIT_ROWS = 100           # commit after this many written rows...
@@ -190,6 +204,11 @@ class LibraryWalk:
         self.helper_walk = True
         return self._helper_walk(iterator)
 
+    def _companion(self, name, names):
+        """True for a file an Insta360 camera writes beside a 360 video (its LRV, or its
+        second lens's file; names: the folder's), which is part of that video."""
+        return self.videos and videos.is_companion(name, names)
+
     def _scandir_walk(self):
         if not self.root or not os.path.isdir(self.root):
             self.reachable = False
@@ -208,6 +227,7 @@ class LibraryWalk:
                 self._error(rel_dir, error)
                 continue
             subdirs = []
+            names = [entry.name for entry in entries]
             for entry in entries:
                 rel = rel_dir + "/" + entry.name if rel_dir else entry.name
                 try:
@@ -217,7 +237,8 @@ class LibraryWalk:
                     if is_dir and common.should_prune_dir(rel, self.patterns):
                         continue
                     if not is_dir and (not common.is_media_file(entry.name, self.videos)
-                                       or common.matches_ignore(rel, self.patterns)):
+                                       or common.matches_ignore(rel, self.patterns)
+                                       or self._companion(entry.name, names)):
                         continue
                     if link:
                         self.links.append(rel)
@@ -264,8 +285,9 @@ class LibraryWalk:
                                if not common.should_prune_dir(prefix + name, self.patterns)]
                 for filename in sorted(filenames):
                     rel = prefix + filename
-                    if not common.is_media_file(filename, self.videos) or common.matches_ignore(
-                            rel, self.patterns):
+                    if (not common.is_media_file(filename, self.videos)
+                            or common.matches_ignore(rel, self.patterns)
+                            or self._companion(filename, filenames)):
                         continue
                     stat = common.stat_path(self.helper, os.path.join(dirpath, filename))
                     if stat is None:
@@ -427,7 +449,14 @@ def _record_read_failure(conn, library_id, rel, size, mtime, error):
 
 
 def _update_row(conn, image_id, values, extra=""):
-    """UPDATE one images row with a dict of column values (extra: more SQL assignments)."""
+    """UPDATE one images row with a dict of column values (extra: more SQL assignments).
+
+    A file read again (its lat and lon among the values): a position the
+    GPS check set aside stays aside while the file gives it, and any other
+    is the check's to decide again (gps_check.file_read_again).
+    """
+    if "lat" in values:
+        gps_check.file_read_again(conn, image_id, values)
     columns = sorted(values)
     assignments = ", ".join("%s = ?" % column for column in columns)
     if extra:
@@ -553,7 +582,8 @@ _ROW_SQL = """
            hidden, has_preview, missing_since, media
     FROM images WHERE library_id = ?"""
 
-_SOURCE_COLUMNS = "id, library_id, path, " + ", ".join(_DESCRIPTION_COLUMNS) + ", missing_since"
+_SOURCE_COLUMNS = ("id, library_id, path, media, " + ", ".join(_DESCRIPTION_COLUMNS)
+                   + ", missing_since")
 # Rows with the same content: the images_hash index makes this one lookup.
 _SOURCE_BY_HASH_SQL = ("SELECT " + _SOURCE_COLUMNS
                        + " FROM images WHERE content_hash = ? AND id <> ?")
@@ -648,10 +678,12 @@ class LibraryScan:
         # content (hash, or (size, dhash) for imported rows), so a file that
         # still holds the old content elsewhere can keep them.
         self.replaced = {}
-        # The owner's edits (image_edits): ids of this library's rows that
-        # have one, the rows given new content in this scan (added or
-        # changed), and {id: (old row, new dHash)} of edited rows whose
-        # content changed -- the edit follows its content to another path.
+        # The owner's edits (image_edits) and marks (albums: favorite,
+        # rating, album places), which follow a picture alike: ids of this
+        # library's rows that have either, the rows given new content in
+        # this scan (added or changed), and {id: (old row, new dHash)} of
+        # such rows whose content changed -- the edit and marks follow
+        # their content to another path.
         self.edited = set()
         self.any_edits = False
         self.new_content = set()
@@ -702,8 +734,10 @@ class LibraryScan:
         self.edited = {row[0] for row in self.conn.execute(
             "SELECT e.image_id FROM image_edits AS e JOIN images AS i ON i.id = e.image_id "
             "WHERE i.library_id = ?", (self.library_id,))}
+        self.edited |= albums.marked_ids(self.conn, self.library_id)
         self.any_edits = bool(self.edited) or self.conn.execute(
-            "SELECT 1 FROM image_edits LIMIT 1").fetchone() is not None
+            "SELECT 1 FROM image_edits LIMIT 1").fetchone() is not None or albums.any_marks(
+                self.conn)
 
     def delete_rows(self, ids):
         """Delete image rows with their thumbnails, previews and meaning vectors (no commit)."""
@@ -828,7 +862,7 @@ class LibraryScan:
                 continue
             if row is not None and (unreadable_video or (
                     row["size"] == size and abs(row["mtime"] - mtime) < MTIME_TOLERANCE
-                    and row["id"] in self.thumb_ids)):
+                    and row["id"] in self.thumb_ids and not self._companions_changed(row, rel))):
                 # (An indexed video stays as it is while ffmpeg is missing.)
                 self.summary["unchanged"] += 1
                 if row["missing_since"] is not None:
@@ -845,6 +879,16 @@ class LibraryScan:
                 self.ctx.step(item=rel, quick=True)
                 continue
             yield entry
+
+    def _companions_changed(self, row, rel):
+        """True for an unchanged .insv whose LRV or second lens's file came, went or
+        changed since it was read (videos.companions_changed): it is read again, as
+        an updated file (its description is kept)."""
+        if not videos.is_360_video(rel) or not self.root:
+            return False
+        found = self.conn.execute("SELECT exif FROM images WHERE id = ?", (row["id"],)).fetchone()
+        return videos.companions_changed(os.path.join(self.root, *rel.split("/")),
+                                         found[0] if found else "")
 
     def _read(self, entry):
         """Worker thread: read one file. Returns (result, error); never raises."""
@@ -928,7 +972,8 @@ class LibraryScan:
         not take a "core" description (it would never be asked for the
         rest). Descriptions from an older prompt stay stale wherever they go.
         """
-        if row["library_id"] == self.library_id or row["prompt_ver"] < describe.PROMPT_VER:
+        if row["library_id"] == self.library_id or prompts.is_stale(row["prompt_ver"],
+                                                                    row["media"]):
             return True
         try:
             provenance = json.loads(row["provenance"] or "{}")
@@ -1052,10 +1097,11 @@ class LibraryScan:
         self.new_content.add(image_id)
         if moved:
             # The old row was the same file at its previous path; the
-            # owner's edit (image_edits) moves along with it, and so does a
-            # video's playable copy.
+            # owner's edit (image_edits) and marks (albums) move along with
+            # it, and so does a video's playable copy.
             if source["id"] in self.edited:
                 image_edits.give(self.conn, source["id"], [image_id])
+                albums.give(self.conn, source["id"], [image_id])
             if metadata.get("media") == videos.MEDIA_VIDEO:
                 videos.move_proxy(self.library_id, source["id"], image_id)
             self.delete_rows([source["id"]])
@@ -1073,24 +1119,32 @@ class LibraryScan:
     # -- the owner's edits ---------------------------------------------------
 
     def _adopt_edit(self, image_id, rel, content_hash):
-        """A new file whose content was last seen as a missing file gets that file's edit.
+        """A new file whose content was last seen as a missing file gets that file's edit
+        and marks.
 
         The missing file is most likely the same one, moved here from
-        another library; it keeps its edit too (copied), in case it comes
-        back.
+        another library; it keeps them too (copied), in case it comes back.
+        The edit comes from the latest missing copy with an edit, the marks
+        from the latest with marks (two copies may hold one each).
         """
         if not content_hash:
             return
-        for row in self.conn.execute(
-                "SELECT i.id, i.library_id, i.path FROM image_edits AS e "
-                "JOIN images AS i ON i.id = e.image_id WHERE i.content_hash = ? "
-                "AND i.missing_since IS NOT NULL AND i.id <> ? "
-                "ORDER BY i.missing_since DESC, i.id DESC", (content_hash, image_id)).fetchall():
-            if row["library_id"] == self.library_id and row["path"] in self.walked:
-                continue        # back at its own path in this walk
-            if image_edits.give(self.conn, row["id"], [image_id], copy=True) is not None:
-                self._note("edits", "Kept your edit of %s for %s" % (row["path"], rel))
-            return
+        for has, give, what in (
+                ("EXISTS (SELECT 1 FROM image_edits AS e WHERE e.image_id = i.id)",
+                 image_edits.give, "edit"),
+                ("(EXISTS (SELECT 1 FROM image_marks AS m WHERE m.image_id = i.id) OR EXISTS "
+                 "(SELECT 1 FROM album_items AS a WHERE a.image_id = i.id))",
+                 albums.give, "favorite, rating or albums")):
+            for row in self.conn.execute(
+                    "SELECT i.id, i.library_id, i.path FROM images AS i WHERE i.content_hash = ? "
+                    "AND i.missing_since IS NOT NULL AND i.id <> ? AND " + has +
+                    " ORDER BY i.missing_since DESC, i.id DESC",
+                    (content_hash, image_id)).fetchall():
+                if row["library_id"] == self.library_id and row["path"] in self.walked:
+                    continue        # back at its own path in this walk
+                if give(self.conn, row["id"], [image_id], copy=True) is not None:
+                    self._note("edits", "Kept your %s of %s for %s" % (what, row["path"], rel))
+                break
 
     def _follow_content(self, present):
         """Edits of files whose content changed go where the old content is now.
@@ -1116,6 +1170,9 @@ class LibraryScan:
         for source, target in sorted(image_edits.reassign(self.conn, plan).items()):
             self._note("edits", "Your edit of %s went with its picture to %s"
                        % (self.edit_left[source][0]["path"], paths.get(target, target)))
+        for source, target in sorted(albums.reassign(self.conn, plan).items()):
+            self._note("edits", "Your favorite, rating or albums of %s went with the picture "
+                       "to %s" % (self.edit_left[source][0]["path"], paths.get(target, target)))
 
     def _share_edit(self, row):
         """Copy a file's edit, as it goes missing, to the same picture in another library.
@@ -1131,6 +1188,9 @@ class LibraryScan:
         if heirs and image_edits.give(self.conn, row["id"], heirs, copy=True) is not None:
             self._note("edits", "Kept your edit of %s for its copy in another library"
                        % row["path"])
+        if heirs and albums.give(self.conn, row["id"], heirs, copy=True) is not None:
+            self._note("edits", "Kept your favorite, rating or albums of %s for its copy in "
+                       "another library" % row["path"])
 
     def _hand_on_edit(self, row, preferred=()):
         """Before a missing file's row is deleted, give its edit to a present copy.
@@ -1145,6 +1205,18 @@ class LibraryScan:
                 "SELECT id FROM images WHERE content_hash = ? AND missing_since IS NULL "
                 "AND id <> ? ORDER BY id DESC", (row["content_hash"], row["id"]))
                       if other["id"] not in heirs]
+        if heirs:
+            # (Marks and album places too: a copy without marks of its own
+            # takes them; album places always find a copy.)
+            favorite, rating, _albums = albums.picture_marks(self.conn, row["id"])
+            albums.give(self.conn, row["id"], heirs)
+            if (favorite or rating) and not any(
+                    albums.picture_marks(self.conn, heir)[:2] == (favorite, rating)
+                    for heir in heirs):
+                self._note("edits lost", "Your %s of %s went with it: every copy of the picture "
+                           "has a favorite or rating of its own" % (
+                               "favorite" if favorite and not rating else "rating" if not favorite
+                               else "favorite and rating", row["path"]))
         if not heirs or image_edits.give(self.conn, row["id"], heirs) is not None:
             return
         edit = image_edits.load(self.conn, row["id"])
@@ -1309,7 +1381,7 @@ class LibraryScan:
         (missing): it moved away, and is shown again when it comes back.
         """
         missing = [row for row in self.conn.execute(
-            "SELECT " + _SOURCE_COLUMNS + ", content_hash, size, dhash, media FROM images "
+            "SELECT " + _SOURCE_COLUMNS + ", content_hash, size, dhash FROM images "
             "WHERE library_id = ? AND missing_since IS NOT NULL", (self.library_id,))
                    if row["path"] not in self.walked]
         twins_of = {row["id"]: self._twins(row, present_walked) for row in missing}
@@ -1518,18 +1590,100 @@ def backfill(conn, library, ctx, helper=None, thumbs=None, previews=None, thread
     left alone).
     Rows of files the ignore patterns now exclude are left alone. It runs
     as stage "previews", can be stopped at any point and continues where
-    it left off. Returns a summary dict: {needed, filled, failed, changed,
-    unsupported, aborted, panoramas, panos, restitched}.
+    it left off. Then the dates of the videos the current rules may date
+    otherwise are read again (redate_videos). Returns a summary dict:
+    {needed, filled, failed, changed, unsupported, aborted, panoramas,
+    panos, restitched, redated (redate_videos's, unless it stopped)}.
     """
     own_thumbs = thumbs is None
     thumbs = thumbs or cache.ThumbStore()
     previews = previews or cache.PreviewStore()
+    video = video if video is not None else videos.setup()
     try:
-        return _backfill(conn, library, ctx, helper, thumbs, previews, threads,
-                         video if video is not None else videos.setup())
+        summary = _backfill(conn, library, ctx, helper, thumbs, previews, threads, video)
+        if not summary["aborted"] and not ctx.should_stop():
+            summary["redated"] = redate_videos(conn, library, ctx, video)
+        return summary
     finally:
         if own_thumbs:
             thumbs.close()
+
+
+# The meta row (this prefix + library id) of the videos redate_videos read
+# again and left as they were (their dates stand), as JSON: {"rules":
+# REDATE_RULES, "kept": [ids]}; they are not read again for the same rules.
+REDATE_META = "redate:"
+# Raise this when videos.creation_date reads dates another way that older
+# rows are worth checking against (see redate_videos).
+REDATE_RULES = 1
+
+_REDATE_SQL = """
+    SELECT id, path, name, mtime, taken_at, taken_source, tz_offset, duration
+    FROM images WHERE library_id = ? AND media = 'video' AND missing_since IS NULL
+        AND taken_source = 'video' AND tz_offset = '' ORDER BY id"""
+
+
+def _redate_kept(conn, library_id):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?",
+                       (REDATE_META + library_id,)).fetchone()
+    try:
+        value = json.loads(row[0]) if row is not None else None
+    except ValueError:
+        value = None
+    if not isinstance(value, dict) or value.get("rules") != REDATE_RULES:
+        return set()
+    return {item for item in value.get("kept") or ()
+            if isinstance(item, int) and not isinstance(item, bool)}
+
+
+def redate_videos(conn, library, ctx, video):
+    """Read the dates of a library's videos again where the current rules may date them
+    otherwise: those dated by a creation time read as UTC whose name holds the same
+    time as the camera's own clock (videos.clock_candidate: a dashcam's videos, dated
+    hours off by an older version). Only ffprobe runs (no frames are read); a video
+    whose date stands is not read again (REDATE_META). Needs ffmpeg (video, a
+    videos.Setup); files that cannot be read now are tried again by the next run.
+    Returns {"checked", "changed", "failed"}."""
+    summary = {"checked": 0, "changed": 0, "failed": 0}
+    if video.tools is None or not common.library_videos(library):
+        return summary
+    library_id = library["id"]
+    kept = _redate_kept(conn, library_id)
+    patterns = common.ignore_patterns(library)
+    rows = [row for row in conn.execute(_REDATE_SQL, (library_id,)).fetchall()
+            if row["id"] not in kept and not excluded_by_ignores(row["path"], patterns)
+            and videos.clock_candidate(row["name"], row["taken_at"], row["duration"])]
+    if not rows:
+        return summary
+    ctx.log("Reading the dates of %d video(s) in %s again (a camera's own clock, written "
+            "as if it were UTC)" % (len(rows), common.library_label(library)))
+    root = common.library_root(library)
+    for row in rows:
+        if ctx.should_stop():
+            break
+        try:
+            data = videos.probe(video.tools, os.path.join(root, *row["path"].split("/")))
+            facts = videos.parse_probe(data, row["name"], row["mtime"])
+        except (videos.VideoReadError, OSError):
+            summary["failed"] += 1
+            continue
+        summary["checked"] += 1
+        found = (facts["taken_at"], facts["taken_source"], facts["tz_offset"])
+        if found[0] and found != (row["taken_at"], row["taken_source"], row["tz_offset"]):
+            conn.execute("UPDATE images SET taken_at = ?, taken_source = ?, tz_offset = ?, "
+                         "updated = ? WHERE id = ?", found + (time.time(), row["id"]))
+            summary["changed"] += 1
+        else:
+            kept.add(row["id"])
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                 (REDATE_META + library_id,
+                  json.dumps({"rules": REDATE_RULES, "kept": sorted(kept)},
+                             separators=(",", ":"))))
+    conn.commit()
+    if summary["changed"]:
+        ctx.log("%d video(s) in %s now have the time of their camera's clock."
+                % (summary["changed"], common.library_label(library)))
+    return summary
 
 
 def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
@@ -1561,7 +1715,7 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
                 and (has_preview or not want_previews)
                 and row["projection"] != images.PROJECTION_UNKNOWN
                 and row["id"] not in restitch
-                and not (want_previews and has_preview
+                and not (want_previews and has_preview and not is_video
                          and row["projection"] in images.PROJECTIONS_360
                          and images.has_pano(row["width"], row["height"])
                          and row["id"] not in panos_on_disk)
@@ -1579,10 +1733,15 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
     summary["needed"] = len(needed)
     if not needed:
         return summary
-    stitching = sum(1 for row in needed if row["id"] in restitch)
+    stitching = [row["media"] == videos.MEDIA_VIDEO for row in needed if row["id"] in restitch]
     if stitching:
-        ctx.log("Stitching %d 360-degree photo(s) in %s again (their descriptions are kept)"
-                % (stitching, common.library_label(library)))
+        counted = []
+        if stitching.count(False):
+            counted.append("%d 360-degree photo(s)" % stitching.count(False))
+        if stitching.count(True):
+            counted.append("%d 360-degree video(s)" % stitching.count(True))
+        ctx.log("Stitching %s in %s again (their descriptions are kept)"
+                % (" and ".join(counted), common.library_label(library)))
     ctx.stage("previews", total=len(needed))
     ctx.log("Filling in previews and details for %d image(s) in %s"
             % (len(needed), common.library_label(library)))
@@ -1644,7 +1803,8 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
             _update_row(conn, row["id"], values)
             thumbs.put(row["id"], result["thumb"], commit=False)
             summary["filled"] += 1
-            if values["projection"] in images.PROJECTIONS_360:
+            if (values["projection"] in images.PROJECTIONS_360
+                    and values["media"] != videos.MEDIA_VIDEO):
                 summary["panoramas"] += 1
                 if (values["projection"] == images.PROJECTION_DUAL_FISHEYE
                         and row["described"] and row["projection"] != values["projection"]):
@@ -1698,9 +1858,12 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
     step (embeddings.after_run) follows when search by meaning is set up.
     Looks (looks.py) are not made here (a job for the image model of its
     own): when they are set up, the log says how many pictures wait.
-    Returns {"libraries": [scan summaries], "describe": describe summary
-    or None, "embed": embed summary or None, "looks_pending": pictures
-    without looks (None when looks are off), "stopped": bool}.
+    After the scan (also one that was stopped) the GPS check
+    (gps_check.run) looks at the positions of every library's pictures. Returns
+    {"libraries": [scan summaries], "gps_check": its summary (when it
+    ran), "describe": describe summary or None, "embed": embed summary or
+    None, "looks_pending": pictures without looks (None when looks are
+    off), "stopped": bool}.
     """
     libraries = describe.selected_libraries(config, library_ids)
     summary = {"libraries": [], "describe": None, "embed": None, "looks_pending": None,
@@ -1744,6 +1907,12 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
                         if labelled["aborted"]:
                             summary["stopped"] = True
                             break
+            # Positions that cannot be right are set aside (every library's:
+            # one may vouch for another's), also after a stopped scan: the
+            # positions it read are not left unchecked.
+            checked = gps_check.run_safely(conn, config, ctx)
+            if checked is not None:
+                summary["gps_check"] = checked
         if describe_images and not summary["stopped"] and not ctx.should_stop():
             summary["describe"] = describe.describe_pending(
                 conn, config, ctx, helper=helper,
@@ -1952,8 +2121,9 @@ def main(argv=None):
                         help="Also retry images that failed to describe %d times."
                              % describe.MAX_FAILURES)
     parser.add_argument("--redescribe-stale", action="store_true",
-                        help="Also describe again images described with an older prompt "
-                             "(after the new ones).")
+                        help="Also describe again images whose description is out of date "
+                             "(an older prompt, or a video description that talks about its "
+                             "frames), after the new ones.")
     parser.add_argument("--limit", type=int, metavar="N",
                         help="Describe (with --embed or --embed-images: embed) at most N images "
                              "in this run.")

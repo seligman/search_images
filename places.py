@@ -803,7 +803,9 @@ def status(conn=None):
     cannot be used but the downloaded files are there, so the places job
     builds it again (rebuild_if_needed). pictures counts the present
     pictures with a GPS position of every library -- what the places job
-    looks up (when conn, an index.db connection, is given).
+    looks up (when conn, an index.db connection, is given) -- and then
+    also "gps_ignored", the present pictures whose position the GPS check
+    set aside (gps_check.py: they count nowhere else).
     """
     result = {"available": False, "cities": 0, "built": None, "source": "", "error": "",
               "rebuild": False, "attribution_url": ATTRIBUTION_URL,
@@ -835,6 +837,9 @@ def status(conn=None):
             "AND lon IS NOT NULL").fetchone()
         result["pictures"] = {key: int(value or 0) for key, value in
                               zip(("located", "named", "region_only", "far", "pending"), row)}
+        result["gps_ignored"] = conn.execute(
+            "SELECT COUNT(*) FROM gps_checks AS g JOIN images AS i ON i.id = g.image_id "
+            "WHERE g.ignored = 1 AND i.lat IS NULL AND i.missing_since IS NULL").fetchone()[0]
     return result
 
 

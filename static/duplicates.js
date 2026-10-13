@@ -8,9 +8,14 @@
    duplicates" through POST /api/admin/duplicates/not-duplicates. The last
    action can be undone from the notice it leaves.
 
-   The address holds the choices: ?kind=exact|similar, ?min=3, ?page=2,
-   and ?stack=<picture id> for the one stack that holds that picture (the
-   search page links there); the library is the header's.
+   The address holds the choices: ?kind=exact|similar|same, ?min=3,
+   ?page=2, and ?stack=<picture id> for the one stack that holds that
+   picture (the search page links there); the library is the header's.
+   kind=same ("Same picture, any date") lists pictures that look the same
+   whatever their dates, which the search page does not stack together
+   (duplicates.build_same_stacks: it needs the looks). Its pictures link to
+   their stacks on the search page (?stack=<id>&from=same, which keeps the
+   list's page and offers the way back).
 
    Built with DOM calls and textContent only, never innerHTML.
    DUPLICATES_FORMAT holds the parts that need no page (the tests load it
@@ -19,7 +24,9 @@
 var DUPLICATES_FORMAT = (function () {
     "use strict";
 
-    var KINDS = ["all", "exact", "similar"];
+    var KINDS = ["all", "exact", "similar", "same"];
+    var LABELS = {all: "All stacks", exact: "Identical files", similar: "Similar pictures",
+                  same: "Same picture, any date"};
     var MINIMUMS = [2, 3, 5, 10];
 
     // The page's choices from the address (SHELL.getState()): anything
@@ -33,8 +40,39 @@ var DUPLICATES_FORMAT = (function () {
             kind: KINDS.indexOf(wanted.kind) >= 0 ? wanted.kind : "all",
             min: MINIMUMS.indexOf(min) >= 0 ? min : 2,
             page: page > 0 ? page : 1,
-            stack: stack > 0 ? stack : null
+            stack: stack > 0 ? stack : null,
+            // (Where a stack was opened from: "same" offers the way back.)
+            from: stack > 0 && wanted.from === "same" ? "same" : null
         };
+    }
+
+    // The address (SHELL.setState's changes) of a page's choices.
+    function address(state) {
+        return {
+            kind: state.kind === "all" ? null : state.kind,
+            min: state.min === 2 ? null : String(state.min),
+            page: state.page > 1 ? String(state.page) : null,
+            stack: state.stack ? String(state.stack) : null,
+            from: state.stack && state.from ? state.from : null
+        };
+    }
+
+    // The query string ("?lib=x&stack=7&from=same") of the search page's
+    // stack that holds picture id, opened from "Same picture, any date"
+    // whose choices are state, with the other parameters of query (the
+    // address's query string) kept.
+    function stackQuery(query, state, id) {
+        var params = new URLSearchParams(query || "");
+        var changes = address({kind: "all", min: state.min, page: state.page, stack: id,
+                               from: "same"});
+        Object.keys(changes).forEach(function (key) {
+            if (changes[key] === null) {
+                params.delete(key);
+            } else {
+                params.set(key, changes[key]);
+            }
+        });
+        return "?" + params.toString();
     }
 
     // "14 May 2019, 14:23" from "2019-05-14T14:23:01"; the day alone when
@@ -75,21 +113,106 @@ var DUPLICATES_FORMAT = (function () {
     // What "Not a duplicate" on member (called name) does, in words.
     function apartText(stack, member, name) {
         var copies = sameFiles(stack, member);
+        var what = stack.kind === "same" ? "listed" : "stacked";
         return copies ? name + " and its " + plural(copies, "identical file") +
-            " are no longer stacked with the others." : name + " is no longer stacked with the others.";
+            " are no longer " + what + " with the others." : name + " is no longer " + what +
+            " with the others.";
     }
 
     // What "Not duplicates" on a stack does, in words.
+    // The owner's marks of a member in words: "\u2605 Favorite \u00b7 4 stars \u00b7 in 2 albums".
+    function marksText(member) {
+        var parts = [];
+        if (member.favorite) {
+            parts.push("\u2605 Favorite");
+        }
+        if (member.rating) {
+            parts.push(plural(member.rating, "star"));
+        }
+        if (member.albums) {
+            parts.push(member.albums === 1 ? "in an album" : "in " + member.albums + " albums");
+        }
+        return parts.join(" \u00b7 ");
+    }
+
+    // A stack's title: "3 identical files", "2 similar pictures", "4 pictures
+    // that look the same".
+    function stackTitle(stack) {
+        if (stack.kind === "same") {
+            return plural(stack.size, "picture") + " that look the same";
+        }
+        return stack.kind === "exact" ? plural(stack.size, "identical file")
+            : plural(stack.size, "similar picture");
+    }
+
+    // "Taken 14 May 2019 to 2 Jun 2021" for a stack whose pictures were
+    // taken on different days ("" when they were not, or have no dates).
+    function spanText(stack) {
+        var days = [];
+        stack.members.forEach(function (member) {
+            var match = /^(\d{4}-\d{2}-\d{2})/.exec(member.taken || "");
+            if (match) {
+                days.push(match[1]);
+            }
+        });
+        days.sort();
+        if (days.length < 2 || days[0] === days[days.length - 1]) {
+            return "";
+        }
+        return "Taken " + dateText(days[0]) + " to " + dateText(days[days.length - 1]);
+    }
+
+    // What the search page does with member of a "Same picture, any date"
+    // stack ("" when it shows it alone): the link to that stack.
+    function stackedText(member) {
+        return member.stacked > 1 ? "Its stack of " + member.stacked + " (search page)" : "";
+    }
+
+    // The pictures of a "Same picture, any date" stack that share a stack of
+    // the search page: lists of two ids or more ("Not duplicates" leaves
+    // them stacked).
+    function togetherOf(stack) {
+        var groups = {};
+        var order = [];
+        stack.members.forEach(function (member) {
+            if (member.stack) {
+                var key = String(member.stack);
+                if (!groups[key]) {
+                    groups[key] = [];
+                    order.push(key);
+                }
+                groups[key].push(member.id);
+            }
+        });
+        return order.map(function (key) {
+            return groups[key];
+        }).filter(function (ids) {
+            return ids.length > 1;
+        });
+    }
+
     function notDuplicatesText(stack) {
+        if (stack.kind === "same") {
+            return "These pictures are no longer listed as the same picture; their stacks on " +
+                "the search page stay as they are.";
+        }
         return stack.contents < stack.size
             ? "These pictures are no longer stacked together, except identical files: those " +
                 "always stay together."
             : "These " + stack.size + " pictures are no longer stacked together.";
     }
 
-    var api = {KINDS: KINDS, MINIMUMS: MINIMUMS, choices: choices, dateText: dateText,
-               sizeText: sizeText, sameFiles: sameFiles, apartText: apartText,
-               notDuplicatesText: notDuplicatesText};
+    // What undoing "Not duplicates" (or "Not a duplicate") on a stack did.
+    function undoneText(stack) {
+        return stack.kind === "same" ? "They are listed together again."
+            : "They are stacked again.";
+    }
+
+    var api = {KINDS: KINDS, LABELS: LABELS, MINIMUMS: MINIMUMS, choices: choices,
+               address: address, stackQuery: stackQuery, dateText: dateText, sizeText: sizeText,
+               sameFiles: sameFiles, apartText: apartText, notDuplicatesText: notDuplicatesText,
+               undoneText: undoneText, togetherOf: togetherOf, marksText: marksText,
+               stackTitle: stackTitle, spanText: spanText, stackedText: stackedText};
     if (typeof module !== "undefined" && module.exports) {
         module.exports = api;
     }
@@ -123,12 +246,7 @@ var DUPLICATES_FORMAT = (function () {
     }
 
     function writeAddress() {
-        SHELL.setState({
-            kind: state.kind === "all" ? null : state.kind,
-            min: state.min === 2 ? null : String(state.min),
-            page: state.page > 1 ? String(state.page) : null,
-            stack: state.stack ? String(state.stack) : null
-        });
+        SHELL.setState(F.address(state));
     }
 
     /* ---------- Words ------------------------------------------------------------- */
@@ -143,10 +261,7 @@ var DUPLICATES_FORMAT = (function () {
         return name;
     }
 
-    function stackTitle(stack) {
-        return stack.kind === "exact" ? fmt.plural(stack.size, "identical file")
-            : fmt.plural(stack.size, "similar picture");
-    }
+    var stackTitle = F.stackTitle;
 
     // What messages call a picture: its file name (the pictures of a stack
     // often share one title).
@@ -243,21 +358,30 @@ var DUPLICATES_FORMAT = (function () {
         });
     }
 
-    function keepApart(ids, apart, describe) {
-        var body = {ids: ids};
-        if (apart) {
-            body.apart = apart;
+    // "Not duplicates" on the pictures ids of stack (apart: only that one
+    // from the others). In "Same picture, any date", pictures that share a
+    // stack of the search page stay stacked (together).
+    function keepApart(stack, ids, apart, describe) {
+        var together = stack.kind === "same" ? F.togetherOf(stack) : [];
+        function request(undo) {
+            var body = {ids: ids};
+            if (apart) {
+                body.apart = apart;
+            }
+            if (together.length) {
+                body.together = together;
+            }
+            if (undo) {
+                body.undo = true;
+            }
+            return body;
         }
         return act(function () {
-            return SHELL.admin("/duplicates/not-duplicates", body);
+            return SHELL.admin("/duplicates/not-duplicates", request(false));
         }).then(function () {
             showNotice("ok", describe, function () {
-                var back = {ids: ids, undo: true};
-                if (apart) {
-                    back.apart = apart;
-                }
-                return SHELL.admin("/duplicates/not-duplicates", back).then(function () {
-                    return "They are stacked again.";
+                return SHELL.admin("/duplicates/not-duplicates", request(true)).then(function () {
+                    return F.undoneText(stack);
                 });
             });
         }, function () {
@@ -277,6 +401,11 @@ var DUPLICATES_FORMAT = (function () {
         });
     }
 
+    // A picture the owner marked: a favorite, rated, or in an album.
+    function isMarked(member) {
+        return Boolean(member.favorite || member.rating || member.albums);
+    }
+
     function keepOnly(stack, member) {
         var ids = othersOf(stack, member.id);
         return hide(ids, function (count) {
@@ -292,10 +421,26 @@ var DUPLICATES_FORMAT = (function () {
         var shown = answer;
         var stacks = shown.stacks || [];
         var ids = [];
+        var marked = 0;
         stacks.forEach(function (stack) {
-            ids = ids.concat(othersOf(stack, stack.best));
+            // (Pictures the owner marked stay: hide them one by one if meant.)
+            stack.members.forEach(function (member) {
+                if (member.id === stack.best) {
+                    return;
+                }
+                if (isMarked(member)) {
+                    marked += 1;
+                } else {
+                    ids.push(member.id);
+                }
+            });
         });
         if (!ids.length) {
+            if (marked) {
+                showNotice("warn", "Every other picture of these stacks is one you marked (a " +
+                           "favorite, rated, or in an album), so none was hidden. Hide them " +
+                           "one by one if you want.");
+            }
             return;
         }
         SHELL.confirm({
@@ -303,7 +448,8 @@ var DUPLICATES_FORMAT = (function () {
             message: [
                 el("p", {text: "This hides " + fmt.plural(ids.length, "picture") + " and keeps the " +
                          "best one of each of the " + fmt.plural(stacks.length, "stack") +
-                         " on this page."}),
+                         " on this page." + (marked ? " " + fmt.plural(marked, "picture") +
+                         " you marked (a favorite, rated, or in an album) stay too." : "")}),
                 el("p", {text: "Hidden pictures are left out of searches and exports; nothing is " +
                          "deleted. Undo it right after, or unhide them later with \u201cShow " +
                          "hidden\u201d on the search page."})
@@ -375,6 +521,24 @@ var DUPLICATES_FORMAT = (function () {
                                    text: member.twin === stack.best ? "Same file as the best"
                                        : "Same file as another one here"}));
         }
+        if (isMarked(member)) {
+            notes.push(el("span", {className: "dup-marks", text: F.marksText(member)}));
+        }
+        if (stack.kind === "same" && F.stackedText(member)) {
+            notes.push(el("a", {className: "dup-stacked",
+                                href: F.stackQuery(window.location.search, state, member.id),
+                                text: F.stackedText(member),
+                                title: "Show the stack it is in on the search page",
+                                on: {click: function (event) {
+                                    // (A new tab or window opens the address.)
+                                    if (event.button || event.ctrlKey || event.metaKey ||
+                                            event.shiftKey || event.altKey) {
+                                        return;
+                                    }
+                                    event.preventDefault();
+                                    showStackOf(member.id);
+                                }}}));
+        }
         var facts = el("dl", {className: "dup-facts"}, [
             fact("Size", F.sizeText(member)),
             fact("File", [member.bytes ? fmt.bytes(member.bytes) : "", member.format]
@@ -383,6 +547,8 @@ var DUPLICATES_FORMAT = (function () {
                  : ""),
             fact("Quality", scores(member)),
             fact("Camera", member.camera),
+            // (A stack of pictures in more than one library.)
+            stack.libraries ? fact("Library", libraryName(member.library) || member.library) : null,
             fact("File name", filePath(member), "dup-path")
         ]);
         var card = el("li", {className: "dup-member" + (best ? " is-best" : "")}, [
@@ -413,12 +579,12 @@ var DUPLICATES_FORMAT = (function () {
                 });
             }}
         }));
-        if (stack.contents > 1) {
+        if (stack.contents > 1 && member.can_apart !== false) {
             actions.appendChild(el("button", {
                 type: "button", className: "button small subtle", text: "Not a duplicate",
                 attrs: {"aria-label": name + " is not a duplicate of the others"},
                 on: {click: function () {
-                    keepApart(memberIds(stack), member.id, F.apartText(stack, member, name));
+                    keepApart(stack, memberIds(stack), member.id, F.apartText(stack, member, name));
                 }}
             }));
         }
@@ -429,8 +595,17 @@ var DUPLICATES_FORMAT = (function () {
     function stackCard(stack, showLibrary) {
         var titleId = "dup-stack-" + stack.id;
         var head = [el("h2", {id: titleId, text: stackTitle(stack)})];
-        if (showLibrary && libraryName(stack.library)) {
+        if (stack.libraries) {
+            // ("Same picture, any date": pictures kept in more than one library.)
+            var names = stack.libraries.map(function (id) {
+                return libraryName(id) || id;
+            });
+            head.push(el("span", {className: "dup-library", text: names.join(" \u00b7 ")}));
+        } else if (showLibrary && libraryName(stack.library)) {
             head.push(el("span", {className: "dup-library", text: libraryName(stack.library)}));
+        }
+        if (stack.kind === "same" && F.spanText(stack)) {
+            head.push(el("span", {className: "dup-span", text: F.spanText(stack)}));
         }
         var actions = el("div", {className: "dup-stack-actions"}, [
             el("button", {type: "button", className: "button primary", text: "Keep best, hide the others",
@@ -440,15 +615,18 @@ var DUPLICATES_FORMAT = (function () {
                           }}})
         ]);
         var limit = (answer && answer.not_duplicates_limit) || 100;
-        if (stack.contents > 1 && stack.size <= limit) {
+        // (Nothing to keep apart: identical files, or pictures of one stack
+        // of the search page, in "Same picture, any date".)
+        var separable = stack.contents > 1 && stack.can_apart !== false;
+        if (separable && stack.size <= limit) {
             actions.appendChild(el("button", {
                 type: "button", className: "button", text: "Not duplicates",
                 title: "Stop stacking these pictures (identical files stay together)",
                 on: {click: function () {
-                    keepApart(memberIds(stack), null, F.notDuplicatesText(stack));
+                    keepApart(stack, memberIds(stack), null, F.notDuplicatesText(stack));
                 }}
             }));
-        } else if (stack.contents > 1) {
+        } else if (separable) {
             actions.appendChild(el("span", {
                 className: "dup-limit",
                 text: "Too many pictures to call them all not duplicates at once (at most " +
@@ -475,11 +653,10 @@ var DUPLICATES_FORMAT = (function () {
 
     function renderTools() {
         var counts = (answer && answer.counts) || {};
-        var labels = {all: "All stacks", exact: "Identical files", similar: "Similar pictures"};
         Array.prototype.forEach.call(document.querySelectorAll("#dup-tools [data-kind]"), function (button) {
             var kind = button.getAttribute("data-kind");
             button.setAttribute("aria-pressed", String(kind === state.kind && !state.stack));
-            button.textContent = labels[kind] + (counts[kind] !== undefined ? " (" +
+            button.textContent = F.LABELS[kind] + (counts[kind] !== undefined ? " (" +
                 fmt.number(counts[kind]) + ")" : "");
         });
         byId("dup-min").value = String(state.min);
@@ -490,7 +667,25 @@ var DUPLICATES_FORMAT = (function () {
         if (state.stack) {
             return [el("p", {text: "This stack is gone: its pictures were hidden, kept apart or " +
                              "changed since."}),
-                    el("p", {}, [el("a", {href: "#", text: "Show all stacks", on: {click: showAll}})])];
+                    el("p", {}, [state.from === "same"
+                        ? el("a", {href: "#", text: "Back to Same picture, any date",
+                                   on: {click: backToSame}})
+                        : el("a", {href: "#", text: "Show all stacks", on: {click: showAll}})])];
+        }
+        if (state.kind === "same") {
+            if (answer && !answer.looked) {
+                return [el("p", {text: "This needs the looks of the pictures" + where + "."}),
+                        el("p", {className: "muted", text: "Looks are made by an image model on " +
+                                 "this computer: set it up as SETTINGS.md describes, then use " +
+                                 "\u201cUpdate looks\u201d on the Manage page."})];
+            }
+            return [el("p", {text: "No pictures" + where + " that look the same apart from " +
+                             "the stacks on the search page."}),
+                    el("p", {className: "muted", text: "This lists pictures that look the same " +
+                             "whatever their dates (a copy saved again later or kept in another " +
+                             "library, a picture without a date) when the search page does not " +
+                             "stack them together. With all libraries shown, it compares them " +
+                             "with each other too."})];
         }
         if (answer && answer.counts && answer.counts.all) {
             return [el("p", {text: "No stacks of this kind" + where + "."})];
@@ -501,14 +696,40 @@ var DUPLICATES_FORMAT = (function () {
                          "on the Manage page to find new ones."})];
     }
 
+    // The search page's stack that holds picture id, from "Same picture, any
+    // date" (a new history entry: Back returns to the list).
+    function showStackOf(id) {
+        var query = F.stackQuery(window.location.search, state, id);
+        window.history.pushState(null, "", window.location.pathname + query + window.location.hash);
+        readAddress();
+        load().then(function () {
+            window.scrollTo(0, 0);
+        });
+    }
+
     function showAll(event) {
         if (event) {
             event.preventDefault();
         }
         state.stack = null;
+        state.from = null;
         state.page = 1;
         writeAddress();
         load();
+    }
+
+    // Back to the "Same picture, any date" page a stack was opened from.
+    function backToSame(event) {
+        if (event) {
+            event.preventDefault();
+        }
+        state.kind = "same";
+        state.stack = null;
+        state.from = null;
+        writeAddress();
+        load().then(function () {
+            window.scrollTo(0, 0);
+        });
     }
 
     function renderPages() {
@@ -546,7 +767,13 @@ var DUPLICATES_FORMAT = (function () {
         clear(summary);
         var stacks = answer.stacks || [];
         if (state.stack) {
-            summary.appendChild(document.createTextNode("One stack, from the search page. "));
+            summary.appendChild(document.createTextNode(state.kind === "same"
+                ? "One stack of pictures that look the same. " : "One stack, from the search page. "));
+            if (state.from === "same") {
+                summary.appendChild(el("a", {href: "#", text: "Back to Same picture, any date",
+                                             on: {click: backToSame}}));
+                summary.appendChild(document.createTextNode(" \u00b7 "));
+            }
             summary.appendChild(el("a", {href: "#", text: "Show all stacks", on: {click: showAll}}));
         } else if (answer.total) {
             summary.textContent = fmt.plural(answer.total, "stack") + " \u00b7 " +
@@ -574,6 +801,9 @@ var DUPLICATES_FORMAT = (function () {
         }
         if (state.stack) {
             params.set("stack", String(state.stack));
+            if (state.kind === "same") {
+                params.set("kind", "same");
+            }
         } else {
             params.set("kind", state.kind);
             params.set("min", String(state.min));
@@ -617,6 +847,7 @@ var DUPLICATES_FORMAT = (function () {
             button.addEventListener("click", function () {
                 state.kind = button.getAttribute("data-kind");
                 state.stack = null;
+                state.from = null;
                 state.page = 1;
                 writeAddress();
                 load();
@@ -630,9 +861,15 @@ var DUPLICATES_FORMAT = (function () {
             load();
         });
         byId("keep-all").addEventListener("click", keepAllOnPage);
+        // (Back and Forward after showStackOf.)
+        window.addEventListener("popstate", function () {
+            readAddress();
+            load();
+        });
         SHELL.onLibraryChange(function () {
             state.page = 1;
             state.stack = null;
+            state.from = null;
             writeAddress();
             load();
         });

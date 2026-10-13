@@ -16,6 +16,7 @@ from contextlib import redirect_stderr
 import support
 
 import admin
+import albums
 import common
 import duplicates
 import not_duplicates
@@ -352,6 +353,23 @@ class RankTest(unittest.TestCase):
                          ["24,600 bytes", "24,590 bytes"])
         self.assertEqual(duplicates._bytes_texts(5000000, 3000000), ["4.8 MB", "2.9 MB"])
 
+    def test_the_picture_the_owner_marked_comes_first(self):
+        # A favorite, a rating or an album (albums.py) beats everything else:
+        # "Keep the best" must not hide the copy the owner chose.
+        favorite = dict(member(2, width=1200, height=900, sharpness=2), favorite=True)
+        ranked, reason = duplicates.rank_members([member(1, sharpness=5), favorite])
+        self.assertEqual(ranked[0]["id"], 2)
+        self.assertEqual(reason, "You marked this one: a favorite (the next one: no marks).")
+        ranked, reason = duplicates.rank_members([dict(member(1), rating=3),
+                                                  dict(member(2), rating=5),
+                                                  dict(member(3), albums=2)])
+        self.assertEqual([item["id"] for item in ranked], [2, 1, 3])
+        self.assertIn("rated 5 stars (the next one: rated 3 stars)", reason)
+        _, reason = duplicates.rank_members([member(5, content="same"),
+                                             dict(member(6, content="same"), albums=1)])
+        self.assertEqual(reason, "Identical files. You marked this one: in an album (the next "
+                                 "one: no marks).")
+
     def test_file_formats(self):
         self.assertEqual(duplicates.file_format("a.JPG"), "JPEG")
         self.assertEqual(duplicates.file_format("a.heic"), "HEIC")
@@ -432,6 +450,10 @@ class ReviewPageTest(DuplicatesFixture, unittest.TestCase):
         one = self.stacks("?stack=%d" % self.burst[2])
         self.assertEqual([stack["best"] for stack in one["stacks"]], [self.burst[1]])
         self.assertEqual(self.stacks("?stack=%d" % self.single)["stacks"], [])
+        # "Same picture, any date" needs looks (there are none here).
+        same = self.stacks("?kind=same")
+        self.assertEqual((same["kind"], same["total"], same["looked"]), ("same", 0, 0))
+        self.assertEqual(self.stacks("?kind=same&stack=%d" % self.burst[2])["stacks"], [])
 
     def test_bad_requests(self):
         for query in ("?kind=odd", "?min=1", "?min=x", "?min=101", "?page=0", "?stack=-1",
@@ -575,6 +597,21 @@ class DuplicatesPageTest(DuplicatesFixture, unittest.TestCase):
         self.assertIsNot(second, first)
         not_duplicates.change({("c1", "c2")})
         self.assertIsNot(duplicates.stacks_for(self.conn, config, ["lib_family1"]), second)
+
+    def test_a_marked_picture_is_the_best_and_shows_its_marks(self):
+        first = self.stacks()["stacks"][0]
+        self.assertEqual(first["best"], self.burst[1])
+        albums.set_marks(self.conn, [self.burst[0]], favorite=True, rating=4)
+        albums.create_album(self.conn, "Beach", ids=[self.burst[0], self.burst[2]])
+        self.conn.commit()
+        first = self.stacks()["stacks"][0]
+        self.assertEqual(first["best"], self.burst[0])
+        self.assertIn("You marked this one: a favorite, rated 4 stars, in an album",
+                      first["reason"])
+        marks = {item["id"]: (item.get("favorite"), item.get("rating"), item.get("albums"))
+                 for item in first["members"]}
+        self.assertEqual(marks, {self.burst[0]: (True, 4, 1), self.burst[1]: (None, None, None),
+                                 self.burst[2]: (None, None, 1)})
 
 
 @unittest.skipIf(NODE is None, "Node.js is not installed")

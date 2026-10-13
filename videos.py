@@ -12,8 +12,9 @@ duration and a contact sheet:
   when it was taken (see creation_date: the QuickTime creation date with
   its UTC offset, else the container's creation time, which is UTC, in
   this computer's time zone -- as a photo's file time is -- unless it is
-  when the file was converted, else a date in the file name, else the
-  file's time), the GPS position (ISO 6709) and the camera;
+  when the file was converted, or a camera's own clock that agrees with
+  the file name, else a date in the file name, else the file's time),
+  the GPS position (ISO 6709) and the camera;
 - a poster: the frame at min(1 s, 10 % of the duration), or a later one
   when that frame is black. It becomes the thumbnail, the preview and the
   dHash, as a photo's own picture does;
@@ -37,10 +38,20 @@ play HEVC. "video_proxies" in config.json (off by default) lets a proxies
 job write H.264 copies of the others into data/proxies/<library id>/,
 which /video/<id> then serves instead (see make_proxies).
 
+Insta360 360-degree videos (.insv) of the cameras whose lenses are known
+here (CAMERAS_360) are read from the small copy the camera writes next to
+them (the LRV), or from their two lenses, and their frames are stitched
+like unstitched 360 photos (see Video360): the poster and the contact
+sheet are equirectangular panoramas, and the viewer plays the LRV (or a
+proxy with both lenses side by side) and stitches each frame as it is
+shown. The LRV and the second lens's file of a video recorded as two files
+are never indexed on their own (is_companion).
+
 Run "python videos.py FILE" to see what is read from one video and where
 ffmpeg was found.
 """
 
+import collections
 import datetime
 import hashlib
 import io
@@ -49,6 +60,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -88,7 +100,8 @@ TAKEN_SOURCE = "video"          # the taken_source of a date found in the video'
 # cannot be when the video was recorded (the file is written as it is
 # recorded): it is when an app converted or exported it. (A camera east of
 # Greenwich that writes its local time as if it were UTC is caught too; its
-# videos then keep their file's time, as photos without a date do.)
+# videos then keep their file's time, as photos without a date do, unless
+# their names hold the time: see local_clock_time.)
 CREATION_SLACK = 15 * 60
 
 TOOLS_MISSING = ("Videos need ffmpeg and ffprobe: install ffmpeg, or set \"ffmpeg\" in "
@@ -112,6 +125,7 @@ MIME_TYPES = {
     ".3g2": "video/3gpp2", ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
     ".webm": "video/webm", ".wmv": "video/x-ms-wmv", ".mts": "video/mp2t",
     ".m2ts": "video/mp2t", ".mpg": "video/mpeg", ".mpeg": "video/mpeg",
+    ".insv": "video/mp4",
 }
 
 
@@ -537,13 +551,149 @@ def _too_late(when, mtime):
     return written is not None and (when - written).total_seconds() > CREATION_SLACK
 
 
-def creation_date(format_tags, stream_tags, filename="", mtime=None):
+# An Insta360 camera's file name: VID_<date>_<time>_<nn>_<number>.insv (or
+# .mp4, and LRV_... .lrv or .insv for its low-resolution copy). The date
+# and time are when the recording started, on the camera's own clock.
+_INSTA360_NAME_RE = re.compile(
+    r"^(VID|LRV)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_(\d{2})_(\d+)\.(insv|lrv|mp4)$",
+    re.IGNORECASE)
+# How far (minutes) a camera's local name time may be from its UTC creation
+# time plus a whole number of quarter hours, and the largest UTC offset.
+NAME_OFFSET_SLACK = 2
+NAME_OFFSET_MAX = 14 * 60
+
+
+def named_local_time(filename, format_tags, stream_tags):
+    """(taken_at, tz_offset) of an Insta360 camera's video from its name, or None.
+
+    The camera names a video by when it started on its own clock (as its
+    photos' EXIF dates are) and writes the creation time in UTC, so their
+    difference is the UTC offset where it was filmed: taken when it is a
+    whole number of quarter hours (within NAME_OFFSET_SLACK minutes, at most
+    NAME_OFFSET_MAX). VID_20190514_142301_00_007.insv created at
+    2019-05-14T12:23:01Z -> ('2019-05-14T14:23:01', '+02:00'). A difference
+    of zero says nothing (offset ""): older cameras (the ONE R) write their
+    own clock's time as the creation time, marked as UTC.
+    """
+    match = _INSTA360_NAME_RE.match(os.path.basename(filename or ""))
+    if not match:
+        return None
+    named = _datetime(*match.groups()[1:7])
+    if named is None:
+        return None
+    for tags in (format_tags, stream_tags):
+        found = _TAGGED_DATE_RE.match(tags.get("creation_time") or "")
+        if not found or (found.group(7) or "").upper() != "Z":
+            continue
+        utc = _datetime(*found.groups()[:6])
+        if utc is None or utc.year <= 1970:
+            continue
+        minutes = (named - utc).total_seconds() / 60.0
+        quarters = int(round(minutes / 15.0)) * 15
+        if abs(minutes - quarters) > NAME_OFFSET_SLACK or abs(quarters) > NAME_OFFSET_MAX:
+            return None
+        if quarters == 0:
+            return imageinfo.format_datetime(named), ""
+        return imageinfo.format_datetime(named), "%s%02d:%02d" % (
+            "-" if quarters < 0 else "+", abs(quarters) // 60, abs(quarters) % 60)
+    return None
+
+
+# A camera that writes its own clock's time as the creation time, marked as
+# UTC, and names its files by the same clock (dashcams): read as local time
+# the creation time is at most this many seconds before the name's time, or
+# after it by the video's length and this (some date a clip by its end).
+LOCAL_CLOCK_SLACK = 2 * 60
+# File names in UTC (Pixel phones' PXL_...): never a camera's own clock.
+_UTC_NAME_RE = re.compile(r"^PXL_", re.IGNORECASE)
+# Tags only phones write: their creation time is UTC for real.
+_PHONE_TAG_PREFIXES = ("com.android.", "com.apple.")
+
+
+def _clock_name(filename):
+    """The date and time in a file name (a datetime) that may be a camera's own clock,
+    or None: none in it, a date without a time, or a name in UTC."""
+    if _UTC_NAME_RE.match(os.path.basename(filename or "")):
+        return None
+    named = imageinfo.parse_capture_date({}, filename, None)
+    if named[1] != "filename" or named[0].endswith("T00:00:00"):
+        return None
+    return datetime.datetime.strptime(named[0][:19], "%Y-%m-%dT%H:%M:%S")
+
+
+def _clock_matches(clock, start, duration):
+    """True when clock (a creation time read as local time) is the name's start time,
+    give or take LOCAL_CLOCK_SLACK, or its end (duration seconds later)."""
+    length = duration if isinstance(duration, (int, float)) and duration > 0 else 0.0
+    seconds = (clock - start).total_seconds()
+    return -LOCAL_CLOCK_SLACK <= seconds <= length + LOCAL_CLOCK_SLACK
+
+
+def local_clock_time(filename, format_tags, stream_tags, duration=None):
+    """The time in a video's name (taken_at) when its creation time is the camera's own
+    clock marked as UTC, or None.
+
+    Dashcams (and other cameras that know no time zone) write the time of
+    their own clock as the creation time, marked as UTC, and name the file
+    by the same clock: 20230817_142005_0412_N_A.MP4 created at
+    2023-08-17T14:21:05Z (the end of a one-minute clip). Read as local time,
+    with no conversion, the creation time then agrees with the name (see
+    _clock_matches), and the name's time (when it started) is taken, with
+    no UTC offset. Phones write a real UTC time: never for a name in UTC
+    (Pixel's PXL_...) or a video with a phone's own tags (com.android...,
+    com.apple...), nor when the creation time converted to this computer's
+    time agrees with the name (creation_date's usual rules take the name
+    then: a phone, or a camera in this computer's time zone).
+    """
+    start = _clock_name(filename)
+    if start is None or any(str(key).lower().startswith(_PHONE_TAG_PREFIXES)
+                            for key in format_tags):
+        return None
+    for tags in (format_tags, stream_tags):
+        found = _TAGGED_DATE_RE.match(tags.get("creation_time") or "")
+        if not found or (found.group(7) or "").upper() != "Z":
+            continue
+        clock = _datetime(*found.groups()[:6])
+        if clock is None or clock.year <= 1970:
+            continue
+        if not _clock_matches(clock, start, duration):
+            return None
+        converted = _utc_to_local(clock)
+        if converted is not None and abs((converted - start).total_seconds()) <= CREATION_SLACK:
+            return None
+        return imageinfo.format_datetime(start)
+    return None
+
+
+def clock_candidate(filename, taken_at, duration=None):
+    """True when a stored date may be a camera's own clock read as UTC: one from the
+    creation time (source "video", no UTC offset) that, moved back by this computer's
+    UTC offset at that time, agrees with the time in the name (as local_clock_time
+    reads it). Such videos are read again (scan.redate_videos)."""
+    start = _clock_name(filename)
+    if start is None or not isinstance(taken_at, str):
+        return False
+    try:
+        stored = datetime.datetime.strptime(taken_at[:19], "%Y-%m-%dT%H:%M:%S")
+        clock = datetime.datetime(1970, 1, 1) + datetime.timedelta(
+            seconds=time.mktime(stored.timetuple()))
+    except (ValueError, OverflowError, OSError):
+        return False
+    return clock != stored and _clock_matches(clock, start, duration)
+
+
+def creation_date(format_tags, stream_tags, filename="", mtime=None, duration=None):
     """(taken_at, taken_source, tz_offset) of a video.
 
     In order: the local date tags (the QuickTime creation date with its UTC
-    offset first: phones write it when they record), source "video"; the
-    container's (else the video stream's) creation time, which is UTC, in
-    this computer's time zone, source "video" -- unless it is more than
+    offset first: phones write it when they record), source "video"; an
+    Insta360 camera's name with its UTC creation time (named_local_time:
+    the camera's local time, and the offset), source "video"; the name of a
+    camera that writes its own clock's time as the creation time, marked as
+    UTC (local_clock_time: a dashcam's; duration is the video's length),
+    source "video", no offset; the container's (else the video stream's)
+    creation time, which is UTC, in this computer's time zone, source
+    "video" -- unless it is more than
     CREATION_SLACK later than the file's time, as in videos converted or
     exported by an app, whose creation time is when that was done; a date
     in the file name (as for photos), source "filename"; else the file's
@@ -557,6 +707,12 @@ def creation_date(format_tags, stream_tags, filename="", mtime=None):
         when, offset = parse_tagged_date(format_tags.get(key))
         if when is not None:
             return imageinfo.format_datetime(when), TAKEN_SOURCE, offset
+    named_local = named_local_time(filename, format_tags, stream_tags)
+    if named_local is not None:
+        return named_local[0], TAKEN_SOURCE, named_local[1]
+    clock = local_clock_time(filename, format_tags, stream_tags, duration)
+    if clock is not None:
+        return clock, TAKEN_SOURCE, ""
     recorded = None
     for tags in (format_tags, stream_tags):
         when, offset = parse_tagged_date(tags.get("creation_time"))
@@ -726,7 +882,8 @@ def parse_probe(data, filename="", mtime=None):
     bitrate = _number(format_info.get("bit_rate")) or _number(video.get("bit_rate"))
     audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
     format_tags, stream_tags = _tags(format_info), _tags(video)
-    taken_at, source, offset = creation_date(format_tags, stream_tags, filename, mtime)
+    taken_at, source, offset = creation_date(format_tags, stream_tags, filename, mtime,
+                                             duration)
     lat, lon = parse_iso6709(_first(format_tags, _LOCATION_KEYS))
     camera = _camera(format_tags)
     facts = {
@@ -866,6 +1023,11 @@ def grab_frame(tools, path, seconds, info, edge):
         code, out, err = run(False)
     if code != 0:
         raise VideoReadError("ffmpeg could not read a frame (%s)" % _error_line(err, path))
+    return _decode_frame(out, images)
+
+
+def _decode_frame(out, images):
+    """The RGB Pillow image of the BMP ffmpeg wrote (None when it wrote nothing)."""
     if not out:
         return None
     try:
@@ -889,16 +1051,20 @@ def poster_times(duration):
     return [first] + [fraction * duration for fraction in LATER_POSTERS]
 
 
-def poster(tools, path, info, edge):
+def poster(tools, path, info, edge, grab=None):
     """The poster frame (an RGB image at most edge pixels). Raises VideoReadError when there is none.
 
     The frame at min(1 s, 10 % of the duration); when it is black (a fade
     in, a hand over the lens), the first later one of LATER_POSTERS that is
-    not, else the brightest.
+    not, else the brightest. grab(seconds, edge) takes the frames when
+    given (a 360 video's are stitched, see Video360); else grab_frame.
     """
+    if grab is None:
+        def grab(seconds, size):
+            return grab_frame(tools, path, seconds, info, size)
     best, best_level = None, -1.0
     for seconds in poster_times(info.get("duration")):
-        frame = grab_frame(tools, path, seconds, info, edge)
+        frame = grab(seconds, edge)
         if frame is None and seconds > 0:
             continue
         if frame is None:
@@ -909,7 +1075,7 @@ def poster(tools, path, info, edge):
         if level > best_level:
             best, best_level = frame, level
     if best is None and info.get("duration"):
-        best = grab_frame(tools, path, 0.0, info, edge)
+        best = grab(0.0, edge)
     if best is None:
         raise VideoReadError("no frame could be read from the video")
     return best
@@ -961,7 +1127,7 @@ def contact_sheet(frames, width, height, edge, count=None):
     return buffer.getvalue()
 
 
-def make_sheet(tools, path, info, edge, count=DEFAULT_FRAMES, poster_frame=None):
+def make_sheet(tools, path, info, edge, count=DEFAULT_FRAMES, poster_frame=None, grab=None):
     """(JPEG bytes, frames on it): the contact sheet of a video, count frames, long edge edge.
 
     The frames are spread over the part of the video that has pictures
@@ -969,26 +1135,588 @@ def make_sheet(tools, path, info, edge, count=DEFAULT_FRAMES, poster_frame=None)
     looked for once more half way back to the moment before it, else left
     out; with none at all (or no known duration) the sheet is the poster
     alone. The describe step tells the model how many frames the sheet
-    really holds.
+    really holds. grab: as for poster().
     """
+    if grab is None:
+        def grab(seconds, size):
+            return grab_frame(tools, path, seconds, info, size)
     _c, _r, cell_w, cell_h, _g, _w, _h = sheet_layout(info["width"], info["height"], count,
                                                     edge)
     frames = []
     before = 0.0
     for seconds in sheet_times(info.get("span") or info.get("duration"), count):
-        frame = grab_frame(tools, path, seconds, info, max(cell_w, cell_h))
+        frame = grab(seconds, max(cell_w, cell_h))
         if frame is None and seconds > before:
-            frame = grab_frame(tools, path, (before + seconds) / 2.0, info,
-                               max(cell_w, cell_h))
+            frame = grab((before + seconds) / 2.0, max(cell_w, cell_h))
         if frame is not None:
             frames.append(frame)
         before = seconds
     if not frames:
         frame = poster_frame if poster_frame is not None else poster(
-            tools, path, info, max(cell_w, cell_h))
+            tools, path, info, max(cell_w, cell_h), grab)
         return contact_sheet([frame], info["width"], info["height"], edge, 1), 1
     return (contact_sheet(frames, info["width"], info["height"], edge, len(frames)),
             len(frames))
+
+
+# ---------------------------------------------------------------------------
+# 360-degree videos (Insta360 .insv)
+#
+# An Insta360 camera saves a 360-degree video as VID_<date>_<time>_00_<n>.insv,
+# an MP4 holding the picture of each lens in a stream of its own (the X4) --
+# or, on cameras that write each lens to a file of its own (the ONE R), one
+# lens, the other being in VID_<date>_<time>_10_<n>.insv. Next to it the
+# camera writes a small H.264 copy with both lenses side by side,
+# LRV_<date>_<time>_<nn>_<n>.lrv (or .insv), which browsers play. The poster
+# and the contact sheet are made from that copy's frames -- or, without one,
+# from the two lenses put side by side (ffmpeg's hstack filter, on the
+# processor) -- stitched into equirectangular panoramas as unstitched 360
+# photos are (images.dual_fisheye_to_equirect with the camera's lens model,
+# see CAMERAS_360, and the pole fill settings). The viewer plays the copy and
+# stitches each frame the same way (the lens geometry is kept in the facts:
+# "fisheye"). The videos of a camera whose lenses are not known here are read
+# as ordinary videos (the picture of one lens). An LRV and a second lens's
+# file are never indexed on their own (is_companion).
+
+PROJECTION_360 = imageinfo.PROJECTION_DUAL_FISHEYE
+INSV_EXTENSION = ".insv"
+# The cameras whose 360 videos are stitched, by the model the trailer of
+# their files names (insta360_model, compared without spaces or case): the
+# name of their lens model in images.py, and which lens is on the left and
+# which on the right of a frame holding both, as the camera's LRV has them --
+# the video streams of one file (layout "streams": their indexes), or the
+# two files (layout "files": 0 the _00_ file, 1 the _10_ one).
+CAMERAS_360 = {
+    "insta360x4": {"params": "INSTA360_VIDEO_PARAMS", "order": (1, 0)},
+    "insta360oner": {"params": "INSTA360_ONE_R_VIDEO_PARAMS", "order": (0, 1)},
+}
+# The middle field of the names of a video recorded as two files.
+FIRST_LENS, SECOND_LENS = "00", "10"
+# The end of an Insta360 file (its "trailer") names the camera.
+TRAILER_BYTES = 64 * 1024
+_TRAILER_MAGIC = b"8db42d694ccc418790edff439fe026bf"
+_TRAILER_MODEL_RE = re.compile(rb"\x12([\x01-\x3f])(Insta360[\x20-\x7e]*)")
+# The maker Insta360 photos name in their EXIF, so a camera's videos and
+# photos have the same camera name.
+INSTA360_MAKER = "Arashi Vision"
+# The frames of a 2:1 dual-fisheye picture may be this far from 2:1.
+LENS_ASPECT_SLACK = 0.02
+# A folder's names (to find an LRV or a second lens's file), as the server
+# looks for them, are listed again after this many seconds (or when the
+# folder's time changes, where the file system says so at once); this many
+# folders are remembered. Reading a video always lists its folder now.
+LISTING_SECONDS = 10.0
+LISTINGS_KEPT = 64
+
+_listing_lock = threading.Lock()
+_listings = collections.OrderedDict()      # folder -> (its mtime_ns, when listed, names)
+
+
+def is_360_video(name):
+    """True for the name of a file read as a 360-degree video when it is one (an .insv)."""
+    return isinstance(name, str) and name.lower().endswith(INSV_EXTENSION)
+
+
+def _insta360_parts(name):
+    """(kind "VID" or "LRV", date, time, middle field, number, extension) of an
+    Insta360 camera's file name (the extension in lower case), or None."""
+    match = _INSTA360_NAME_RE.match(os.path.basename(name or ""))
+    if not match:
+        return None
+    groups = match.groups()
+    return (groups[0].upper(), "".join(groups[1:4]), "".join(groups[4:7]), groups[7],
+            groups[8], groups[9].lower())
+
+
+def _folder_names(folder, cached=False):
+    """The names in a folder, or () when it cannot be listed.
+
+    cached: a listing made less than LISTING_SECONDS ago will do, unless
+    the folder's time changed since (LISTINGS_KEPT folders are kept): the
+    server looks for a video's LRV each time it is opened or played, and a
+    listing of a folder on a share is slow. Else it is listed now (and
+    kept).
+    """
+    folder = folder or "."
+    try:
+        stamp = os.stat(folder).st_mtime_ns
+    except OSError:
+        return ()
+    now = time.monotonic()
+    with _listing_lock:
+        found = _listings.get(folder)
+        if (cached and found is not None and found[0] == stamp
+                and now - found[1] < LISTING_SECONDS):
+            _listings.move_to_end(folder)
+            return found[2]
+    try:
+        names = tuple(sorted(os.listdir(folder)))
+    except OSError:
+        return ()
+    with _listing_lock:
+        _listings[folder] = (stamp, now, names)
+        _listings.move_to_end(folder)
+        while len(_listings) > LISTINGS_KEPT:
+            _listings.popitem(last=False)
+    return names
+
+
+def _same_recording(parts, other):
+    """True when two name parts (_insta360_parts) have the same date, time and number."""
+    return other[1:3] == parts[1:3] and other[4] == parts[4]
+
+
+def _lens_file_name(parts, middle, names):
+    """The name among names of the VID_ .insv of the recording parts names, with the
+    middle field middle (FIRST_LENS, SECOND_LENS), whatever the case; or None."""
+    for other in names:
+        found = _insta360_parts(other)
+        if (found and found[0] == "VID" and found[5] == "insv" and found[3] == middle
+                and _same_recording(parts, found)):
+            return other
+    return None
+
+
+def is_companion(name, names):
+    """True for a file an Insta360 camera writes beside a 360 video, not indexed on its own.
+
+    Its low-resolution copy: any LRV_<date>_<time>_<nn>_<number> name (.lrv
+    is no video extension, but some cameras write .insv); and the second
+    lens's file of a video recorded as two files, VID_..._10_<number>.insv
+    when its VID_..._00_<number>.insv is among names (the other names in
+    its folder). A second lens's file alone is indexed (as one lens).
+    """
+    parts = _insta360_parts(name)
+    if parts is None:
+        return False
+    if parts[0] == "LRV":
+        return True
+    return (parts[3] == SECOND_LENS and parts[5] == "insv"
+            and _lens_file_name(parts, FIRST_LENS, names or ()) is not None)
+
+
+def lrv_companion(path, hint=None, cached=False):
+    """The path of an Insta360 video's low-resolution copy (its LRV), or None.
+
+    For VID_<date>_<time>_<nn>_<number>.insv that is the file in the same
+    folder named LRV_<date>_<time>_<any nn>_<number>.lrv (or .insv, as
+    older cameras name it): the same date, time and number, whatever the
+    case of the letters. hint is the name a scan found (looked at first);
+    cached: a recent listing of the folder will do (_folder_names). The
+    second lens's file of a video recorded as two files has none: the LRV
+    is its first file's.
+    """
+    folder, name = os.path.split(path or "")
+    parts = _insta360_parts(name)
+    if parts is None or parts[0] != "VID" or parts[5] != "insv":
+        return None
+    names = None
+    if parts[3] == SECOND_LENS:
+        names = _folder_names(folder, cached)
+        if _lens_file_name(parts, FIRST_LENS, names) is not None:
+            return None
+    hinted = _insta360_parts(hint) if isinstance(hint, str) else None
+    if (hinted and hinted[0] == "LRV" and hinted[5] in ("lrv", "insv")
+            and _same_recording(parts, hinted)):
+        candidate = os.path.join(folder, os.path.basename(hint))
+        if os.path.isfile(candidate):
+            return candidate
+    for other in _folder_names(folder, cached) if names is None else names:
+        found = _insta360_parts(other)
+        if (found and found[0] == "LRV" and found[5] in ("lrv", "insv")
+                and _same_recording(parts, found)):
+            candidate = os.path.join(folder, other)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def second_lens_file(path, cached=False):
+    """The file with the other lens of an Insta360 video recorded as two files, or None.
+
+    For VID_<date>_<time>_00_<number>.insv: VID_<date>_<time>_10_<number>.insv
+    in the same folder (whatever the case of the letters). cached: see
+    lrv_companion.
+    """
+    folder, name = os.path.split(path or "")
+    parts = _insta360_parts(name)
+    if parts is None or parts[0] != "VID" or parts[3] != FIRST_LENS or parts[5] != "insv":
+        return None
+    other = _lens_file_name(parts, SECOND_LENS, _folder_names(folder, cached))
+    return os.path.join(folder, other) if other else None
+
+
+def companions(path):
+    """An .insv's companions as text, for a scan to see when they change ("" for none):
+    its LRV (name and size) and its second lens's file (name)."""
+    found = []
+    _folder_names(os.path.dirname(path))        # (listed now, once, for both lookups)
+    lrv = lrv_companion(path, cached=True)
+    if lrv is not None:
+        try:
+            size = os.path.getsize(lrv)
+        except OSError:
+            size = None
+        found.append("lrv:%s:%s" % (os.path.basename(lrv), size))
+    second = second_lens_file(path, cached=True)
+    if second is not None:
+        found.append("lens:%s" % os.path.basename(second))
+    return " ".join(found)
+
+
+def companions_changed(path, exif_text):
+    """True when an indexed .insv's LRV or second lens's file is not what it was read with
+    (exif_text: its exif column; read before this was kept: True)."""
+    return video_facts(exif_text).get("companions") != companions(path)
+
+
+def camera_360(model):
+    """CAMERAS_360's entry for a camera model (with "model"), or None for one not known."""
+    model = model.strip() if isinstance(model, str) else ""
+    found = CAMERAS_360.get(re.sub(r"\s+", "", model).lower())
+    return dict(found, model=model) if found else None
+
+
+def _video_streams(data):
+    return [stream for stream in data.get("streams") or ()
+            if isinstance(stream, dict) and stream.get("codec_type") == "video"
+            and not (isinstance(stream.get("disposition"), dict)
+                     and stream["disposition"].get("attached_pic") == 1)]
+
+
+def _stream_sizes(data):
+    return [(_number(stream.get("width")), _number(stream.get("height")))
+            for stream in _video_streams(data if isinstance(data, dict) else {})]
+
+
+def _is_lens_pair(width, height):
+    """True for a 2:1 frame (two lens circles side by side)."""
+    return bool(width and height) and abs(float(width) / height - 2.0) < LENS_ASPECT_SLACK * 2
+
+
+def lens_layout(data, second=None):
+    """How a probed .insv (ffprobe's JSON) holds its two lenses.
+
+    "streams": two video streams of the same size (one per lens); "frame":
+    one 2:1 stream holding both; "files": one square stream, and second
+    (ffprobe's JSON of its second lens's file, see second_lens_file) one of
+    the same size; "" for anything else.
+    """
+    sizes = _stream_sizes(data)
+    if len(sizes) >= 2 and sizes[0] == sizes[1] and sizes[0][0] and sizes[0][1]:
+        return "streams"
+    if len(sizes) == 1 and _is_lens_pair(*sizes[0]):
+        return "frame"
+    if (len(sizes) == 1 and second is not None and sizes[0][0]
+            and sizes[0][0] == sizes[0][1] and _stream_sizes(second) == sizes):
+        return "files"
+    return ""
+
+
+def insta360_model(path):
+    """The camera an Insta360 file's trailer names ("Insta360 X4"), or "".
+
+    The trailer at the end of the file (it ends with a fixed 32-byte mark)
+    holds the camera's details as protobuf: its model is the string field
+    starting with "Insta360". Only the last TRAILER_BYTES are read.
+    """
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            handle.seek(max(0, size - TRAILER_BYTES))
+            tail = handle.read(TRAILER_BYTES)
+    except (OSError, TypeError, ValueError):
+        return ""
+    if not tail.endswith(_TRAILER_MAGIC):
+        return ""
+    for match in _TRAILER_MODEL_RE.finditer(tail):
+        length = match.group(1)[0]
+        text = match.group(2)[:length]
+        if len(text) == length:
+            return text.decode("ascii").strip()
+    return ""
+
+
+def media_data_size(path):
+    """The bytes of an MP4's media data (its mdat boxes), or None when it is not read as one.
+
+    About what a copy without metadata keeps (strip_copy): not the other
+    boxes, nor what a camera writes after them (an Insta360 trailer).
+    """
+    total = 0
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            position = 0
+            while position + 8 <= size:
+                handle.seek(position)
+                header = handle.read(16)
+                length, kind = struct.unpack(">I4s", header[:8])
+                if length == 1 and len(header) == 16:
+                    length = struct.unpack(">Q", header[8:16])[0]
+                elif length == 0:
+                    length = size - position
+                if length < 8 or position + length > size or not kind.isalnum():
+                    break               # (no box: a trailer)
+                if kind == b"mdat":
+                    total += length
+                position += length
+    except (OSError, struct.error, TypeError, ValueError):
+        return None
+    return total or None
+
+
+def _lens_inputs(path, seconds, layout, order, second=None):
+    """(ffmpeg's input arguments, the two lenses' inputs to the filter graph, left to
+    right) of an .insv: its streams (layout "streams"; order: their indexes), or its
+    file and second, its second lens's ("files": order 0 is path, 1 second)."""
+    def source(name):
+        return (["-ss", "%.3f" % seconds] if seconds and seconds > 0 else []) + [
+            "-i", _input(name)]
+    if layout == "files":
+        return source(path) + source(second), tuple("[%d:v:0]" % index for index in order)
+    return source(path), tuple("[0:v:%d]" % index for index in order)
+
+
+def lens_filter(width, inputs=("[0:v:1]", "[0:v:0]")):
+    """The -filter_complex that puts an .insv's two lenses (inputs, see _lens_inputs)
+    side by side, width wide: [frame], width x width / 2 (even numbers)."""
+    width = max(4, int(width) // 4 * 4)
+    return "%s%shstack=inputs=2,scale=w=%d:h=%d[frame]" % (inputs[0], inputs[1], width,
+                                                         width // 2)
+
+
+def grab_lenses(tools, path, seconds, edge, pair_width, layout="streams", order=(1, 0),
+                second=None):
+    """The frame at seconds of an .insv's two lenses side by side (RGB, 2:1), or None.
+
+    layout, order and second: see _lens_inputs. At most edge pixels wide
+    (and never wider than pair_width, the two lenses' width together).
+    Raises VideoReadError when ffmpeg fails.
+    """
+    width = max(4, min(int(edge), int(pair_width or edge)))
+    inputs, labels = _lens_inputs(path, seconds, layout, order, second)
+    argv = tools.ffmpeg + ["-nostdin", "-hide_banner", "-loglevel", "error"] + inputs + [
+        "-filter_complex", lens_filter(width, labels), "-map", "[frame]", "-frames:v", "1",
+        "-an", "-sn", "-dn", "-f", "image2pipe", "-c:v", "bmp", "pipe:1"]
+    code, out, err = _run(argv, FRAME_TIMEOUT)
+    if code != 0:
+        raise VideoReadError("ffmpeg could not read a frame (%s)" % _error_line(err, path))
+    return _decode_frame(out, _images())
+
+
+class Video360:
+    """A 360-degree video's frames, stitched (see video_360()).
+
+    grab(seconds, edge) is the equirectangular panorama at seconds, at most
+    edge pixels wide (None past the end): a frame of the LRV (lrv, read with
+    lrv_info), else of the lenses (layout "streams": its two streams,
+    "files": its file and second, see _lens_inputs) or the video's own 2:1
+    stream (layout "frame"), stitched with the lens model of camera (an
+    entry of CAMERAS_360). info is the video's parse_probe() result with
+    width x height the panorama's full size: twice a lens's width by its
+    width (7680 x 3840 for two 3840 px lenses), as the original's stitched
+    panorama would be. The lens circles and gains of the stitches are kept
+    for the player (fisheye()).
+    """
+
+    def __init__(self, tools, path, info, layout, camera, lrv=None, lrv_info=None,
+                 stream_width=0, second=None):
+        self.tools = tools
+        self.path = path
+        self.layout = layout
+        self.camera = camera
+        self.params = getattr(_images(), camera["params"])
+        self.lrv = lrv
+        self.lrv_info = lrv_info
+        self.second = second if layout == "files" else None
+        self.stream_width = int(stream_width or 0)
+        if layout == "frame":
+            size = (int(info["width"]), max(1, int(info["width"]) // 2))
+        else:
+            size = (2 * self.stream_width, self.stream_width)
+        if not size[0] and lrv_info:
+            size = (int(lrv_info["width"]), max(1, int(lrv_info["width"]) // 2))
+        self.info = dict(info, width=size[0], height=size[1])
+        self.frame_size = None
+        self.circles = None
+        self.gains = []
+
+    def frame(self, seconds, edge):
+        """The unstitched frame (both lenses side by side) at seconds, at most edge wide."""
+        if self.lrv:
+            return grab_frame(self.tools, self.lrv, seconds, self.lrv_info, edge)
+        if self.layout in ("streams", "files"):
+            return grab_lenses(self.tools, self.path, seconds, edge, 2 * self.stream_width,
+                               self.layout, self.camera["order"], self.second)
+        return grab_frame(self.tools, self.path, seconds, self.info, edge)
+
+    def grab(self, seconds, edge):
+        images = _images()
+        # (The circles are stretched over the whole panorama: a frame a
+        # little wider than it holds its detail; see images.py.)
+        frame = self.frame(seconds, images._fisheye_source_edge(edge, self.params))
+        if frame is None:
+            return None
+        details = {}
+        panorama = images.dual_fisheye_to_equirect(frame, min(int(edge), frame.size[0]),
+                                                   self.params, details=details)
+        self.frame_size = frame.size
+        self.circles = details.get("circles")
+        if details.get("gains"):
+            self.gains.append(details["gains"])
+        return panorama
+
+    def fisheye(self):
+        """The lens geometry the player stitches the frames with, or None before a stitch.
+
+        {"lens": [[x, y, r] of the left and the right lens circle: centre
+        and radius as fractions of the frame's width (x) and height (y, r)],
+        "fov", "turn" (each lens's rotation, degrees), "front" (0: the left
+        lens is the middle of the panorama, 1: the right one), "mirror",
+        "blend" (degrees either side of the seams, as used), "gain" (the
+        front and the back lens's red, green and blue gains, the mean of
+        those of the frames stitched), "fill" (the nadir and zenith fill
+        degrees)}.
+        """
+        if not self.circles or not self.frame_size:
+            return None
+        images = _images()
+        params = self.params
+        width, height = self.frame_size
+        fov = float(params["fov"])
+        gains = [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]
+        if self.gains:
+            gains = [[sum(found[lens][channel] for found in self.gains) / len(self.gains)
+                      for channel in range(3)] for lens in (0, 1)]
+        fill = images.stitch_settings()
+        return {
+            "lens": [[round(cx / float(width), 5), round(cy / float(height), 5),
+                      round(radius / float(height), 5)] for cx, cy, radius in self.circles],
+            "fov": fov,
+            "turn": [float(turn) for turn in (params.get("rotation") or (0, 0))],
+            "front": 0 if params.get("front", "left") == "left" else 1,
+            "mirror": bool(params.get("mirror")),
+            "blend": round(min(max(0.0, float(params.get("blend", 0.0))),
+                               max(0.0, fov / 2.0 - 90.0)), 3),
+            "gain": [[round(value, 4) for value in lens] for lens in gains],
+            "fill": [fill["nadir_fill_deg"], fill["zenith_fill_deg"]],
+        }
+
+
+def video_360(tools, path, data, info, model=None):
+    """A Video360 for an .insv at path (data: ffprobe's JSON, info: its parse_probe()), or None.
+
+    The camera is the one the trailer of the file (or of its LRV) names
+    (model: already read); None for one whose lenses are not known here
+    (CAMERAS_360: the video is then read as an ordinary one). Its LRV
+    (lrv_companion) is used when ffprobe reads it as a 2:1 video; else its
+    own lenses (lens_layout: its streams, or it and its second lens's
+    file). None when neither will do.
+    """
+    model = insta360_model(path) if model is None else model
+    _folder_names(os.path.dirname(path))        # (listed now, once, for both lookups)
+    lrv, lrv_info = lrv_companion(path, cached=True), None
+    if not model and lrv is not None:
+        model = insta360_model(lrv)
+    camera = camera_360(model)
+    if camera is None:
+        return None
+    second, second_data = second_lens_file(path, cached=True), None
+    if second is not None:
+        try:
+            second_data = probe(tools, second)
+        except VideoReadError:
+            second = None           # (an unreadable second lens: as if it were not there)
+    layout = lens_layout(data, second_data)
+    if lrv is not None:
+        try:
+            lrv_info = parse_probe(probe(tools, lrv), os.path.basename(lrv))
+        except VideoReadError:
+            lrv = None              # (an unreadable copy: the lenses instead)
+        else:
+            if not _is_lens_pair(lrv_info["width"], lrv_info["height"]):
+                lrv, lrv_info = None, None
+    if lrv is None and not layout:
+        return None
+    sizes = _stream_sizes(data)
+    stream_width = int(sizes[0][0] or 0) if sizes else 0
+    return Video360(tools, path, info, layout, camera, lrv, lrv_info, stream_width, second)
+
+
+def _facts_360(v360, facts):
+    """A 360 video's facts (exif "video"): the original's; how its lenses are stored
+    ("lenses": its layout, "lrv" when only its LRV holds both); "lens_file", its
+    second lens's file; its LRV ({name, codec, pix_fmt, container, width, height,
+    size, media_size: see media_data_size}); and the lens geometry."""
+    facts = dict(facts)
+    facts["lenses"] = v360.layout or "lrv"
+    if v360.second:
+        facts["lens_file"] = os.path.basename(v360.second)
+    if v360.lrv and v360.lrv_info:
+        try:
+            size = os.path.getsize(v360.lrv)
+        except OSError:
+            size = None
+        lrv = v360.lrv_info["video"]
+        facts["lrv"] = {"name": os.path.basename(v360.lrv), "codec": lrv.get("codec", ""),
+                        "pix_fmt": lrv.get("pix_fmt", ""),
+                        "container": lrv.get("container", ""),
+                        "width": v360.lrv_info["width"], "height": v360.lrv_info["height"],
+                        "size": size, "media_size": media_data_size(v360.lrv)}
+    geometry = v360.fisheye()
+    if geometry is not None:
+        facts["fisheye"] = geometry
+    return facts
+
+
+def lrv_facts(exif_text):
+    """The "lrv" facts of a 360 video's exif column ({} when it has no LRV)."""
+    lrv = video_facts(exif_text).get("lrv")
+    return lrv if isinstance(lrv, dict) else {}
+
+
+def _read_360(v360, want_preview, preview_edge, sheet_edge, frames, want_sheet):
+    """_read_video for a 360 video: its stitched poster and sheet (see Video360)."""
+    images = _images()
+    info = v360.info
+    working_edge = max(preview_edge, images.THUMB_SIZE)
+    panorama = poster(v360.tools, v360.path, info, working_edge, v360.grab)
+    # As for a 360 photo: the thumbnail (and dHash) show the front view,
+    # the preview the whole panorama.
+    view = images.front_view(panorama)
+    preview = None
+    if want_preview:
+        wanted = _fit(panorama.size, preview_edge)
+        resample = getattr(images.Image, "Resampling", images.Image).LANCZOS
+        preview = _jpeg(panorama if panorama.size == wanted
+                        else panorama.resize(wanted, resample), images.PREVIEW_QUALITY)
+    if want_sheet is None:
+        want_sheet = want_preview
+    sheet, on_sheet = None, None
+    if want_sheet:
+        sheet, on_sheet = make_sheet(v360.tools, v360.path, info, sheet_edge, frames, panorama,
+                                     v360.grab)
+    facts = _facts_360(v360, info["video"])
+    if want_sheet:
+        facts.update(sheet_frames=on_sheet, sheet_asked=frames)
+    return {
+        "width": info["width"], "height": info["height"],
+        "thumb": _jpeg(view, images.THUMB_QUALITY), "preview": preview,
+        "exif": {"video": facts}, "dhash": images.compute_dhash(view),
+        "mime": mime_type(v360.path),
+        "taken_at": info["taken_at"], "taken_source": info["taken_source"],
+        "tz_offset": info["tz_offset"],
+        "camera": info["camera"] or _insta360_camera(v360.camera["model"]), "lat": info["lat"],
+        "lon": info["lon"], "projection": PROJECTION_360, "pano": None, "media": MEDIA_VIDEO,
+        "duration": round(info["duration"], 3) if info["duration"] else None,
+        "sheet": sheet,
+    }
+
+
+def _insta360_camera(model):
+    """The camera name of an Insta360 model as its photos give it ("" for none)."""
+    return imageinfo.camera_name({"Make": INSTA360_MAKER, "Model": model}) if model else ""
 
 
 def _fit(size, edge):
@@ -1017,6 +1745,11 @@ def read_video(path, tools, want_preview=True, mtime=None, preview_edge=None,
     pano None -- and media "video", duration (seconds or None) and sheet
     (the contact sheet's JPEG bytes, up to frames frames with a long edge
     of sheet_edge; None unless want_sheet, which defaults to want_preview).
+    A 360-degree video (is_360_video, see Video360) has projection
+    "dual_fisheye": its poster and sheet frames are stitched panoramas, the
+    preview is the poster's panorama, the thumbnail and dHash its front
+    view, width x height the full panorama's size, and its facts say how
+    its lenses are stored, which LRV it has and the lens geometry.
     Raises ToolsMissing without tools, images.SourceReadError when the file
     cannot be read (also when it could not be while ffprobe or ffmpeg read
     it, or a program took too long: see _read_failure) and VideoReadError
@@ -1052,7 +1785,29 @@ def _read_video(path, tools, want_preview, mtime, preview_edge, sheet_edge, fram
     images = _images()
     preview_edge = int(preview_edge or images.PREVIEW_EDGE)
     name = os.path.basename(path)
-    info = parse_probe(probe(tools, path), name, mtime)
+    data = probe(tools, path)
+    info = parse_probe(data, name, mtime)
+    if is_360_video(name):
+        # (Also an .insv read as an ordinary video, a camera not known
+        # here: a scan reads it again when its companions change.)
+        model = insta360_model(path)
+        v360 = video_360(tools, path, data, info, model)
+        if v360 is not None:
+            result = _read_360(v360, want_preview, preview_edge, sheet_edge, frames, want_sheet)
+        else:
+            result = _read_flat(tools, path, info, want_preview, preview_edge, sheet_edge,
+                                frames, want_sheet)
+            result["camera"] = result["camera"] or _insta360_camera(model)
+        result["exif"]["video"]["companions"] = companions(path)
+        return result
+    return _read_flat(tools, path, info, want_preview, preview_edge, sheet_edge, frames,
+                      want_sheet)
+
+
+def _read_flat(tools, path, info, want_preview, preview_edge, sheet_edge, frames, want_sheet):
+    """_read_video for an ordinary video (info: its parse_probe())."""
+    images = _images()
+    name = os.path.basename(path)
     working_edge = max(preview_edge, images.THUMB_SIZE)
     frame = poster(tools, path, info, working_edge)
     resample = getattr(images.Image, "Resampling", images.Image).LANCZOS
@@ -1088,30 +1843,42 @@ def _read_video(path, tools, want_preview, mtime, preview_edge, sheet_edge, fram
 def poster_jpeg(tools, path, edge=None):
     """JPEG bytes of a video's poster at most edge pixels (default: the preview size).
 
-    Raises as read_video does (images.SourceReadError when the file cannot
-    be read).
+    A 360 video's is its stitched panorama (as its preview). Raises as
+    read_video does (images.SourceReadError when the file cannot be read).
     """
     images = _images()
     if tools is None:
         raise ToolsMissing()
     try:
-        info = parse_probe(probe(tools, path), os.path.basename(path))
-        frame = poster(tools, path, info, int(edge or images.PREVIEW_EDGE))
+        info, grab = _frames_of(tools, path)
+        frame = poster(tools, path, info, int(edge or images.PREVIEW_EDGE), grab)
     except VideoReadError as error:
         raise _read_failure(error, path)
     return _jpeg(frame, images.PREVIEW_QUALITY)
 
 
+def _frames_of(tools, path):
+    """(info, grab) for poster() and make_sheet(): a 360 video's stitched frames, or
+    (parse_probe's result, None) for any other video."""
+    data = probe(tools, path)
+    info = parse_probe(data, os.path.basename(path))
+    v360 = video_360(tools, path, data, info) if is_360_video(path) else None
+    if v360 is not None:
+        return v360.info, v360.grab
+    return info, None
+
+
 def sheet_jpeg(tools, path, edge=common.DEFAULT_MAX_IMAGE_EDGE, frames=DEFAULT_FRAMES):
     """(JPEG bytes, frames on it) of a video's contact sheet, made now (make_sheet).
 
-    For when none was kept with the previews. Raises as read_video does.
+    For when none was kept with the previews (a 360 video's frames are
+    stitched). Raises as read_video does.
     """
     if tools is None:
         raise ToolsMissing()
     try:
-        info = parse_probe(probe(tools, path), os.path.basename(path))
-        return make_sheet(tools, path, info, edge, frames)
+        info, grab = _frames_of(tools, path)
+        return make_sheet(tools, path, info, edge, frames, grab=grab)
     except VideoReadError as error:
         raise _read_failure(error, path)
 
@@ -1222,18 +1989,49 @@ def proxy_command(tools, source, target, info, height=720, crf=26, tone_map=None
         "-f", "mp4", _input(target)]
 
 
+def lens_proxy_command(tools, source, target, height=720, crf=26, layout="streams",
+                       order=(1, 0), second=None):
+    """The ffmpeg command that makes a playable copy of a 360 video's two lenses.
+
+    Its two streams (layout "streams") or its file and second, its second
+    lens's ("files"), side by side in order (see _lens_inputs; as its LRV
+    has them: the player stitches them as it does an LRV's frames), height
+    pixels tall and twice as wide, H.264 / AAC (source's sound) in an MP4,
+    without metadata.
+    """
+    height = max(2, int(height) // 2 * 2)
+    inputs, labels = _lens_inputs(source, 0, layout, order, second)
+    graph = ("%s%shstack=inputs=2,scale=w=%d:h=%d,format=yuv420p[frame]"
+             % (labels[0], labels[1], 2 * height, height))
+    return tools.ffmpeg + [
+        "-nostdin", "-hide_banner", "-loglevel", "error", "-y"] + inputs + [
+        "-filter_complex", graph, "-map", "[frame]", "-map", "0:a:0?", "-dn", "-sn",
+        "-map_metadata", "-1", "-map_metadata:s", "-1", "-map_chapters", "-1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(int(crf)),
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-movflags", "+faststart",
+        "-f", "mp4", _input(target)]
+
+
 def make_proxy(tools, source, target, height=720, crf=26, timeout=None):
     """Write a playable copy of source to target (proxy_command). Returns target.
 
     When the tone mapping of an HDR video fails, the copy is made without
-    it (as grab_frame does).
+    it (as grab_frame does). A 360 video whose lenses are two streams or
+    two files gets them side by side (lens_proxy_command); one with both
+    in one stream is copied as any video.
     """
     if tools is None:
         raise ToolsMissing()
-    info = parse_probe(probe(tools, source), os.path.basename(source))
+    data = probe(tools, source)
+    info = parse_probe(data, os.path.basename(source))
     if timeout is None:
         # A generous limit: slow computers encode at about real time.
         timeout = max(REMUX_TIMEOUT, int(4 * (info.get("duration") or 0)) + 60)
+    v360 = video_360(tools, source, data, info) if is_360_video(source) else None
+    if v360 is not None and v360.layout in ("streams", "files"):
+        return _write_with(lambda temp: lens_proxy_command(
+            tools, source, temp, height, crf, v360.layout, v360.camera["order"], v360.second),
+            target, timeout, "make a playable copy", source)
     tone_map = tools.hdr_filter and bool(info["video"].get("hdr"))
 
     def write(tone):
@@ -1395,12 +2193,69 @@ def effective_info(info, media):
     return dict(info, photo_type=MEDIA_VIDEO)
 
 
-def proxy_candidates(conn, library_id):
-    """Rows (id, path, content_hash, exif) of a library's present videos browsers may not play."""
+def proxy_candidates(conn, library_id, root=None):
+    """Rows (id, path, content_hash, exif, projection) of a library's present videos that
+    need a playable copy (see wants_copy). root: the library's folder, to look for 360
+    videos' LRVs now (else as the scan found them)."""
     rows = conn.execute(
-        "SELECT id, library_id, path, content_hash, exif FROM images WHERE library_id = ? "
-        "AND media = 'video' AND missing_since IS NULL ORDER BY id", (library_id,)).fetchall()
-    return [row for row in rows if playable(video_facts(row["exif"])) != "yes"]
+        "SELECT id, library_id, path, content_hash, exif, projection FROM images "
+        "WHERE library_id = ? AND media = 'video' AND missing_since IS NULL ORDER BY id",
+        (library_id,)).fetchall()
+    found = []
+    for row in rows:
+        facts = video_facts(row["exif"])
+        lrv = None
+        if row["projection"] == PROJECTION_360:
+            if root is None:
+                lrv = facts.get("lrv")
+            else:
+                lrv = lrv_companion(os.path.join(root, *row["path"].split("/")),
+                                    _lrv_name(facts))
+        if wants_copy(row["projection"], facts, bool(lrv)):
+            found.append(row)
+    return found
+
+
+def wants_copy(projection, facts, has_lrv=False):
+    """True when a video needs a playable copy (facts: its exif "video").
+
+    One browsers may not play (not H.264 in an MP4, ...); a 360 video
+    (projection) only when there is no LRV (has_lrv) and its original does
+    not hold both lenses in one stream browsers play: its lenses' streams
+    or files are put side by side. One whose LRV alone holds both lenses
+    gets none (a copy of the original would show one lens).
+    """
+    if projection != PROJECTION_360:
+        return playable(facts) != "yes"
+    if has_lrv:
+        return False
+    lenses = facts.get("lenses")
+    return lenses in ("streams", "files") or (lenses == "frame" and playable(facts) != "yes")
+
+
+def _lrv_name(facts):
+    lrv = facts.get("lrv")
+    return lrv.get("name") if isinstance(lrv, dict) else None
+
+
+def playable_360(row, full):
+    """(path, kind) of what a 360 video row's player gets when it has no playable copy.
+
+    Its LRV, looked for now (lrv_companion of its original at full; kind
+    "video-lrv"); else the original when it holds both lenses in one stream
+    browsers play (lenses "frame"; kind "video"); else (None, None): no
+    browser plays lens streams as they are. Also (None, None) for any other
+    row (row: its projection and exif).
+    """
+    if row["projection"] != PROJECTION_360 or not full:
+        return None, None
+    facts = video_facts(row["exif"])
+    lrv = lrv_companion(full, _lrv_name(facts), cached=True)
+    if lrv is not None:
+        return lrv, "video-lrv"
+    if facts.get("lenses") == "frame" and playable(facts) == "yes":
+        return full, "video"
+    return None, None
 
 
 def _remove_stale_proxies(library_id, rows):
@@ -1430,8 +2285,10 @@ def make_proxies(conn, config, ctx, library_ids):
     in a container browsers take) get an H.264 / AAC copy in
     data/proxies/<library id>/ ("video_proxies": height and crf), unless
     they have one for their current content; copies of videos that are gone
-    or changed are removed. Returns {"made", "kept", "failed", "removed",
-    "stopped"}. Raises ToolsMissing without ffmpeg.
+    or changed are removed. A 360 video plays its LRV: only one without
+    (there now) gets a copy, of its two lenses side by side (see wants_copy
+    and lens_proxy_command). Returns {"made", "kept", "failed", "removed", "stopped"}. Raises
+    ToolsMissing without ffmpeg.
     """
     settings = proxy_settings(config)
     tools = find_tools(config)
@@ -1441,9 +2298,9 @@ def make_proxies(conn, config, ctx, library_ids):
     work = []
     for library_id in library_ids:
         library = common.get_library(config, library_id) or {}
-        rows = proxy_candidates(conn, library_id)
-        summary["removed"] += _remove_stale_proxies(library_id, rows)
         root = common.library_root(library)
+        rows = proxy_candidates(conn, library_id, root or None)
+        summary["removed"] += _remove_stale_proxies(library_id, rows)
         for row in rows:
             if existing_proxy(library_id, row["id"], row["content_hash"]):
                 summary["kept"] += 1
@@ -1491,7 +2348,8 @@ def main(argv=None):
         except OSError:
             mtime = None
         try:
-            info = parse_probe(probe(tools, path), os.path.basename(path), mtime)
+            data = probe(tools, path)
+            info = parse_probe(data, os.path.basename(path), mtime)
         except VideoReadError as error:
             print("%s: %s" % (path, error))
             code = 1
@@ -1500,6 +2358,15 @@ def main(argv=None):
             info.pop(key, None)
         info["length"] = duration_text(info["duration"])
         info["playable"] = playable(info["video"])
+        if is_360_video(path):
+            # (What a scan reads a 360 video's frames from: "" for a
+            # camera whose lenses are not known here, read as one lens.)
+            v360 = video_360(tools, path, data, info)
+            info["lenses"] = (v360.layout or "lrv") if v360 is not None else ""
+            info["lrv"] = (v360.lrv or "") if v360 is not None else ""
+            info["lens_file"] = (v360.second or "") if v360 is not None else ""
+            model = v360.camera["model"] if v360 is not None else insta360_model(path)
+            info["camera"] = info["camera"] or _insta360_camera(model)
         print(path)
         print(json.dumps(info, indent=2, ensure_ascii=False))
     return code

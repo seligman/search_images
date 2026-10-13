@@ -39,11 +39,14 @@ import threading
 import time
 import urllib.parse
 
+import albums
 import common
 import db
+import drives
 import duplicates
 import embeddings
 import export
+import gps_check
 import image_edits
 import jobs
 import library_ops
@@ -55,6 +58,7 @@ import prompts
 import refine
 import search_index
 import settings
+import sheet_talk
 import videos
 
 URL_PREFIX = "/api/admin"
@@ -90,6 +94,7 @@ JOB_PARAMS = {
     "delete_library": ("confirm_name",),
     "export": ("options", "save_options", "out_dir"),
     "proxies": (),
+    "drive_previews": (),
 }
 BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force", "save_options",
                "rebuild")
@@ -483,22 +488,29 @@ def video_counts(conn):
 
 
 def videos_view(config):
-    """Videos for the Manage page: {"available", "problem", "ffmpeg", "proxies"}.
+    """Videos for the Manage page: {"available", "problem", "ffmpeg", "proxies",
+    "drive_previews", "sheet_check"}.
 
     available: ffmpeg and ffprobe were found (problem says what to do
-    otherwise); proxies: the "video_proxies" settings (videos.proxy_settings).
+    otherwise); proxies: the "video_proxies" settings (videos.proxy_settings);
+    drive_previews: the "drive_previews" settings (drives.preview_settings);
+    sheet_check: a video whose description talks about its frames is asked
+    again ("video_sheet_check", see sheet_talk).
     """
     status = videos.tools_status(config)
     return {"available": status["available"], "problem": status["problem"],
-            "ffmpeg": status["ffmpeg"], "proxies": videos.proxy_settings(config)}
+            "ffmpeg": status["ffmpeg"], "proxies": videos.proxy_settings(config),
+            "drive_previews": drives.preview_settings(config),
+            "sheet_check": sheet_talk.enabled(config)}
 
 
-def library_video_view(conn, config, library, counts, usage):
-    """A library's videos for the Manage page: {"on", "count", "proxies": {count, bytes, pending}}.
+def library_video_view(conn, config, library, counts, usage, drive_usage=None):
+    """A library's videos for the Manage page: {"on", "count", "proxies": {count, bytes,
+    pending}, "drives" (drives.library_view, when it has videos)}.
 
-    counts is video_counts(); usage videos.proxy_usage(). pending (the
-    videos that would get a playable copy) is only counted while playable
-    copies are turned on.
+    counts is video_counts(); usage videos.proxy_usage(); drive_usage
+    drives.preview_usage(). pending (the videos that would get a playable
+    copy) is only counted while playable copies are turned on.
     """
     library_id = library.get("id")
     view = {"on": common.library_videos(library), "count": counts.get(library_id, 0),
@@ -508,6 +520,11 @@ def library_video_view(conn, config, library, counts, usage):
             view["proxies"]["pending"] = sum(
                 1 for row in videos.proxy_candidates(conn, library_id)
                 if not videos.existing_proxy(library_id, row["id"], row["content_hash"]))
+        except sqlite3.Error:
+            pass
+    if view["count"]:
+        try:
+            view["drives"] = drives.library_view(conn, config, library_id, drive_usage)
         except sqlite3.Error:
             pass
     return view
@@ -1059,12 +1076,14 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         return refine_view(config, library, counted, key_info=resolve_key)
 
     def view_of(config, library):
-        view = library_view(config, library, db.library_counts(get_conn(), prompts.PROMPT_VER),
+        view = library_view(config, library,
+                            db.library_counts(get_conn(), stale_sql=prompts.stale_sql(config)),
                             manager.latest_by_library(), folder_status(library),
                             endpoint_info(config, library), refine_info(config, library),
                             meaning_counts(config).get(library.get("id")))
         view["video_info"] = library_video_view(get_conn(), config, library,
-                                                video_counts(get_conn()), videos.proxy_usage())
+                                                video_counts(get_conn()), videos.proxy_usage(),
+                                                drives.preview_usage())
         found = looks_counts(config).get(library.get("id"))
         if found is not None:
             view["looks"] = found
@@ -1182,6 +1201,9 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         if kind == "proxies" and not videos.proxy_settings(config)["enabled"]:
             raise AdminError(400, "Playable copies of videos are turned off: set "
                                   "\"video_proxies\": {\"enabled\": true} in config.json first.")
+        if kind == "drive_previews" and not drives.preview_settings(config)["enabled"]:
+            raise AdminError(400, "Sped-up previews of drives are turned off: set "
+                                  "\"drive_previews\": {\"enabled\": true} in config.json first.")
         if kind == "embed":
             endpoint, problem = embeddings.endpoint_for(config)
             if endpoint is None:
@@ -1312,7 +1334,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
     def api_state():
         config = state.config()
         conn = get_conn()
-        counts = db.library_counts(conn, prompts.PROMPT_VER)
+        counts = db.library_counts(conn, stale_sql=prompts.stale_sql(config))
         latest = manager.latest_by_library()
         meaning = meaning_counts(config)
         libraries = [library_view(config, library, counts, latest, folder_status(library),
@@ -1320,10 +1342,12 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                   meaning.get(library["id"]))
                      for library in config.get("libraries", []) if library.get("id")]
         with_videos, usage = video_counts(conn), videos.proxy_usage()
+        drive_usage = drives.preview_usage()
         looked = looks_counts(config)
         for view, library in zip(libraries, [library for library in config.get("libraries", [])
                                              if library.get("id")]):
-            view["video_info"] = library_video_view(conn, config, library, with_videos, usage)
+            view["video_info"] = library_video_view(conn, config, library, with_videos, usage,
+                                                    drive_usage)
             if library["id"] in looked:
                 view["looks"] = looked[library["id"]]
         return jsonify({
@@ -1710,10 +1734,14 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
 
     @bp.route("/duplicates/not-duplicates", methods=["POST"])
     def keep_apart():
-        """{ids, apart?, undo?}: say pictures are not duplicates (undo: take that back).
+        """{ids, apart?, together?, undo?}: say pictures are not duplicates (undo: take
+        that back).
 
         Every two of the pictures are kept apart, or with apart (one of the
         ids) only that one from each of the others; see not_duplicates.py.
+        together (lists of some of the ids) leaves out the pairs within one
+        list: "Same picture, any date" sends the pictures that share a stack
+        of the search page, which stay stacked.
         """
         data = body()
         apart = data.get("apart")
@@ -1730,6 +1758,16 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         undo = data.get("undo", False)
         if not isinstance(undo, bool):
             raise AdminError(400, "undo must be true or false.", {"undo": "True or false."})
+        together = data.get("together")
+        if together is not None:
+            if not isinstance(together, list) or len(together) > len(ids):
+                raise AdminError(400, "together must be lists of the ids.",
+                                 {"together": "Lists of the ids."})
+            together = [image_ids(group, len(ids), "together") for group in together]
+            known = set(ids)
+            if any(image_id not in known for group in together for image_id in group):
+                raise AdminError(400, "together must be lists of the ids.",
+                                 {"together": "Lists of the ids."})
         keys = {}
         conn = get_conn()
         for chunk in id_chunks(ids):
@@ -1744,6 +1782,12 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                   "index): identical files always stay together.")
         pairs = not_duplicates.pairs_among(keys.values(),
                                            keys[apart] if apart is not None else None)
+        for group in together or ():
+            pairs -= not_duplicates.pairs_among([keys[image_id] for image_id in group
+                                                 if image_id in keys])
+        if not pairs:
+            raise AdminError(400, "There is nothing to keep apart: these pictures are "
+                                  "identical files, or share a stack of the search page.")
         try:
             changed = not_duplicates.change(pairs, add=not undo)
         except OSError as error:
@@ -1835,6 +1879,171 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                  for image_id, tags in result["tags"].items()},
                         "edited": {str(image_id): edited
                                    for image_id, edited in result["edited"].items()}})
+
+    # -- the GPS check (gps_check.py) ---------------------------------------------
+
+    @bp.route("/images/<int:image_id>/location", methods=["POST"])
+    def choose_location(image_id):
+        """{use: true or false}: use a picture's GPS position anyway, or ignore it.
+
+        The choice is made for every copy of the shot and kept by content
+        (gps_check.set_choice: only while it differs from what the check
+        decides), and the check runs again at once, as the position may be
+        another picture's reference. Answers the picture's location_check
+        (as /api/image has it), the keys of its search record a position
+        changes (absent: none), "copies": how many copies the choice was
+        also made for, and "others": {id: those keys} of the other pictures
+        whose position or place the check changed (at most
+        gps_check.OTHERS_MAX; "more": how many more there are).
+        """
+        use = body().get("use")
+        if not isinstance(use, bool):
+            raise AdminError(400, "Send use: true (use the position) or false (ignore it).",
+                             {"use": "Send true or false."})
+        conn = get_conn()
+        config = state.config()
+        changed = set()
+        try:
+            with conn:
+                ids = (gps_check.set_choice(conn, config, image_id, use)
+                       if image_id <= IMAGE_ID_MAX else [])
+            if not ids:
+                raise AdminError(404, "Picture %d has no GPS position." % image_id)
+            gps_check.run(conn, config, changed=changed)
+        except sqlite3.OperationalError as error:
+            raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
+
+        def keys(picture_id):
+            record = search_index.picture_record(conn, picture_id,
+                                                 image_edits.load(conn, picture_id)) or {}
+            return {key: record[key] for key in gps_check.RECORD_KEYS if key in record}
+
+        others = sorted((set(ids) | changed) - {image_id})
+        row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+        return jsonify({"id": image_id, "location_check": gps_check.picture_view(conn, row),
+                        "record": keys(image_id), "copies": len(ids) - 1,
+                        "others": {str(other): keys(other)
+                                   for other in others[:gps_check.OTHERS_MAX]},
+                        "more": max(0, len(others) - gps_check.OTHERS_MAX)})
+
+    # -- favorites, ratings and albums (albums.py) --------------------------------
+
+    def album_error(error):
+        return AdminError(error.status, str(error), error.fields)
+
+    def busy(error):
+        return AdminError(503, "The database is busy (%s); try again in a moment." % error)
+
+    def album_change(change):
+        """change(conn) in one transaction; AlbumError and a busy database answered."""
+        conn = get_conn()
+        try:
+            with conn:
+                return change(conn)
+        except albums.AlbumError as error:
+            raise album_error(error)
+        except sqlite3.IntegrityError as error:
+            raise AdminError(409, "That cannot be saved (%s)." % error)
+        except sqlite3.OperationalError as error:
+            raise busy(error)
+
+    @bp.route("/marks", methods=["POST"])
+    def set_marks():
+        """{ids, favorite?, rating?}: make pictures favorites (or not) and rate them (0: none)."""
+        data = body()
+        ids = image_ids(data.get("ids"), albums.MARK_LIMIT)
+        favorite, rating = data.get("favorite"), data.get("rating")
+        if favorite is None and rating is None:
+            raise AdminError(400, "Send favorite (true or false) or a rating (0 to 5).",
+                             {"favorite": "Send one.", "rating": "Send one."})
+        result = album_change(lambda conn: albums.set_marks(conn, ids, favorite, rating))
+        return jsonify({"changed": result["changed"], "found": result["found"],
+                        "unknown": len(ids) - result["found"],
+                        "marks": {str(image_id): mark
+                                  for image_id, mark in result["marks"].items()}})
+
+    @bp.route("/albums", methods=["GET"])
+    def album_list():
+        """Every album with its count (manual albums), by name."""
+        return jsonify({"albums": albums.list_albums(get_conn())})
+
+    @bp.route("/albums", methods=["POST"])
+    def new_album():
+        """{name, kind ("manual" or "smart"), query?, options? (smart), ids? (manual)}."""
+        data = body()
+        ids = data.get("ids")
+        ids = image_ids(ids, albums.MARK_LIMIT) if ids not in (None, []) else []
+        album = album_change(lambda conn: albums.create_album(
+            conn, data.get("name"), data.get("kind") or "manual", data.get("query"),
+            data.get("options"), ids))
+        return jsonify({"album": album}), 201
+
+    @bp.route("/albums/<int:album_id>", methods=["GET"])
+    def album_detail(album_id):
+        """One album, and the ids of a manual album's pictures in order."""
+        conn = get_conn()
+        album = albums.get_album(conn, album_id) if album_id <= IMAGE_ID_MAX else None
+        if album is None:
+            raise AdminError(404, "There is no album %d." % album_id)
+        items = albums.album_items(conn, album_id) if album["kind"] == "manual" else []
+        if album["kind"] == "manual":
+            album["count"] = len(items)
+        return jsonify({"album": album, "items": items})
+
+    @bp.route("/albums/<int:album_id>", methods=["POST"])
+    def edit_album(album_id):
+        """{name?, cover?, query?, options?}: rename an album, choose its cover, or change
+        the search of a smart album (only the fields sent change)."""
+        changes = body()
+        album = album_change(lambda conn: albums.update_album(conn, album_id, changes))
+        return jsonify({"album": album})
+
+    @bp.route("/albums/<int:album_id>/delete", methods=["POST"])
+    def remove_album(album_id):
+        """Delete an album; its pictures stay where they are."""
+        body()
+        count = album_change(lambda conn: albums.delete_album(conn, album_id))
+        return jsonify({"deleted": album_id, "pictures": count})
+
+    @bp.route("/albums/<int:album_id>/items", methods=["POST"])
+    def album_items_change(album_id):
+        """{add?: ids, remove?: ids}: put pictures in a manual album (at the end), or take
+        them out."""
+        data = body()
+        add = data.get("add")
+        remove = data.get("remove")
+        add = image_ids(add, albums.MARK_LIMIT, "add") if add not in (None, []) else []
+        remove = (image_ids(remove, albums.MARK_LIMIT, "remove") if remove not in (None, [])
+                  else [])
+        if not add and not remove:
+            raise AdminError(400, "Send the pictures to add or remove.",
+                             {"add": "Send some.", "remove": "Send some."})
+
+        def change(conn):
+            removed = albums.remove_items(conn, album_id, remove) if remove else 0
+            added = albums.add_items(conn, album_id, add) if add else {"added": 0, "found": 0}
+            return {"added": added["added"], "removed": removed,
+                    "count": len(albums.album_items(conn, album_id)),
+                    "album": albums.get_album(conn, album_id)}
+
+        return jsonify(album_change(change))
+
+    @bp.route("/albums/<int:album_id>/order", methods=["POST"])
+    def album_order(album_id):
+        """{ids, before?}: move pictures of a manual album to just before picture before
+        (null or left out: to the end); or {order}: all its pictures in a new order."""
+        data = body()
+        if "order" in data:
+            order = image_ids(data.get("order"), albums.ITEMS_LIMIT, "order")
+            new = album_change(lambda conn: albums.set_order(conn, album_id, order))
+        else:
+            ids = image_ids(data.get("ids"), albums.MARK_LIMIT)
+            before = data.get("before")
+            if before is not None and (isinstance(before, bool) or not isinstance(before, int)):
+                raise AdminError(400, "before is a picture id (or null).",
+                                 {"before": "A picture id."})
+            new = album_change(lambda conn: albums.move_items(conn, album_id, ids, before))
+        return jsonify({"order": new})
 
     def picture_file(config, image_id):
         """The full path of a present picture of a configured library; AdminError 404 otherwise."""
@@ -2131,7 +2340,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                       state.helper, max_edge=endpoint["max_image_edge"])
 
     def pending_for_endpoint(config, name):
-        counts = db.library_counts(get_conn(), prompts.PROMPT_VER)
+        counts = db.library_counts(get_conn(), stale_sql=prompts.stale_sql(config))
         total = 0
         for library in common.enabled_libraries(config):
             names = [item["name"] for item in common.endpoints_for_library(config, library)]

@@ -2,7 +2,8 @@
 """Ask LLMs to describe indexed images and store the replies.
 
 For every image that has no description yet (and, when asked, every one
-described with an older prompt), the cached preview -- or the original when
+whose description is out of date: from an older prompt, or a video's that
+talks about its frames), the cached preview -- or the original when
 there is no preview -- is shrunk with images.prepare_for_llm() and sent as a
 JPEG with the prompt from prompts.py to the library's endpoint(s). The JSON
 reply is checked and tidied by parse_reply() and stored with the image,
@@ -20,6 +21,13 @@ needs it (local_server.Lease).
 refine_pending() is the refine pass: documents and screenshots that are
 described already are described again by the library's refine endpoint
 (see refine.py), and their provenance says tier "refine".
+
+A video is described from its contact sheet. When the title or the
+description of a video's reply talks about the sheet instead of the video
+("four frames show ...", see sheet_talk), the same endpoint is asked once
+more with the same picture and one more sentence (describe_checked); the
+provenance then says "reasked": "sheet". config.json's "video_sheet_check"
+(true by default) turns this off.
 
 A reply cut off at the length limit is used when it got as far as the
 title and the description (repair; the provenance says "truncated"),
@@ -82,6 +90,7 @@ import images
 import jobs
 import llm
 import prompts
+import sheet_talk
 import videos
 from prompts import PROMPT_VER
 
@@ -686,12 +695,14 @@ _PENDING_SQL = """
 
 
 def pending_rows(conn, libraries, newest_first=None, retry_failed=False,
-                 redescribe_stale=False, ids=None, force=False):
+                 redescribe_stale=False, ids=None, force=False, stale_sql=None):
     """The images to describe, in order. Returns (rows, skipped_failed).
 
     Images that have never been described come first; then, only when
-    redescribe_stale is set, those described with an older prompt
-    (prompt_ver < PROMPT_VER). Within each group, libraries keep their
+    redescribe_stale is set, those whose description is out of date
+    (stale_sql, default prompts.stale_sql(): prompt_ver before
+    prompts.CURRENT_SINCE for their media, or a video's description that
+    talks about its frames). Within each group, libraries keep their
     config order, and each library is sorted by capture date: newest first
     when newest_first is True, oldest first when False, and by the
     library's own "newest_first" setting when None -- except that images
@@ -712,11 +723,15 @@ def pending_rows(conn, libraries, newest_first=None, retry_failed=False,
     force = bool(force) and wanted is not None
     if force:
         retry_failed = True
-    sql = _PENDING_SQL % ("1" if force else "prompt_ver < ?" if redescribe_stale else "0")
+    if force:
+        condition = "1"
+    elif redescribe_stale:
+        condition = stale_sql or prompts.stale_sql()
+    else:
+        condition = "0"
+    sql = _PENDING_SQL % condition
     for library in libraries:
-        args = ((library["id"], PROMPT_VER) if redescribe_stale and not force
-                else (library["id"],))
-        rows = conn.execute(sql, args).fetchall()
+        rows = conn.execute(sql, (library["id"],)).fetchall()
         if wanted is not None:
             # Filtered here, not in SQL: up to 1000 ids would pass the
             # parameter limit of older SQLite versions.
@@ -733,15 +748,17 @@ def pending_rows(conn, libraries, newest_first=None, retry_failed=False,
     return fresh + stale, skipped_failed
 
 
-def stale_count(conn, libraries):
-    """How many present images of these libraries were described with an older prompt."""
+def stale_count(conn, libraries, stale_sql=None):
+    """How many present images of these libraries have an out-of-date description
+    (stale_sql, default prompts.stale_sql())."""
     ids = [library["id"] for library in libraries]
     if not ids:
         return 0
     return conn.execute(
         "SELECT COUNT(*) FROM images WHERE missing_since IS NULL AND described = 1 "
-        "AND prompt_ver < ? AND library_id IN (%s)" % ",".join("?" * len(ids)),
-        [PROMPT_VER] + ids).fetchone()[0]
+        "AND %s AND library_id IN (%s)" % (stale_sql or prompts.stale_sql(),
+                                           ",".join("?" * len(ids))),
+        ids).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -960,7 +977,7 @@ _FINISH_TEXT = {"length": "the reply was cut off (max_output_tokens reached)",
 
 def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
                   helper_lock=None, image_id=0, source_path="", should_stop=None,
-                  sleep=time.sleep, max_retries=None, read_helper=None):
+                  sleep=time.sleep, max_retries=None, read_helper=None, content_retries=None):
     """Describe prepared image bytes with one endpoint. Never raises.
 
     Sends the profile's system prompt and schema with user_text (default:
@@ -970,6 +987,8 @@ def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
     retry_extra() for local servers). helper's call_api hook, if any, sees
     every request (image_id and source_path are passed on to it); an image
     it swaps in is read through read_helper (default: helper).
+    max_retries and content_retries (default MAX_RETRIES, CONTENT_RETRIES)
+    limit the two kinds of retries; 0 and 0 send a single request.
 
     A reply cut off at the length limit is closed (repair) and used when
     it got as far as the description and the title ("truncated" is then
@@ -1023,7 +1042,7 @@ def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
     last_error = None
     fallback = None         # (Repaired, cut): the best repaired reply so far
     doubled = False         # more room was asked for already
-    for attempt in range(1 + CONTENT_RETRIES):
+    for attempt in range(1 + (CONTENT_RETRIES if content_retries is None else content_retries)):
         if attempt and should_stop is not None and should_stop():
             break
         text, data, mime = user_text, jpeg, "image/jpeg"
@@ -1107,6 +1126,124 @@ def describe_jpeg(endpoint, jpeg, profile="core", user_text=None, helper=None,
     return result
 
 
+def describe_checked(endpoint, jpeg, kind="video", user_text=None, **options):
+    """describe_jpeg for a contact sheet: a video's (kind "video") or a drive's ("drive").
+
+    When the reply's title or description talks about the sheet instead
+    of the footage (sheet_talk.in_info), the same endpoint is asked once
+    more with the same picture and user_text plus sheet_talk.reask_note(kind).
+    That second request waits out rate limits and server errors like any
+    other (options' max_retries, default MAX_RETRIES), but an unusable
+    reply is not asked for again (no content retries): never more than one
+    extra answer. The second reply is kept when it is better: complete
+    (not cut off or repaired) where the first was not, or as complete and
+    with fewer phrases of sheet talk (none: fixed). Otherwise the first is
+    kept: on a tie (the second did no better, and it answered the usual
+    prompt), when the second is incomplete and the first is not (its
+    missing fields would be guessed), and when the second request gets no
+    usable answer. options are passed on to describe_jpeg (the endpoint's
+    hidden-picture rules are the caller's, as for any request).
+
+    Returns describe_jpeg's dict for the reply kept, with the requests,
+    seconds, tokens, cost and content errors of both requests, plus
+    "reasked": None when the first reply was kept as it is, else {"phrases":
+    the first reply's sheet talk, "kept": "first" or "second", "fixed": the
+    second reply was kept and has none, "left": the sheet talk of the reply
+    kept, "partial": the second reply was cut off or repaired, "settled":
+    the model answered the second request (the description then counts as
+    asked again, even when it still has sheet talk), "error": why the
+    second request got no usable answer, or ""}.
+    """
+    first = describe_jpeg(endpoint, jpeg, user_text=user_text, **options)
+    first["reasked"] = None
+    phrases = sheet_talk.in_info(first["info"]) if first["status"] == "ok" else []
+    should_stop = options.get("should_stop")
+    if not phrases or (should_stop is not None and should_stop()):
+        return first
+    text = user_text if user_text is not None else prompts.user_text(None)
+    options = dict(options, content_retries=0)
+    second = describe_jpeg(endpoint, jpeg, user_text=text + "\n\n" + sheet_talk.reask_note(kind),
+                           **options)
+    later = sheet_talk.in_info(second["info"]) if second["status"] == "ok" else None
+    if later is not None and (_partial(second), len(later)) < (_partial(first), len(phrases)):
+        keep = second           # complete, with no sheet talk or less of it
+    else:
+        keep = first            # no answer, or no better (a tie keeps the first)
+    result = dict(keep)
+    for key in ("requests", "seconds", "content_errors"):
+        result[key] = first.get(key, 0) + second.get(key, 0)
+    for key in ("tokens_in", "tokens_out", "cost"):
+        values = [item[key] for item in (first, second) if item.get(key) is not None]
+        result[key] = sum(values) if values else None
+    result["reasked"] = {
+        "phrases": phrases, "kept": "second" if keep is second else "first",
+        "fixed": keep is second and later == [], "left": later if keep is second else phrases,
+        "partial": later is not None and _partial(second),
+        "settled": second["status"] == "ok" or second.get("kind") in ("content", "image"),
+        "error": "" if second["status"] == "ok" else second.get("error") or "no answer"}
+    return result
+
+
+def _partial(result):
+    """True when a describe_jpeg result's reply was cut off or repaired (fields guessed)."""
+    return bool(result.get("truncated") or result.get("repaired") or result.get("missing"))
+
+
+def reask_note(reasked):
+    """What a log line says about a describe_checked result's "reasked" ("" for None)."""
+    if not reasked:
+        return ""
+    what = "it described the frames (%s), asked again: " % ", ".join(
+        '"%s"' % phrase for phrase in reasked["phrases"][:sheet_talk.MAX_PHRASES])
+    if reasked["fixed"]:
+        return what + "fixed"
+    if not reasked["settled"]:
+        return what + ("the second request failed (%s); kept the first answer, still out of "
+                       "date" % reasked["error"])
+    if reasked["error"]:
+        return what + ("the second answer could not be used (%s); kept the first answer"
+                       % reasked["error"])
+    if reasked["kept"] == "first" and reasked["partial"]:
+        return what + "the second answer was incomplete; kept the first answer"
+    return what + "still about the frames; kept the %s answer" % reasked["kept"]
+
+
+def reask_provenance(provenance, reasked):
+    """Record a describe_checked result's "reasked" in a provenance dict (when settled)."""
+    if reasked and reasked["settled"]:
+        provenance["reasked"] = sheet_talk.REASKED
+        provenance["reask_kept"] = reasked["kept"]
+        if reasked["left"]:
+            provenance["sheet_talk"] = reasked["left"][:sheet_talk.MAX_PHRASES]
+    return provenance
+
+
+def reask_count(summary, reasked):
+    """Count a describe_checked result's "reasked" in a run's summary: reasked (the
+    model answered the second request), reask_fixed and reask_failed (it did not)."""
+    if not reasked:
+        return
+    if reasked["settled"]:
+        summary["reasked"] += 1
+        summary["reask_fixed"] += 1 if reasked["fixed"] else 0
+    else:
+        summary["reask_failed"] += 1
+
+
+def reask_summary(what, summary):
+    """The run's line about descriptions asked again (summary's reasked, reask_fixed and
+    reask_failed; "" when there were none)."""
+    parts = []
+    if summary.get("reasked"):
+        parts.append("%d %s description(s) asked again because they described the frames; "
+                     "%d fixed." % (summary["reasked"], what, summary.get("reask_fixed", 0)))
+    if summary.get("reask_failed"):
+        parts.append("%d %s description(s) described the frames but could not be asked again "
+                     "(the second request failed): they stay out of date."
+                     % (summary["reask_failed"], what))
+    return " ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Storing results
 
@@ -1124,11 +1261,12 @@ _SHARE_SQL = """
 
 
 def store_description(conn, row, info, provenance, library_ids=None, include_stale=False,
-                      also_ids=None):
+                      also_ids=None, stale_sql=None):
     """Save a description for a row and its exact copies. Returns (stored, shared).
 
     Copies only get it when they have no description yet (or, with
-    include_stale, one from an older prompt, or when their id is in
+    include_stale, one that is out of date: stale_sql, default
+    prompts.stale_sql(); or when their id is in
     also_ids: pictures someone asked to describe again), and only in
     library_ids when given: libraries that would ask for the same thing
     (metadata profile and context notes). stored is False when the row
@@ -1141,6 +1279,7 @@ def store_description(conn, row, info, provenance, library_ids=None, include_sta
     stored = conn.execute(_STORE_SQL, (info_text, PROMPT_VER, provenance_text, now,
                                        row["id"], row["content_hash"])).rowcount == 1
     shared = 0
+    stale_sql = stale_sql or prompts.stale_sql()
     if stored and row["content_hash"] and (library_ids is None or library_ids):
         values = [info_text, PROMPT_VER, provenance_text, now]
         where = "content_hash = ? AND id <> ? AND missing_since IS NULL"
@@ -1153,14 +1292,13 @@ def store_description(conn, row, info, provenance, library_ids=None, include_sta
         if also_ids:
             # Copies the update below leaves alone (their description is
             # current) that were asked to be described again.
-            current = " AND described = 1" + (" AND prompt_ver >= ?" if include_stale else "")
+            current = " AND described = 1" + (" AND NOT " + stale_sql
+                                              if include_stale else "")
             forced = [found[0] for found in conn.execute(
-                "SELECT id FROM images WHERE " + where + current,
-                where_args + ([PROMPT_VER] if include_stale else []))
+                "SELECT id FROM images WHERE " + where + current, where_args)
                 if found[0] in also_ids]
         if include_stale:
-            where += " AND (described = 0 OR prompt_ver < ?)"
-            where_args.append(PROMPT_VER)
+            where += " AND (described = 0 OR %s)" % stale_sql
         else:
             where += " AND described = 0"
         shared = conn.execute(_SHARE_SQL + where, values + where_args).rowcount
@@ -1247,7 +1385,8 @@ def _new_summary():
     return {"described": 0, "shared": 0, "failed": 0, "skipped": 0, "skipped_failed": 0,
             "skipped_offline": 0, "skipped_hidden": 0, "pending": 0, "stale": 0,
             "stopped": False, "error": "", "fatal": False, "retired": [], "requests": 0,
-            "tokens_in": 0, "tokens_out": 0, "cost": None}
+            "tokens_in": 0, "tokens_out": 0, "cost": None, "reasked": 0, "reask_fixed": 0,
+            "reask_failed": 0}
 
 
 def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_first=None,
@@ -1258,7 +1397,8 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
 
     conn is an index.db connection; ctx a jobs.JobContext. Only enabled
     libraries are described (limited to library_ids when given): images
-    without a description, plus those described with an older prompt when
+    without a description, plus those whose description is out of date (an
+    older prompt, or a video's description that talks about its frames) when
     redescribe_stale is set (see pending_rows), at most limit of them.
     ids (image ids) limits the run to those pictures; with ids, force
     describes them again even when they have a description (the
@@ -1282,31 +1422,86 @@ def describe_pending(conn, config, ctx, helper=None, library_ids=None, newest_fi
 
     Summary keys: described, shared (copies that got the same description),
     failed, skipped, skipped_failed, skipped_offline, skipped_hidden,
-    pending, stale (described with an older prompt and not included),
+    pending, stale (out of date and not included: see pending_rows),
     stopped, error, fatal, retired (endpoint names), requests, tokens_in,
-    tokens_out, cost (None when unknown).
+    tokens_out, cost (None when unknown), reasked, reask_fixed and
+    reask_failed (videos asked again because their description talked
+    about the frames, how many of those the second answer fixed, and how
+    many could not be asked again because the second request failed: see
+    describe_checked).
+
+    A run over whole libraries (no ids, no limit) then describes the drives
+    that need it (runs of video clips, see drives.describe_drives), with a
+    model server lease held over both, so a server started for the pictures
+    is not stopped and started again for the drives; their summary is in
+    summary["drives"], and their requests, tokens and cost count in the totals.
     """
+    options = dict(helper=helper, library_ids=library_ids, newest_first=newest_first,
+                   retry_failed=retry_failed, redescribe_stale=redescribe_stale, limit=limit,
+                   endpoint_name=endpoint_name, previews=previews, sleep=sleep, ids=ids,
+                   force=force, servers=servers)
+    if ids is not None or limit is not None:
+        return _describe_pictures(conn, config, ctx, **options)
+    import drives
+    import local_server     # stdlib only; imported here to keep this module's imports short
+    work, offline = drives.reachable(drives.pending(
+        conn, config, selected_libraries(config, library_ids), redescribe_stale, retry_failed),
+        ctx, FOLDER_CHECK_TIMEOUT)
+    if not work:
+        return _describe_pictures(conn, config, ctx, **options)
+    lease = local_server.lease_for(ctx, config,
+                                   drives.endpoint_names(config, work, endpoint_name),
+                                   manager=servers)
+    try:
+        lease.acquire()     # (each pass finds and reports its own problems)
+        summary = _describe_pictures(conn, config, ctx, **options)
+        if not summary["stopped"] and not summary["fatal"] and not ctx.should_stop():
+            summary["drives"] = drives.describe_drives(
+                conn, config, ctx, selected_libraries(config, library_ids),
+                endpoint_name=endpoint_name, redescribe_stale=redescribe_stale,
+                retry_failed=retry_failed, servers=servers, sleep=sleep, work=work)
+            summary["drives"]["skipped"] += offline
+            summary["stopped"] = summary["drives"]["stopped"]
+            # (What the drives used counts in the run's totals.)
+            used = summary["drives"]
+            for key in ("requests", "tokens_in", "tokens_out"):
+                summary[key] += used[key]
+            if used["cost"] is not None:
+                summary["cost"] = (summary["cost"] or 0.0) + used["cost"]
+            if used["tokens_in"] or used["tokens_out"]:
+                ctx.log("In all (pictures and drives):" + drives.usage_text(summary))
+    finally:
+        lease.release()
+    return summary
+
+
+def _describe_pictures(conn, config, ctx, helper=None, library_ids=None, newest_first=None,
+                       retry_failed=False, redescribe_stale=False, limit=None,
+                       endpoint_name=None, previews=None, sleep=time.sleep, ids=None,
+                       force=False, servers=None):
+    """describe_pending for the pictures (the drives come after them)."""
     summary = _new_summary()
     libraries = selected_libraries(config, library_ids)
     if ids is not None:
         ids = {image_id for image_id in ids
                if isinstance(image_id, int) and not isinstance(image_id, bool)}
     force = bool(force) and ids is not None
+    stale = prompts.stale_sql(config)
     rows, summary["skipped_failed"] = pending_rows(conn, libraries, newest_first,
                                                    retry_failed, redescribe_stale,
-                                                   ids=ids, force=force)
+                                                   ids=ids, force=force, stale_sql=stale)
     rows, summary["skipped_offline"] = _drop_unreachable(rows, libraries, ctx, helper)
     if not redescribe_stale and ids is None:
         # (Not for a run over chosen pictures: the hint is about the library.)
-        summary["stale"] = stale_count(conn, libraries)
+        summary["stale"] = stale_count(conn, libraries, stale)
     if summary["skipped_failed"]:
         ctx.log("Skipping %d image(s) that failed %d times; Retry failed on the Manage page "
                 "(or scan.py --retry-failed) tries them again."
                 % (summary["skipped_failed"], MAX_FAILURES))
     if summary["stale"]:
-        ctx.log("%d image(s) have descriptions from an older prompt; Re-describe out of date "
-                "on the Manage page (or scan.py --redescribe-stale) updates them."
-                % summary["stale"])
+        ctx.log("%d image(s) have out-of-date descriptions (from an older prompt, or of a "
+                "video and about its frames); Re-describe out of date on the Manage page (or "
+                "scan.py --redescribe-stale) updates them." % summary["stale"])
     summary["pending"] = len(rows) if limit is None else min(len(rows), max(0, limit))
     if not rows:
         if ids is not None and not summary["skipped_offline"]:
@@ -1425,6 +1620,8 @@ def _execute(conn, config, ctx, summary, assigned, by_library, helper, previews,
     run.force_ids = force_ids
     run.tier = tier
     run.video_frames = videos.frame_count(config)
+    run.sheet_check = sheet_talk.enabled(config)
+    run.stale_sql = prompts.stale_sql(config)
 
     def profile_of(library):
         return "core" if tier == "refine" else library_profile(library)
@@ -1637,6 +1834,8 @@ class _DescribeRun:
         self.last_progress = self.started
         self.hashes = {}
         self.video_frames = videos.DEFAULT_FRAMES   # frames on a contact sheet made now
+        self.sheet_check = True                     # ask videos again (describe_checked)
+        self.stale_sql = None                       # prompts.stale_sql(config)
 
     # -- setting up -------------------------------------------------------------
 
@@ -1837,11 +2036,13 @@ class _DescribeRun:
                 # Not the image's fault: it works once the decoder is installed.
                 return {"status": "skipped", "error": text}
             return {"status": "error", "kind": "local", "error": text, "exception": None}
-        return describe_jpeg(state.settings, jpeg, profile=task.profile,
-                             user_text=user_text, helper=self.helper,
-                             helper_lock=self.helper_lock, image_id=row["id"],
-                             source_path=source_path, should_stop=self.should_stop,
-                             sleep=self.sleep, read_helper=self.read_helper)
+        options = dict(profile=task.profile, user_text=user_text, helper=self.helper,
+                       helper_lock=self.helper_lock, image_id=row["id"],
+                       source_path=source_path, should_stop=self.should_stop,
+                       sleep=self.sleep, read_helper=self.read_helper)
+        if _is_video(row) and self.sheet_check:
+            return describe_checked(state.settings, jpeg, "video", **options)
+        return describe_jpeg(state.settings, jpeg, **options)
 
     def run(self):
         workers = sum(state.concurrency for state in self.endpoints if not state.retired)
@@ -1909,6 +2110,7 @@ class _DescribeRun:
 
     def handle(self, task, state, result):
         self.count_usage(result)
+        reask_count(self.summary, result.get("reasked"))
         status = result["status"]
         row = task.row
         if status == "ok":
@@ -2078,6 +2280,7 @@ class _DescribeRun:
             provenance["repaired"] = True
         if partial and result.get("missing"):
             provenance["missing_fields"] = list(result["missing"])
+        reask_provenance(provenance, result.get("reasked"))
         if self.tier:
             provenance["tier"] = self.tier
             before = _json_dict(row["provenance"] if "provenance" in row.keys() else "")
@@ -2090,7 +2293,7 @@ class _DescribeRun:
                                            library_ids=self.share_ids.get(
                                                self.share_key.get(row["library_id"]), []),
                                            include_stale=self.redescribe_stale,
-                                           also_ids=self.force_ids)
+                                           also_ids=self.force_ids, stale_sql=self.stale_sql)
         if stored:
             self.summary["described"] += 1
             self.summary["shared"] += shared
@@ -2101,6 +2304,8 @@ class _DescribeRun:
                 note = ", cut off at the length limit"
             elif result.get("repaired"):
                 note = ", from a reply whose JSON broke off"
+            if result.get("reasked"):
+                note += "; " + reask_note(result["reasked"])
             self.ctx.log("%s %s (%.1f s)%s" % ("Refined" if self.tier else "Described",
                                                  row["path"], result["seconds"], note))
         else:
@@ -2127,5 +2332,8 @@ class _DescribeRun:
                 text += " (about $%.4f)" % summary["cost"]
             text += "."
         self.ctx.log(text)
+        line = reask_summary("video", summary)
+        if line:
+            self.ctx.log(line)
         if summary["stopped"]:
             self.ctx.log("Stopped. Descriptions so far are saved; run again to continue.")

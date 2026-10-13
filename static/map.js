@@ -550,6 +550,7 @@ var MAP = (function () {
         var records = [];
         var indexById = {};
         var indexLibraries = [];
+        var indexAlbums = [];
         var searchIndex = null;
         var vectorsWanted = false;
         var allLocations = null;
@@ -1281,6 +1282,35 @@ var MAP = (function () {
                         startPin = selection.point;
                     }
                     applySearch(false);
+                },
+                // The picture's albums, and the album picker's list.
+                albums: function () {
+                    return indexAlbums;
+                },
+                onMarked: function () {
+                    // (A search of favorites, a rating or an album may change.)
+                    if (selection && selection.point) {
+                        startPin = selection.point;
+                    }
+                    applySearch(false);
+                },
+                onEdited: function () {
+                    // A record changed in place (an edit; a GPS position used
+                    // or ignored, which may move other pictures too): the
+                    // search sees it, and the pins come from the server again.
+                    searchIndex = SearchCore.prepare(records);
+                    if (vectorsWanted) {
+                        SITE.attachVectors(searchIndex);
+                    }
+                    SITE.loadLocations(function (loaded) {
+                        if (loaded) {
+                            allLocations = loaded;
+                        }
+                        if (selection && selection.point) {
+                            startPin = selection.point;
+                        }
+                        applySearch(false);
+                    });
                 }
             });
             if (opened) {
@@ -1608,7 +1638,8 @@ var MAP = (function () {
                 library: library || "", libraries: indexLibraries, filters: search.filters,
                 hidden: adminOn && search.hidden, sensitive: search.sensitive || undefined,
                 junk: search.junk, group: false, sort: search.sort || undefined,
-                range: {from: search.from, to: search.to}, seed: SITE.shuffleSeed()
+                range: {from: search.from, to: search.to}, seed: SITE.shuffleSeed(),
+                albums: indexAlbums
             });
             rank = {};
             found.items.forEach(function (id, index) {
@@ -1657,6 +1688,8 @@ var MAP = (function () {
                     indexById[rec.i] = rec;
                 });
                 indexLibraries = data.libraries || [];
+                // (album: in the search names one of these.)
+                indexAlbums = Array.isArray(data.albums) ? data.albums : [];
                 searchIndex = SearchCore.prepare(records);
                 SITE.loadLocations(function (loaded) {
                     if (!loaded) {

@@ -17,9 +17,10 @@ What the model sees of a picture (picture_jpeg): its stored preview (or,
 without one, its original) made upright and at most image_embedding.max_edge
 pixels on its long edge (images.prepare_for_looks); for a 360-degree photo
 the front view its thumbnail shows, not the whole panorama; for a video its
-poster frame. Hidden pictures are embedded too: an image endpoint must be on
-this computer or the local network (there is no allow_cloud for pictures),
-and their vectors only go to the admin's pages.
+poster frame (a 360 video's front view, as its thumbnail shows it). Hidden
+pictures are embedded too: an image endpoint must be on this computer or
+the local network (there is no allow_cloud for pictures), and their vectors
+only go to the admin's pages.
 
 data/image_vectors.db is a database of its own. Deleting it is harmless but
 costly: making the vectors again takes hours on a CPU (it is a GPU job). So
@@ -380,7 +381,11 @@ def picture_jpeg(row, options, previews, config=None, helper=None, root=None):
                                           projection=row["projection"])
         else:
             data = images.read_source_bytes(full, helper)
-    return images.prepare_for_looks(data, options["max_edge"], panorama=kind == KIND_PANO)
+    # (A 360 video's poster is a stitched panorama: its front view is seen,
+    # as its thumbnail shows it.)
+    panorama = kind == KIND_PANO or (kind == KIND_POSTER and "projection" in row.keys()
+                                     and row["projection"] in imageinfo.PROJECTIONS_360)
+    return images.prepare_for_looks(data, options["max_edge"], panorama=panorama)
 
 
 def _bmp(width, height, pixel):
@@ -546,6 +551,58 @@ def read_meta():
         return None
     finally:
         store.close()
+
+
+_key_lock = threading.Lock()
+_key_memo = {"stamp": None, "key": None, "read": 0.0}
+# store_key() reads the store again after this many seconds even when its
+# files look unchanged (a write-ahead log that was reset and written again
+# can keep its size, and a file's time may lag on some systems).
+KEY_RECHECK = 2.0
+
+
+def _file_stamp(path):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def store_key():
+    """A short value that changes whenever the kept vectors do: [epoch, generation,
+    dims, native dims] of data/image_vectors.db, or None without one (or one that
+    cannot be read).
+
+    For the caches of what is worked out from the looks (the duplicate stacks
+    of search_index, the Duplicates page). Cheap: the store is only read
+    again when its file or its write-ahead log changed (every write bumps
+    the generation, in the same commit), or KEY_RECHECK seconds passed.
+    """
+    path = store_path()
+    stamp = (path, _file_stamp(path), _file_stamp(path + "-wal"))
+    now = time.monotonic()
+    with _key_lock:
+        if _key_memo["stamp"] == stamp and now - _key_memo["read"] < KEY_RECHECK:
+            return _key_memo["key"]
+    key = None
+    if stamp[1] is not None:
+        try:
+            store = connect(path, create=False)
+        except sqlite3.Error:
+            store = None
+        if store is not None:
+            try:
+                rows = _meta_rows(store)
+                key = [rows.get("epoch") or "", rows.get("generation") or "0",
+                       rows.get("dims") or "0", rows.get("native_dims") or "0"]
+            except sqlite3.Error:
+                key = None
+            finally:
+                store.close()
+    with _key_lock:
+        _key_memo.update(stamp=stamp, key=key, read=now)
+    return key
 
 
 def _set_meta(conn, values):

@@ -11,8 +11,9 @@ Anthropic's Claude). A library can also be published as a static website.
 Supported image types are JPG/JPEG, PNG, GIF, WebP, TIFF, BMP, HEIC/HEIF,
 AVIF (HEIC needs `pillow-heif`; AVIF needs a Pillow built with AVIF support)
 and Insta360 `.insp` photos. RAW files (`.dng`, `.arw`, ...) are not indexed.
-Videos (MOV, MP4, M4V, 3GP, AVI, MKV, WebM, WMV, MTS, MPEG) are indexed too
-when ffmpeg is installed: see [Videos](#videos).
+Videos (MOV, MP4, M4V, 3GP, AVI, MKV, WebM, WMV, MTS, MPEG, and Insta360
+`.insv` 360-degree videos) are indexed too when ffmpeg is installed: see
+[Videos](#videos).
 
 360-degree photos are recognised: stitched panoramas (2:1 images tagged as
 equirectangular, or from a known 360 camera) and unstitched Insta360 frames
@@ -256,8 +257,10 @@ Options:
 - `--newest-first` / `--oldest-first` choose the order images are described
   in (by default each library's `newest_first` setting).
 - `--retry-failed` also retries images the LLM failed on three times.
-- `--redescribe-stale` also describes again images described with an older
-  prompt (after the new ones). Older descriptions stay searchable until then.
+- `--redescribe-stale` also describes again images whose description is out
+  of date (an older prompt, or a video description that talks about its
+  frames, see [Videos](#videos)), after the new ones, and drives whose
+  description is. Older descriptions stay searchable until then.
 - `--limit N` describes at most N images in this run.
 - `--endpoint NAME` describes with this endpoint (or group) instead of each
   library's own.
@@ -307,8 +310,9 @@ can be found: on the PATH, or where `"ffmpeg"` in `config.json` says (see
 SETTINGS.md, "Videos"). Without them a scan lists the videos but does not
 read them, and the Manage page says once how many were found and what to
 do; videos indexed before stay as they are. A library's `videos` setting
-(**Index videos** in its settings on the Manage page) turns them off. 360
-videos (`.insv`) are not indexed.
+(**Index videos** in its settings on the Manage page) turns them off.
+Insta360 360-degree videos are indexed too: see [360-degree
+videos](#360-degree-videos).
 
 A scan reads each new or changed video once (frames are decoded on the
 processor, never the graphics card):
@@ -325,9 +329,21 @@ processor, never the graphics card):
   a name within 15 minutes of the creation time is used instead of it,
   as cameras that write when the recording ended name the file when it
   started); otherwise the file's time, as for a photo without a date (not
-  shown on the timeline or in On this day). A video that cannot be read
-  because its file cannot (a share that went away for a moment) is tried
-  again by the next scan, not marked as unreadable.
+  shown on the timeline or in On this day). Dashcams and other cameras
+  that know no time zone write their own clock's time as the creation
+  time, marked as UTC, and name the file by the same clock
+  (`20230817_142005_0412_N_A.MP4` created at 14:21:05 "UTC", when that
+  one-minute clip ended): when the creation time, read as it is, is the
+  name's time give or take two minutes (or its end: the name's time plus
+  the video's length), the name's time is taken, with no time zone shown.
+  (Phones write a real UTC time; their videos keep the rules above: never
+  for a Pixel's names, which are in UTC, or a video with a phone's own
+  tags.) Videos an older version dated hours off this way get the name's
+  time on the next scan (**Scan** on the Manage page, or `scan.py`): it
+  reads the dates of just those videos again (ffprobe only), once. A
+  video that cannot be read because its file cannot (a share that went
+  away for a moment) is tried again by the next scan, not marked as
+  unreadable.
 - A poster: the frame at 1 second (10 % into a shorter video), or a later
   one when that frame is black. It is the video's thumbnail and 2048 px
   preview, and finds look-alikes as a photo's picture does.
@@ -343,12 +359,43 @@ processor, never the graphics card):
 
 Videos never stack with photos, and with other videos only when they are
 the same file. The AI model gets the contact sheet with a note saying it
-holds four frames, in order, of a video of so many seconds, and describes
-what happens; the kind of picture is always "video" (the refine pass never
-picks videos), though what the model saw (a screen recording looks like a
-screenshot) is still searched and still counts for an export's **Leave
-out** choices. The model never hears a video's sound. Hidden videos are
-never sent to a cloud service, as with photos.
+holds four frames, in order, of a video of so many seconds, and that the
+title and description are about what happens in the video, never about
+the frames or the grid, and that a video filmed with a camera is a photo
+(even with the date, time or speed a dashcam prints on it) and only a
+recording of a screen a screenshot. The kind of picture is always "video"
+(the refine pass never picks videos), though what the model saw (a screen
+recording looks like a screenshot) is still searched and still counts for
+an export's **Leave out** choices. The model never hears a video's sound.
+Hidden videos are never sent to a cloud service, as with photos.
+
+Models still describe the sheet now and then ("Four sequential frames
+show ...", "The top-left panel shows ...", "visible in each frame"). When
+a new video's (or drive's) title or description does, the same endpoint
+is asked once more, with the same picture and one more sentence saying
+that it described the frames and is to describe the footage itself as
+one continuous scene. That request waits out rate limits and server
+errors like any other, but an unusable answer is not asked for again, so
+there is one extra answer at most. The second answer is kept when it no
+longer talks about the frames, otherwise whichever of the two does so
+less (the first on a tie, and the first when the second was cut off and
+the first was not); either way the description counts as asked again
+("reasked" in its provenance) and stays as it is. When the second request
+gets no answer at all (the service stays busy or fails), the first one
+is kept and stays out of date. The run's log says how many were asked
+again, how many that fixed and how many could not be asked again, and
+the tokens include the extra request. Video and drive descriptions that
+talk about their frames and were not asked again (made before this
+check, or whose second request failed) count as out of date: **Re-describe
+out of date** (or `scan.py --redescribe-stale`) describes them again.
+`"video_sheet_check": false` in `config.json` turns all of this off (see
+SETTINGS.md). The check reads English words, such as "four frames", "a
+sequence of dashcam footage", "in the final frame", "in the first shot",
+"the bottom two panels", "a split-screen" or "across the frames";
+"across the frame", "in the frame", "out of frame", "picture frame",
+"frame rate", "a sequence of events", "The final shot shows" and a
+dashcam's time and speed "in each frame" are ordinary video words and
+never count.
 
 In the search page, videos have a play sign and their length on the
 thumbnail (`▶ 0:24`), `is:video` (or `type:video`, or **Videos** in the
@@ -367,9 +414,160 @@ computer with **Download the original**). For those videos
 when the file is moved or renamed, and goes when the video or the
 library's indexed data is deleted.
 
+### Drives
+
+Dashcams and many action cameras cut what they record into short files, a
+minute or a few each. A run of such clips is a **drive**: videos in the
+same folder whose names follow the same pattern
+(`20230817_142005_0412_N_A.MP4`, `20230817_142105_0413_N_A.MP4`, ...), of
+the same size and kind (not 360 videos, nor any `.insv` file), each one
+starting at most 20 seconds after the one before it ended (and not before
+it ended), and each one but the last as long as the other clips of that
+recording (at least 30 seconds): a shorter clip means the recording stopped
+there. So videos started and stopped by hand one after another (a phone's
+clips of one evening) make no drives, while the long segments a camera cuts
+one recording into do, whatever their length. When the names count the
+clips (most dashcams number them), the count must go on from clip to clip:
+a drive also goes on over a few missing clips (deleted, or kept elsewhere
+as "locked" event clips) when the time between fits them (the gap is a hole
+in the drive), and two cameras of the same kind in one folder make drives
+of their own. A drive has at least three clips. Drives are worked out from
+the index whenever they are needed, so a scan that finds more clips at the
+end of a drive makes it longer (it keeps its description until the next
+describe run describes it again). `"drives"` in `config.json` changes the
+20 seconds and the three clips (see SETTINGS.md).
+
+- The search page shows each drive as one tile, a stack with its whole
+  length (`▶ Drive 1:04:30`) and the number of its clips (`×65`), which
+  opens them in the grid, in order (in the viewer, **Show its clips in the
+  grid** does the same). A drive holds the clips the search may show: not
+  hidden, sensitive or private ones the options leave out, and in the
+  search of an album (`album:`) only the album's clips, as an export of the
+  album has them. **Fold drives** next to **Group similar** shows the clips
+  one by one instead (it shows only where there are drives). The clips stay
+  searchable: a search that finds a clip shows its drive, as that clip, and
+  the clips that match are ringed when the drive is opened. With nothing
+  searched, a drive shows as its middle clip (its first is often the car
+  still parked). `is:drive` finds the clips of drives, and the word drive
+  finds them too. Selecting a drive's tile (**Select**) selects the clips
+  that match the search (all of them when the drive matched by its own
+  description), in the drive's order, and a smart album, **Copy to a new
+  album** and the album's count take a drive found by its description with
+  all of its clips.
+- The viewer plays a drive clip after clip (the next one loads while one
+  plays), with a strip under it across the whole drive: its clips (those
+  that match the search in amber, a red edge after a hole: clips the camera
+  made that are not there, also hidden ones, ones an export left out and,
+  in an album, those not in it), how far it has played, and where it is
+  ("Clip 12 of 65 · 11:04 / 1:04:30"). Click the strip to go there; with
+  the focus on it, `←` and `→` go 10 seconds back or ahead, `Page Up` and
+  `Page Down` a clip, `Home` and `End` to the start or the last clip.
+  `Space` plays and pauses. The information pane follows the clip that
+  plays, under the drive's own description, and so do the star and rating
+  above the picture and their keys (`F`, `1`-`5`, `0`, `A`): they mark the
+  clip on show. A clip of a drive plays the whole drive this way, folded or
+  not. Clips a browser cannot play (HEVC) play once they have playable
+  copies (`video_proxies`); until then, and for clips an export publishes
+  as stills only, the viewer shows a clip's still with a note for a few
+  seconds and goes on with the next one.
+- Describing (the end of every describe run over whole libraries) also
+  describes each drive once, from nine frames spread evenly over the whole
+  drive in a 3 x 3 grid, with a note that they come, in order, from a
+  drive of so many minutes made of so many clips. The description is kept
+  in `data/drives.json`, shown with the drive and searched as the drive's
+  own words, by words and by meaning: a search that matches them finds the
+  drive (as its middle clip, unless a clip matches by itself). A drive
+  with a hidden clip is only sent to endpoints on this computer or the
+  local network, and its description is yours alone: it was made from
+  that clip's frames too, so visitors, exports and the meaning vectors
+  never get it (as for its sped-up preview). One the model flagged as
+  showing private information or as sensitive is searched and shown only
+  where such pictures are.
+- Sped-up previews, off by default (`"drive_previews"`, see SETTINGS.md):
+  **Make sped-up drives** on the Manage page writes an H.264 copy of each
+  drive, 60 times faster (an hour in a minute) and 720 pixels high,
+  without sound, into `data/drive-previews/`. The viewer then offers
+  **Sped up ×60** next to the strip, and plays it by itself when the clips
+  cannot be played in the browser. Only the key frames of the clips are
+  decoded when they come often enough (most dashcams: two a second), so a
+  preview is made about as fast as the clips can be read; it takes some
+  tens of MB per hour of driving.
+- An export keeps the drives of the clips it publishes, with a hole
+  where clips are left out (as long as what is missing there), and their
+  descriptions unless its options leave out what they are flagged as
+  (private information, sensitive) or a clip of the drive is hidden; the
+  review step says how many keep theirs. It has no sped-up previews.
+
+To list the drives found, without changing anything (`--sheet FOLDER` also
+writes the 3 x 3 sheets the model sees):
+
+    python drives.py [--library NAME] [--sheet FOLDER]
+
 To see what is read from one video, without changing anything:
 
     python videos.py path/to/video.mov
+
+### 360-degree videos
+
+Insta360 cameras save a 360-degree video as
+`VID_<date>_<time>_00_<number>.insv`. The X4 keeps both lenses in that one
+file (an MP4 with the picture of each lens in a stream of its own, HEVC,
+which no browser plays as such); the ONE R (with its 360 lens) writes the
+second lens to a file of its own, `VID_<date>_<time>_10_<number>.insv`.
+Next to them the camera writes a small H.264 copy with both lenses side by
+side, the LRV: `LRV_<date>_<time>_01_<number>.lrv` (the ONE R names it
+`LRV_<date>_<time>_11_<number>.insv`). A scan indexes the first `.insv` as
+the video and pairs it with its LRV and second lens's file: the ones in the
+same folder with the same date, time and number. Those are never indexed
+on their own.
+
+The lenses of each camera's videos are measured, so only those of the X4
+and the ONE R are stitched; the videos of other Insta360 cameras are
+indexed as ordinary videos (the picture of one lens), as are videos whose
+camera the file does not name.
+
+- The poster and the contact sheet are made from the LRV's frames (without
+  one, from the two lenses put side by side, which takes some seconds per
+  video on the processor) and stitched into equirectangular panoramas the
+  way unstitched 360 photos are: the same lens model (with values for each
+  camera's videos), the same blend at the seams, the same evening out of
+  the two lenses and the same `nadir_fill_deg` and `zenith_fill_deg`. As
+  for a 360 photo, the preview is the panorama, the thumbnail (and the
+  picture "Looks like this" compares) its front view; the size shown is
+  the full panorama's (7680 x 3840 for two 3840 px lenses). The model gets
+  the four stitched frames with the video note and a note that each frame
+  is a 360-degree view.
+- The camera writes its own clock's time in the file name and the creation
+  time in UTC: the name's time is when it was taken, and the difference is
+  the time zone (`UTC+02:00`), so the videos sit among the camera's photos
+  on the timeline. (No difference says nothing: older cameras write their
+  clock's time as the creation time, so no time zone is shown.) The
+  camera's model comes from the end of the file ("Arashi Vision Insta360
+  X4", as its photos name it).
+- When an LRV or a second lens's file is added or deleted later, the next
+  scan reads the video again (its description is kept).
+- The viewer shows the poster in the 360 view at once; **Play** (or `Space`)
+  plays the LRV on the sphere: each frame is stitched as it is shown, by
+  the graphics card (WebGL), with the same lens model and seam blend as the
+  poster, so nothing is converted or stored. Drag to look around while it
+  plays; the bar under the view has play and pause, the time, a bar to move
+  in the video and the sound. Without WebGL (or in an export opened from
+  disk, where browsers do not let the 360 view read the video) it plays
+  flat: the circle of the front lens.
+- A 360 video without its LRV plays once `video_proxies` is on and
+  **Make playable copies** has run: its copy holds both lenses side by side
+  (as an LRV does), at the `height` of that setting. Until then the viewer
+  shows its poster in the 360 view and says so. (A video that holds both
+  lenses in one H.264 stream plays as it is.)
+- An export with videos included publishes the LRV (or that copy), without
+  its metadata, up to `max_video_mb` (an LRV counts as what its copy keeps:
+  not the camera's data at its end); the site's viewer plays it on the
+  sphere the same way (from a web server). Without it, the site shows the
+  poster in the 360 view.
+
+The stitch is not levelled with the camera's motion sensors: a video
+filmed with the camera tilted or upside down looks tilted, as the camera
+saw it.
 
 ## Searching
 
@@ -417,18 +615,22 @@ the page header or the filters.
 - **Group similar** shows near-duplicates (and exact copies) within each
   library as one stack with a "x3" badge; click the badge to see them all
   (copies in two different libraries show separately). The stack shows its
-  best picture: the best looking and sharpest, then the largest, then an
-  original (with a camera name and the earliest date) rather than a copy.
-  Pictures whose camera (or file name) dates them are only stacked when
-  they were taken the same day (or within 12 hours across midnight), and
-  then rather with each other than with a look-alike dated only by its
+  best picture: one you marked (a favorite, then the higher rating, then
+  one in an album; in an export only with its **marks** option), then the
+  best looking and sharpest, then the largest,
+  then an original (with a camera name and the earliest date) rather than
+  a copy. Pictures whose camera (or file name) dates them are only stacked
+  when they were taken the same day (or within 12 hours across midnight),
+  and then rather with each other than with a look-alike dated only by its
   file; pictures dated only by their file need a closer match. Shots of a
   burst or an exposure bracket (taken within two seconds) may differ a
   little more. Pictures of clearly different shapes (a photo and a
   panorama, 4:3 and 16:9, or a landscape and an upright picture: more than
   15% apart) are only stacked when they are identical files. Documents and
   screenshots are only stacked with exact copies, as different pages look
-  alike to the comparison.
+  alike to the comparison. With [looks](#looks-like-this-and-search-by-a-picture)
+  (made by an image model), stacks also go by what the pictures look like:
+  see [Duplicates by look](#duplicates-by-look).
 - **The viewer** opens when you click a thumbnail: the picture at screen
   size, arrow keys (or swiping) for the next and previous result, zoom with
   the wheel, a pinch or a double click, and the information pane (`i`):
@@ -438,7 +640,8 @@ the page header or the filters.
   of the closest pictures, and a **More like this** button (or `M`) that
   searches for all of them (see [Search by meaning](#search-by-meaning)).
   360-degree photos can be looked around in by dragging (the flat
-  panorama when the browser cannot show that).
+  panorama when the browser cannot show that), and so can 360-degree
+  videos while they play.
   "Details page" opens the same on a page of its own, to link to.
 - **The address** holds the search, the filters, the sort order and the open
   picture, so links, reloads and the Back button bring the same view back.
@@ -470,6 +673,11 @@ the page header or the filters.
   removed from the index, unless a copy of it is still there. Published
   exports and other computers see your words (never the model's text you
   replaced, nor which pictures you edited).
+- **Favorites, ratings and albums** (on this computer too): the star in the
+  viewer (or `F`) makes a picture a favorite, the five small stars (or the
+  keys `1` to `5`) rate it, `0` clears the rating, and **Add to album...**
+  (or `A`) puts it in an album; see [Favorites, ratings and
+  albums](#favorites-ratings-and-albums).
 - The **Map** shows the located pictures of the current search as pins; a
   pin with a number holds pictures taken close together, which come apart
   as you zoom in. Click a pin for a list of its pictures: click one to view
@@ -549,11 +757,24 @@ about it.
   in the place names ranks below the same word in what a picture shows: a
   room in Long Beach comes after the pictures of beaches.
 - `is:360`, `is:duplicate`, `is:undescribed`, `is:edited` - 360-degree
-  photos, pictures with near-duplicates in the same library, pictures not
-  described yet, pictures whose title, description or tags you edited
+  photos and videos, pictures with near-duplicates in the same library,
+  pictures not described yet, pictures whose title, description or tags you
+  edited
 - `is:video` (or `type:video`) - videos; `is:photo` - photos (not videos,
-  screenshots or documents)
+  screenshots or documents); `is:drive` - the clips of drives (see
+  [Drives](#drives))
+- `is:gps-ignored` - pictures whose GPS position the GPS check set aside
+  (on this computer only; see [the GPS
+  check](#positions-that-cannot-be-right-the-gps-check))
 - `lib:name` - only the pictures of one library
+- `is:favorite` - your favorites; `rating:4` - rated 4 stars,
+  `rating:>=4` (or `rating:4+`) 4 or 5 stars, `rating:<3` 1 or 2,
+  `rating:2-4` 2 to 4, `rating:0` not rated (`is:rated`, `is:unrated`)
+- `album:"Summer trip"` - the pictures of an album (its name in any case,
+  or the start of it when only one album starts so; quotes when it has
+  spaces; `album:#12` the album with id 12, which is what the albums'
+  links use when a name could mean another album). Alone it shows the
+  album in its own order.
 - `similar:1234` - the pictures most like picture 1234, closest first (what
   **More like this** searches; see below)
 - `look:1234` - the pictures that look most like picture 1234, closest
@@ -706,6 +927,126 @@ image model against vectors it made before (see `probe_check` in
 says why, and the Manage page offers **Rebuild looks** for when the
 earlier vectors were the wrong ones.
 
+### Duplicates by look
+
+With look vectors, **Group similar** and the Duplicates page also go by
+what the pictures look like, not only by their dHashes (a small picture
+fingerprint that a crop, a filter or the next shot of a burst changes).
+How close two looks are is a cosine from 0 to 1 (1: the same look):
+
+- Two pictures taken at most a minute apart (both dated to the second by
+  the camera or the file name) stack when their looks have a cosine of at
+  least 0.985, however different their dHashes are: bursts, the same view
+  taken again, copies and edits made the same moment. Taken up to ten
+  minutes apart they must look the same (0.99, as for **Same picture, any
+  date** below); taken further apart, only their dHashes can stack them.
+  On a varied library, pairs that close a minute apart were nearly always
+  one shot or the same view again, while a few minutes apart half of
+  those from 0.985 to 0.99 were other shots of the subject (the frog from
+  the side, the next patch of leaves). A stack joins another whole, and
+  only its first picture's look counts, so a long series does not chain
+  into one stack; a single picture that is nearly the same as one
+  picture of a stack taken within two seconds (the next frame of a
+  burst) joins that stack. The shape rule and **Not duplicates** still
+  apply, identical files always stack, and pictures without a time to
+  trust (no camera date, or a date without a time) never stack by their
+  look.
+- Two pictures whose looks are clearly different are not stacked however
+  close their dHashes are: a cosine of at most 0.85, or at most 0.93 when
+  they were taken more than a minute apart (coins, casino chips or the
+  sides of a mug photographed one by one on the same cloth). Every
+  picture of a stack is compared, not just its first, so a picture kept
+  out of one stack does not bring two different things together in
+  another. Alike things photographed within one minute (or without times
+  to compare) may still stack: true bursts of a dark scene came out as low
+  as 0.86, and a black-and-white copy of a photo at 0.91.
+- Only ordinary pictures go by their looks: documents, screenshots and
+  videos stack only with identical files as before (two clips of a drive,
+  or a 360-degree video's poster and a 360-degree photo of the same spot,
+  look alike without being the same), and 360-degree photos keep to their
+  dHashes, as their look is that of their front view only. Pictures with
+  little detail (a dark or plain sky picture), which their dHashes cannot
+  tell apart, may stack by their looks.
+- **Same picture, any date** on the Duplicates page finds pictures whose
+  looks have a cosine of at least 0.99 whatever their dates (a picture
+  saved twice, an edited copy, the next frame of a burst) and lists those
+  the search page does not show as one stack. It compares the pictures of
+  the library shown, or of all libraries with **All libraries** (a copy
+  kept in two libraries; each picture then says which library it is in).
+  On a library with few copies saved again on other days, most of what it
+  lists are near-identical shots of one moment that the search page put in
+  two stacks, and series without a date to go by.
+
+The cut-offs are the same for every library: near duplicates come out at
+about the same cosine everywhere, and a cut-off worked out from each
+library would change when pictures are added or hidden. They were set for
+the default image model (see [image_embedding](SETTINGS.md#image_embedding)).
+The groups are worked out again when looks are added or rebuilt (the
+search page then gets its index anew). Neither the stacks nor **Same
+picture, any date** compare every two pictures: the stacks compare a
+picture with those taken about when it was, and **Same picture, any
+date** only with pictures whose looks share enough of their signs, so both
+stay quick on large libraries.
+
+### Favorites, ratings and albums
+
+On this computer (where the Manage page works) you can mark pictures and
+put them together:
+
+- **In the viewer**, the star at the top (or `F`) makes the picture a
+  favorite (again: takes the star away), the five small stars beside it
+  (or the keys `1` to `5`) rate it, and `0` clears the rating (when the
+  picture is zoomed in, or a 360-degree view is turned, `0` first puts
+  the view back). The information pane shows the same under the title,
+  with the albums the picture is in (each opens its album) and **Add to
+  album...** (or `A`): type to find an album and press `Enter` to put the
+  picture in it (`Enter` never takes a picture out, and makes a new album
+  only when no album matches what you typed; **New album** makes one
+  whatever is listed), or click an album (clicking one the picture is in
+  takes it out again). The details page works the same way.
+- **Select** on the search page does the same for many pictures at once:
+  **Favorite** (when all of them are favorites already: takes the star
+  away), **Rate...**, **Add to album...** and **Remove from album...**.
+  Favorites carry a small star in the grid.
+- The **Favorites** and **Rating** filters count them, and `is:favorite`,
+  `rating:` and `album:` find them (see [Search syntax](#search-syntax)).
+- **Save as album** above the results keeps the search shown -- the words,
+  the filters, the library, the timeline's dates, the sort and Words /
+  Meaning -- as a **smart album**: it always holds the pictures that search
+  finds now, so new pictures join it by themselves. Saving under the name
+  of a smart album that exists changes its search. (Hiding blurry or
+  sensitive pictures alone is not a search to keep.)
+- **Albums** (in the page header) lists the albums with a cover, how many
+  pictures each shows and **Open** (a search of the album). A manual album
+  shows in its own order; **Arrange** changes it: drag the pictures (or use
+  the buttons on each one), make one the cover, or take one out (with
+  **Undo** right after). From the keyboard the arrow keys go from picture
+  to picture, `Alt` and the arrow keys move one (`Alt+Home`, `Alt+End`: to
+  the start, the end), `C` makes it the cover and `Delete` takes it out.
+  **Rename** and **Delete** (its pictures stay in the library) are there
+  too, and for a smart album **Change its search** (its search on the
+  search page, where **Save the album's search** then updates the album,
+  or saves it as a new one) and **Copy to a new album**, which makes a
+  manual album of the pictures it finds now (an export can be limited to
+  that one).
+- The **Duplicates** page shows your marks on each picture, and the
+  picture you marked (a favorite, then the higher rating, then one in an
+  album) is the best of its stack; **Keep the best** never hides a
+  picture you marked. On the search page, a stack shows that picture too
+  (in an export only with its **marks** option; without it, the stack
+  shows its best by quality).
+
+Marks and album places belong to the picture, like your own words: a file
+moved or renamed (in its library or to another one) keeps them, two files
+that swapped names swap them, and they go when the picture is removed from
+the index (a copy of it left in a library takes them; a favorite or
+rating that no copy can take, because each has its own, is noted in the
+scan's log). Other computers (a server started with `--host`) see the
+stars, the ratings and the albums that hold pictures they can see, and can
+open them, but never change them. A published site shows none of it
+unless its `marks` option says so (see [Publishing a
+library](#publishing-a-library)).
+
 ### Place names
 
 Pictures with a GPS position can be found by the town, region and country
@@ -746,6 +1087,76 @@ computers](#searching-from-other-computers)), and an export publishes them
 only when it publishes locations, with the GeoNames credit at the foot of
 its pages.
 
+### Positions that cannot be right (the GPS check)
+
+A camera writes the GPS position it has, which is not always where the
+picture was taken. A phone in an aeroplane keeps the last fix it had on
+the ground, and a camera without a GPS receiver of its own (many 360
+cameras and other cameras paired with a phone app) writes the last
+position the app gave it, which may be from the day before, at home.
+Such a picture would get the wrong place, sit in the wrong spot on the
+map and turn up in searches for a place it was never in.
+
+After every scan (and **Build previews** and **Add place names**, also
+when one was stopped, and before an export with locations) the GPS check
+looks at the positions of the pictures of all libraries together, using
+only what is already in the database, and sets aside a position when the
+data shows it cannot be right:
+
+- the GPS time saved with the picture shows the fix is older than the
+  picture: by more than 15 minutes, or by more than 5 minutes when the
+  speed the fix states would have taken the camera over 2 km away in that
+  time (a phone standing still keeps a fix of a few minutes that is
+  still right). Without a time zone every offset the picture may have
+  had must make the fix that old. Only for cameras whose other pictures
+  mostly have fresh fixes, so a camera whose clock is a few minutes off
+  keeps its positions;
+- the camera gave the same position, with the same speed, to pictures
+  taken minutes apart (a fix that says it was moving cannot stay put;
+  the first of those pictures, taken before the camera could have moved
+  away, keep theirs), or marked its fix as not valid;
+- the pictures taken nearest in time disagree: most of the 4 nearest
+  (at least 2), within 12 hours, are too far away to reach at 1,300 km/h
+  (an airliner with the jet stream behind it) in the time between them.
+  Copies of one shot count once, pictures at exactly the same position
+  (the same cached fix) do not count, and without a time zone the times
+  allow for every offset the library used within 36 hours (failing that,
+  any library's). A time zone that cannot be right for the position (a
+  phone that kept the one it had before a flight) widens the times, and
+  so does a date taken from the name of an app's export (named when it
+  was exported). A camera without a GPS receiver of its own that saves
+  no GPS time and no accuracy and gave one position to pictures taken
+  hours apart, with no other position in between (its last known
+  position), is weaker still: it is never a reference for other pictures
+  and is set aside when more than half of the pictures compared
+  contradict it, even if that is only one.
+
+A position set aside gives the picture no place: it is not on the map,
+not found by place or `has:gps` searches, and never exported (neither
+the position nor its place). Nothing is deleted: the file's own GPS data
+stays in the database, and the check decides again after every scan, so
+a position comes back when the pictures around it change, and a file
+that is changed is judged by the position it gives now. The log of a
+scan says how many positions were set aside, and the Manage page's place
+names count them.
+
+On this computer the viewer says why ("Location ignored: a picture taken
+3 minutes later is 2,100 km away.") and which place the position gave,
+with **Use this location anyway**; **Ignore location** among the
+picture's actions sets aside a position the check keeps. Your choice
+is made for every copy of the shot (an app's export of it, the same file
+in another library), follows the picture (by its content, also when it
+is moved or renamed) and survives every scan; choosing what the check
+decides anyway removes it. `is:gps-ignored` lists the pictures whose
+position is set aside. Other computers are not shown the position or
+the place (but the original file, which they can download, still holds
+its GPS data), and exports never hold them. The settings are
+`gps_check` in config.json (see SETTINGS.md): it can be turned off, and
+it can give a picture whose position was set aside the place that the
+pictures taken around the same time agree on (off by default; shown as
+"estimated from pictures taken around the same time", and exported only
+with locations, like any place name).
+
 ### Searching from other computers
 
 By default the server only answers this computer. To let the other
@@ -779,12 +1190,15 @@ a library](#publishing-a-library)): it leaves out what you choose.
 
 The header of every page links to **Duplicates**, **Manage** and
 **Settings** when the server runs on this computer (the default address,
-`127.0.0.1`). Most of what the command line does can be done there:
+`127.0.0.1`), and to **Albums** (see [Favorites, ratings and
+albums](#favorites-ratings-and-albums)). Most of what the command line
+does can be done there:
 
 - **Manage** lists each library with its folder, whether the folder can be
   reached, how many pictures are described, waiting, out of date or failed,
   and the last job. Its buttons scan a library, describe it, do both, retry
-  failed pictures, re-describe pictures described with an older prompt,
+  failed pictures, re-describe pictures whose description is out of date (an
+  older prompt, or a video description that talks about its frames),
   refine documents and screenshots (when the library names a refine
   endpoint), update search by meaning (**Update meaning search**, when it
   is set up: the card says how many pictures have a meaning vector, and
@@ -864,6 +1278,19 @@ The header of every page links to **Duplicates**, **Manage** and
   stop stacking them too. On the search page, an opened stack
   (**Review**) and the viewer's note about a folded stack (**Review
   duplicates**) open that stack on the Duplicates page.
+- **Same picture, any date** (on the Duplicates page, with
+  [looks](#looks-like-this-and-search-by-a-picture)) lists pictures that
+  look the same whenever they were taken, which the search page does not
+  stack together: a copy saved again years later, an edited or re-sent
+  copy, a picture without a date to go by, or a near-identical shot that
+  ended up in another stack (see [Duplicates by look](#duplicates-by-look)).
+  It compares the pictures of the library shown in the header, or of all
+  of them with **All libraries** (then a copy kept in another library is
+  found too). The best and the buttons are the same as for the other
+  stacks, except that **Not duplicates** here only keeps apart pictures of
+  different stacks of the search page: the pictures of one stack stay
+  stacked. A picture that is in a stack on the search page links to it
+  (**Its stack of 5**), and that stack offers the way back to the list.
 
 Only the command line can let a scan mark most of a library missing
 (`scan.py --allow-mass-removal`; a scan from Manage that stops for this
@@ -890,7 +1317,9 @@ static web host, and when opened from disk (double-click `index.html`).
 
 On the Manage page, **Export...** on a library opens a dialog:
 
-1. **Options**, in plain words: web-size pictures, originals (with their
+1. **Options**, in plain words: the whole library or only the pictures of
+   one album (the way to choose what to publish: put them in an album
+   first); web-size pictures, originals (with their
    hidden details removed) or thumbnails only; what to leave out
    (screenshots, documents, scans, videos, pictures flagged as private or
    sensitive, pictures not checked yet); whether to also publish file
@@ -971,7 +1400,27 @@ options.
   (`--file-names`), folder names (`--folders`), and GPS positions with the
   map (`--location`, which also adds the AI model's separate landmark and
   place-guess fields, and the place names: then the pages credit GeoNames
-  at their foot, the map in a corner). Hidden pictures are never published.
+  at their foot, the map in a corner). Without it, GPS positions written
+  out in the text in a picture or in its title or description (a
+  dashcam prints its position on its video, `N:12.34567 E:65.43210`, and
+  the model reads it) are taken out of them too; the frames themselves
+  still show what the camera printed. Hidden pictures are never published.
+- `--album NAME` (an album's name or id; **Which pictures** in the
+  dialog) publishes only the pictures of that manual album that are in
+  the library, still left out by the rules above when they say so; the
+  review counts only those. A smart album cannot be used: **Copy to a
+  new album** on the Albums page makes a manual one of its pictures.
+- Your favorites, ratings and album names are published only with
+  `--marks` (**Favorites, ratings and albums** in the dialog, `marks` in
+  the saved options): then the site's `is:favorite`, `rating:` and
+  `album:` work, and it lists the albums that hold published pictures
+  (in their order) and your smart albums with their searches as you saved
+  them. A smart album is left out when its search cannot be published: one
+  limited to another library, one that searches by folder, file name or
+  place (`folder:`, `file:`, `place:`, `has:gps`, the Place filter) while
+  those are not published, by library (`lib:`), or for pictures like one
+  that is not published. Without `--marks`, not even the name of the
+  album the export is limited to goes out.
 - Titles, descriptions, tags and the text read from pictures are published
   as the AI model wrote them: they can name people or places a picture
   shows, whatever the options say. Read through what you publish.
@@ -990,6 +1439,8 @@ options.
   each: copied into an MP4 without their metadata (no place, date or
   device; the picture and sound are not re-encoded). HEVC videos without
   a playable copy keep their poster only; the review step says how many.
+  A 360-degree video goes out as its LRV (or its playable copy), both
+  lenses side by side, which the site's viewer stitches as it plays.
   The AI model checked only a few still frames of each video for private
   or sensitive content and never heard its sound: watch the videos you
   publish. **Videos** under **Leave out** leaves every video out.
@@ -1043,19 +1494,23 @@ options.
   `robots.txt` says the same) unless `allow_indexing` is set, but anyone
   who has the address can open the site.
 
-Try the site with any static web server (the export prints the command for
-its folder), for example:
+Try the site on this computer with export.py's own small web server (the
+export prints the command for its folder), for example:
 
-    python -m http.server --bind 127.0.0.1 --directory data/exports/family
+    python export.py --serve data/exports/family
 
-and open http://localhost:8000/ (with `--bind 127.0.0.1` only this computer
-can open it). To publish it, copy everything in the folder to any host
-that serves plain files (GitHub Pages, Netlify, your own web server);
-nothing needs to be installed there. Export again after
+and open http://localhost:8000/ (`--port` takes another port; only this
+computer can open it; `Ctrl+C` stops it). Any static web server works
+too, but `python -m http.server` cannot move in a video (it does not
+answer the range requests browsers make for that): drives and videos only
+play from their start there. To publish it, copy everything in the folder
+to any host that serves plain files (GitHub Pages, Netlify, your own web
+server); nothing needs to be installed there. Export again after
 describing more pictures: only what changed is written.
 
 Opened from disk, the 360-degree view shows the flat panorama (browsers do
-not allow it for files); over http it can be turned around.
+not allow it for files), and a 360-degree video plays flat (its front
+lens); over http they can be turned around.
 
 ## Comparing models
 
@@ -1118,11 +1573,15 @@ left as it is.
 private:
 
 - `index.db` - the database: file names, folders, dates, camera, EXIF and
-  GPS data, the descriptions, and your own titles, descriptions and tags
-  (kept apart from the model's).
+  GPS data, the descriptions, your own titles, descriptions and tags
+  (kept apart from the model's), your favorites, ratings and albums, and
+  the positions the GPS check set aside (with your choices).
 - `thumbs.db` and `previews/` - thumbnails, and 2048 px previews, 360
   panoramas and the contact sheets of videos (about 0.5 MB per picture).
 - `proxies/` - playable copies of videos (only with `video_proxies`).
+- `drives.json` - the descriptions of drives (runs of video clips, see
+  [Drives](#drives)); `drive-previews/` - their sped-up previews (only
+  with `drive_previews`).
 - `jobs.db` and `logs/` - the Manage page's jobs and their logs, which name
   files. With the `LOG_ERRORS` environment variable set, the LLM's replies
   to failed requests are saved in `logs/` too. `logs/model-server.log` is
@@ -1149,8 +1608,8 @@ private:
   [Upgrading](#upgrading-from-an-older-version)).
 - `*.lock` files and `abort` - used while tools run.
 
-To keep the descriptions, back up `config.json`, `data/index.db` and
-`data/not-duplicates.json` while no tool is running.
+To keep the descriptions, back up `config.json`, `data/index.db`,
+`data/drives.json` and `data/not-duplicates.json` while no tool is running.
 
 ### Other tools
 
@@ -1186,6 +1645,8 @@ writes the missing or damaged ones.
 - `settings.py` - manage settings from a menu
 - `scan.py` - scan libraries, then request descriptions
 - `describe.py`, `prompts.py` - the describe step and the prompt it sends
+- `sheet_talk.py` - spots video and drive descriptions that describe the
+  frames of the contact sheet instead of the video (they are asked again)
 - `refine.py` - which pictures the refine pass describes again
 - `local_server.py` - starts and stops the local model servers (Settings
   page, describe and embed jobs, searches by meaning, the daily stop time)
@@ -1203,15 +1664,23 @@ writes the missing or damaged ones.
 - `progress.py`, `world_map.py`, `make_tiles.py`, `make_places.py` - see
   [Other tools](#other-tools)
 - `videos.py` - videos: what ffprobe says, posters, contact sheets,
-  copies without metadata and playable copies (ffmpeg)
+  copies without metadata and playable copies (ffmpeg); 360-degree videos
+  (their LRV, stitched frames, the lens geometry the viewer uses)
+- `drives.py` - drives: runs of video clips recorded one after the other,
+  their descriptions and their sped-up previews (see [Drives](#drives))
 - `places.py` - place names: the GeoNames download, the place index and
   the nearest town of a GPS position (`static/place-names.js` is their
   part of the Manage page)
+- `gps_check.py` - the GPS check: positions that cannot be where a
+  picture was taken are set aside (see [the GPS
+  check](#positions-that-cannot-be-right-the-gps-check))
 - `example_helper.py` - the hooks a helper module can have
 - `search_index.py` - the compact search records the search page downloads
   and searches in the browser, and the groups of near-duplicate pictures
 - `image_edits.py` - your own titles, descriptions and tags, kept apart
   from the model's descriptions and laid over them
+- `albums.py` - your favorites, ratings and albums (and how they follow
+  moved files)
 - `duplicates.py`, `not_duplicates.py` - the Duplicates page's stacks and
   best pictures, and the pictures kept apart as not duplicates
 - `admin.py`, `library_ops.py` - the Manage and Settings pages' server side
@@ -1223,7 +1692,8 @@ writes the missing or damaged ones.
   `embed-engine.js` and `embed-kernel.js` run the embedding model in a
   published site (only there, and only once a search needs it);
   `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
-  `duplicates.js` the Duplicates page; `manage.js` and `settings.js` run
+  `duplicates.js` the Duplicates page, `albums.js` the Albums page;
+  `manage.js` and `settings.js` run
   Manage and Settings, `model-server.js` the Settings page's Model server
   panel, and `export-review.js` holds the rules and words of the Export
   dialog)
@@ -1285,6 +1755,29 @@ Other changes to be aware of:
   the first scan after upgrading reads the videos in your libraries. The
   database gets two columns for them (`media`, `duration`), with the usual
   copy of the database as it was (`data/index.db.bak-v4`).
+- Favorites, ratings and albums are kept in three new tables of the
+  database, made by the first run after upgrading (with the usual copy of
+  the database as it was, `data/index.db.bak-v5`); nothing else changes.
+- The prompt is now version 6: only what a video is told changed (its
+  title and description are about what happens in it, never about the
+  frames the model sees). Pictures described by version 5 are up to date;
+  videos are out of date, so **Re-describe out of date** on Manage (or
+  `scan.py --redescribe-stale`) describes the videos again, and only
+  them. Until then they keep their descriptions.
+- Video descriptions of version 6 (and drive descriptions) that still
+  talk about the frames ("four frames show ...") now count as out of date
+  too, and **Re-describe out of date** describes those again, asking twice
+  when needed (see [Videos](#videos)). `"video_sheet_check": false` leaves
+  them as they are.
+- Videos from dashcams and other cameras that write their own clock's
+  time as if it were UTC were dated hours off (see [Videos](#videos)); the
+  first scan after upgrading reads the dates of those videos again and
+  gives them their names' times.
+- Insta360 360-degree videos (`.insv`) are indexed now too (see
+  [360-degree videos](#360-degree-videos)): the first scan after upgrading
+  reads them; their LRV copies and second lens files are never indexed.
+  Insta360 videos read again (changed files) also get the camera's local
+  time and time zone from their names.
 - Search by meaning now recommends a small model, mdbr-leaf-ir, which also
   runs in published sites, and its `query_prefix` is the new default.
   With Qwen3-Embedding set `query_prefix` to its instruction (see

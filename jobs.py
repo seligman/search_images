@@ -514,6 +514,8 @@ STAGE_LABELS = {
     "places": "Adding place names",
     "proxies": "Making playable copies of videos",
     "looks": "Making the looks of pictures",
+    "drives": "Describing drives",
+    "drive_previews": "Making sped-up previews of drives",
 }
 # The job queue lives in data/jobs.db, a database of its own: a running scan
 # keeps index.db's write lock almost all the time, and adding, pausing or
@@ -1549,6 +1551,8 @@ def _scan_summary(result, params, offline_fails):
         summary["describe"] = described
         if described.get("error"):
             summary["error"] = described["error"]
+    if isinstance(result.get("gps_check"), dict):
+        summary["gps_check"] = result["gps_check"]
     if isinstance(result.get("embed"), dict):
         summary["embed"] = result["embed"]
     if isinstance(result.get("looks_pending"), int):
@@ -1669,7 +1673,11 @@ def run_process(ctx, conn, config, params, helper=None):
 
 
 def run_previews(ctx, conn, config, params, helper=None):
-    """Build missing previews (and other details older rows lack); no scan, no describing."""
+    """Build missing previews (and other details older rows lack); no scan, no describing.
+
+    The GPS check (gps_check.run) follows, as after a scan (also when
+    stopped): a picture read again may have a position it had not.
+    """
     import cache
     import scan
     import videos
@@ -1697,6 +1705,12 @@ def run_previews(ctx, conn, config, params, helper=None):
             if result.get("aborted"):
                 break
     summary = {"libraries": results, "stopped": ctx.should_stop()}
+    # (Pictures read again may have positions back: check them again, also
+    # when stopped.)
+    import gps_check
+    checked = gps_check.run_safely(conn, config, ctx)
+    if checked is not None:
+        summary["gps_check"] = checked
     if params.get("library_id") and len(results) == 1 and results[0].get("offline"):
         summary["error"] = "The folder of %s is not available (offline?)." % results[0]["name"]
     return summary
@@ -1745,7 +1759,8 @@ def run_places(ctx, conn, config, params, helper=None):
     every picture is looked up again). The pictures of every library are
     looked up, enabled or not: it only touches the database, and the
     Manage page counts them all (places.status). Raises JobError when
-    there are no place names (or the download fails).
+    there are no place names (or the download fails). The GPS check
+    (gps_check.run) follows.
     """
     import places
     summary = {}
@@ -1763,6 +1778,10 @@ def run_places(ctx, conn, config, params, helper=None):
         summary["places"] = places.label_pictures(
             conn, ctx, None, redo=bool(params.get("download") or params.get("redo")
                                        or summary.get("index")))
+        import gps_check
+        checked = gps_check.run_safely(conn, config, ctx)
+        if checked is not None:
+            summary["gps_check"] = checked
     except places.PlacesError as error:
         if ctx.should_stop():
             return summary          # (cancelled: no error)
@@ -1789,6 +1808,24 @@ def run_proxies(ctx, conn, config, params, helper=None):
         raise JobError(str(error))
 
 
+def run_drive_previews(ctx, conn, config, params, helper=None):
+    """Make sped-up previews of the drives (drives.make_previews).
+
+    Only when "drive_previews" is enabled in config.json; raises JobError
+    otherwise, and when ffmpeg is missing.
+    """
+    import drives
+    import videos
+    if not drives.preview_settings(config)["enabled"]:
+        raise JobError("Sped-up previews of drives are turned off: set \"drive_previews\": "
+                       "{\"enabled\": true} in config.json first.")
+    libraries = job_libraries(config, params)
+    try:
+        return drives.make_previews(conn, config, ctx, [library["id"] for library in libraries])
+    except videos.ToolsMissing as error:
+        raise JobError(str(error))
+
+
 RUNNERS = {
     "scan": run_scan,
     "describe": run_describe,
@@ -1801,4 +1838,5 @@ RUNNERS = {
     "export": run_export,
     "places": run_places,
     "proxies": run_proxies,
+    "drive_previews": run_drive_previews,
 }

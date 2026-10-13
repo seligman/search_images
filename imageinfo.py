@@ -438,6 +438,39 @@ def exif_gps_to_decimal(gps_dict):
     return round(lat, 7), round(lon, 7)
 
 
+# A GPS position written out in text, as a dashcam prints it over its video
+# (and a model then reads it into the text of the picture): "N:12.34567
+# E:65.43210", "12.34567N 65.43210E", 12 degrees 20' 44.4" N with the
+# degree sign, "lat 12.34567", "12.34567, -65.43210". Only numbers
+# precise enough to say where (three decimals or more: about 100 m), or
+# degrees with a degree sign, go with a hemisphere letter; a plain pair
+# needs four decimals each.
+_DEGREES = (r"(?:\d{1,3}\s*\u00b0\s*\d{1,2}(?:[.,]\d+)?\s*['\u2032\u2019]"
+            r"(?:\s*\d{1,2}(?:[.,]\d+)?\s*(?:\"|''|\u2033|\u201d))?"
+            r"|\d{1,3}(?:[.,]\d+)?\s*\u00b0|\d{1,3}[.,]\d{3,})")
+_POSITION_RES = (
+    re.compile(r"(?<![A-Za-z0-9])[NSEW]\s*[:=]?\s*[-+]?" + _DEGREES),
+    re.compile(_DEGREES + r"\s*[NSEW](?![A-Za-z])"),
+    re.compile(r"(?i)\b(?:lat|latitude|lon|lng|long|longitude)\s*[:=]?\s*[-+]?"
+               r"\d{1,3}[.,]\d{3,}"),
+    re.compile(r"(?<![\d.])[-+]?\d{1,2}\.\d{4,}\s*[,;/]?\s*[-+]?\d{1,3}\.\d{4,}(?!\.?\d)"),
+)
+
+
+def scrub_positions(text):
+    """text without the GPS positions written in it (see _POSITION_RES), its spaces
+    tidied where one was taken out; other text is left as it is."""
+    if not isinstance(text, str) or not text:
+        return text
+    scrubbed = text
+    for pattern in _POSITION_RES:
+        scrubbed = pattern.sub("", scrubbed)
+    if scrubbed == text:
+        return text
+    lines = [" ".join(line.split()) for line in scrubbed.split("\n")]
+    return "\n".join(line.strip(" ,;/") for line in lines).strip()
+
+
 # Trailing words dropped from a camera maker ("NIKON CORPORATION" -> "NIKON").
 _MAKER_NOISE = {
     "co", "co.", "corp", "corp.", "corporation", "company", "inc", "inc.",

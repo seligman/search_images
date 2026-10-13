@@ -47,11 +47,12 @@ test("the address keeps a search and reads it back", function () {
                            year: ["2019"]},
                  group: false, size: "l", hidden: true, junk: true, sensitive: "show",
                  ids: "5-2.2", view: "-17.5,179.9,4", from: "2019-03", to: "2019-05-14",
-                 by: "meaning"};
+                 by: "meaning", drives: false};
     var query = SITE.searchState.params(state);
     var back = SITE.searchState.read("?" + query);
     assert.deepStrictEqual(back, state);
     assert.ok(/(^|&)by=meaning(&|$)/.test(query), query);
+    assert.ok(/(^|&)drives=0(&|$)/.test(query), query);
     // One parameter per value, named after the facet group.
     assert.ok(/(^|&)type=photo&type=doc%3Areceipt(&|$)/.test(query), query);
     assert.ok(query.indexOf("tags=sun+%26+sea") >= 0, query);
@@ -1110,6 +1111,7 @@ function fakePage(options) {
         }
     };
 
+    var timers = [];
     var window = {
         location: {protocol: "http:"},
         devicePixelRatio: 1,
@@ -1118,7 +1120,16 @@ function fakePage(options) {
         requestAnimationFrame: function () {
             return 1;
         },
-        cancelAnimationFrame: function () {}
+        cancelAnimationFrame: function () {},
+        setTimeout: function (callback, delay) {
+            timers.push({callback: callback, delay: delay, done: false});
+            return timers.length;
+        },
+        clearTimeout: function (id) {
+            if (timers[id - 1]) {
+                timers[id - 1].done = true;
+            }
+        }
     };
     if (options.fetch) {
         // Answered by the test: call.answer(width, height) or call.fail().
@@ -1154,8 +1165,22 @@ function fakePage(options) {
             return {textContent: text};
         }
     };
+    // Runs the timers that are due (all, or those of at most delay ms);
+    // returns how many ran.
+    function runTimers(delay) {
+        var ran = 0;
+        for (var k = 0; k < timers.length; k++) {
+            var timer = timers[k];
+            if (!timer.done && (delay === undefined || timer.delay <= delay)) {
+                timer.done = true;
+                ran += 1;
+                timer.callback();
+            }
+        }
+        return ran;
+    }
     return {log: log, window: window, document: document, Image: FakeImage,
-            box: new Element("div")};
+            box: new Element("div"), runTimers: runTimers, timers: timers};
 }
 
 // A WebGL context that compiles anything, takes textures up to maxTexture
@@ -1519,6 +1544,739 @@ test("an export without the video shows the poster", function () {
     });
 });
 
+/* ---------- Drives (clips played one after another) ------------------------- */
+
+var DRIVE_CLIPS = [
+    {i: 31, mv: 1, dr: 60, vc: "h264", w: 1920, hgt: 1080, t: "Leaving town", dv: 31,
+     dvt: "Coast drive", dvd: "A drive along the sea."},
+    {i: 32, mv: 1, dr: 60, vc: "h264", w: 1920, hgt: 1080, t: "Busy street", dv: 31, dx: 1},
+    {i: 33, mv: 1, dr: 22, vc: "h264", w: 1920, hgt: 1080, t: "Old bridge", dv: 31, dx: 2,
+     dh: 60}
+];
+
+// codec: of every clip (default H.264; another one this browser cannot play).
+function driveSpec(start, matched, onClip, codec) {
+    return {clips: DRIVE_CLIPS.map(function (rec) {
+        rec = codec ? Object.assign({}, rec, {vc: codec}) : rec;
+        return {id: rec.i, rec: rec, video: "/video/" + rec.i, poster: "/preview/" + rec.i,
+                original: "/image/" + rec.i, playable: !codec, duration: rec.dr,
+                hole: rec.dh || 0};
+    }), start: start, matched: matched || {}, onClip: onClip};
+}
+
+function videosOf(box) {
+    return box.children.filter(function (child) {
+        return child.tagName === "VIDEO";
+    });
+}
+
+// The stage's box in a parent, as in the viewer (the strip goes after it).
+function inParent(page) {
+    var parent = new page.box.constructor("div");
+    parent.appendChild(page.box);
+    return parent;
+}
+
+test("drive timelines: where a moment of a drive is", function () {
+    var line = format.driveTimeline([60, 60, 22.5, null]);
+    assert.deepStrictEqual(line, {starts: [0, 60, 120, 142.5], lengths: [60, 60, 22.5, 60],
+                                  total: 202.5});
+    assert.deepStrictEqual(format.drivePlace(line, 0), {index: 0, offset: 0});
+    assert.deepStrictEqual(format.drivePlace(line, 59.5), {index: 0, offset: 59.5});
+    assert.deepStrictEqual(format.drivePlace(line, 60), {index: 1, offset: 0});
+    assert.deepStrictEqual(format.drivePlace(line, 130), {index: 2, offset: 10});
+    assert.deepStrictEqual(format.drivePlace(line, 999), {index: 3, offset: 60});
+    assert.deepStrictEqual(format.drivePlace(line, -5), {index: 0, offset: 0});
+    assert.deepStrictEqual(format.drivePlace(format.driveTimeline([]), 5), {index: 0, offset: 0});
+});
+
+test("a drive plays clip after clip, the next one loading before", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        var parent = inParent(page);
+        var shown = [];
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(DRIVE_CLIPS[0], {thumb: "/thumb/31", preview: "/preview/31", video: "/video/31",
+                                    drive: driveSpec(0, {33: true}, function (index) {
+                                        shown.push(index);
+                                    })});
+        var players = videosOf(page.box);
+        assert.strictEqual(players.length, 1);
+        var first = players[0];
+        assert.strictEqual(first.src, "/video/31");
+        assert.strictEqual(first.hidden, false);
+        assert.strictEqual(stage.mode, "video");
+        assert.deepStrictEqual(shown, [0]);
+        // The strip under the stage: the clips (the one that matched marked, a
+        // hole before the last), where it is.
+        var strip = parent.children[1];
+        assert.strictEqual(strip.className, "drive-strip");
+        var label = strip.children[0];
+        var track = strip.children[1];
+        assert.strictEqual(label.textContent, "Clip 1 of 3 · 0:00 / 2:22");
+        var pieces = track.children.filter(function (child) {
+            return /drive-piece/.test(child.className);
+        });
+        assert.strictEqual(pieces.length, 3);
+        assert.ok(/is-match/.test(pieces[2].className) && /after-hole/.test(pieces[2].className));
+        assert.ok(!/is-match/.test(pieces[0].className));
+        assert.strictEqual(pieces[1].style.left, (100 * 60 / 142) + "%");
+        assert.ok(pieces[0].classList.contains("is-current"));
+        assert.strictEqual(track.getAttribute("role"), "slider");
+        // Near the end of the first clip the second one loads, out of sight.
+        first.currentTime = 50;
+        first.duration = 60;
+        first.fire("timeupdate");
+        players = videosOf(page.box);
+        assert.strictEqual(players.length, 2);
+        var spare = players[1];
+        assert.strictEqual(spare.src, "/video/32");
+        assert.strictEqual(spare.hidden, true);
+        assert.strictEqual(spare.preload, "auto");
+        assert.strictEqual(label.textContent, "Clip 1 of 3 · 0:50 / 2:22");
+        // It ends: the second plays at once, in the player that loaded it.
+        first.fire("ended");
+        assert.strictEqual(first.hidden, true);
+        assert.strictEqual(spare.hidden, false);
+        assert.strictEqual(spare.played, 1);
+        assert.strictEqual(stage.video, spare);
+        assert.deepStrictEqual(shown, [0, 1]);
+        assert.ok(pieces[1].classList.contains("is-current"));
+        assert.ok(!pieces[0].classList.contains("is-current"));
+        // Space pauses it (as for any video).
+        assert.strictEqual(stage.togglePlay(), true);
+        assert.strictEqual(spare.paused, true);
+        // Another picture takes the drive away, strip and all.
+        stage.show({i: 10, w: 400, hgt: 300}, {thumb: "/thumb/10", preview: "/preview/10"});
+        assert.strictEqual(videosOf(page.box).length, 0);
+        assert.strictEqual(parent.children.length, 1);
+        assert.strictEqual(first.src, "");
+        stage.destroy();
+    });
+});
+
+test("the strip and its keys move in the whole drive", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        inParent(page);
+        var shown = [];
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(DRIVE_CLIPS[0], {thumb: "/thumb/31", preview: "/preview/31", video: "/video/31",
+                                    drive: driveSpec(0, {}, function (index) {
+                                        shown.push(index);
+                                    })});
+        function current() {
+            return stage.video;
+        }
+        // 2:10 into the drive: 10 s into the third clip (once it has loaded).
+        stage.driveSeekTo(130);
+        assert.strictEqual(current().src, "/video/33");
+        current().videoWidth = 1920;
+        current().fire("loadedmetadata");
+        assert.strictEqual(current().currentTime, 10);
+        assert.deepStrictEqual(shown, [0, 2]);
+        // Page Up: the start of this clip, then the one before.
+        current().readyState = 1;
+        stage.driveKey("PageUp");
+        assert.strictEqual(current().currentTime, 0);
+        assert.strictEqual(current().src, "/video/33");
+        stage.driveKey("PageUp");
+        assert.strictEqual(current().src, "/video/32");
+        stage.driveKey("PageDown");
+        assert.strictEqual(current().src, "/video/33");
+        assert.strictEqual(stage.driveKey("Home"), true);
+        assert.strictEqual(current().src, "/video/31");
+        current().readyState = 1;
+        stage.driveKey("ArrowRight");
+        assert.strictEqual(current().currentTime, 10);
+        // The arrows on the player (seekBy) go across clips too.
+        stage.seekBy(55);
+        assert.strictEqual(current().src, "/video/32");
+        assert.strictEqual(stage.driveKey("x"), false);
+        assert.deepStrictEqual(shown, [0, 2, 1, 2, 0, 1]);
+        stage.destroy();
+    });
+});
+
+test("a drive this browser cannot play shows its stills; its sped-up preview plays", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        var parent = inParent(page);
+        var savedSite = global.SITE;
+        global.SITE = page.window.SITE = {drivePreviewUrl: function (rec) {
+            return "/drive-preview/" + rec.i;
+        }};
+        try {
+            var shown = [];
+            var stage = new viewer.Stage(page.box, {});
+            var rec = Object.assign({}, DRIVE_CLIPS[0], {vc: "hevc"});
+            stage.show(rec, {thumb: "/thumb/31", preview: "/preview/31", video: "/video/31",
+                             drive: driveSpec(0, {}, function (index) {
+                                 shown.push(index);
+                             }, "hevc")});
+            assert.strictEqual(videosOf(page.box).length, 0);
+            assert.ok(/can't play this video \(HEVC\)/.test(stage.note.textContent));
+            // The strip still goes through the clips: their stills.
+            stage.driveSeekTo(70);
+            assert.strictEqual(stage.img.src, "/preview/32");
+            assert.deepStrictEqual(shown, [0, 1]);
+            // The full record says there is a sped-up preview: it is shown from
+            // there (1:10 into the drive is 70 / 60 s into it).
+            stage.videoDetail({id: 31, drive: {clips: 3, preview: true, speed: 60,
+                                               copies: []}});
+            var player = videosOf(page.box)[0];
+            assert.strictEqual(player.src, "/drive-preview/31");
+            player.videoWidth = 1280;
+            player.fire("loadedmetadata");
+            assert.strictEqual(player.currentTime, 70 / 60);
+            var strip = parent.children[1];
+            assert.ok(/^×60 · Clip 2 of 3/.test(strip.children[0].textContent),
+                      strip.children[0].textContent);
+            // (No switch back to clips that cannot play.)
+            assert.strictEqual(strip.children[2].hidden, true);
+            // As it plays, the strip follows at once; the pane only once it
+            // stays on a clip (a clip a second would flicker) or is paused.
+            player.currentTime = 2.1;
+            player.fire("timeupdate");
+            assert.ok(/^×60 · Clip 3 of 3/.test(strip.children[0].textContent));
+            assert.deepStrictEqual(shown, [0, 1]);
+            player.fire("pause");
+            assert.deepStrictEqual(shown, [0, 1, 2]);
+            player.currentTime = 1.5;
+            player.fire("timeupdate");
+            assert.deepStrictEqual(shown, [0, 1, 2]);
+            assert.strictEqual(page.runTimers(), 1);
+            assert.deepStrictEqual(shown, [0, 1, 2, 1]);
+            stage.destroy();
+        } finally {
+            global.SITE = savedSite;
+        }
+    });
+});
+
+test("a drive that plays offers its sped-up preview at the same place", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        var parent = inParent(page);
+        var savedSite = global.SITE;
+        global.SITE = page.window.SITE = {drivePreviewUrl: function (rec) {
+            return "/drive-preview/" + rec.i;
+        }};
+        try {
+            var stage = new viewer.Stage(page.box, {});
+            stage.show(DRIVE_CLIPS[0], {thumb: "/thumb/31", preview: "/preview/31",
+                                        video: "/video/31", drive: driveSpec(0, {})});
+            var clipPlayer = stage.video;
+            clipPlayer.currentTime = 30;
+            clipPlayer.duration = 60;
+            clipPlayer.fire("timeupdate");
+            stage.videoDetail({id: 31, drive: {preview: true, speed: 60}});
+            var toggle = parent.children[1].children[2];
+            assert.strictEqual(toggle.hidden, false);
+            assert.strictEqual(toggle.textContent, "Sped up ×60");
+            assert.strictEqual(clipPlayer.src, "/video/31");      // (still the clips)
+            stage.driveToggle();
+            assert.strictEqual(stage.video.src, "/drive-preview/31");
+            assert.strictEqual(toggle.textContent, "Full speed");
+            assert.strictEqual(toggle.getAttribute("aria-pressed"), "true");
+            stage.video.videoWidth = 1280;
+            stage.video.fire("loadedmetadata");
+            assert.strictEqual(stage.video.currentTime, 0.5);
+            // And back: the clip at that moment, 30 s in.
+            stage.video.currentTime = 1.5;
+            stage.video.fire("timeupdate");
+            stage.driveToggle();
+            assert.strictEqual(stage.video.src, "/video/32");
+            stage.destroy();
+        } finally {
+            global.SITE = savedSite;
+        }
+    });
+});
+
+test("a clip that cannot load is not asked for again: its still shows, and the drive goes on", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        var parent = inParent(page);
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(DRIVE_CLIPS[0], {thumb: "/thumb/31", preview: "/preview/31", video: "/video/31",
+                                    drive: driveSpec(0, {})});
+        var first = stage.video;
+        first.videoWidth = 1920;
+        first.duration = 60;
+        // Near the end the next clip loads, and fails (a copy this browser
+        // cannot decode, a file that is gone).
+        first.currentTime = 50;
+        first.fire("timeupdate");
+        var spare = videosOf(page.box)[1];
+        var asked = 0;
+        var src = spare.src;
+        Object.defineProperty(spare, "src", {get: function () {
+            return src;
+        }, set: function (value) {
+            asked += 1;
+            src = value;
+        }, configurable: true});
+        spare.fire("error");
+        for (var tick = 0; tick < 40; tick++) {
+            first.currentTime = 50 + tick / 4;
+            first.fire("timeupdate");
+        }
+        assert.strictEqual(asked, 0);
+        // Its turn: its still, with why, for a moment; then the drive goes on.
+        first.fire("ended");
+        assert.strictEqual(stage.video, null);
+        assert.strictEqual(stage.img.hidden, false);
+        assert.strictEqual(stage.img.src, "/preview/32");
+        assert.ok(/can't play this video \(H\.264\)/.test(stage.note.textContent),
+                  stage.note.textContent);
+        assert.ok(/Clip 2 of 3/.test(parent.children[1].children[0].textContent));
+        assert.strictEqual(asked, 0);
+        assert.strictEqual(page.runTimers(), 1);
+        assert.strictEqual(stage.video.src, "/video/33");
+        assert.strictEqual(stage.video.played, 1);
+        assert.strictEqual(stage.note.hidden, true);
+        // Seeking back to it shows its still again (and asks for nothing).
+        stage.driveSeekTo(65);
+        assert.strictEqual(stage.img.src, "/preview/32");
+        assert.strictEqual(asked, 0);
+        stage.destroy();
+    });
+});
+
+test("each clip of a drive plays or shows its still on its own", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        var parent = inParent(page);
+        var shown = [];
+        var stage = new viewer.Stage(page.box, {});
+        // An export: only the first and last clips are published as videos;
+        // the middle one is HEVC (no copy) on the server.
+        var spec = driveSpec(0, {}, function (index) {
+            shown.push(index);
+        });
+        spec.clips[1].video = null;
+        stage.show(DRIVE_CLIPS[0], {thumb: "/thumb/31", preview: "/preview/31",
+                                    video: "/video/31", drive: spec});
+        var label = parent.children[1].children[0];
+        assert.strictEqual(stage.video.src, "/video/31");
+        // The strip goes to the clip without a video: its still, and the label.
+        stage.driveSeekTo(70);
+        assert.strictEqual(stage.video, null);
+        assert.strictEqual(stage.img.src, "/preview/32");
+        assert.strictEqual(label.textContent, "Clip 2 of 3 · 1:10 / 2:22");
+        assert.strictEqual(stage.note.textContent,
+                           "Only a still frame of this clip is published here.");
+        assert.deepStrictEqual(shown, [0, 1]);
+        // ...and to the one after it, which plays.
+        stage.driveSeekTo(125);
+        assert.strictEqual(stage.video.src, "/video/33");
+        assert.strictEqual(stage.note.hidden, true);
+        // Playing through: the first clip ends, the still shows for a moment,
+        // then the third clip plays.
+        stage.driveSeekTo(0);
+        stage.video.fire("ended");
+        assert.strictEqual(stage.img.src, "/preview/32");
+        page.runTimers();
+        assert.strictEqual(stage.video.src, "/video/33");
+        assert.strictEqual(stage.video.played, 1);
+        stage.destroy();
+    });
+});
+
+test("a drive's HEVC clips with playable copies play; the others show why not", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        inParent(page);
+        var stage = new viewer.Stage(page.box, {});
+        var rec = Object.assign({}, DRIVE_CLIPS[0], {vc: "hevc"});
+        stage.show(rec, {thumb: "/thumb/31", preview: "/preview/31", video: "/video/31",
+                         original: "/image/31", drive: driveSpec(0, {}, null, "hevc")});
+        assert.strictEqual(stage.video, null);
+        assert.ok(/HEVC/.test(stage.note.textContent));
+        // The full record: the first and last clips have a playable copy.
+        stage.videoDetail({id: 31, playable_copy: true,
+                           drive: {clips: 3, preview: false, copies: [31, 33]}});
+        assert.strictEqual(stage.video.src, "/video/31");
+        stage.driveSeekTo(130);
+        assert.strictEqual(stage.video.src, "/video/33");
+        // The one without a copy: its still, and a download of its own original.
+        stage.driveSeekTo(70);
+        assert.strictEqual(stage.video, null);
+        assert.strictEqual(stage.img.src, "/preview/32");
+        // (The fake page keeps earlier notes' children: the last one is new.)
+        var link = stage.note.children.filter(function (child) {
+            return child.tagName === "A";
+        }).pop();
+        assert.ok(link, "a download link");
+        assert.strictEqual(link.href || link.getAttribute("href"), "/image/32");
+        stage.destroy();
+    });
+});
+
+/* ---------- 360 videos -------------------------------------------------------- */
+
+var GLSL = require(path.join(__dirname, "glsl.js"));
+var FISHEYE = {lens: [[0.24925, 0.5075, 0.5], [0.75, 0.5, 0.5]], fov: 190.8, turn: [-0.4, 0],
+               front: 1, mirror: false, blend: 3, gain: [[1.02, 1, 0.98], [0.98, 1, 1.02]],
+               fill: [0, 0]};
+// (A ONE R style camera: the left lens in front, both a quarter turned.)
+var ONE_R_FISHEYE = {lens: [[0.24775, 0.4985, 0.5], [0.749, 0.5, 0.5]], fov: 188.4,
+                     turn: [90, 270], front: 0, mirror: false, blend: 3,
+                     gain: [[1, 1, 1], [1, 1, 1]], fill: [0, 0]};
+var V360_REC = {i: 21, mv: 1, p: "360", vc: "h264", dr: 12.5, w: 7680, hgt: 3840,
+                t: "A lawn", fx: FISHEYE};
+var V360_URLS = {thumb: "/thumb/21", preview: "/preview/21", pano: null, video: "/video/21",
+                 playableCopy: false, original: null};
+
+// The first <video> in a tree of fake elements.
+function videoIn(node) {
+    if (node.tagName === "VIDEO") {
+        return node;
+    }
+    for (var index = 0; index < (node.children || []).length; index++) {
+        var found = videoIn(node.children[index]);
+        if (found) {
+            return found;
+        }
+    }
+    return null;
+}
+
+function childWithClass(box, name) {
+    return box.children.filter(function (child) {
+        return String(child.className || "").split(" ").indexOf(name) >= 0;
+    })[0] || null;
+}
+
+// The 360 video shader's own lens sums (tests/js/glsl.js), with the
+// uniforms fisheyeParams gives.
+function fisheyeSums(p) {
+    function vec(values) {
+        return {x: values[0], y: values[1], z: values[2]};
+    }
+    return GLSL.functions(VIEWER.format.fisheyeShader,
+                          ["lens", "frontPoint", "backPoint", "frontWeight", "gained"],
+                          {u_front: vec(p.front), u_back: vec(p.back),
+                           u_turn: {x: p.frontTurn, y: p.backTurn}, u_aspect: p.aspect,
+                           u_scale: p.scale, u_mirror: p.mirror ? 1 : 0, u_blend: p.blend});
+}
+
+test("the 360 video lens model: lens centres, seams, gains and fills", function () {
+    var f = VIEWER.format;
+    var p = f.fisheyeParams(FISHEYE, 1664, 832);
+    assert.deepStrictEqual(p.front, [0.75, 0.5, 0.5]);
+    assert.deepStrictEqual(p.back, [0.24925, 0.5075, 0.5]);
+    assert.strictEqual(p.aspect, 0.5);
+    assert.ok(Math.abs(p.backTurn + 0.4 * Math.PI / 180) < 1e-12);
+    assert.ok(Math.abs(p.blend - 3 * Math.PI / 180) < 1e-12);
+    assert.deepStrictEqual(p.frontGain, [1.02, 1, 0.98]);
+    var sums = fisheyeSums(p);
+    // Straight ahead: the middle of the front lens, all of it.
+    var ahead = sums.frontPoint({x: 0, y: 0, z: 1});
+    assert.deepStrictEqual([ahead.x, ahead.y, sums.frontWeight({x: 0, y: 0, z: 1})],
+                           [0.75, 0.5, 1]);
+    // Straight behind: the middle of the back lens.
+    var behind = sums.backPoint({x: 0, y: 0, z: -1});
+    assert.ok(Math.abs(behind.x - 0.24925) < 1e-9);
+    assert.strictEqual(sums.frontWeight({x: 0, y: 0, z: -1}), 0);
+    // On a seam both lenses count alike.
+    assert.ok(Math.abs(sums.frontWeight({x: 1, y: 0, z: 0}) - 0.5) < 1e-12);
+    // A lens's gain fades out towards white.
+    assert.ok(Math.abs(sums.gained(0.5, 1.1) - 0.5 * Math.pow(1.1, 1 - 0.0625)) < 1e-12);
+    assert.strictEqual(sums.gained(1, 1.2), 1);
+    // A camera whose lenses are laid sideways in the frame (a quarter turn).
+    var sideways = f.fisheyeParams(ONE_R_FISHEYE, 736, 368);
+    var up = fisheyeSums(sideways).frontPoint({x: 0, y: 0.5, z: Math.sqrt(0.75)});
+    // (Up is towards the frame's outer edge: left of the left lens's centre.)
+    assert.ok(up.x < ONE_R_FISHEYE.lens[0][0] &&
+              Math.abs(up.y - ONE_R_FISHEYE.lens[0][1]) < 1e-9, JSON.stringify(up));
+    // The blend is never wider than what the lenses see past 180 degrees.
+    var narrow = f.fisheyeParams(Object.assign({}, FISHEYE, {fov: 184, blend: 9}), 1664, 832);
+    assert.ok(Math.abs(narrow.blend - 2 * Math.PI / 180) < 1e-12);
+    assert.strictEqual(f.fisheyeParams(null, 1664, 832), null);
+    assert.strictEqual(f.fisheyeParams(Object.assign({}, FISHEYE, {fov: 60}), 1664, 832), null);
+    assert.strictEqual(f.fisheyeParams(FISHEYE, 0, 832), null);
+});
+
+test("a 360 video's full record becomes its compact record", function () {
+    var rec = SITE.compactRecord({id: 21, library_id: "lib_x", name: "VID_1.insv",
+                                  path: "VID_1.insv", width: 7680, height: 3840,
+                                  projection: "dual_fisheye", media: "video", duration: 12.5,
+                                  video: {codec: "hevc", lrv: {codec: "h264"}, fisheye: FISHEYE},
+                                  info: null});
+    assert.deepStrictEqual(rec, {i: 21, l: "lib_x", n: "VID_1.insv", w: 7680, hgt: 3840,
+                                 p: "360", mv: 1, ty: "video", dr: 12.5, vc: "h264",
+                                 fx: FISHEYE});
+    // A geometry of another shape is left out; no pano for a video.
+    var bad = SITE.compactRecord({id: 22, projection: "dual_fisheye", media: "video",
+                                  video: {codec: "hevc", fisheye: {lens: [[1, 2]]}}});
+    assert.strictEqual(bad.fx, undefined);
+    assert.strictEqual(SITE.panoUrl(V360_REC), null);
+});
+
+test("a 360 video starts as its poster in the 360 view, then plays on the sphere", function () {
+    return onFakePage({webgl: true, fetch: true}, function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(V360_REC, V360_URLS);
+        assert.deepStrictEqual(page.log.images.map(function (image) {
+            return image.src;
+        }), ["/preview/21"]);
+        page.log.images[0].finish(2048, 1024);
+        // The poster (a stitched panorama) in the 360 view, as a 360 photo.
+        assert.strictEqual(stage.mode, "pano");
+        assert.strictEqual(page.log.uploads.length, 1);
+        // The player: never shown (its frames go to the 360 view), with
+        // controls of the stage's own.
+        var video = stage.video;
+        assert.ok(video, "a player");
+        assert.strictEqual(video.src, "/video/21");
+        assert.strictEqual(videoIn(page.box), null);
+        var controls = childWithClass(page.box, "stage-controls");
+        assert.ok(controls, "controls");
+        assert.ok(page.box.classList.contains("has-controls"));
+        var play = controls.children[0];
+        assert.strictEqual(play.getAttribute("aria-label"), "Play");
+        // Play: each frame is uploaded and stitched.
+        video.videoWidth = 1664;
+        video.videoHeight = 832;
+        video.readyState = 4;
+        video.duration = 12.5;
+        play.fire("click");
+        assert.strictEqual(video.played, 1);
+        video.fire("play");
+        assert.strictEqual(page.log.uploads.length, 2);
+        assert.strictEqual(page.log.uploads[1], video);
+        assert.strictEqual(stage.pano.current, stage.pano.fisheye);
+        assert.strictEqual(play.getAttribute("aria-label"), "Pause");
+        assert.strictEqual(controls.children[1].textContent, "0:00 / 0:12");
+        // Moved while paused: that frame.
+        video.paused = true;
+        video.fire("seeked");
+        assert.strictEqual(page.log.uploads.length, 3);
+        // Space plays and pauses; the view still turns.
+        assert.strictEqual(stage.togglePlay(), true);
+        assert.strictEqual(video.played, 2);
+        // No large panorama is asked for.
+        assert.strictEqual(page.log.fetches.length, 0);
+        // The next picture stops it and takes the controls away.
+        stage.show({i: 10, w: 400, hgt: 300}, {thumb: "/thumb/10", preview: "/preview/10"});
+        assert.strictEqual(video.paused, true);
+        assert.strictEqual(video.src, "");
+        assert.strictEqual(childWithClass(page.box, "stage-controls"), null);
+        assert.ok(!page.box.classList.contains("has-controls"));
+        stage.destroy();
+    });
+});
+
+test("without the 360 view a 360 video plays flat: its front lens", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(V360_REC, V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        var box = childWithClass(page.box, "stage-fisheye");
+        assert.ok(box, "a square for the lens");
+        var video = videoIn(box);
+        assert.strictEqual(video.src, "/video/21");
+        assert.strictEqual(video.controls, true);
+        // The right lens is the front one here.
+        assert.strictEqual(video.style.objectPosition, "100% 50%");
+        assert.strictEqual(stage.mode, "video");
+        assert.ok(/this is the front lens/.test(stage.note.textContent), stage.note.textContent);
+        stage.layout();
+        assert.strictEqual(box.style.width, "600px");
+        assert.strictEqual(box.style.height, "600px");
+        stage.show({i: 10, w: 400, hgt: 300}, {thumb: "/thumb/10", preview: "/preview/10"});
+        assert.strictEqual(childWithClass(page.box, "stage-fisheye"), null);
+        stage.destroy();
+    });
+});
+
+test("frames the 360 view may not read play flat from where they were", function () {
+    return onFakePage({webgl: true, fetch: false}, function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(V360_REC, V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        var video = stage.video;
+        video.videoWidth = 1664;
+        video.videoHeight = 832;
+        video.readyState = 4;
+        video.currentTime = 4.5;
+        // (A video from another origin, an export opened from disk.)
+        stage.pano.gl.texImage2D = function () {
+            throw new Error("SecurityError");
+        };
+        video.paused = false;
+        video.fire("play");
+        assert.strictEqual(stage.pano, null);
+        var flat = videoIn(childWithClass(page.box, "stage-fisheye"));
+        assert.ok(flat);
+        flat.fire("loadedmetadata");
+        assert.strictEqual(flat.currentTime, 4.5);
+        assert.strictEqual(flat.played, 1);
+        stage.destroy();
+    });
+});
+
+test("a 360 video without a playable copy shows its poster in the 360 view", function () {
+    return onFakePage({webgl: true, fetch: false}, function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        // (An LRV in HEVC, which this browser does not play.)
+        stage.show(Object.assign({}, V360_REC, {vc: "hevc"}), V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        assert.strictEqual(stage.mode, "pano");
+        assert.strictEqual(stage.video, null);
+        assert.ok(/can't play this video \(HEVC\)/.test(stage.note.textContent));
+        // The full record says the proxies job made a copy: it plays.
+        stage.videoDetail({id: 21, playable_copy: true});
+        assert.strictEqual(stage.video.src, "/video/21");
+        assert.strictEqual(stage.mode, "pano");
+        // An export without the video: the poster in the 360 view.
+        stage.show(V360_REC, {thumb: "t.jpg", preview: "p.jpg", video: null,
+                              videoNote: "Only a still frame of this video is published here."});
+        page.log.images[1].finish(2048, 1024);
+        assert.strictEqual(stage.mode, "pano");
+        assert.strictEqual(stage.video, null);
+        assert.strictEqual(stage.note.textContent,
+                           "Only a still frame of this video is published here.");
+        // A record without its lens geometry cannot be stitched.
+        var plain = Object.assign({}, V360_REC);
+        delete plain.fx;
+        stage.show(plain, V360_URLS);
+        page.log.images[2].finish(2048, 1024);
+        assert.strictEqual(stage.video, null);
+        assert.ok(/can't be played here/.test(stage.note.textContent));
+        stage.destroy();
+    });
+});
+
+test("a 360 video with no LRV waits for a playable copy, whatever the browser plays", function () {
+    // (Its record has no codec: lens streams play only as a copy.)
+    var rec = Object.assign({}, V360_REC);
+    delete rec.vc;
+    return onFakePage({webgl: true, fetch: false, canPlayType: function () {
+        return "probably";
+    }}, function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(rec, V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        assert.strictEqual(stage.mode, "pano");
+        assert.strictEqual(stage.video, null);
+        assert.strictEqual(stage.note.textContent, "Only a still frame of this video is shown here.");
+        assert.ok(!/browser/.test(stage.note.textContent));
+        // The full record says the proxies job made a copy: it plays.
+        stage.videoDetail({id: 21, playable_copy: true});
+        assert.strictEqual(stage.video.src, "/video/21");
+        // A copy known at once plays at once.
+        stage.show(rec, Object.assign({}, V360_URLS, {playableCopy: true}));
+        page.log.images[1].finish(2048, 1024);
+        assert.strictEqual(stage.video.src, "/video/21");
+        // The full record may come before the poster: it plays once that is there.
+        stage.show(rec, V360_URLS);
+        stage.videoDetail({id: 21, playable_copy: true});
+        assert.strictEqual(stage.video, null);
+        page.log.images[2].finish(2048, 1024);
+        assert.strictEqual(stage.video.src, "/video/21");
+        // ... for that showing only.
+        stage.show(rec, V360_URLS);
+        page.log.images[3].finish(2048, 1024);
+        assert.strictEqual(stage.video, null);
+        stage.destroy();
+    });
+});
+
+test("the admin is told what makes a 360 video without an LRV play", function () {
+    var rec = Object.assign({}, V360_REC);
+    delete rec.vc;
+    return onFakePage({webgl: true, fetch: false}, function (viewer, page) {
+        global.SITE = page.window.SITE = {capabilities: {admin: true, static: false}};
+        global.SHELL = page.window.SHELL = {admin: true};
+        try {
+            var stage = new viewer.Stage(page.box, {});
+            stage.show(rec, V360_URLS);
+            page.log.images[0].finish(2048, 1024);
+            assert.ok(/no low-resolution copy \(\.lrv\)/.test(stage.note.textContent),
+                      stage.note.textContent);
+            assert.ok(/Make playable copies/.test(stage.note.textContent));
+            stage.destroy();
+        } finally {
+            delete global.SITE;
+            delete global.SHELL;
+        }
+    });
+});
+
+test("a 360 video whose file cannot be loaded does not blame the browser", function () {
+    return onFakePage({webgl: true, fetch: false}, function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(V360_REC, V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        // (H.264, which this browser plays: the server had nothing to send.)
+        stage.video.fire("error");
+        assert.strictEqual(stage.video, null);
+        assert.strictEqual(stage.note.textContent, "This 360\u00b0 video could not be loaded.");
+        stage.destroy();
+    });
+});
+
+test("a 360 video whose lens lies sideways plays flat turned upright", function () {
+    return onFakePage(videoPage(), function (viewer, page) {
+        var stage = new viewer.Stage(page.box, {});
+        stage.show(Object.assign({}, V360_REC, {fx: ONE_R_FISHEYE}), V360_URLS);
+        page.log.images[0].finish(2048, 1024);
+        var box = childWithClass(page.box, "stage-fisheye");
+        var video = videoIn(box);
+        // The left lens is the front one; turned a quarter clockwise, under
+        // the stage's own controls (the browser's would turn with it).
+        assert.strictEqual(video.style.objectPosition, "0% 50%");
+        assert.strictEqual(video.style.transform, "rotate(90deg)");
+        assert.strictEqual(video.controls, false);
+        var controls = childWithClass(page.box, "stage-controls");
+        assert.ok(controls, "controls");
+        controls.children[0].fire("click");
+        assert.strictEqual(video.played, 1);
+        stage.show({i: 10, w: 400, hgt: 300}, {thumb: "/thumb/10", preview: "/preview/10"});
+        assert.strictEqual(childWithClass(page.box, "stage-controls"), null);
+        stage.destroy();
+    });
+});
+
+test("one stage: a drive, a 360 video whose full record comes early, then a video", function () {
+    // (The full record of each goes where it belongs: Stage.videoDetail.)
+    var v360 = Object.assign({}, V360_REC);
+    delete v360.vc;
+    return onFakePage({webgl: true, fetch: false, canPlayType: function () {
+        return "";
+    }}, function (viewer, page) {
+        inParent(page);
+        var stage = new viewer.Stage(page.box, {});
+        // A drive of HEVC clips: the full record of a clip without a copy
+        // still says which other clips have one.
+        stage.show(Object.assign({}, DRIVE_CLIPS[0], {vc: "hevc"}),
+                   {thumb: "/thumb/31", preview: "/preview/31", video: "/video/31",
+                    original: "/image/31", drive: driveSpec(0, {}, null, "hevc")});
+        assert.strictEqual(stage.video, null);
+        stage.videoDetail({id: 31, playable_copy: false,
+                           drive: {clips: 3, preview: false, copies: [32]}});
+        assert.strictEqual(stage.video, null);
+        stage.driveSeekTo(70);
+        assert.strictEqual(stage.video.src, "/video/32");
+        // A 360 video: no drive any more; its copy plays once its poster is there.
+        stage.show(v360, V360_URLS);
+        assert.strictEqual(stage.drive, null);
+        assert.strictEqual(stage.video, null);
+        stage.videoDetail({id: 21, playable_copy: true,
+                           drive: {clips: 3, preview: true, copies: [21]}});
+        assert.strictEqual(stage.video, null);
+        assert.strictEqual(stage.drive, null);
+        page.log.images[page.log.images.length - 1].finish(2048, 1024);
+        assert.strictEqual(stage.video.src, "/video/21");
+        assert.strictEqual(stage.mode, "pano");
+        // A video this browser cannot play: only its own full record starts it.
+        stage.show(Object.assign({}, VIDEO_REC, {vc: "hevc"}), VIDEO_URLS);
+        assert.strictEqual(stage.video, null);
+        stage.videoDetail({id: 21, playable_copy: true});
+        assert.strictEqual(stage.video, null);
+        stage.videoDetail({id: 9, playable_copy: true});
+        assert.strictEqual(stage.video.src, "/video/9");
+        assert.strictEqual(stage.drive, null);
+        stage.destroy();
+    });
+});
+
 /* A fake page with what the viewer's lightbox (VIEWER.open) needs too: a
    body, keyboard listeners on the document and the focus. page.key(name,
    target) sends a keydown to the document's listeners and returns the
@@ -1664,6 +2422,252 @@ test("in the viewer Space plays a video, though the focus is on Close", function
         }));
         page.key("Escape");
         assert.strictEqual(closed, 1);
+    });
+});
+
+function textOf(node) {
+    if (!node) {
+        return "";
+    }
+    return (node.textContent || "") + (node.children || []).map(textOf).join(" ");
+}
+
+test("in the viewer a drive plays as one and the pane follows its clips", function () {
+    var records = {};
+    DRIVE_CLIPS.forEach(function (rec) {
+        records[rec.i] = rec;
+    });
+    records[10] = {i: 10, w: 400, hgt: 300, t: "Cat"};
+    return onLightboxPage(videoPage(), function (viewer, page) {
+        assert.ok(viewer.open({ids: [32, 10], index: 0, get: function (id) {
+            return records[id] || null;
+        }, driveOf: function (id) {
+            return id === 32 ? {key: 31, clips: [31, 32, 33], matched: {32: true}, text: 31,
+                                folded: false} : null;
+        }}));
+        // It starts at the clip that matched; the title is the drive's.
+        var video = lightboxVideo(page);
+        assert.strictEqual(video.src, "/video/32");
+        var strip = byClass(page.document.body, "drive-strip")[0];
+        assert.ok(strip, "a strip");
+        assert.strictEqual(byClass(page.document.body, "viewer-title")[0].textContent,
+                           "Coast drive");
+        var pane = byClass(page.document.body, "viewer-info")[0];
+        assert.ok(/Busy street/.test(textOf(pane)), textOf(pane));
+        assert.ok(/A drive along the sea\./.test(textOf(pane)));
+        assert.ok(/Clip 2 of 3/.test(textOf(pane)));
+        // The clip ends: the next plays and the pane follows it.
+        video.fire("ended");
+        assert.ok(/Old bridge/.test(textOf(pane)), textOf(pane));
+        assert.ok(/Clip 3 of 3/.test(textOf(pane)));
+        // With the focus on the strip the keys move in the drive...
+        var track = byClass(strip, "drive-track")[0];
+        var event = page.key("Home", track);
+        assert.ok(event.prevented);
+        assert.strictEqual(lightboxVideo(page).src, "/video/31");
+        assert.ok(/Leaving town/.test(textOf(pane)));
+        // ...and elsewhere the arrows go to the next result, which ends the drive.
+        page.key("ArrowRight");
+        assert.strictEqual(byClass(page.document.body, "drive-strip").length, 0);
+        assert.strictEqual(lightboxVideo(page), null);
+        page.key("Escape");
+    });
+});
+
+test("in the viewer a folded drive opens in the grid, and the pane stays on the clip that plays", function () {
+    var records = {};
+    DRIVE_CLIPS.forEach(function (rec) {
+        records[rec.i] = Object.assign({}, rec);
+    });
+    return onLightboxPage(videoPage(), function (viewer, page) {
+        var expanded = [];
+        var folded = true;
+        assert.ok(viewer.open({ids: [32], index: 0, get: function (id) {
+            return records[id] || null;
+        }, driveOf: function () {
+            return {key: 31, clips: [31, 32, 33], matched: {}, text: 31, folded: folded};
+        }, onExpandDrive: function (id) {
+            expanded.push(id);
+            folded = false;
+            viewer.update([31, 32, 33]);
+        }}));
+        // A note under the stage: the drive's clips, and a button (the
+        // keyboard's way to open it in the grid).
+        var note = byClass(page.document.body, "viewer-stack")[0];
+        assert.strictEqual(note.hidden, false);
+        assert.ok(/A drive of 3 clips/.test(textOf(note)), textOf(note));
+        var button = note.children.filter(function (child) {
+            return child.tagName === "BUTTON";
+        })[0];
+        button.fire("click");
+        assert.deepStrictEqual(expanded, [32]);
+        assert.strictEqual(note.hidden, true);
+        // The next clip plays: the pane follows it, and stays on it when it
+        // is drawn again (meaning vectors arrived) or a clip is edited.
+        lightboxVideo(page).fire("ended");
+        var pane = byClass(page.document.body, "viewer-info")[0];
+        assert.ok(/Old bridge/.test(textOf(pane)), textOf(pane));
+        viewer.refreshInfo();
+        assert.ok(/Old bridge/.test(textOf(pane)), textOf(pane));
+        assert.ok(/Clip 3 of 3/.test(textOf(pane)));
+        assert.strictEqual(byClass(page.document.body, "viewer-title")[0].textContent,
+                           "Coast drive");
+        page.key("Escape");
+    });
+});
+
+test("in a drive the viewer's marks go with the clip on show", function () {
+    var records = {};
+    DRIVE_CLIPS.forEach(function (rec) {
+        records[rec.i] = Object.assign({}, rec);
+    });
+    var sent = [];
+    var shell = {
+        admin: function (url, body) {
+            sent.push([url, JSON.parse(JSON.stringify(body))]);
+            var marks = {};
+            body.ids.forEach(function (id) {
+                var rec = records[id];
+                marks[id] = {favorite: body.favorite !== undefined ? body.favorite
+                    : Boolean(rec.fav), rating: body.rating !== undefined ? body.rating
+                    : rec.rt || 0};
+            });
+            return Promise.resolve({changed: body.ids.length, marks: marks});
+        },
+        toast: function () {}
+    };
+    var saved = {capabilities: SITE.capabilities, loadRecord: SITE.loadRecord,
+                 shell: global.SHELL};
+    function restore() {
+        SITE.capabilities = saved.capabilities;
+        SITE.loadRecord = saved.loadRecord;
+        if (saved.shell === undefined) {
+            delete global.SHELL;
+        } else {
+            global.SHELL = saved.shell;
+        }
+    }
+    SITE.capabilities = {admin: true, static: false};
+    // Each clip's full record: its size shows in the pane (clip 32: 2 MB).
+    SITE.loadRecord = function (id, callback) {
+        callback({id: id, size: (id - 30) * 1048576});
+    };
+    global.SHELL = shell;
+    return onLightboxPage(videoPage(), function (viewer, page) {
+        page.window.SHELL = shell;
+        assert.ok(viewer.open({ids: [32], index: 0, get: function (id) {
+            return records[id] || null;
+        }, driveOf: function () {
+            return {key: 31, clips: [31, 32, 33], matched: {}, text: 31, folded: false};
+        }}));
+        var pane = byClass(page.document.body, "viewer-info")[0];
+        function barStar() {
+            return byClass(page.document.body, "viewer-star")[0];
+        }
+        function paneStar() {
+            return byClass(pane, "info-mark-favorite")[0];
+        }
+        assert.ok(/\b2(\.0)? MB/.test(textOf(pane)), textOf(pane));
+        // The drive goes on to clip 33, which the pane follows.
+        lightboxVideo(page).fire("ended");
+        assert.ok(/Old bridge/.test(textOf(pane)), textOf(pane));
+        assert.ok(/\b3(\.0)? MB/.test(textOf(pane)), textOf(pane));
+        // F marks the clip on show, not the one the viewer was opened on...
+        assert.ok(page.key("f").prevented);
+        return settle().then(function () {
+            assert.deepStrictEqual(sent, [["/marks", {ids: [33], favorite: true}]]);
+            assert.strictEqual(records[33].fav, 1);
+            assert.strictEqual(records[32].fav, undefined);
+            // ...the bar's star says so, and the pane is still the clip's own:
+            // its title and its own details.
+            assert.strictEqual(barStar().getAttribute("aria-pressed"), "true");
+            assert.strictEqual(paneStar().getAttribute("aria-pressed"), "true");
+            assert.ok(/Old bridge/.test(textOf(pane)), textOf(pane));
+            assert.ok(/\b3(\.0)? MB/.test(textOf(pane)), textOf(pane));
+            assert.ok(!/\b2(\.0)? MB/.test(textOf(pane)), textOf(pane));
+            page.key("4");
+            return settle();
+        }).then(function () {
+            assert.deepStrictEqual(sent[1], ["/marks", {ids: [33], rating: 4}]);
+            assert.strictEqual(records[33].rt, 4);
+            // The pane's own star on that clip: saved, and drawn again (not
+            // left pressed and disabled).
+            paneStar().fire("click");
+            return settle();
+        }).then(function () {
+            assert.deepStrictEqual(sent[2], ["/marks", {ids: [33], favorite: false}]);
+            assert.strictEqual(paneStar().getAttribute("aria-pressed"), "false");
+            assert.ok(!paneStar().disabled);
+            assert.strictEqual(barStar().getAttribute("aria-pressed"), "false");
+            // Back at the start of the drive: the bar is clip 31's again.
+            var track = byClass(page.document.body, "drive-track")[0];
+            page.key("Home", track);
+            assert.ok(/Leaving town/.test(textOf(pane)), textOf(pane));
+            page.key("f");
+            return settle();
+        }).then(function () {
+            assert.deepStrictEqual(sent[3], ["/marks", {ids: [31], favorite: true}]);
+            assert.strictEqual(records[33].fav, undefined);
+            page.key("Escape");
+        });
+    }).then(function (value) {
+        restore();
+        return value;
+    }, function (error) {
+        restore();
+        throw error;
+    });
+});
+
+test("in the viewer a slider keeps its arrows, but not the viewer's other keys", function () {
+    var records = {9: VIDEO_REC, 10: {i: 10, w: 400, hgt: 300, t: "Cat"}};
+    return onLightboxPage(videoPage(), function (viewer, page) {
+        assert.ok(viewer.open({ids: [9, 10], index: 0, get: function (id) {
+            return records[id] || null;
+        }}));
+        var video = lightboxVideo(page);
+        // (A 360 video's seek bar, say.)
+        var slider = new page.box.constructor("input");
+        slider.type = "range";
+        var info = byClass(page.document.body, "viewer-info-toggle")[0];
+        var before = info.getAttribute("aria-pressed");
+        page.key("i", slider);
+        assert.notStrictEqual(info.getAttribute("aria-pressed"), before);
+        assert.ok(page.key(" ", slider).prevented);
+        assert.strictEqual(video.paused, false);
+        // Its arrows move it: the picture stays.
+        assert.strictEqual(page.key("ArrowRight", slider).prevented, false);
+        assert.strictEqual(page.key("End", slider).prevented, false);
+        assert.strictEqual(lightboxVideo(page), video);
+        // A box to type in keeps every key.
+        var box = new page.box.constructor("input");
+        box.type = "text";
+        before = info.getAttribute("aria-pressed");
+        page.key("i", box);
+        assert.strictEqual(info.getAttribute("aria-pressed"), before);
+        page.key("Escape");
+    });
+});
+
+test("a drive shows a hole where its clips are not there (an album's clips)", function () {
+    var records = {};
+    // Clips 1 and 3 of a drive and its clip 4 (dx 0, 2, 3): one is missing.
+    [{i: 71, dx: 0}, {i: 73, dx: 2}, {i: 74, dx: 3}].forEach(function (part) {
+        records[part.i] = Object.assign({mv: 1, dr: 60, vc: "h264", w: 1920, hgt: 1080,
+                                         t: "Clip " + part.i, dv: 71}, part);
+    });
+    return onLightboxPage(videoPage(), function (viewer, page) {
+        assert.ok(viewer.open({ids: [71], index: 0, get: function (id) {
+            return records[id] || null;
+        }, driveOf: function () {
+            return {key: 71, clips: [71, 73, 74], matched: {}, text: null, folded: true};
+        }}));
+        var pieces = byClass(page.document.body, "drive-piece");
+        assert.strictEqual(pieces.length, 3);
+        assert.deepStrictEqual(pieces.map(function (piece) {
+            return /(^| )after-hole( |$)/.test(piece.className);
+        }), [false, true, false]);
+        page.key("Escape");
     });
 });
 

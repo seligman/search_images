@@ -32,8 +32,10 @@
 <option value="name">File name</option>
 <option value="quality">Best looking</option>
 <option value="shuffle">Shuffle</option>
+<option value="album" hidden disabled>Album order</option>
 </select></label>
 <label class="tool tool-check"><input id="group" type="checkbox"> Group similar</label>
+<label id="drives-tool" class="tool tool-check" title="Show each drive (video clips recorded one after the other) as one tile" hidden><input id="drives" type="checkbox"> Fold drives</label>
 <label class="tool tool-size"><span class="tool-label">Size</span><input id="size" type="range" min="0" max="2" step="1" aria-label="Thumbnail size"></label>
 <button id="select-button" type="button" class="button tool-button" aria-pressed="false" hidden>Select</button>
 </div>
@@ -57,6 +59,8 @@
 <span id="result-notes"></span>
 <button id="surprise-button" type="button" class="button subtle small" title="Open a picture of these, chosen at random" hidden><span class="wide-only">Surprise me</span><span class="narrow-only">Surprise</span></button>
 <a id="map-link" class="button subtle small" hidden></a>
+<a id="album-link" class="button subtle small" hidden></a>
+<button id="save-search" type="button" class="button subtle small" title="Keep this search as a smart album: it always shows the pictures the search finds" hidden>Save as album</button>
 </div>
 <p id="query-notes" hidden></p>
 <p id="meaning-notes" hidden></p>

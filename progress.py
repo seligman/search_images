@@ -5,6 +5,7 @@ import sys
 
 import common
 import db
+import prompts
 from prompts import PROMPT_VER
 
 
@@ -67,7 +68,8 @@ def library_rows(conn, config):
     counts is a db.library_counts() entry. Orphans (libraries in the database
     that are no longer in config.json) are listed only if they hold images.
     """
-    counts = db.library_counts(conn, PROMPT_VER, MAX_FAILURES)
+    counts = db.library_counts(conn, max_failures=MAX_FAILURES,
+                               stale_sql=prompts.stale_sql(config))
     names = db.library_names(conn)
     empty = dict.fromkeys(COUNT_KEYS, 0)
     rows = []
@@ -105,8 +107,9 @@ def count_cells(counts):
 def show_counts(conn=None, config=None):
     """Print a table of described / pending images per library.
 
-    "older" are descriptions from an older prompt (described again only
-    with scan.py --redescribe-stale); "left" is what the next run describes
+    "older" are descriptions that are out of date: from an older prompt, or
+    of a video and talking about its frames (described again only with
+    scan.py --redescribe-stale); "left" is what the next run describes
     (images without a description, but not those it gave up on); "failed"
     counts undescribed images with a failed attempt, and "gave up" those
     that failed MAX_FAILURES times (retried with --retry-failed).
@@ -122,7 +125,7 @@ def show_counts(conn=None, config=None):
         if close_after:
             conn.close()
 
-    grid = Grid(["library", "described", f"at v={PROMPT_VER}", "older", "left", "failed",
+    grid = Grid(["library", "described", "current", "older", "left", "failed",
                  "gave up", "missing", "total", "done"])
     totals = dict.fromkeys(COUNT_KEYS, 0)
     for label, counts in rows:
@@ -137,18 +140,20 @@ def show_counts(conn=None, config=None):
 def pending_rows(conn, config):
     """Present images of enabled libraries that still need a (current)
     description, as (library label, row): new ones first, then those
-    given up on, then those described with an older prompt. Hidden images
-    are included: they are described too."""
+    given up on, then those that are out of date (prompts.stale_sql; the
+    row's "older" is 1 for an older prompt). Hidden images are included:
+    they are described too."""
     labels = {library["id"]: common.library_label(library)
               for library in common.enabled_libraries(config) if library.get("id")}
     if not labels:
         return []
     rows = conn.execute(
-        "SELECT library_id, path, described, describe_attempts, describe_error "
-        "FROM images WHERE missing_since IS NULL "
-        "AND (described = 0 OR prompt_ver < ?) AND library_id IN (%s) "
-        "ORDER BY described, describe_attempts >= ?, id" % ",".join("?" * len(labels)),
-        [PROMPT_VER] + list(labels) + [MAX_FAILURES]).fetchall()
+        "SELECT library_id, path, described, describe_attempts, describe_error, "
+        "%s AS older FROM images WHERE missing_since IS NULL "
+        "AND (described = 0 OR %s) AND library_id IN (%s) "
+        "ORDER BY described, describe_attempts >= ?, id"
+        % (prompts.STALE_SQL, prompts.stale_sql(config), ",".join("?" * len(labels))),
+        list(labels) + [MAX_FAILURES]).fetchall()
     return [(labels[row["library_id"]], row) for row in rows]
 
 
@@ -167,7 +172,8 @@ def show_files(conn=None, config=None):
     for i, (label, row) in enumerate(pending, 1):
         line = f"{i:7,}: {label}: {row['path']}"
         if row["described"]:
-            line += "  (older prompt; run scan.py --redescribe-stale)"
+            line += "  (%s; run scan.py --redescribe-stale)" % (
+                "older prompt" if row["older"] else "the description talks about the frames")
         elif row["describe_attempts"] >= MAX_FAILURES:
             line += (f"  (skipped after {row['describe_attempts']} failures: "
                      f"{row['describe_error']}; run scan.py --retry-failed)")

@@ -172,7 +172,7 @@ class CandidateTest(RefineTestCase):
         # Refined already with this prompt version; and with an older one.
         self.set_info("photo4.jpg", DOCUMENT, provenance={"tier": "refine"})
         self.set_info("photo5.jpg", DOCUMENT, provenance={"tier": "refine"},
-                      prompt_ver=describe.PROMPT_VER - 1)
+                      prompt_ver=prompts.CURRENT_SINCE["image"] - 1)
         self.set_info("photo6.jpg", DOCUMENT, missing_since=1.0)
         self.execute("UPDATE images SET info = 'not json', described = 1 "
                      "WHERE path = 'photo7.jpg'")

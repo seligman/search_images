@@ -30,8 +30,9 @@ from urllib.parse import quote
 import common
 import imageinfo
 import jobs
+import sheet_talk
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # The schema for SCHEMA_VERSION 1. Later versions add migrations below rather
 # than editing this list.
@@ -224,13 +225,15 @@ def connect(path=None, check_same_thread=True):
 
     Rows come back as sqlite3.Row. The journal is WAL, except on a network
     drive where WAL is unsafe; there the rollback journal is used and a
-    warning is printed once.
+    warning is printed once. The connection knows the SQL function of
+    prompts.stale_sql (sheet_talk.register).
     """
     path = path or common.db_path()
     folder = os.path.dirname(os.path.abspath(path))
     common.ensure_dir(folder)
     conn = sqlite3.connect(path, timeout=30, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
+    sheet_talk.register(conn)
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
     # Connections are opened per request, so the drive check is remembered.
@@ -269,6 +272,7 @@ def connect_readonly(path=None):
         raise DatabaseError("Could not open %s: %s" % (path, error))
     try:
         conn.row_factory = sqlite3.Row
+        sheet_talk.register(conn)
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA query_only=ON")
         conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
@@ -370,6 +374,95 @@ def _migrate_to_5(conn):
         conn.execute(statement)
 
 
+# Favorites, ratings and albums (see albums.py). A picture without a mark
+# has no image_marks row. An album is "manual" (the pictures put in it,
+# album_items, in their order) or "smart" (a saved search: query is what
+# was typed, options the filters, sort and words/meaning mode as JSON).
+# Marks and album items go when their picture's row does; an album's
+# pictures stay when it is deleted. cover is the picture shown for it
+# (NULL: the first one). Album ids are never used again (AUTOINCREMENT):
+# an export's saved album, or an album:#<id> search, can never come to
+# mean another album once the one it named is deleted. Also the two tables
+# of the GPS check (GPS_CHECK_SCHEMA).
+SCHEMA_V6 = (
+    """CREATE TABLE IF NOT EXISTS image_marks (
+        image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+        favorite INTEGER NOT NULL DEFAULT 0,
+        rating INTEGER NOT NULL DEFAULT 0 CHECK (rating BETWEEN 0 AND 5),
+        updated REAL
+    )""",
+    """CREATE TABLE IF NOT EXISTS albums (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        kind TEXT NOT NULL CHECK (kind IN ('manual', 'smart')),
+        query TEXT NOT NULL DEFAULT '',
+        options TEXT NOT NULL DEFAULT '{}',
+        cover INTEGER REFERENCES images(id) ON DELETE SET NULL,
+        created REAL,
+        updated REAL
+    )""",
+    """CREATE TABLE IF NOT EXISTS album_items (
+        album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+        image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+        position REAL,
+        added REAL,
+        PRIMARY KEY (album_id, image_id)
+    )""",
+    # A picture's albums (and the cascade when its row is deleted).
+    "CREATE INDEX IF NOT EXISTS album_items_image ON album_items(image_id)",
+)
+
+# The GPS check (see gps_check.py), also part of version 6. gps_checks: the
+# position the file gives (lat, lon) of a picture the check finds fault
+# with or the owner chose to ignore, why (reason, JSON) and whether it is
+# set aside (ignored: then the picture's own lat, lon and place columns are
+# cleared, so nothing else ever shows it). The row goes with its
+# picture's. gps_choices: the owner's "use" or "ignore" by content (content
+# hash, or "#<image id>"), so it follows the picture.
+GPS_CHECK_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS gps_checks (
+        image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+        lat REAL NOT NULL,
+        lon REAL NOT NULL,
+        ignored INTEGER NOT NULL DEFAULT 1,
+        reason TEXT NOT NULL DEFAULT '{}',
+        updated REAL
+    )""",
+    """CREATE TABLE IF NOT EXISTS gps_choices (
+        content_key TEXT PRIMARY KEY,
+        choice TEXT NOT NULL CHECK (choice IN ('use', 'ignore')),
+        updated REAL
+    )""",
+)
+GPS_CHECK_TABLES = ("gps_checks", "gps_choices")
+
+
+def _migrate_to_6(conn):
+    for statement in SCHEMA_V6 + GPS_CHECK_SCHEMA:
+        conn.execute(statement)
+
+
+def add_gps_check_tables(conn):
+    """Create the GPS check's tables in a version 6 database made before they were.
+
+    (They joined version 6 before it was released.) Writes nothing when
+    they are there.
+    """
+    present = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if all(name in present for name in GPS_CHECK_TABLES):
+        return
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in GPS_CHECK_SCHEMA:
+            conn.execute(statement)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 # Ordered (version, function, rewrites_data). A migration that rewrites
 # existing data gets a backup copy (index.db.bak-v<old version>) first.
 MIGRATIONS = (
@@ -378,6 +471,7 @@ MIGRATIONS = (
     (3, _migrate_to_3, True),
     (4, _migrate_to_4, True),
     (5, _migrate_to_5, True),
+    (6, _migrate_to_6, True),
 )
 
 
@@ -529,6 +623,7 @@ def init(config=None, log=None):
                 else:
                     log("Upgraded the database from version %d to %d"
                         % (version, SCHEMA_VERSION))
+            add_gps_check_tables(conn)
             register_libraries(conn, config)
         finally:
             conn.close()
@@ -546,13 +641,18 @@ def init(config=None, log=None):
 # ---------------------------------------------------------------------------
 # Queries shared by the scanner, the server and the tools
 
-def library_counts(conn, prompt_ver=0, max_failures=common.MAX_DESCRIBE_FAILURES):
+def library_counts(conn, prompt_ver=0, max_failures=common.MAX_DESCRIBE_FAILURES,
+                   stale_sql=None):
     """Per-library counts: {library_id: {total, described, stale, failed, gave_up,
     missing, hidden}}.
 
     total, described, stale, failed, gave_up and hidden count present files
     only (missing_since IS NULL); missing counts files that have
-    disappeared. stale = described with a prompt_ver older than prompt_ver;
+    disappeared. stale = described with a prompt_ver older than prompt_ver
+    (a number, or {"image": n, "video": m} by media: prompts.CURRENT_SINCE),
+    or when stale_sql is given, described and matching that SQL condition
+    (prompts.stale_sql(config), which also counts video descriptions that
+    talk about their frames);
     failed = not described after at least one failed attempt; gave_up = not
     described after max_failures or more (skipped until a run retries
     them). Registered libraries with no images are included with zeros.
@@ -565,13 +665,21 @@ def library_counts(conn, prompt_ver=0, max_failures=common.MAX_DESCRIBE_FAILURES
         SELECT library_id,
             SUM(missing_since IS NULL),
             SUM(missing_since IS NULL AND described = 1),
-            SUM(missing_since IS NULL AND described = 1 AND prompt_ver < ?),
+            SUM(CASE WHEN missing_since IS NULL AND described = 1 THEN %s ELSE 0 END),
             SUM(missing_since IS NULL AND described = 0 AND describe_attempts > 0),
             SUM(missing_since IS NULL AND described = 0 AND describe_attempts >= ?),
             SUM(missing_since IS NOT NULL),
             SUM(missing_since IS NULL AND hidden = 1)
         FROM images GROUP BY library_id"""
-    for row in conn.execute(sql, (prompt_ver, max_failures)):
+    if stale_sql:
+        sql, current = sql % ("(%s)" % stale_sql), ()
+    else:
+        sql %= "(prompt_ver < (CASE WHEN media = 'video' THEN ? ELSE ? END))"
+        if isinstance(prompt_ver, dict):
+            current = (int(prompt_ver.get("video", 0)), int(prompt_ver.get("image", 0)))
+        else:
+            current = (prompt_ver, prompt_ver)
+    for row in conn.execute(sql, current + (max_failures,)):
         result[row[0]] = {key: int(value or 0) for key, value in zip(keys, row[1:])}
     return result
 

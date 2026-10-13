@@ -548,6 +548,34 @@ class DescribeTest(DescribeTestCase):
         self.assertEqual({row["prompt_ver"] for row in self.rows().values()},
                          {describe.PROMPT_VER})
 
+    def test_after_version_5_only_videos_are_out_of_date(self):
+        # Version 6 changed only what a video is told: pictures described by
+        # version 5 are up to date, videos are described again on request.
+        self.small_images(3)
+        self.configure()
+        self.index()
+        library_id = self.config["libraries"][0]["id"]
+        self.execute("UPDATE images SET described = 1, prompt_ver = 5, info = ?",
+                     (json.dumps(fake_llm.V4_REPLY),))
+        self.execute("UPDATE images SET media = 'video' WHERE path = 'photo1.jpg'")
+        conn = db.connect()
+        try:
+            rows, _ = describe.pending_rows(conn, self.config["libraries"])
+            self.assertEqual(rows, [])
+            rows, _ = describe.pending_rows(conn, self.config["libraries"],
+                                            redescribe_stale=True)
+            self.assertEqual([row["path"] for row in rows], ["photo1.jpg"])
+            self.assertEqual(describe.stale_count(conn, self.config["libraries"]), 1)
+            self.assertEqual(db.library_counts(conn, prompts.CURRENT_SINCE)[library_id]["stale"],
+                             1)
+            # (A plain number counts every kind alike.)
+            self.assertEqual(db.library_counts(conn, 6)[library_id]["stale"], 3)
+            conn.execute("UPDATE images SET prompt_ver = 6 WHERE media = 'video'")
+            conn.commit()
+            self.assertEqual(describe.stale_count(conn, self.config["libraries"]), 0)
+        finally:
+            conn.close()
+
     def test_limit(self):
         self.small_images(4)
         self.configure()
@@ -1499,7 +1527,7 @@ class LlmTest(unittest.TestCase):
             "print(progress.PROMPT_VER, prompts.PROMPT_VER)")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split(), [str(describe.PROMPT_VER)] * 2)
-        self.assertEqual(describe.PROMPT_VER, 5)
+        self.assertEqual(describe.PROMPT_VER, 6)
 
 
 class RemovedLibraryDescribeTest(DescribeTestCase):

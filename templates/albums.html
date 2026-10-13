@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Albums - Image Search</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="__ASSET_PREFIX__style.css">
+<link rel="stylesheet" href="__ASSET_PREFIX__albums.css">
+</head>
+<body class="albums-page">
+<main id="albums" class="admin-main albums-main">
+<div class="page-head">
+<div>
+<h1 id="albums-title">Albums</h1>
+<p id="albums-lead" class="lead">Pictures you put together, and searches you saved. Open an album to see its pictures in the search page.</p>
+</div>
+<div id="albums-actions" class="page-actions"></div>
+</div>
+<div id="albums-notices" aria-live="polite"></div>
+<div id="albums-body"><p class="message">Loading...</p></div>
+</main>
+<noscript><p>This page needs JavaScript.</p></noscript>
+<script type="application/json" id="app-config">__APP_CONFIG__</script>
+<script src="__ASSET_PREFIX__site.js"></script>
+<script src="__ASSET_PREFIX__shell.js"></script>
+<script src="__ASSET_PREFIX__search-core.js"></script>
+<script src="__ASSET_PREFIX__albums.js"></script>
+</body>
+</html>

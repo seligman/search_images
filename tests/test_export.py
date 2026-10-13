@@ -1223,12 +1223,60 @@ class ExportTest(ExportFixture):
                               env=support.child_env(), capture_output=True, text=True,
                               timeout=120)
 
+    def test_its_own_server_answers_range_requests(self):
+        # Browsers move in a video with range requests; python -m http.server
+        # answers them with the whole file, so seeking fails there.
+        import http.client
+        import threading
+        folder = self.out("served")
+        os.makedirs(os.path.join(folder, "videos"))
+        body = bytes(range(256)) * 40
+        with open(os.path.join(folder, "videos", "clip.mp4"), "wb") as handle:
+            handle.write(body)
+        with open(os.path.join(folder, "index.html"), "w", encoding="utf-8",
+                  newline="\n") as handle:
+            handle.write("<!doctype html><title>Site</title>\n")
+        server = export.make_server(folder, 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.assertEqual(server.server_address[0], "127.0.0.1")
+
+        def get(path, headers=None):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1],
+                                              timeout=10)
+            try:
+                conn.request("GET", path, headers=headers or {})
+                answer = conn.getresponse()
+                return answer.status, dict(answer.getheaders()), answer.read()
+            finally:
+                conn.close()
+        status, headers, data = get("/videos/clip.mp4", {"Range": "bytes=100-199"})
+        self.assertEqual((status, data), (206, body[100:200]))
+        self.assertEqual(headers["Content-Range"], "bytes 100-199/%d" % len(body))
+        self.assertEqual(headers["Content-Length"], "100")
+        self.assertEqual(headers["Accept-Ranges"], "bytes")
+        # Open-ended and from the end.
+        self.assertEqual(get("/videos/clip.mp4", {"Range": "bytes=10200-"})[2], body[10200:])
+        self.assertEqual(get("/videos/clip.mp4", {"Range": "bytes=-5"})[2], body[-5:])
+        # Past the end: 416. Without a range, the whole file (ranges offered).
+        self.assertEqual(get("/videos/clip.mp4", {"Range": "bytes=99999-"})[0], 416)
+        status, headers, data = get("/videos/clip.mp4")
+        self.assertEqual((status, data, headers["Accept-Ranges"]), (200, body, "bytes"))
+        self.assertEqual(get("/")[0], 200)
+        self.assertEqual(get("/nothing.js", {"Range": "bytes=0-1"})[0], 404)
+        # A folder without a site is refused.
+        with self.assertRaises(export.ExportError):
+            export.serve_folder(os.path.join(folder, "videos"))
+
     def test_command_lines(self):
         out = self.out("cli")
         result = self.run_script("export.py", "--library", "Family", "--out", out,
                                  "--images", "none", "--include-screenshots", "--zip")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("python -m http.server --bind 127.0.0.1 --directory", result.stdout)
+        # (Its own server, which answers range requests: videos can be moved in.)
+        self.assertIn("export.py\" --serve \"%s\"" % out, result.stdout)
         # What was left out, and why.
         self.assertIn("Left out: ", result.stdout)
         self.assertIn("1 picture with private information", result.stdout)

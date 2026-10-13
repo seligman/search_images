@@ -540,13 +540,15 @@ class LeaseTest(ServerFixture, unittest.TestCase):
 
     def test_a_run_is_interrupted_before_the_stop_time(self):
         config = self.configure(stop_at="03:30")
-        now = [datetime(2026, 5, 4, 3, 19, 59)]
+        # The timer is armed before the server starts: leave it more time than a
+        # slow start takes, or it fires while acquire() is still starting the server.
+        now = [datetime(2026, 5, 4, 3, 19, 52)]
         manager = local_server.ServerManager(clock=lambda: now[0])
         ctx = jobs.JobContext("describe")
         lease = manager.lease(ctx, config, ["local"])
         self.assertEqual(lease.acquire(), {})
         now[0] = datetime(2026, 5, 4, 3, 20, 1)
-        self.assertTrue(wait_for(ctx.should_stop, 10))
+        self.assertTrue(wait_for(ctx.should_stop, 20))
         self.assertIn("daily stop time (03:30)", ctx.interrupted)
         self.assertIn("resumed after 04:30", ctx.interrupted)
         lease.release()

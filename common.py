@@ -35,10 +35,13 @@ IMAGE_EXTENSIONS = (
 # Pillow build with AVIF support), and that browsers may not display.
 HEIC_EXTENSIONS = (".heic", ".heif", ".hif", ".avif")
 # Videos, indexed when ffmpeg and ffprobe are there (see videos.py) and the
-# library's "videos" setting is on. 360-degree videos (.insv) are not.
+# library's "videos" setting is on. Insta360 360-degree videos (.insv) are
+# videos too; the low-resolution copies such cameras write next to them
+# (.lrv) are not indexed on their own (see videos.lrv_companion).
 VIDEO_EXTENSIONS = (
     ".mov", ".mp4", ".m4v", ".3gp", ".3g2", ".avi", ".mkv", ".webm", ".wmv", ".mts",
     ".m2ts", ".mpg", ".mpeg",
+    ".insv",            # Insta360 360-degree videos (two lens streams in an MP4)
 )
 
 # The folder holding the scripts (and the templates/static folders).

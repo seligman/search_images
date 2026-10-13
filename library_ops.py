@@ -24,6 +24,7 @@ import time
 import cache
 import common
 import db
+import drives
 import embeddings
 import jobs
 import prompts
@@ -746,7 +747,7 @@ def orphans(conn, config, counts=None):
     """
     names = db.library_names(conn)
     if counts is None:
-        counts = db.library_counts(conn, prompts.PROMPT_VER)
+        counts = db.library_counts(conn, stale_sql=prompts.stale_sql(config))
     result = []
     for library_id in db.orphan_library_ids(conn, config):
         found = counts.get(library_id, {})
@@ -819,6 +820,7 @@ def reattach_orphan(conn, orphan_id, library_id, config, previews=None):
     # scan (the scanner checks that the files exist).
     previews_moved = _move_previews(previews or cache.PreviewStore(), orphan_id, library_id)
     videos.move_library_proxies(orphan_id, library_id)
+    drives.move_library(orphan_id, library_id)
     return {"moved": moved, "previews_moved": previews_moved}
 
 
@@ -826,7 +828,8 @@ def delete_library_data(conn, library_id, ctx=None, chunk=500):
     """Delete every row, thumbnail, preview and meaning vector of a library id (and its
     read failures), and the looks (looks.py) no other row needs.
 
-    The playable copies of its videos (videos.py) go too.
+    The playable copies of its videos (videos.py) go too, and so do its
+    drives' descriptions and sped-up previews (drives.py).
 
     Works in chunks and stops early when ctx asks to (running it again
     finishes the work). Returns {"deleted", "previews_removed", "stopped"}.
@@ -856,6 +859,7 @@ def delete_library_data(conn, library_id, ctx=None, chunk=500):
     looks.forget_unreferenced(conn)     # (the looks of pictures no row has any more)
     result["previews_removed"] = cache.PreviewStore().delete_library(library_id)
     videos.delete_library_proxies(library_id)
+    drives.forget_library(library_id)
     with conn:
         conn.execute("DELETE FROM read_failures WHERE library_id = ?", (library_id,))
         conn.execute("DELETE FROM libraries WHERE id = ?", (library_id,))

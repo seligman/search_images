@@ -247,12 +247,26 @@ test("counts, size and details in words", function () {
     options.location = true;
     assert.ok(/file name, folder and location \(GPS position and place names\)\.$/.test(
         R.detailsText(options)));
+    // The owner's marks are named only when they go.
+    options.marks = true;
+    assert.ok(/and favorite star, rating and albums\.$/.test(R.detailsText(options)),
+              R.detailsText(options));
+    options.marks = false;
+    // An export limited to an album says so.
+    assert.strictEqual(R.headline({total: 20, exported: 18, album: {id: 3, name: "Trip"}}),
+                       "18 of the 20 pictures of the album \u201cTrip\u201d will be published.");
+    assert.strictEqual(R.headline({total: 0, exported: 0, album: {id: 3, name: "Trip"}}),
+                       "The album has no pictures in this library.");
+    assert.ok(R.OPTIONS.album.label && R.OPTIONS.marks.hint);
     // The Location option says that it publishes the place names.
     assert.ok(/town, region and country/.test(R.OPTIONS.location.hint));
-    // Only this computer can open the site the command serves.
+    // Only this computer can open the site the command serves (export.py's
+    // own server, which lets videos be moved in): the export's own command.
     assert.strictEqual(R.serveCommand("C:\\Photos\\Family"),
-                       "python -m http.server --bind 127.0.0.1 --directory " +
-                       "\"C:\\Photos\\Family\"");
+                       "python export.py --serve \"C:\\Photos\\Family\"");
+    assert.strictEqual(R.serveCommand("C:\\Photos\\Family",
+                                      {serve: "python \"program/export.py\" --serve x"}),
+                       "python \"program/export.py\" --serve x");
 });
 
 test("search by meaning in the browser: its size, or why it cannot go", function () {

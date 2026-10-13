@@ -85,7 +85,9 @@ class ProgressTest(support.TempBaseMixin, unittest.TestCase):
         conn = self.open_db()
         current = progress.PROMPT_VER
         insert_image(conn, "lib_family1", "done.jpg", described=1, prompt_ver=current)
-        insert_image(conn, "lib_family1", "stale.jpg", described=1, prompt_ver=current - 1)
+        # (Out of date for a picture: before prompts.CURRENT_SINCE.)
+        insert_image(conn, "lib_family1", "stale.jpg", described=1,
+                     prompt_ver=progress.prompts.CURRENT_SINCE["image"] - 1)
         insert_image(conn, "lib_family1", "new.jpg")
         insert_image(conn, "lib_family1", "hidden.jpg", hidden=1)
         insert_image(conn, "lib_family1", "once.jpg", describe_attempts=1,

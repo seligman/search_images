@@ -24,10 +24,13 @@ import threading
 import urllib.parse
 
 import admin
+import albums
 import cache
 import common
 import db
+import drives
 import embeddings
+import gps_check
 import image_edits
 import imageinfo
 import jobs
@@ -69,7 +72,7 @@ CONTENT_SECURITY_POLICY = ("default-src 'self'; img-src 'self' data: blob:; "
 # The name each page template goes by in the page settings ("page").
 PAGE_NAMES = {"page.html": "search", "detail.html": "detail", "map.html": "map",
               "manage.html": "manage", "settings.html": "settings",
-              "duplicates.html": "duplicates"}
+              "duplicates.html": "duplicates", "albums.html": "albums"}
 
 
 def _images():
@@ -212,25 +215,31 @@ def place_of(row):
     """The place names of a row (places.py) as /api/image sends them, or None.
 
     {"city" ("" when no town is near enough), "region", "country", "cc",
-    "km" (how far the town is, when there is one)}.
+    "km" (how far the town is, when there is one), "estimated": true (only
+    for a place without a position: the GPS check set it aside and the
+    pictures taken around the same time gave the place, see gps_check.py)}.
     """
     if not row["place_country"]:
         return None
     place = {"city": row["place_city"], "region": row["place_region"],
              "country": row["place_country"], "cc": row["place_cc"]}
+    if row["lat"] is None:
+        place["estimated"] = True
     km = finite(row["place_km"])
     if place["city"] and km is not None and km >= 0:
         place["km"] = km
     return place
 
 
-def detail_record(row, library_name, edit=None, for_admin=False):
+def detail_record(row, library_name, edit=None, for_admin=False, marks=None):
     """Build the full metadata record used by the detail page.
 
     info is the description as shown and searched: the model's with the
     owner's edit (image_edits) laid over it. For the admin (for_admin)
     also edited, whether there is one, model_info, the model's own
-    description, and edits, the edit itself (image_edits.view).
+    description, and edits, the edit itself (image_edits.view). marks
+    are the owner's {"favorite", "rating", "albums": [{id, name}]}
+    (albums.py), sent as they are.
     """
     exif = load_json(row["exif"], {})
     model_info = load_json(row["info"], None)
@@ -274,7 +283,21 @@ def detail_record(row, library_name, edit=None, for_admin=False):
         record["edited"] = not image_edits.is_empty(edit)
         record["model_info"] = model_info
         record["edits"] = image_edits.view(edit)
+    if marks is not None:
+        record["marks"] = marks
     return record
+
+
+def picture_marks_view(conn, image_id):
+    """{"favorite", "rating", "albums": [{id, name}, by name]} of a picture (albums.py)."""
+    favorite, rating, album_ids = albums.picture_marks(conn, image_id)
+    names = []
+    if album_ids:
+        names = [{"id": row[0], "name": row[1]} for row in conn.execute(
+            "SELECT id, name FROM albums WHERE id IN (%s)" % ",".join("?" * len(album_ids)),
+            album_ids)]
+        names.sort(key=lambda item: (item["name"].casefold(), item["id"]))
+    return {"favorite": bool(favorite), "rating": rating, "albums": names}
 
 
 # --- Map tiles ---------------------------------------------------------------
@@ -669,6 +692,11 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     def duplicates_page():
         return admin_page("duplicates.html")
 
+    @app.route("/albums")
+    def albums_page():
+        # Everyone may look at the albums; only the admin changes them.
+        return page("albums.html")
+
     @app.route("/api/locations")
     def api_locations():
         library_ids = list(visible_libraries(state.config()))
@@ -819,12 +847,64 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             return jsonify({"error": "not found"}), 404
         names = visible_libraries(state.config())
         edit = image_edits.load(get_conn(), image_id)
-        record = detail_record(row, names[row["library_id"]], edit, for_admin=is_admin())
+        record = detail_record(row, names[row["library_id"]], edit, for_admin=is_admin(),
+                               marks=picture_marks_view(get_conn(), image_id))
+        if is_admin():
+            # The GPS check of the picture: why its position was set aside.
+            record["location_check"] = gps_check.picture_view(get_conn(), row)
+        elif row["lat"] is None and gps_check.is_ignored(get_conn(), image_id):
+            # A position set aside is nobody else's business, not even raw.
+            record["exif"].pop("GPS", None)
         if record["media"] == videos.MEDIA_VIDEO:
-            # /video/<id> sends a playable (H.264) copy when there is one.
+            # /video/<id> sends a playable (H.264) copy when there is one
+            # (for a 360 video also its LRV, or an original browsers play).
             record["playable_copy"] = bool(videos.existing_proxy(
                 row["library_id"], row["id"], row["content_hash"]))
+            if not record["playable_copy"] and row["projection"] == videos.PROJECTION_360:
+                record["playable_copy"] = videos.playable_360(
+                    row, original_path(row)[0])[0] is not None
+            # (A drive never holds 360 videos: drives.clip_from_row leaves them out.)
+            preview = drive_preview(row)
+            if preview is not None:
+                # A clip of a drive: its sped-up preview (/drive-preview/<id>),
+                # and which of its clips the caller sees have a playable copy.
+                clips = [clip for clip in preview[0].clips if is_admin() or not clip.hidden]
+                record["drive"] = {
+                    "clips": len(clips), "preview": bool(preview[1]), "speed": preview[2],
+                    "copies": [clip.id for clip in clips if videos.existing_proxy(
+                        row["library_id"], clip.id, clip.content_hash)]}
         return jsonify(record)
+
+    def drive_preview(row):
+        """(Drive, path of its sped-up preview or None, speed) of a video row in a drive,
+        or None. Visitors get no preview of a drive with a hidden clip."""
+        config = state.config()
+        drive = drives.drive_of(get_conn(), row["library_id"], row["id"], config)
+        if drive is None:
+            return None
+        path, speed = drives.existing_preview(row["library_id"], drive, config)
+        if path is None or (drive.hidden and not is_admin()):
+            return drive, None, None
+        return drive, path, speed
+
+    @app.route("/drive-preview/<int:image_id>")
+    def drive_preview_file(image_id):
+        # The sped-up preview of the drive a clip belongs to (drives.make_previews).
+        row = visible_row(image_id, "id, media")
+        if row is None or row["media"] != videos.MEDIA_VIDEO:
+            return not_found()
+        found = drive_preview(row)
+        if found is None or found[1] is None:
+            return not_found()
+        drive, path = found[0], found[1]
+        try:
+            response = send_file(path, mimetype="video/mp4", conditional=True,
+                                 etag=_source_etag("drive-preview", drive.key, os.stat(path)),
+                                 max_age=CACHE_SECONDS)
+        except OSError:
+            return not_found()
+        response.headers["Accept-Ranges"] = "bytes"
+        return private_cache(response)
 
     @app.route("/thumb/<int:image_id>")
     def thumb(image_id):
@@ -881,10 +961,13 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     @app.route("/pano/<int:image_id>")
     def pano(image_id):
         # The large panorama of a 360 photo (cache.PreviewStore), for the
-        # 360 view; 404 for any other picture, and for a 360 photo not
-        # larger than its preview (which is then the whole picture).
-        row = visible_row(image_id, "id, path, name, width, height, has_preview, projection")
-        if row is None or row["projection"] not in imageinfo.PROJECTIONS_360:
+        # 360 view; 404 for any other picture (a 360 video too: it plays),
+        # and for a 360 photo not larger than its preview (which is then
+        # the whole picture).
+        row = visible_row(image_id, "id, path, name, width, height, has_preview, projection, "
+                                    "media")
+        if (row is None or row["projection"] not in imageinfo.PROJECTIONS_360
+                or row["media"] == videos.MEDIA_VIDEO):
             return not_found()
         images = _images()
         if images is not None and not images.has_pano(row["width"], row["height"]):
@@ -946,10 +1029,13 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     @app.route("/video/<int:image_id>")
     def video(image_id):
         # A video, for the viewer's player: its playable copy (see
-        # videos.make_proxies) when there is one, else the original. Byte
-        # ranges (206, 416), ETags and 304 come from send_file, which
-        # streams the file from disk.
-        row = visible_row(image_id, "id, path, name, media, content_hash")
+        # videos.make_proxies) when there is one, else the original -- for
+        # a 360 video its LRV (both lenses side by side; the player
+        # stitches them), else its original only when that holds both
+        # lenses in one stream browsers play (videos.playable_360): no
+        # browser plays lens streams. Byte ranges (206, 416), ETags and 304
+        # come from send_file, which streams the file from disk.
+        row = visible_row(image_id, "id, path, name, media, content_hash, projection, exif")
         if row is None or row["media"] != videos.MEDIA_VIDEO:
             return not_found()
         proxy = videos.existing_proxy(row["library_id"], row["id"], row["content_hash"])
@@ -958,7 +1044,15 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
                 path, stat, kind, mime = proxy, os.stat(proxy), "video-proxy", "video/mp4"
             except OSError:
                 proxy = None
-        if proxy is None:
+        if proxy is None and row["projection"] == videos.PROJECTION_360:
+            path, kind = videos.playable_360(row, original_path(row)[0])
+            if path is None:
+                return not_found()
+            try:
+                stat, mime = os.stat(path), "video/mp4"
+            except OSError:
+                return not_found()
+        elif proxy is None:
             path, stat = original_path(row)
             if path is None:
                 return not_found()

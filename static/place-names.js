@@ -77,26 +77,34 @@
     function counts(data) {
         var pictures = data.pictures || {};
         var located = pictures.located || 0;
+        var text;
         if (!located) {
-            return "No picture has a GPS position yet.";
-        }
-        if (!data.available) {
-            return fmt.plural(located, "picture") + " " + (located === 1 ? "has" : "have") +
+            text = data.gps_ignored ? "No picture has a GPS position that is used."
+                : "No picture has a GPS position yet.";
+        } else if (!data.available) {
+            text = fmt.plural(located, "picture") + " " + (located === 1 ? "has" : "have") +
                 " a GPS position.";
+        } else {
+            var parts = [fmt.number(pictures.named || 0) + " near a town"];
+            if (pictures.region_only) {
+                parts.push(fmt.number(pictures.region_only) + " farther than " + data.city_km +
+                           " km from one (region and country only)");
+            }
+            if (pictures.far) {
+                parts.push(fmt.number(pictures.far) + " with no town within " + data.max_km +
+                           " km");
+            }
+            text = "Of " + fmt.plural(located, "picture") + " with a GPS position: " +
+                parts.join(", ") + ".";
+            if (pictures.pending) {
+                text += " " + fmt.plural(pictures.pending, "picture") + " " +
+                    (pictures.pending === 1 ? "is" : "are") + " still to be looked up.";
+            }
         }
-        var parts = [fmt.number(pictures.named || 0) + " near a town"];
-        if (pictures.region_only) {
-            parts.push(fmt.number(pictures.region_only) + " farther than " + data.city_km +
-                       " km from one (region and country only)");
-        }
-        if (pictures.far) {
-            parts.push(fmt.number(pictures.far) + " with no town within " + data.max_km + " km");
-        }
-        var text = "Of " + fmt.plural(located, "picture") + " with a GPS position: " +
-            parts.join(", ") + ".";
-        if (pictures.pending) {
-            text += " " + fmt.plural(pictures.pending, "picture") + " " +
-                (pictures.pending === 1 ? "is" : "are") + " still to be looked up.";
+        if (data.gps_ignored) {
+            // (gps_check.py: positions that cannot be where the picture was taken)
+            text += " The GPS check ignored the position of " +
+                fmt.plural(data.gps_ignored, "picture") + " (search is:gps-ignored).";
         }
         return text;
     }

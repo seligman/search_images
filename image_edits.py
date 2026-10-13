@@ -356,6 +356,45 @@ def change_tags(conn, ids, add=(), remove=(), now=None):
     return result
 
 
+def choose_heirs(plan, owners):
+    """{from id: to id}: where the data of plan's pictures goes (see reassign).
+
+    plan is reassign's; owners holds the ids (of its pictures) that have
+    data of their own. Each source that has data goes to the first of its
+    to ids that has none -- or whose own moves on as well -- and that no
+    other source takes. A target whose own data finds nowhere to go keeps
+    it; the data meant for it stays where it was (albums.py hands marks on
+    by the same rules).
+    """
+    chosen = {}
+    taken = set()
+    for source in sorted(plan):
+        targets, _copy = plan[source]
+        if source not in owners:
+            continue
+        for target in targets:
+            if target == source or target in taken:
+                continue
+            if target in owners and (target not in plan or plan[target][1]):
+                continue        # its own data stays: never overwritten
+            chosen[source] = target
+            taken.add(target)
+            break
+
+    def leaves(image_id):
+        return image_id in chosen and not plan[image_id][1]
+
+    # (And so on, until nothing changes.)
+    changed = True
+    while changed:
+        changed = False
+        for source, target in list(chosen.items()):
+            if target in owners and not leaves(target):
+                del chosen[source]
+                changed = True
+    return chosen
+
+
 def reassign(conn, plan, now=None):
     """Hand edits on to the pictures their content went to (moves, swaps); no commit.
 
@@ -372,35 +411,9 @@ def reassign(conn, plan, now=None):
     for targets, _copy in plan.values():
         ids.update(targets)
     edits = load_many(conn, ids)
-    chosen = {}
-    taken = set()
-    for source in sorted(plan):
-        targets, _copy = plan[source]
-        if source not in edits:
-            continue
-        for target in targets:
-            if target == source or target in taken:
-                continue
-            if target in edits and (target not in plan or plan[target][1]):
-                continue        # its own edit stays: never overwritten
-            chosen[source] = target
-            taken.add(target)
-            break
-
-    def leaves(image_id):
-        return image_id in chosen and not plan[image_id][1]
-
-    # A target whose own edit found nowhere to go keeps it; the edit meant
-    # for it stays where it was (and so on, until nothing changes).
-    changed = True
-    while changed:
-        changed = False
-        for source, target in list(chosen.items()):
-            if target in edits and not leaves(target):
-                del chosen[source]
-                changed = True
+    chosen = choose_heirs(plan, edits)
     for source in chosen:
-        if leaves(source):
+        if not plan[source][1]:
             conn.execute("DELETE FROM image_edits WHERE image_id = ?", (source,))
     for source, target in sorted(chosen.items()):
         edit = edits[source]

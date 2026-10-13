@@ -495,7 +495,8 @@
                                    "Pictures that have no description yet"));
             if (counts.stale) {
                 stats.appendChild(stat("out of date", counts.stale, "Described with an " +
-                    "older version of the instructions; Re-describe updates them", "warn"));
+                    "older version of the instructions, or videos whose descriptions talk " +
+                    "about their frames; Re-describe updates them", "warn"));
             }
             if (counts.failed) {
                 stats.appendChild(stat("failed", counts.failed, "Pictures the AI model could " +
@@ -551,6 +552,20 @@
                 R.bytes(proxyInfo.bytes || 0) : "none yet") + (proxyInfo.pending ? "; " +
                 fmt.plural(proxyInfo.pending, "video") + " still " +
                 (proxyInfo.pending === 1 ? "needs" : "need") + " one" : "") + "."}));
+        }
+        var driveInfo = (lib.video_info || {}).drives || null;
+        var drivePreviews = state.videos && state.videos.drive_previews || {};
+        if (driveInfo && driveInfo.count) {
+            // Runs of clips recorded one after the other (drives.py).
+            var previewInfo = driveInfo.previews || {};
+            card.appendChild(el("p", {className: "card-note", text: "Drives (video clips " +
+                "recorded one after the other): " + fmt.plural(driveInfo.count, "drive") + ", " +
+                fmt.duration(driveInfo.seconds) + " of video, " +
+                fmt.number(driveInfo.described) + " described" +
+                (drivePreviews.enabled ? "; sped-up previews: " + (previewInfo.count
+                    ? fmt.number(previewInfo.count) + ", " + R.bytes(previewInfo.bytes || 0)
+                    : "none yet") + (previewInfo.pending ? " (" +
+                    fmt.number(previewInfo.pending) + " to make)" : "") : "") + "."}));
         }
         var meaningInfo = lib.meaning;
         var meaningSetup = (state && state.meaning) || {};
@@ -627,7 +642,8 @@
             actions.appendChild(jobButton("Re-describe out of date (" +
                 fmt.number(counts.stale) + ")", "", "describe", {redescribe_stale: true},
                 lib.id + ":stale", off || noModel,
-                modelTitle || "Describe again the pictures described with older instructions"));
+                modelTitle || "Describe again the pictures described with older instructions, " +
+                "and videos whose descriptions talk about their frames"));
         }
         var refineInfo = lib.refine_info || {};
         if (refineInfo.enabled) {
@@ -688,6 +704,13 @@
                 fmt.number(proxyInfo.pending) + ")", "", "proxies", {}, lib.id + ":proxies", off,
                 "Make H.264 copies of the videos most browsers cannot play (HEVC and " +
                 "others), so they play in the viewer; this takes a while"));
+        }
+        if (drivePreviews.enabled && driveInfo && (driveInfo.previews || {}).pending) {
+            actions.appendChild(jobButton("Make sped-up drives (" +
+                fmt.number(driveInfo.previews.pending) + ")", "", "drive_previews", {},
+                lib.id + ":drive_previews", off,
+                "Make a sped-up copy of each drive (" + drivePreviews.speed + " times faster, " +
+                "H.264), which the viewer can play instead of the clips; this takes a while"));
         }
         var exporting = exportJobOf(lib);
         actions.appendChild(button(exporting ? "Export... (" + (exporting.state === "queued" ?
@@ -914,6 +937,12 @@
             return Promise.resolve(true);
         }
         var unknownCost = false;
+        // A video whose first description talks about its frames is asked
+        // once more (describe.describe_checked): up to two requests.
+        var sheetCheck = !(state && state.videos && state.videos.sheet_check === false);
+        var withVideos = sheetCheck && risky.some(function (lib) {
+            return Boolean((lib.video_info || {}).count);
+        });
         var items = risky.map(function (lib) {
             var line = cloudLine(lib, kind, params, found);
             if (!line.costKnown) {
@@ -929,6 +958,9 @@
             el("ul", {className: "warning-list"}, items),
             unknownCost ? el("p", {text: "The service charges for each picture. Test the " +
                 "endpoint on the Settings page to see what one picture costs."}) : null,
+            withVideos ? el("p", {text: "A video whose first description talks about its " +
+                "frames instead of the video is asked once more, so a video can cost up to " +
+                "twice as much as a picture."}) : null,
             el("p", {className: "muted", text: "You are asked once for each library."})
         ];
         return SHELL.confirm({
@@ -2434,6 +2466,40 @@
                 "folder. Nothing is uploaded; the files are written to a folder on this " +
                 "computer."}));
 
+            // Which pictures: the whole library, or the pictures of one album.
+            var albumSelect = el("select", {className: "input export-album"});
+            albumSelect.appendChild(el("option", {value: "", text: "The whole library"}));
+            if (opts.album) {
+                albumSelect.appendChild(el("option", {value: String(opts.album),
+                                                      text: "The album chosen before"}));
+                albumSelect.value = String(opts.album);
+            }
+            SHELL.admin("/albums", undefined, {quiet: true}).then(function (reply) {
+                var chosen = albumSelect.value;
+                while (albumSelect.options.length > 1) {
+                    albumSelect.remove(1);
+                }
+                (reply.albums || []).forEach(function (album) {
+                    if (album.kind !== "manual") {
+                        return;
+                    }
+                    albumSelect.appendChild(el("option", {
+                        value: String(album.id),
+                        text: album.name + " (" + fmt.plural(album.count || 0, "picture") + ")"}));
+                });
+                albumSelect.value = chosen;
+                if (albumSelect.value !== chosen) {
+                    // (The album is gone: the whole library, as the export would refuse it.)
+                    albumSelect.value = "";
+                    changed();
+                }
+            }, function () {});
+            albumSelect.addEventListener("change", changed);
+            fields.album = field(R.OPTIONS.album.label, albumSelect, {hint: R.OPTIONS.album.hint});
+            body.appendChild(el("fieldset", {className: "group"}, [
+                el("legend", {text: "Which pictures"}), fields.album.node
+            ]));
+
             // Pictures
             var modes = {};
             var modeList = el("div", {className: "export-choices"});
@@ -2497,7 +2563,7 @@
             var details = {};
             var detailList = el("div", {className: "export-choices two"});
             ["file_names", "folders", "location", "similar", "meaning",
-             "looks"].forEach(function (key) {
+             "looks", "marks"].forEach(function (key) {
                 details[key] = check(R.OPTIONS[key].label, opts[key], R.OPTIONS[key].hint);
                 details[key].input.addEventListener("change", changed);
                 detailList.appendChild(details[key].node);
@@ -2594,6 +2660,7 @@
                 });
                 result.title = title.value.trim();
                 result.credits = credits.value.trim();
+                result.album = albumSelect.value ? Number(albumSelect.value) : null;
                 result.zip = zip.input.checked;
                 result.allow_indexing = indexing.input.checked;
                 if (withVideos) {
@@ -2741,6 +2808,10 @@
             var videoNote = R.videoText(counts.videos, opts);
             if (videoNote) {
                 holder.appendChild(el("p", {className: "muted", text: videoNote}));
+            }
+            var drivesNote = R.drivesText(counts);
+            if (drivesNote) {
+                holder.appendChild(el("p", {className: "muted", text: drivesNote}));
             }
             if (counts.unavailable) {
                 holder.appendChild(notice("error", "The folder of " + lib.name + " cannot be " +
@@ -2964,7 +3035,7 @@
                 summary.zip ? el("span", {className: "field-hint", text: "Zip file: " +
                                           summary.zip}) : null
             ]));
-            var command = R.serveCommand(output);
+            var command = R.serveCommand(output, summary);
             box.body.appendChild(el("h3", {className: "export-h3", text: "Putting it on the web"}));
             box.body.appendChild(el("ol", {className: "export-steps"}, [
                 el("li", {text: "Copy everything in the folder to a web host that serves " +

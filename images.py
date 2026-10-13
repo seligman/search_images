@@ -14,7 +14,8 @@ converts originals a browser cannot show (HEIC, TIFF, ...) to JPEG.
 360-degree photos are recognised by detect_projection(). Unstitched
 dual-fisheye frames (Insta360 .insp) are stitched into an equirectangular
 panorama by dual_fisheye_to_equirect() (the two lenses evened out and
-blended at the seams, a tripod under a soft fill at the bottom), and
+blended at the seams, a tripod under a soft fill at the bottom; the
+frames of Insta360 360-degree videos too, see videos.py), and
 front_view() cuts a natural looking picture from a panorama for the
 thumbnail. read_image(want_pano=True) also makes a larger panorama of a
 360 photo (PANO_EDGE wide) for the interactive 360 view.
@@ -130,6 +131,42 @@ INSTA360_PARAMS = {
     "rotation": (90, 270),
     "mirror": False,
     "offsets": ((-0.009, 0.0), (0.0, 0.0)),
+    "blend": 3.0,
+}
+# The same lens model for the frames of Insta360 360-degree videos (.insv,
+# see videos.py), one for each camera whose videos are known (see
+# videos.CAMERAS_360). An Insta360 X4's: the low-resolution copy the
+# camera writes next to each video (LRV_..._01_<n>.lrv, 2:1, both lenses
+# upright side by side), or the video's two lens streams put side by side
+# in the same order. The lens that does not face the person holding the
+# camera (usually: the one without the screen) is on the right; it is the
+# middle of the panorama. Derived empirically from the frames of an
+# Insta360 X4, as for INSTA360_PARAMS: the orientation that gives level
+# horizons and an upright, unmirrored scene, then fov, the centres and a
+# small turn of the left lens tuned to minimise the difference between the
+# two lenses' pictures along the seams (over some forty frames of
+# different scenes). The circles reach the frame's edges, so they are not
+# measured.
+INSTA360_VIDEO_PARAMS = {
+    "fov": 190.8,
+    "front": "right",
+    "rotation": (-0.4, 0.0),
+    "mirror": False,
+    "offsets": ((-0.003, 0.015), (0.0, 0.0)),
+    "blend": 3.0,
+}
+# An Insta360 ONE R's (360 lens): the camera writes each lens's video to a
+# file of its own (VID_..._00_<n>.insv and VID_..._10_<n>.insv) and a copy
+# with both side by side (LRV_..._11_<n>.insv), the _00_ lens on the left,
+# turned as in its photos (INSTA360_PARAMS). Tuned on two dozen frames of
+# its copies as for the X4: its videos see less of each lens circle than
+# its photos (fov 188.4, not 199, for a circle as tall as the frame).
+INSTA360_ONE_R_VIDEO_PARAMS = {
+    "fov": 188.4,
+    "front": "left",
+    "rotation": (90, 270),
+    "mirror": False,
+    "offsets": ((-0.006, -0.003), (-0.004, 0.0)),
     "blend": 3.0,
 }
 # Evening out the two lenses (see _lens_gains): only pixels with levels in
@@ -1192,7 +1229,7 @@ def _fill_pole(panorama, degrees, bottom=True):
 
 
 def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARAMS,
-                             nadir_fill=None, zenith_fill=None):
+                             nadir_fill=None, zenith_fill=None, details=None):
     """Stitch a dual-fisheye frame into an equirectangular panorama.
 
     image holds the two lens circles side by side (see find_lens_circles()
@@ -1210,7 +1247,10 @@ def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARA
 
     nadir_fill and zenith_fill are degrees around the bottom and top pole to
     cover with a soft fill (_fill_pole; 0 = none); None takes the settings
-    of config.json (stitch_settings()).
+    of config.json (stitch_settings()). details, when a dict, is given
+    what the stitch used: "circles" (find_lens_circles) and "gains" (the
+    front and the back lens's, see _lens_gains; 1.0 without a blend), so
+    a 360 video's player can stitch its frames the same way.
     """
     if image.mode != "RGB":
         image = to_rgb(image)
@@ -1221,6 +1261,7 @@ def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARA
         nadir_fill = settings["nadir_fill_deg"] if nadir_fill is None else nadir_fill
         zenith_fill = settings["zenith_fill_deg"] if zenith_fill is None else zenith_fill
     circles = find_lens_circles(image, params)
+    gains = ((1.0, 1.0, 1.0), (1.0, 1.0, 1.0))
     half_fov = math.radians(float(params["fov"]) / 2.0)
     front = 0 if params.get("front", "left") == "left" else 1
     rotation = params.get("rotation") or (0, 0)
@@ -1278,6 +1319,8 @@ def dual_fisheye_to_equirect(image, out_width=PREVIEW_EDGE, params=INSTA360_PARA
         gains = _lens_gains(layers[0], layers[1], blend)
         layers = [_apply_gains(layer, gain) for layer, gain in zip(layers, gains)]
         panorama = Image.composite(layers[0], layers[1], _seam_mask(out_width, out_height, blend))
+    if isinstance(details, dict):
+        details.update(circles=circles, gains=gains)
     if nadir_fill:
         _fill_pole(panorama, nadir_fill, bottom=True)
     if zenith_fill:

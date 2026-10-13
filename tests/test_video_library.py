@@ -5,6 +5,7 @@ ffmpeg and ffprobe are played by tests/fake_ffmpeg.py (see videotools.py),
 the AI model by tests/fake_llm.py; everything runs in a temporary data root.
 """
 
+import datetime
 import io
 import json
 import os
@@ -337,6 +338,72 @@ class ScanTest(VideoLibraryCase):
         self.assertFalse(os.path.exists(proxy))
 
 
+class RedateTest(VideoLibraryCase):
+    """Videos an older version dated by a camera's clock read as UTC get the time of
+    their names on the next scan (scan.redate_videos)."""
+
+    def probes(self, name):
+        return [argv for argv in self.commands
+                if len(argv) > 2 and argv[2] == "ffprobe" and argv[-1].endswith(name)]
+
+    def test_dashcam_clips_get_their_clock_times(self):
+        clock = datetime.datetime(2023, 8, 17, 14, 21, 5)
+        if videos._utc_to_local(clock) == clock:
+            self.skipTest("this computer keeps UTC: such dates were never off")
+        self.configure()
+        dashcam = "cam/20230817_142005_0412_N_A.MP4"
+        self.make_video(self.folder, dashcam, fake_ffmpeg.probe_json(
+            duration=60.0, codec="hevc", audio=False,
+            format_tags={"creation_time": "2023-08-17T14:21:05.000000Z"},
+            stream_tags={"creation_time": "2023-08-17T14:21:05.000000Z"}))
+        # A phone that names its videos in UTC (its own tags say it is one):
+        # read again once, and kept as it is.
+        phone = "cam/VID_20230817_212005.mp4"
+        self.make_video(self.folder, phone, fake_ffmpeg.probe_json(
+            duration=20.0, format_tags={"creation_time": "2023-08-17T21:20:05.000000Z",
+                                        "com.android.version": "13"}))
+        # The scan of an older version: the creation times as UTC (and no
+        # dates read again).
+        older = mock.patch.object(videos, "local_clock_time", lambda *args: None)
+        unread = mock.patch.object(scan, "redate_videos", lambda *args: None)
+        with older, unread:
+            self.scan()
+        old = self.rows()[dashcam]
+        self.assertEqual((old["taken_source"], old["tz_offset"]), ("video", ""))
+        self.assertNotEqual(old["taken_at"], "2023-08-17T14:20:05")
+        phone_date = self.rows()[phone]["taken_at"]
+        self.assertTrue(videos.clock_candidate(phone.split("/")[1], phone_date, 20.0))
+        # The next scan reads the dates of those two again (ffprobe only).
+        del self.commands[:]
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["redated"],
+                         {"checked": 2, "changed": 1, "failed": 0})
+        rows = self.rows()
+        self.assertEqual((rows[dashcam]["taken_at"], rows[dashcam]["taken_source"],
+                          rows[dashcam]["tz_offset"]), ("2023-08-17T14:20:05", "video", ""))
+        self.assertGreater(rows[dashcam]["updated"], old["updated"])
+        self.assertEqual(rows[phone]["taken_at"], phone_date)
+        self.assertEqual(len(self.probes("20230817_142005_0412_N_A.MP4")), 1)
+        self.assertFalse(any(argv[2] == "ffmpeg" for argv in self.commands
+                             if len(argv) > 2), self.commands)
+        self.assertIn("now have the time of their camera's clock", self.log_text())
+        # And never again: the phone's date stands, the clip's is right now.
+        del self.commands[:]
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["redated"],
+                         {"checked": 0, "changed": 0, "failed": 0})
+        self.assertEqual(self.probes(".mp4") + self.probes(".MP4"), [])
+
+    def test_without_ffmpeg_nothing_is_read_again(self):
+        self.configure()
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["redated"]["checked"], 0)
+        self.use_fake_tools(available=False)
+        summary = self.scan()
+        self.assertEqual(summary["backfill"]["redated"],
+                         {"checked": 0, "changed": 0, "failed": 0})
+
+
 class LibraryDataTest(VideoLibraryCase):
     """Deleting or re-attaching a library's data takes the playable copies along."""
 
@@ -402,7 +469,7 @@ class MigrationTest(support.TempBaseMixin, unittest.TestCase):
         conn.close()
         lines = []
         report = db.init({"libraries": []}, log=lines.append)
-        self.assertEqual((report["from_version"], report["version"]), (4, 5))
+        self.assertEqual((report["from_version"], report["version"]), (4, db.SCHEMA_VERSION))
         self.assertTrue(os.path.isfile(path + ".bak-v4"))
         conn = db.connect()
         try:

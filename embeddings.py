@@ -12,10 +12,13 @@ The search text (search_text) is made from what the description already
 shows: the effective title, description and tags (the owner's edits laid
 over the model's), subjects, animals, food, vehicles, people, objects,
 activities, scene, setting, time of day, event, colors, the kind of
-picture and the start of the text in it. Never file or folder names,
-library names, dates, places, GPS positions, cameras or who described the
-picture: a vector reveals nothing that the description does not show, so
-an export can ship vectors whatever its privacy options are.
+picture and the start of the text in it (and for the clip that carries
+a drive's own words, the drive's title, description and tags: see
+drives.cover_texts). Never file or folder names, library names, dates,
+places, GPS positions, cameras or who described the picture: a vector
+reveals nothing that the description does not show, so an export can
+ship vectors whatever its privacy options are (an export checks a
+clip's vector against the drive words it publishes, see fresh_vectors).
 
 data/vectors.db is a database of its own (deleting it is harmless: it is
 built again):
@@ -82,6 +85,7 @@ import time
 import browser_model
 import common
 import db
+import drives
 import image_edits
 import llm
 import videos
@@ -464,19 +468,47 @@ def _load_info(text):
     return info if isinstance(info, dict) else None
 
 
-def library_texts(conn, library_ids):
+def drive_text(fields):
+    """The search text of a drive's own words as its records publish them (fields: dvt,
+    dvd and dvg, see drives.text_fields): its title, description and tags only."""
+    fields = fields or {}
+    return search_text({"title": fields.get("dvt"), "description": fields.get("dvd"),
+                        "tags": fields.get("dvg")})
+
+
+def drive_texts(conn, library_ids):
+    """{image id: search text of its drive} for the clip that carries the words of every
+    described drive of some libraries (drives.cover_texts): search by meaning finds
+    the drive by that clip."""
+    return {image_id: drive_text(drives.text_fields(info))
+            for image_id, info in drives.cover_texts(conn, library_ids).items()}
+
+
+def _with_drive(text, words):
+    """A clip's search text with its drive's (words) added, when it carries them."""
+    if not words:
+        return text
+    return (text + "\n" if text else "") + "Drive: " + words
+
+
+def library_texts(conn, library_ids, driven=None):
     """[(image id, library id, hidden, search text)] of the present pictures of some
-    libraries that have one (described, or edited by the owner), in id order."""
+    libraries that have one (described, or edited by the owner), in id order.
+    driven: {image id: the search text of the drive words it carries} (default:
+    drive_texts')."""
     library_ids = list(library_ids)
     if not library_ids:
         return []
     edits = image_edits.for_libraries(conn, library_ids)
+    if driven is None:
+        driven = drive_texts(conn, library_ids)
     result = []
     for row in conn.execute("SELECT id, library_id, info, described, hidden, media FROM images "
                             "WHERE missing_since IS NULL AND library_id IN (%s) ORDER BY id"
                             % ",".join("?" * len(library_ids)), library_ids):
         info = _load_info(row["info"]) if row["described"] else None
-        text = search_text(info, edits.get(row["id"]), row["media"])
+        text = _with_drive(search_text(info, edits.get(row["id"]), row["media"]),
+                           driven.get(row["id"]))
         if text:
             result.append((row["id"], row["library_id"], bool(row["hidden"]), text))
     return result
@@ -518,7 +550,8 @@ class TextHashes:
                 self._where = where
                 self._rows = {}
             known = {row[0]: self._rows.get(row[0]) for row in rows}
-        keys = {row[0]: (row[3], row[4], row[5]) for row in rows}
+        driven = drive_texts(conn, library_ids)
+        keys = {row[0]: (row[3], row[4], row[5], driven.get(row[0], "")) for row in rows}
         changed = [image_id for image_id, entry in known.items()
                    if entry is None or entry[0] != keys[image_id]]
         fresh = {}
@@ -528,7 +561,8 @@ class TextHashes:
             for row in conn.execute("SELECT id, info, described, media FROM images "
                                     "WHERE id IN (%s)" % ",".join("?" * len(part)), part):
                 info = _load_info(row[1]) if row[2] else None
-                text = search_text(info, edits.get(row[0]), row[3])
+                text = _with_drive(search_text(info, edits.get(row[0]), row[3]),
+                                   driven.get(row[0]))
                 fresh[row[0]] = text_hash(text, model, dims) if text else ""
         with self._lock:
             if self._where == where:
@@ -1309,15 +1343,19 @@ def after_run(conn, config, ctx, library_ids=None, servers=None):
 # ---------------------------------------------------------------------------
 # Exports
 
-def fresh_vectors(conn, library_id, image_ids, store=None):
+def fresh_vectors(conn, library_id, image_ids, store=None, carried=None):
     """The up-to-date vectors of some pictures of a library, for an export.
 
     Only vectors made from the picture's current search text count (an
     edit or a new description since makes a vector stale: it is left out,
     so a vector never holds words the exported description does not), with
-    the model and dims vectors.db holds. Returns {"model", "dims", "vectors":
-    {image id: bytes}, "stale": how many had an older vector, "missing":
-    how many had none}; vectors is empty when there is no vectors.db.
+    the model and dims vectors.db holds. carried: {image id: the drive words
+    (dvt, dvd, dvg) its exported record carries}: a clip's text holds those
+    and no others (a vector made with a drive's words that the export does
+    not publish, or on another clip, is stale). Returns {"model", "dims",
+    "vectors": {image id: bytes}, "stale": how many had an older vector,
+    "missing": how many had none}; vectors is empty when there is no
+    vectors.db.
     """
     wanted = set(image_ids)
     result = {"model": "", "dims": 0, "vectors": {}, "stale": 0, "missing": 0}
@@ -1341,7 +1379,9 @@ def fresh_vectors(conn, library_id, image_ids, store=None):
     finally:
         if own:
             store.close()
-    for image_id, _library, _hidden, text in library_texts(conn, [library_id]):
+    driven = None if carried is None else {
+        image_id: drive_text(fields) for image_id, fields in carried.items() if fields}
+    for image_id, _library, _hidden, text in library_texts(conn, [library_id], driven):
         if image_id not in wanted:
             continue
         found = have.get(image_id)
@@ -1546,6 +1586,8 @@ class VectorService:
             ready = query_ready(config, current)
             key = [VECTORS_VERSION, current, ready, bool(include_hidden),
                    [[library_id, name] for library_id, name in libraries.items()], index_state]
+            # (A drive's description changes the text its vector must match.)
+            key.append(drives.version())
             etag = hashlib.sha1(json.dumps(key, separators=(",", ":"), sort_keys=True)
                                 .encode("utf-8")).hexdigest()[:32]
             headers = {"ETag": '"%s"' % (etag + "-gzip" if accept_gzip else etag),

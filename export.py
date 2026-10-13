@@ -66,13 +66,34 @@ from the export. Every picture written is cleaned of its metadata (EXIF,
 XMP, IPTC, comments, text chunks, data after the image); a colour profile
 and, for an original JPEG, the orientation are kept.
 
+An export can be limited to one manual album of the owner's (the album
+option, an album id; see albums.py): only the album's pictures of the
+library are candidates, and the privacy rules above still apply to them.
+The owner's favorites, ratings and album names are not published unless
+the "marks" option is on: then the records carry fav, rt and al (album
+numbers of the export, 1, 2, ...), and data/manifest.js lists the albums
+({id, name, kind, items: the export ids of a manual album's exported
+pictures in its order} -- manual albums with at least one exported
+picture; smart albums with their saved search, query and options, as
+typed but without a library choice, similar:/look: naming the picture by
+its export id and album: the album by its number, #2), so album:"Name",
+is:favorite and rating: work in the published site too. A smart album
+whose search cannot be published is left out: one limited to another
+library, or going by what the export leaves out (folder:, file:,
+place:, has:gps or the Place filter while the matching option is off;
+lib:), or naming a picture or an album that is not published.
+
 A video is published as its poster frame (its thumbnail and web-size
 picture), and with the videos option "include" also as a video: the
 playable copy (videos.make_proxies) when there is one, else the original
 when browsers play it (H.264), up to max_video_mb, copied into an MP4
 without its metadata (videos.strip_copy: no tags, data streams, subtitles
 or chapters, so no place, date or device). Other videos (HEVC without a
-playable copy) keep their poster only; the review step counts them.
+playable copy) keep their poster only; the review step counts them. A
+360-degree video's poster is its stitched panorama, and its video is its
+LRV (or playable copy): both lenses side by side, which the site's viewer
+stitches as it plays (the record's fx). A published video's record names
+the codec of what was published (vc: "h264" for a playable copy).
 
 Exports are incremental and deterministic: a file is only written when its
 bytes change, a second export with nothing changed writes no files, and
@@ -88,7 +109,12 @@ command line:
                      [--location] [--file-names] [--folders]
                      [--include-screenshots] [--include-documents]
                      [--include-undescribed] [--include-private]
-                     [--include-sensitive] [--zip]
+                     [--include-sensitive] [--zip] [--album NAME] [--marks]
+    python export.py --serve FOLDER [--port 8000]
+
+--serve tries an export on this computer (only it can open the site): a
+small web server for the folder that, unlike "python -m http.server",
+answers the range requests a browser makes to move in a video.
 
 It exits with status 1 when pictures could not be exported, 2 when it was
 stopped (an abort file: data/abort).
@@ -101,9 +127,11 @@ import concurrent.futures
 import datetime
 import errno
 import fnmatch
+import functools
 import hashlib
 import hmac
 import html
+import http.server
 import json
 import math
 import os
@@ -118,11 +146,14 @@ import unicodedata
 import zipfile
 import zlib
 
+import albums
 import browser_model
 import cache
 import common
 import db
+import drives
 import embeddings
+import gps_check
 import imageinfo
 import jobs
 import library_ops
@@ -255,10 +286,12 @@ DEFAULT_OPTIONS = {
     "meaning": True,                # the query model too: typed searches by meaning (when it
                                     # can be used, see meaning_status)
     "looks": True,                  # look vectors, so "Looks like this" works (no model needed)
+    "album": None,                  # an album id: only that manual album's pictures (None: all)
+    "marks": False,                 # favorites, ratings and album names (see albums.py)
 }
 _BOOLEAN_OPTIONS = ("location", "file_names", "folders", "exclude_private", "exclude_sensitive",
                     "exclude_undescribed", "zip", "allow_indexing", "similar", "meaning",
-                    "looks")
+                    "looks", "marks")
 # Where the query model goes (in data/), and the scripts that run it (in assets/).
 MEANING_FOLDER = "meaning"
 MEANING_ASSETS = ("embed-kernel.js", "embed-engine.js")
@@ -458,6 +491,12 @@ def validate_options(options, base=None):
                     result[key] = [kind for kind in EXPORT_KINDS if kind in value]
         elif key == "include_ids":
             result[key] = _include_list(value, errors)
+        elif key == "album":
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                      or not 0 < value < 2 ** 63):
+                errors[key] = "must be an album id (or null for the whole library)"
+            else:
+                result[key] = value
         elif key == "exclude_ids":
             result[key] = _id_list(value, key, errors)
     if errors:
@@ -501,6 +540,8 @@ def options_summary(options):
     if options["videos"] == "include":
         # (Only then: an export without videos stays as it was.)
         summary["videos"] = options["videos"]
+    if options["marks"]:
+        summary["marks"] = True
     return summary
 
 
@@ -1356,7 +1397,11 @@ def video_plan(row, options, library_id):
     or the original when browsers play it) or "poster" (only the poster is
     published; reason "not_playable" -- HEVC and others, without a
     playable copy -- or "too_large", over max_video_mb). source None with
-    kind "video": the original, read from the library's folder.
+    kind "video": the original, read from the library's folder -- for a
+    360 video its LRV there (both lenses side by side, which the site's
+    player stitches; size: its media data, as the scan found it), or its
+    original only when that holds both lenses in one stream browsers play
+    (videos.playable_360); never lens streams.
     """
     if options.get("videos") != "include" or not _is_video(row):
         return "skip", None, 0, ""
@@ -1364,6 +1409,17 @@ def video_plan(row, options, library_id):
     size = _file_size(proxy) if proxy else None
     if proxy and size is not None:
         source = proxy
+    elif row["projection"] == videos.PROJECTION_360:
+        facts = videos.video_facts(row["exif"])
+        lrv = videos.lrv_facts(row["exif"])
+        if videos.playable(lrv) == "yes" and isinstance(lrv.get("size"), int):
+            # (What a copy without metadata keeps: not the camera's trailer.)
+            media = lrv.get("media_size")
+            source, size = None, media if isinstance(media, int) and media > 0 else lrv["size"]
+        elif facts.get("lenses") == "frame" and videos.playable(facts) == "yes":
+            source, size = None, row["size"] or 0
+        else:
+            return "poster", None, 0, "not_playable"
     else:
         try:
             exif = json.loads(row["exif"] or "{}")
@@ -1378,6 +1434,23 @@ def video_plan(row, options, library_id):
     return "video", source, size, ""
 
 
+def published_codec(row, source):
+    """The codec of the video an export publishes for a row ("" when not known).
+
+    source is video_plan's: a playable copy (H.264), or None for the file in
+    the library -- a 360 video's LRV (its codec as the scan found it), else
+    the original.
+    """
+    if source is not None:
+        return "h264"
+    facts = videos.video_facts(row["exif"])
+    if row["projection"] == videos.PROJECTION_360:
+        lrv = videos.lrv_facts(row["exif"])
+        if lrv.get("codec"):
+            return str(lrv["codec"])
+    return str(facts.get("codec") or "")
+
+
 def _load_rows(conn, library_id):
     """{id: row} of the present, visible pictures of a library."""
     rows = conn.execute(
@@ -1386,9 +1459,54 @@ def _load_rows(conn, library_id):
     return {row["id"]: row for row in rows}
 
 
-def _hidden_count(conn, library_id):
+def _hidden_count(conn, library_id, among=None):
+    if among is not None:
+        ids = sorted(among)
+        count = 0
+        for start in range(0, len(ids), 500):
+            part = ids[start:start + 500]
+            count += conn.execute(
+                "SELECT COUNT(*) FROM images WHERE library_id = ? AND hidden = 1 AND "
+                "missing_since IS NULL AND id IN (%s)" % ",".join("?" * len(part)),
+                [library_id] + part).fetchone()[0]
+        return count
     return conn.execute("SELECT COUNT(*) FROM images WHERE library_id = ? AND hidden = 1 "
                         "AND missing_since IS NULL", (library_id,)).fetchone()[0]
+
+
+# has: words search-core reads as "has a location" (HAS_WORDS), and their starts.
+_LOCATION_WORDS = ("gps", "location", "geo", "position", "coordinate", "place")
+
+
+def _rewrite(text, changes):
+    """text with the spans of changes ({(start, stop): new text}, not overlapping)
+    replaced."""
+    for (start, stop), value in sorted(changes.items(), reverse=True):
+        text = text[:start] + value + text[stop:]
+    return text
+
+
+def album_choice(conn, library_id, options):
+    """The album an export is limited to: {id, name, ids (its pictures of the library,
+    hidden ones too), elsewhere (how many of its pictures are in other libraries)},
+    or None for the whole library. Raises ExportError when the album is gone or is
+    a smart one."""
+    album_id = options.get("album")
+    if album_id is None:
+        return None
+    album = albums.get_album(conn, album_id)
+    if album is None:
+        raise ExportError("The album this export is limited to (id %d) no longer exists. "
+                          "Choose another album, or the whole library, in the export "
+                          "options." % album_id)
+    if album["kind"] != "manual":
+        raise ExportError("%s is a smart album (a saved search). An export can be limited to "
+                          "a manual album only: on the Albums page, \"Copy to a new album\" "
+                          "makes one with its pictures." % album["name"])
+    ids = albums.album_items(conn, album_id, [library_id])
+    everywhere = albums.album_items(conn, album_id)
+    return {"id": album_id, "name": album["name"], "ids": set(ids),
+            "elsewhere": len(everywhere) - len(ids)}
 
 
 def picture_kinds(record):
@@ -1463,6 +1581,9 @@ def select_records(conn, config, library, options):
     library_id = library["id"]
     records = search_index.build_records(conn, config, [library_id], for_export=True,
                                          export_options=options)
+    album = album_choice(conn, library_id, options)
+    if album is not None:
+        records = [record for record in records if record["i"] in album["ids"]]
     include = include_choices(options)
     exclude = set(options["exclude_ids"])
     chosen, excluded, flagged = [], {}, []
@@ -1493,11 +1614,15 @@ def select_records(conn, config, library, options):
                 item["new_flags"] = new_flags
             flagged.append(item)
     by_reason = collections.Counter(excluded.values())
-    hidden = _hidden_count(conn, library_id)
+    hidden = _hidden_count(conn, library_id, album["ids"] if album is not None else None)
     if hidden:
         by_reason["hidden"] = hidden
     counts = {"total": len(records) + hidden, "exported": len(chosen),
               "by_reason": dict(sorted(by_reason.items()))}
+    if album is not None:
+        # (Only the album's pictures were counted; the rest of the library is not mentioned.)
+        counts["album"] = {"id": album["id"], "name": album["name"],
+                           "pictures": len(album["ids"]), "elsewhere": album["elsewhere"]}
     return chosen, {record["i"]: record for record in records}, flagged, counts
 
 
@@ -1583,7 +1708,7 @@ class _Sizes:
             size = self.stored_preview(row)
             parts["images"] = size if size is not None else min(row["size"] or 0,
                                                                 ESTIMATE_WEB_BYTES)
-        if record.get("p") == "360":
+        if record.get("p") == "360" and not _is_video(row):
             if self.images is None:
                 self.images = _images()
             if self.images.has_pano(row["width"], row["height"]):
@@ -1610,12 +1735,24 @@ def _look_sizes(conn, library_id, options, ids):
     return {image_id: size for image_id in found["vectors"]}
 
 
-def _vector_sizes(conn, library_id, options, ids):
+def _carried(pairs):
+    """{image id: the drive words (dvt, dvd, dvg) its record carries} of the pictures
+    ((image id, record) pairs) whose records carry some (embeddings.fresh_vectors)."""
+    carried = {}
+    for image_id, record in pairs:
+        fields = {key: record[key] for key in ("dvt", "dvd", "dvg") if key in record}
+        if fields:
+            carried[image_id] = fields
+    return carried
+
+
+def _vector_sizes(conn, library_id, options, ids, carried=None):
     """{image id: bytes its up-to-date meaning vector adds to the export} for the
-    pictures of ids that have one ({} when the similar option is off)."""
+    pictures of ids that have one ({} when the similar option is off). carried: see
+    embeddings.fresh_vectors."""
     if not options.get("similar"):
         return {}
-    found = embeddings.fresh_vectors(conn, library_id, ids)
+    found = embeddings.fresh_vectors(conn, library_id, ids, carried=carried)
     size = vector_bytes(found["dims"]) if found["dims"] else 0
     return {image_id: size for image_id in found["vectors"]}
 
@@ -1791,7 +1928,10 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
     "meaning": search by meaning in the browser {"available", "reason",
     "bytes", "gzip" (when available)}, see meaning_status, "looks": with
     the looks option, {"vectors": how many of the pictures to export have
-    a look vector, "missing": how many do not}},
+    a look vector, "missing": how many do not}, "drives": the drives among the
+    pictures to publish, see drives.export_texts: {"drives", "described" (those
+    that keep their own description), "private", "sensitive" (those whose
+    description the options leave out)}},
     "flagged": [{id, reason, reasons, title, excluded, bytes
     (what the picture adds to the export), parts (the same by kind, as in
     size_parts), needs_folder, new_flags (see select_records), and for a
@@ -1815,8 +1955,15 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
     flagged_ids = {item["id"] for item in flagged}
     sizes = _Sizes(library_id, options, sorted({record["i"] for record in chosen}
                                                | flagged_ids))
+    # The drives as the export would publish them (on copies of the records).
+    published = [dict(record) for record in chosen]
+    counts["drives"] = drives.export_texts(published, options,
+                                           drives.settings(config)["min_clips"],
+                                           drives.clip_texts(conn, library_id, config),
+                                           drives.clip_places(conn, library_id, config))
     vectors = _vector_sizes(conn, library_id, options,
-                            {record["i"] for record in chosen} | flagged_ids)
+                            {record["i"] for record in chosen} | flagged_ids,
+                            carried=_carried((record["i"], record) for record in published))
     look_sizes = _look_sizes(conn, library_id, options,
                              {record["i"] for record in chosen} | flagged_ids)
     parts = {"thumbs": 0, "images": 0, "panos": 0, "data": 0, "videos": 0,
@@ -2349,6 +2496,8 @@ class _Export:
         # Search by meaning in the browser (the meaning option, see meaning).
         self.meaning = None
         self.meaning_status = None
+        # The albums the manifest lists (the marks option, see album_numbers).
+        self.published_albums = []
 
     # -- set up ---------------------------------------------------------------
 
@@ -2598,7 +2747,13 @@ class _Export:
         if kind != "video":
             return False
         rel = "videos/%s.mp4" % picture.xid
-        if source is None:
+        if source is None and row["projection"] == videos.PROJECTION_360:
+            # (Its LRV, as the server's player gets it.)
+            source, kind = videos.playable_360(row, self.original_path(row))
+            if source is None:
+                raise ValueError("its low-resolution copy (.lrv) is not there")
+            sig = self._source_sig(kind, row, source)
+        elif source is None:
             source = self.original_path(row)
             if source is None:
                 raise ValueError("the library has no folder")
@@ -2673,8 +2828,8 @@ class _Export:
             picture.error = "%s" % (error,) or type(error).__name__
             return picture
         picture.ok = True
-        if mode != "none" and picture.record.get("p") == "360" and _images().has_pano(
-                picture.row["width"], picture.row["height"]):
+        if (mode != "none" and picture.record.get("p") == "360" and not _is_video(picture.row)
+                and _images().has_pano(picture.row["width"], picture.row["height"])):
             try:
                 self._pano(picture)
             except ExportWriteError as error:
@@ -2783,6 +2938,11 @@ class _Export:
             if record.get("dg") is not None:
                 groups[record["dg"]].append(record["i"])
         search_index.apply_groups(records, list(groups.values()))
+        # Drives over the exported clips only, with the drives' own words the
+        # options allow (drives.export_texts), with export ids below.
+        drives.export_texts(records, self.options, drives.settings(self.config)["min_clips"],
+                            drives.clip_texts(self.conn, self.library_id, self.config),
+                            drives.clip_places(self.conn, self.library_id, self.config))
         days = collections.defaultdict(list)
         for picture in pictures:
             day = picture.record.get("dk")
@@ -2795,20 +2955,149 @@ class _Export:
                 for number, entry in enumerate(entries, 1):
                     entry[2]["tn"] = number
         xids = {picture.record["i"]: picture.xid for picture in pictures}
+        numbers = self.album_numbers(pictures)
         for picture in pictures:
             record = picture.record
             record["i"] = picture.xid
             record["l"] = self.export_id
             if record.get("dg") is not None:
                 record["dg"] = xids[record["dg"]]
+            if "al" in record:
+                # (The database's album ids stay here: the export numbers them.)
+                kept = sorted(numbers[album_id] for album_id in record["al"]
+                              if album_id in numbers)
+                if kept:
+                    record["al"] = kept
+                else:
+                    del record["al"]
+            if record.get("dv") is not None:
+                record["dv"] = xids[record["dv"]]
             if picture.ext != "jpg":
                 record["ix"] = picture.ext
             if picture.pano:
                 record["pn"] = 1
             if picture.video:
                 record["vf"] = 1
+                codec = published_codec(picture.row, video_plan(picture.row, self.options,
+                                                                self.library_id)[1])
+                if codec:
+                    # (What the site's player gets: a playable copy is H.264.)
+                    record["vc"] = codec[:20]
         records.sort(key=lambda record: record["i"])
         return records
+
+    def album_numbers(self, pictures):
+        """{album id: its number in the export} of the albums the export publishes (the
+        marks option; else none), and their manifest entries in self.published_albums.
+
+        Manual albums with at least one exported picture (their items: the
+        export ids of those pictures, in the album's order) and the smart
+        albums whose search can be published (see smart_search; one that
+        names an album that is not published is left out too), numbered 1,
+        2, ... in the order of their ids.
+        """
+        self.published_albums = []
+        if not self.options["marks"] or not pictures:
+            return {}
+        xids = {picture.row["id"]: picture.xid for picture in pictures}
+        every = sorted(albums.list_albums(self.conn), key=lambda item: item["id"])
+        manual = {}
+        for album in every:
+            if album["kind"] == "manual":
+                items = [xids[image_id] for image_id in albums.album_items(
+                    self.conn, album["id"], [self.library_id], include_hidden=False)
+                         if image_id in xids]
+                if items:
+                    manual[album["id"]] = items
+        smart = {}
+        for album in every:
+            if album["kind"] == "smart":
+                search = self.smart_search(album, xids)
+                if search is not None:
+                    smart[album["id"]] = search
+        # (A smart album may name another album: it goes when that one is
+        # not published, and so on.)
+        named = {}
+        changed = True
+        while changed:
+            changed = False
+            for album_id in sorted(smart):
+                targets = [albums.find_listed(every, term["value"])
+                           for term in smart[album_id]["albums"]]
+                if any(target is None or (target["id"] not in manual
+                                          and target["id"] not in smart)
+                       for target in targets):
+                    del smart[album_id]
+                    changed = True
+                else:
+                    named[album_id] = [target["id"] for target in targets]
+        numbers = {}
+        for album in every:
+            if album["id"] in manual or album["id"] in smart:
+                numbers[album["id"]] = len(numbers) + 1
+        for album in every:
+            entry = {"name": album["name"], "kind": album["kind"]}
+            if album["id"] in manual:
+                entry["items"] = manual[album["id"]]
+            elif album["id"] in smart:
+                search = smart[album["id"]]
+                # album: terms name the published album by its number there.
+                changes = dict(search["changes"])
+                for term, target in zip(search["albums"], named[album["id"]]):
+                    changes[(term["value_start"], term["value_stop"])] = "#%d" % numbers[target]
+                entry["query"] = _rewrite(album.get("query") or "", changes)
+                entry["options"] = search["options"]
+            else:
+                continue
+            entry["id"] = numbers[album["id"]]
+            self.published_albums.append(entry)
+        return numbers
+
+    def smart_search(self, album, xids):
+        """What of a smart album's saved search can be published, or None when it cannot.
+
+        Not when it is limited to another library (its library choice or
+        Library filter; this library's choice is dropped); nor when its
+        search (query terms or filters) goes by what the export leaves out:
+        folder: (the folders option), file: (file_names), place:, has:gps
+        and the Place filter (location), lib: (the libraries' own names);
+        nor when it looks for pictures like one that is not published
+        (similar:, look:). Returns {"options", "changes": {(start, stop):
+        new value} (similar: and look: name the picture by its export id),
+        "albums": the album: terms (album_numbers checks them)}.
+        """
+        options = dict(album.get("options") or {})
+        if not albums.smart_in_libraries(options, [self.library_id]):
+            return None
+        options.pop("lib", None)
+        filters = dict(options.get("filters") or {})
+        filters.pop("library", None)
+        if not self.options["location"] and (filters.get("place") or "gps" in (
+                filters.get("has") or [])):
+            return None
+        if filters:
+            options["filters"] = filters
+        else:
+            options.pop("filters", None)
+        needs = {"folder": "folders", "file": "file_names", "place": "location"}
+        changes = {}
+        named = []
+        for term in albums.query_terms(album.get("query") or ""):
+            field = term["field"]
+            value = term["value"].strip()
+            if field == "lib" or (field in needs and not self.options[needs[field]]):
+                return None
+            if (field == "has" and not self.options["location"]
+                    and value.lower().startswith(_LOCATION_WORDS)):
+                return None
+            if field in ("similar", "look"):
+                xid = xids.get(int(value)) if re.match(r"^[0-9]{1,18}$", value) else None
+                if xid is None:
+                    return None
+                changes[(term["value_start"], term["value_stop"])] = xid
+            elif field == "album":
+                named.append(term)
+        return {"options": options, "changes": changes, "albums": named}
 
     def data_files(self, pictures, records, capabilities):
         """{relative path: text} of the data scripts, and the manifest (without its date)."""
@@ -2859,6 +3148,8 @@ class _Export:
             manifest["looks"] = look_names
         if meaning is not None:
             manifest["meaning"] = meaning
+        if self.published_albums:
+            manifest["albums"] = self.published_albums
         if self.options["location"]:
             points = []
             for picture in pictures:
@@ -2889,7 +3180,9 @@ class _Export:
         if not self.options["similar"] or not pictures:
             return []
         found = embeddings.fresh_vectors(self.conn, self.library_id,
-                                         [picture.row["id"] for picture in pictures])
+                                         [picture.row["id"] for picture in pictures],
+                                         carried=_carried((picture.row["id"], picture.record)
+                                                          for picture in pictures))
         items = sorted((picture.xid, found["vectors"][picture.row["id"]])
                        for picture in pictures if picture.row["id"] in found["vectors"])
         self.vector_stats.update(vectors=len(items), stale=found["stale"],
@@ -3218,6 +3511,9 @@ class _Export:
                             "folders": self.options["folders"]}
             if any(picture.video for picture in pictures):
                 capabilities["videos"] = True
+            if self.options["marks"]:
+                # (Favorites, ratings and album names were published.)
+                capabilities["marks"] = True
             if location and any(record.get("co") for record in records):
                 # Place names (and with them the GeoNames credit, render_page).
                 capabilities["places"] = True
@@ -3261,6 +3557,15 @@ class _Export:
             ctx.log("Exported %d picture(s) of %s to %s: %d file(s) written, %d unchanged, "
                     "%d removed." % (summary["count"], self.title, self.out_dir,
                                      summary["written"], summary["unchanged"], removed))
+            if counts.get("album"):
+                ctx.log("Limited to the album %s: %d of its picture(s) are in this library%s."
+                        % (counts["album"]["name"], counts["album"]["pictures"],
+                           " (%d more in other libraries were left out)"
+                           % counts["album"]["elsewhere"] if counts["album"]["elsewhere"]
+                           else ""))
+            if self.options["marks"]:
+                ctx.log("Favorites, ratings and %d album(s) were published (the marks option)."
+                        % len(self.published_albums))
             if self.failed:
                 ctx.log("%d picture(s) could not be exported (see the warnings above)."
                         % self.failed, "warn")
@@ -3350,7 +3655,10 @@ class _Export:
                 "vectors": self.vector_stats["vectors"],
                 "looks": self.look_stats["vectors"],
                 "meaning": {"id": self.meaning["id"], "bytes": self.meaning["bytes"],
-                            "gzip": self.meaning["gzip"]} if self.meaning is not None else None}
+                            "gzip": self.meaning["gzip"]} if self.meaning is not None else None,
+                "album": counts.get("album", {}).get("name"),
+                "albums": len(self.published_albums),
+                "serve": serve_command(self.out_dir)}
 
 
 
@@ -3364,6 +3672,7 @@ def export_library(ctx, conn, config, library_id, out_dir=None, options=None, he
     folders that are refused). options override the library's saved
     export options (config "export"; see DEFAULT_OPTIONS and
     validate_options). helper is the configured helper module, if any.
+    With the location option the GPS check (gps_check.run) runs first.
 
     The summary: {library_id, export_id, output, zip, count (pictures
     exported), total, excluded {reason: count}, failed, pano_failed, kept
@@ -3389,6 +3698,10 @@ def export_library(ctx, conn, config, library_id, out_dir=None, options=None, he
         raise ExportError("Another export is running: %s. Try again when it has finished."
                           % (lock.holder() or "another process"))
     try:
+        if options["location"]:
+            # Positions read since the last GPS check (a stopped scan's) are
+            # checked first: one it sets aside is never published.
+            gps_check.run_safely(conn, config, ctx)
         return job.run()
     finally:
         lock.release()
@@ -3402,8 +3715,8 @@ def _cli_options(args, library):
     options = {}
     if args.images:
         options["images"] = args.images
-    for name in ("location", "file_names", "folders", "zip"):
-        if getattr(args, name):
+    for name in ("location", "file_names", "folders", "zip", "marks"):
+        if getattr(args, name, False):
             options[name] = True
     if args.videos:
         options["videos"] = args.videos
@@ -3420,8 +3733,106 @@ def _cli_options(args, library):
 
 
 def serve_command(folder):
-    """The command that tries an export on this computer (only this computer can open it)."""
-    return 'python -m http.server --bind 127.0.0.1 --directory "%s"' % folder
+    """The command that tries an export on this computer (only this computer can open it):
+    this program's own small web server (serve_folder)."""
+    return 'python "%s" --serve "%s"' % (os.path.abspath(__file__), folder)
+
+
+SERVE_PORT = 8000
+# Bytes sent at a time for a range of a file.
+_RANGE_CHUNK = 256 * 1024
+_RANGE_RE = re.compile(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$", re.IGNORECASE)
+
+
+class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
+    """The files of a folder, answering a request for one byte range of a file (206):
+    browsers ask for those to move in a video (python -m http.server sends the whole
+    file instead, so seeking fails)."""
+
+    _range_left = None
+
+    def send_head(self):
+        self._range_left = None
+        wanted = self.headers.get("Range")
+        match = _RANGE_RE.match(wanted) if wanted else None
+        path = self.translate_path(self.path)
+        if (match is None or not (match.group(1) or match.group(2)) or os.path.isdir(path)
+                or path.endswith("/")):
+            return super().send_head()
+        try:
+            handle = open(path, "rb")
+        except OSError:
+            self.send_error(404, "File not found")
+            return None
+        try:
+            size = os.fstat(handle.fileno()).st_size
+            if match.group(1):
+                start = int(match.group(1))
+                end = min(int(match.group(2)), size - 1) if match.group(2) else size - 1
+            else:
+                start, end = max(0, size - int(match.group(2))), size - 1
+            if start >= size or end < start:
+                handle.close()
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+            self.send_response(206)
+            self.send_header("Content-Type", self.guess_type(path))
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Last-Modified",
+                             self.date_time_string(os.fstat(handle.fileno()).st_mtime))
+            self.end_headers()
+            handle.seek(start)
+            self._range_left = end - start + 1
+            return handle
+        except Exception:
+            handle.close()
+            raise
+
+    def end_headers(self):
+        self.send_header("Accept-Ranges", "bytes")
+        super().end_headers()
+
+    def copyfile(self, source, outputfile):
+        if self._range_left is None:
+            super().copyfile(source, outputfile)
+            return
+        left = self._range_left
+        while left > 0:
+            chunk = source.read(min(_RANGE_CHUNK, left))
+            if not chunk:
+                break
+            outputfile.write(chunk)
+            left -= len(chunk)
+
+    def log_message(self, format, *args):
+        pass                    # (quiet: the console shows how to stop it)
+
+
+def make_server(folder, port=SERVE_PORT, bind="127.0.0.1"):
+    """A web server (not started) for the files of folder, on bind:port (port 0: any
+    free one), with RangeRequestHandler."""
+    handler = functools.partial(RangeRequestHandler, directory=os.path.abspath(folder))
+    return http.server.ThreadingHTTPServer((bind, port), handler)
+
+
+def serve_folder(folder, port=SERVE_PORT, log=print):
+    """Serve an export's folder at http://localhost:port/ for this computer only, until
+    Ctrl+C."""
+    if not os.path.isfile(os.path.join(folder, "index.html")):
+        raise ExportError("%s holds no exported site (no index.html)." % folder)
+    server = make_server(folder, port)
+    log("Serving %s at http://localhost:%d/ (only this computer can open it). Press "
+        "Ctrl+C to stop." % (os.path.abspath(folder), server.server_address[1]))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log("Stopped.")
+    finally:
+        server.server_close()
 
 
 def report(summary, log=print):
@@ -3440,7 +3851,7 @@ def report(summary, log=print):
     if summary.get("count"):
         log("Open %s in a browser, or try it with: %s"
             % (os.path.join(summary["output"], "index.html"), serve_command(summary["output"])))
-        log("(then open http://localhost:8000/)")
+        log("(then open http://localhost:%d/)" % SERVE_PORT)
     else:
         log("The site holds no pictures. Change the export options (the Export dialog on the "
             "Manage page, or the switches of export.py), or describe the pictures first.")
@@ -3456,7 +3867,8 @@ def main(argv=None):
         description="Export one library as a static website (see README: Publishing a "
                     "library). The library's saved export options are used, changed by "
                     "the options given here.")
-    parser.add_argument("--library", required=True, help="the library's name or id")
+    parser.add_argument("--library", help="the library's name or id (needed for an "
+                                           "export)")
     parser.add_argument("--out", help="output folder (default: data/exports/<library name> "
                                       "in the data folder); it must be empty or an earlier "
                                       "export")
@@ -3468,7 +3880,9 @@ def main(argv=None):
                              "(when place names were downloaded; with a GeoNames credit), "
                              "the map and the AI model's separate landmark and place-guess "
                              "fields (titles and descriptions are published as written "
-                             "either way)")
+                             "either way, except that without it GPS positions written "
+                             "out in them or in the text in the picture, as a dashcam "
+                             "prints them, are taken out)")
     parser.add_argument("--file-names", action="store_true", help="include file names")
     parser.add_argument("--folders", action="store_true", help="include folder names")
     parser.add_argument("--include-screenshots", action="store_true",
@@ -3485,11 +3899,32 @@ def main(argv=None):
                         help="include pictures flagged as suggestive, explicit or graphic")
     parser.add_argument("--zip", action="store_true",
                         help="also write <output folder>.zip next to the folder")
+    parser.add_argument("--album", metavar="NAME",
+                        help="only the pictures of this manual album (its name, or its id); "
+                             "the privacy options still apply to them")
+    parser.add_argument("--marks", action="store_true",
+                        help="also publish favorites, ratings and album names (so "
+                             "is:favorite, rating: and album: work in the site)")
     parser.add_argument("--videos", choices=VIDEO_MODES,
                         help="skip: videos are published as their poster frame (default); "
                              "include: also the videos browsers can play (H.264, or a "
                              "playable copy), up to max_video_mb, without their metadata")
+    parser.add_argument("--serve", metavar="FOLDER",
+                        help="instead of exporting: try an exported site on this computer "
+                             "(only it can open it) at http://localhost:%d/, with seeking in "
+                             "videos (python -m http.server cannot do that); Ctrl+C stops it"
+                        % SERVE_PORT)
+    parser.add_argument("--port", type=int, default=SERVE_PORT,
+                        help="the port for --serve (default %d)" % SERVE_PORT)
     args = parser.parse_args(argv)
+    if args.serve:
+        try:
+            serve_folder(args.serve, args.port)
+        except (ExportError, OSError) as error:
+            raise SystemExit("Error: %s" % error)
+        return None
+    if not args.library:
+        parser.error("--library is needed (or --serve FOLDER)")
     try:
         db.init()
         config = common.load_config()
@@ -3500,6 +3935,11 @@ def main(argv=None):
         ctx = jobs.ConsoleContext("export")
         conn = db.connect()
         try:
+            if args.album:
+                album = albums.find_album(conn, args.album)
+                if album is None:
+                    raise ExportError("There is no album %r (see the Albums page)." % args.album)
+                options["album"] = album["id"]
             with ctx.stop_on_ctrl_c():
                 summary = export_library(ctx, conn, config, library["id"], args.out, options,
                                          helper=common.load_helper(config.get("helper", "")))

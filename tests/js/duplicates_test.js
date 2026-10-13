@@ -19,13 +19,37 @@ function test(name, body) {
 }
 
 test("the address gives the page's choices", function () {
-    assert.deepStrictEqual(F.choices({}), {kind: "all", min: 2, page: 1, stack: null});
+    assert.deepStrictEqual(F.choices({}), {kind: "all", min: 2, page: 1, stack: null, from: null});
     assert.deepStrictEqual(F.choices({kind: "exact", min: "5", page: "3", stack: "42"}),
-                           {kind: "exact", min: 5, page: 3, stack: 42});
+                           {kind: "exact", min: 5, page: 3, stack: 42, from: null});
     // Anything the page does not offer is the default.
-    assert.deepStrictEqual(F.choices({kind: "odd", min: "4", page: "-1", stack: "x"}),
-                           {kind: "all", min: 2, page: 1, stack: null});
+    assert.deepStrictEqual(F.choices({kind: "odd", min: "4", page: "-1", stack: "x", from: "x"}),
+                           {kind: "all", min: 2, page: 1, stack: null, from: null});
     assert.deepStrictEqual(F.choices(null), F.choices({}));
+    // "from" only goes with a stack.
+    assert.strictEqual(F.choices({stack: "7", from: "same"}).from, "same");
+    assert.strictEqual(F.choices({from: "same"}).from, null);
+    // ... and back: what the address holds of them.
+    assert.deepStrictEqual(F.address(F.choices({})),
+                           {kind: null, min: null, page: null, stack: null, from: null});
+    assert.deepStrictEqual(F.address(F.choices({kind: "same", min: "3", page: "2"})),
+                           {kind: "same", min: "3", page: "2", stack: null, from: null});
+});
+
+test("a stack opened from Same picture, any date, and the way back", function () {
+    var state = F.choices({kind: "same", min: "3", page: "4"});
+    var query = F.stackQuery("?lib=lib_family1&kind=same&min=3&page=4", state, 17);
+    var params = new URLSearchParams(query.slice(1));
+    assert.strictEqual(query.charAt(0), "?");
+    assert.strictEqual(params.get("lib"), "lib_family1");
+    assert.strictEqual(params.get("stack"), "17");
+    assert.strictEqual(params.get("from"), "same");
+    assert.strictEqual(params.get("kind"), null);
+    // The list's page and size stay in the address for the way back.
+    var opened = F.choices({lib: "lib_family1", stack: params.get("stack"), from: "same",
+                            min: params.get("min"), page: params.get("page")});
+    assert.deepStrictEqual(opened, {kind: "all", min: 3, page: 4, stack: 17, from: "same"});
+    assert.strictEqual(F.stackQuery("", F.choices({kind: "same"}), 5), "?stack=5&from=same");
 });
 
 test("dates with and without a time", function () {
@@ -62,6 +86,46 @@ test("what keeping pictures apart does, in words", function () {
     assert.ok(/except identical files/.test(F.notDuplicatesText(stack)));
     var plain = {size: 3, contents: 3, members: [{id: 1}, {id: 2}, {id: 3}]};
     assert.strictEqual(F.notDuplicatesText(plain), "These 3 pictures are no longer stacked together.");
+});
+
+test("the owner's marks of a picture, in words", function () {
+    assert.strictEqual(F.marksText({favorite: true, rating: 4, albums: 2}),
+                       "\u2605 Favorite \u00b7 4 stars \u00b7 in 2 albums");
+    assert.strictEqual(F.marksText({rating: 1}), "1 star");
+    assert.strictEqual(F.marksText({albums: 1}), "in an album");
+    assert.strictEqual(F.marksText({}), "");
+});
+
+test("same picture, any date: the kind, titles and words", function () {
+    assert.ok(F.KINDS.indexOf("same") >= 0);
+    assert.strictEqual(F.LABELS.same, "Same picture, any date");
+    assert.strictEqual(F.choices({kind: "same", stack: "7"}).kind, "same");
+    assert.strictEqual(F.stackTitle({kind: "same", size: 3}), "3 pictures that look the same");
+    assert.strictEqual(F.stackTitle({kind: "exact", size: 2}), "2 identical files");
+    assert.strictEqual(F.stackTitle({kind: "similar", size: 1}), "1 similar picture");
+    // Taken on other days: the first and the last day.
+    var span = F.spanText({members: [{taken: "2021-06-02T10:00:00"}, {taken: ""},
+                                     {taken: "2019-05-14T08:00:00"}]});
+    assert.ok(/^Taken .*2019 to .*2021$/.test(span), span);
+    assert.strictEqual(F.spanText({members: [{taken: "2019-05-14T08:00:00"},
+                                             {taken: "2019-05-14T09:00:00"}]}), "");
+    assert.strictEqual(F.spanText({members: [{taken: "2019-05-14"}]}), "");
+    assert.strictEqual(F.stackedText({stacked: 5}), "Its stack of 5 (search page)");
+    assert.strictEqual(F.stackedText({}), "");
+});
+
+test("same picture, any date: Not duplicates leaves the search page's stacks", function () {
+    var stack = {kind: "same", size: 4, contents: 4,
+                 members: [{id: 1, stack: 9}, {id: 2}, {id: 3, stack: 9}, {id: 4, stack: 12}]};
+    // Pictures of one stack of the search page stay together (one alone needs nothing).
+    assert.deepStrictEqual(F.togetherOf(stack), [[1, 3]]);
+    assert.deepStrictEqual(F.togetherOf({members: [{id: 1}, {id: 2}]}), []);
+    assert.ok(/no longer listed as the same picture/.test(F.notDuplicatesText(stack)));
+    assert.ok(/stay as they are/.test(F.notDuplicatesText(stack)));
+    assert.strictEqual(F.apartText(stack, stack.members[1], "b.jpg"),
+                       "b.jpg is no longer listed with the others.");
+    assert.strictEqual(F.undoneText(stack), "They are listed together again.");
+    assert.strictEqual(F.undoneText({kind: "similar"}), "They are stacked again.");
 });
 
 var failed = 0;

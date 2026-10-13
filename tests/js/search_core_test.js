@@ -850,7 +850,8 @@ test("facet labels", function () {
     assert.strictEqual(SearchCore.facetLabel("people", "3-5"), "3-5 people");
     assert.strictEqual(SearchCore.facetLabel("time", "sunrise_sunset"), "Sunrise or sunset");
     assert.strictEqual(SearchCore.facetLabel("event", "graduation"), "Graduation");
-    assert.strictEqual(SearchCore.facetLabel("has", "360"), "360\u00b0 photos");
+    // (360 videos too.)
+    assert.strictEqual(SearchCore.facetLabel("has", "360"), "360\u00b0 photos and videos");
     assert.strictEqual(SearchCore.facetLabel("tags", "beach"), "beach");
     assert.ok(SearchCore.SYNTAX.length > 5);
     assert.ok(SearchCore.SORTS.indexOf("relevance") >= 0);
@@ -896,6 +897,237 @@ test("a group whose cover does not match shows its best match", function () {
     var single = search(GROUP_RECORDS, "snow -text:x", {group: true, filters: {year: ["2019"]}});
     assert.deepStrictEqual(single.items, [20]);
     assert.deepStrictEqual(single.groups, {});
+});
+
+/* ---------- Drives ---------------------------------------------------------- */
+
+// Two drives (clips 30-33 and 40-42, keyed by their first clips) and a
+// lone video, all made up. 41 is an exact copy of 50 (a duplicate group).
+var DRIVE_RECORDS = [
+    {i: 30, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:00:00", dv: 30,
+     t: "Leaving the driveway", dvt: "Morning drive to the coast",
+     dvd: "A drive along a coastal highway past a lighthouse.", dvg: ["highway", "coast"]},
+    {i: 31, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:01:00", dv: 30, dx: 1,
+     t: "Suburban street"},
+    {i: 33, mv: 1, dr: 22, dk: "2023-08-17", ts: "2023-08-17T08:03:00", dv: 30, dx: 3,
+     dh: 60, t: "A bridge over a river"},
+    {i: 32, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:02:00", dv: 30, dx: 2,
+     t: "Freeway traffic"},
+    {i: 40, mv: 1, dr: 60, dk: "2023-08-18", ts: "2023-08-18T09:00:00", dv: 40,
+     t: "Parking garage"},
+    {i: 41, mv: 1, dr: 60, dk: "2023-08-18", ts: "2023-08-18T09:01:00", dv: 40, dx: 1,
+     t: "Mountain road", dg: 41},
+    {i: 42, mv: 1, dr: 60, dk: "2023-08-18", ts: "2023-08-18T09:02:00", dv: 40, dx: 2,
+     t: "Mountain pass in snow"},
+    {i: 50, mv: 1, dr: 60, dk: "2023-08-19", ts: "2023-08-19T10:00:00", t: "Mountain road",
+     dg: 41},
+    {i: 60, dk: "2023-08-16", t: "A bridge at night"}
+];
+
+test("drives fold into one result each, shown as their middle clip", function () {
+    var flat = search(DRIVE_RECORDS, "");
+    assert.strictEqual(flat.items.length, 9);
+    // (The drives are listed folded or not: the viewer plays them whole.)
+    assert.deepStrictEqual(flat.drives[30].clips, [30, 31, 32, 33]);
+    var folded = search(DRIVE_RECORDS, "", {drives: true});
+    assert.strictEqual(folded.total, 9);
+    // Without words each drive shows as the middle one of its clips (not
+    // its first, often the car still parked), where that clip's date is.
+    assert.deepStrictEqual(folded.items, [50, 41, 31, 60]);
+    assert.deepStrictEqual(folded.drives, {
+        30: {clips: [30, 31, 32, 33], matched: [33, 32, 31, 30], shown: 31, text: 30},
+        40: {clips: [40, 41, 42], matched: [42, 41, 40], shown: 41, text: null}});
+    // (Drives are no duplicate stacks.)
+    assert.deepStrictEqual(folded.groups, {});
+    assert.strictEqual(folded.collapsed, 0);
+    // A clip of a folded drive is never in a duplicate group: 50 stays alone.
+    var both = search(DRIVE_RECORDS, "", {drives: true, group: true});
+    assert.deepStrictEqual(both.items, [50, 41, 31, 60]);
+    assert.strictEqual(both.groups[50], undefined);
+    // Without drives the duplicate group is as before (41 its cover).
+    var dupes = search(DRIVE_RECORDS, "", {group: true});
+    assert.deepStrictEqual(dupes.groups[41], [41, 50]);
+    // Oldest first: the drive sits where its shown clip is.
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "", {drives: true, sort: "oldest"}),
+                           [60, 31, 41, 50]);
+});
+
+test("an album's drive is made of its clips; a drive found by its words is whole", function () {
+    var albums = [{id: 1, name: "Trip", kind: "manual", items: [31, 60]},
+                  {id: 2, name: "Coast", kind: "manual", items: [33, 30, 32]},
+                  {id: 3, name: "Lighthouse", kind: "smart", query: "lighthouse", options: {}}];
+    // One clip of a drive: that clip alone, as an export of the album has it.
+    var trip = search(DRIVE_RECORDS, "album:Trip", {albums: albums, drives: true});
+    assert.deepStrictEqual(trip.items, [31, 60]);
+    assert.deepStrictEqual(trip.drives, {});
+    // Three of its clips: a drive of those three, in the drive's order.
+    var coast = search(DRIVE_RECORDS, "album:Coast", {albums: albums, drives: true});
+    assert.deepStrictEqual(coast.drives[30].clips, [30, 32, 33]);
+    assert.strictEqual(coast.items.length, 1);
+    // Elsewhere the drive holds them all.
+    assert.deepStrictEqual(search(DRIVE_RECORDS, "bridge", {drives: true}).drives[30].clips,
+                           [30, 31, 32, 33]);
+    // Found by its own words only: its cover stands for it, or with
+    // wholeDrives all of its clips, in its order, where it is...
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "lighthouse"), [31]);
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "lighthouse", {wholeDrives: true}),
+                           [30, 31, 32, 33]);
+    // ...but a clip that matches by itself stands for itself.
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "bridge", {wholeDrives: true}).sort(),
+                           [33, 60]);
+    // A smart album holds a drive found by its words whole (the Albums
+    // page counts them so, and Copy to a new album keeps them all).
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "album:Lighthouse",
+                                 {albums: albums, sort: "album", group: false,
+                                  wholeDrives: true}), [30, 31, 32, 33]);
+});
+
+test("a search hit inside a drive shows the drive, as the clip that matched", function () {
+    var index = SearchCore.prepare(DRIVE_RECORDS);
+    var result = index.search("bridge", {drives: true});
+    // The bridge clip of the first drive, and the photo of a bridge.
+    assert.deepStrictEqual(result.items.slice().sort(), [33, 60]);
+    assert.deepStrictEqual(result.drives, {30: {clips: [30, 31, 32, 33], matched: [33],
+                                                shown: 33, text: 30}});
+    assert.deepStrictEqual(index.driveClips(30), [30, 31, 32, 33]);
+    assert.deepStrictEqual(index.driveClips("40"), [40, 41, 42]);
+    assert.deepStrictEqual(index.driveClips(99), []);
+    // Two clips match: the drive shows as the better (here newer) one.
+    var mountain = index.search("mountain", {drives: true});
+    assert.deepStrictEqual(mountain.items, [50, 42]);
+    assert.deepStrictEqual(mountain.drives[40].matched, [42, 41]);
+});
+
+test("a drive's own words find it, as its cover, never as the clip that carries them", function () {
+    // The words are the drive's: they find its cover (the middle clip),
+    // not clip 30 that carries them, whose own words are about leaving.
+    var result = search(DRIVE_RECORDS, "lighthouse", {drives: true});
+    assert.deepStrictEqual(result.items, [31]);
+    assert.deepStrictEqual(result.drives[30].matched, []);   // (none by itself)
+    assert.strictEqual(result.drives[30].shown, 31);
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "lighthouse"), [31]);
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "coast highway"), [31]);
+    // A clip that matches another part by its own words passes the drive's
+    // part too: leaving, on a drive past a lighthouse.
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "leaving lighthouse", {drives: true}), [30]);
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "bridge coast"), [33]);
+    // A field searches the clips' own words only; -word too.
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "title:lighthouse"), []);
+    assert.strictEqual(items(DRIVE_RECORDS, "-lighthouse").length, 9);
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "is:drive").length, 7);
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "is:dashcam", {drives: true}), [41, 31]);
+    assert.deepStrictEqual(items(DRIVE_RECORDS, "-is:drive").sort(), [50, 60]);
+    // "drive" is a kind word of the clips of drives.
+    assert.ok(items(DRIVE_RECORDS, "drive").indexOf(41) >= 0);
+    assert.deepStrictEqual(SearchCore.highlights("Morning drive to the coast", "coast",
+                                                 "dvt"), [[21, 26]]);
+    assert.deepStrictEqual(SearchCore.highlights("Morning drive to the coast", "title:coast",
+                                                 "dvt"), []);
+});
+
+test("a drive's own words do not make its cover a match when a clip matches by itself", function () {
+    var records = DRIVE_RECORDS.map(function (rec) {
+        var copy = JSON.parse(JSON.stringify(rec));
+        if (copy.i === 30) {
+            copy.dvd += " A stop at a gas station.";
+        }
+        if (copy.i === 32) {
+            copy.t = "Gas station by the freeway";
+        }
+        return copy;
+    });
+    var result = search(records, "gas station", {drives: true});
+    // The clip of the gas station stands for the drive, ringed; the cover
+    // (31, by the drive's words only) is no match of its own.
+    assert.deepStrictEqual(result.items, [32]);
+    assert.strictEqual(result.total, 1);
+    assert.deepStrictEqual(result.drives[30].matched, [32]);
+    assert.deepStrictEqual(items(records, "gas station"), [32]);
+    assert.deepStrictEqual(items(records, "gas station", {sort: "newest", drives: true}), [32]);
+});
+
+test("a drive's clips are those the search may show (hidden, sensitive, private, junk)", function () {
+    var records = [
+        {i: 1, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:00:00", dv: 1, h: 1,
+         t: "Garage"},
+        {i: 2, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:01:00", dv: 1, dx: 1,
+         t: "Street", dvt: "Morning drive to the coast", dvd: "Past a lighthouse."},
+        {i: 3, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:02:00", dv: 1, dx: 2,
+         t: "Crash scene", se: "graphic"},
+        {i: 4, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:03:00", dv: 1, dx: 3,
+         t: "Freeway", pr: 1},
+        {i: 5, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:04:00", dv: 1, dx: 4,
+         t: "Blur", qf: ["accidental"]},
+        {i: 6, mv: 1, dr: 60, dk: "2023-08-17", ts: "2023-08-17T08:05:00", dv: 1, dx: 5,
+         t: "Bridge"}
+    ];
+    var index = SearchCore.prepare(records);
+    var shown = index.search("", {drives: true});
+    assert.deepStrictEqual(shown.drives[1].clips, [2, 4, 5, 6]);
+    assert.strictEqual(shown.total, 4);
+    var strict = index.search("", {drives: true, "private": false, junk: true});
+    assert.deepStrictEqual(strict.drives[1].clips, [2, 6]);
+    var all = index.search("", {drives: true, hidden: true, sensitive: true});
+    assert.deepStrictEqual(all.drives[1].clips, [1, 2, 3, 4, 5, 6]);
+    assert.deepStrictEqual(index.driveClips(1, {}), [2, 4, 5, 6]);
+    assert.deepStrictEqual(index.driveClips(1, {hidden: true}), [1, 2, 4, 5, 6]);
+    // The drive's words find it whatever its clip that carries them.
+    assert.deepStrictEqual(index.search("lighthouse", {drives: true, junk: true}).items, [4]);
+    // Fewer than two clips to show: no drive.
+    var one = index.search("", {drives: true, ids: [6]});
+    assert.deepStrictEqual(one.items, [6]);
+    assert.deepStrictEqual(one.drives, {});
+});
+
+test("a drive's own words follow its flags (dvs, dvp) like a picture's", function () {
+    var records = [
+        {i: 1, mv: 1, dr: 60, dv: 1, t: "Garage", dvt: "Crash on the road", dvs: "graphic",
+         dvp: 1},
+        {i: 2, mv: 1, dr: 60, dv: 1, dx: 1, t: "Street"},
+        {i: 3, mv: 1, dr: 60, dv: 1, dx: 2, t: "Freeway"}
+    ];
+    var index = SearchCore.prepare(records);
+    assert.deepStrictEqual(index.search("crash", {drives: true}).items, []);
+    var shown = index.search("crash", {drives: true, sensitive: true});
+    assert.deepStrictEqual(shown.items, [2]);
+    assert.strictEqual(shown.drives[1].text, 1);
+    assert.deepStrictEqual(index.search("crash", {sensitive: true, "private": false}).items, []);
+    // Its clips still show; only its words are not shown.
+    var plain = index.search("", {drives: true});
+    assert.strictEqual(plain.drives[1].text, null);
+    assert.strictEqual(plain.drives[1].clips.length, 3);
+});
+
+test("a drive whose first clip is left out shows its middle one", function () {
+    var records = DRIVE_RECORDS.filter(function (rec) {
+        return rec.i !== 30;
+    });
+    var result = search(records, "", {drives: true});
+    assert.deepStrictEqual(result.items, [50, 41, 32, 60]);
+    assert.deepStrictEqual(result.drives[30].clips, [31, 32, 33]);
+    assert.deepStrictEqual(SearchCore.prepare(records).driveClips(30), [31, 32, 33]);
+});
+
+test("meaning: the clip that carries a drive's words stands for it only when no other is close", function () {
+    // Clip 30 carries the drive's words; its vector holds them too.
+    function records() {
+        return DRIVE_RECORDS.slice(0, 4).map(function (rec) {
+            return JSON.parse(JSON.stringify(rec));
+        });
+    }
+    var index = meaningIndex(records(), {30: closeTo(0.95), 32: closeTo(0.9, 2),
+                                         31: closeTo(0.1, 3), 33: closeTo(0.1, 4)});
+    var result = index.search("seaside", {drives: true, meaning: "meaning", vector: QUERY});
+    // 30 and 32 are close; 30 by its drive's words: 32 stands for the drive.
+    assert.deepStrictEqual(result.items.slice(0, 1), [32]);
+    assert.strictEqual(result.drives[30].shown, 32);
+    assert.deepStrictEqual(result.drives[30].matched, [32]);
+    // Only the carrier is close: the drive is found, shown as its cover.
+    index = meaningIndex(records(), {30: closeTo(0.95), 32: closeTo(0.1, 2),
+                                     31: closeTo(0.1, 3), 33: closeTo(0.1, 4)});
+    result = index.search("seaside", {drives: true, meaning: "meaning", vector: QUERY});
+    assert.strictEqual(result.drives[30].shown, 31);
+    assert.deepStrictEqual(result.drives[30].matched, []);
 });
 
 test("only the pictures picked on the map (ids)", function () {

@@ -46,22 +46,45 @@ its value is empty, zero, or the "nothing" value noted below:
     rg   the town's region                co   its country
     cc   the country's ISO code ("US")    (place names: an export only
                                            with location)
+    pe   1 when the place is only estimated from the pictures taken
+         around the same time (the picture's own position was set aside,
+         see gps_check.py; the place names go out with location)
+    gx   1 when the GPS check set the picture's position aside (server,
+         for the admin only; never exported): it has no gp and no place
     w    displayed width                  hgt  displayed height
-    p    "360" for a 360-degree photo
+    p    "360" for a 360-degree photo (or video)
     mv   1 for a video (see videos.py); its ty is always "video"
     dr   a video's length in seconds (one decimal, rounded down, at least
          0.1: players show whole seconds rounded down)
     vc   a video's codec ("h264", "hevc", ...: the pages ask the browser
-         whether it can play it)
+         whether it can play it; a 360 video's is its LRV's, else its
+         original's only when that holds both lenses in one stream; an
+         export's is what it published)
+    fx   a 360 video's lens geometry, for the player that stitches its
+         frames (videos.Video360.fisheye: lens circles, fov, turn, front,
+         mirror, blend, gain, fill)
     vt   a video's kind according to the AI model when it is not a photo
          ("screenshot" for a screen recording, ...): searched with the
          kind words, and an export's exclude_types look at it
     dg   duplicate group: the id of the group's cover picture, on every
          member of a group of two or more (see duplicate_groups; the cover
          is chosen by cover_key)
+    dv   drive: the id of the drive's first clip, on every clip of a drive
+         (a run of video clips recorded one after the other, see drives.py)
+    dx   the clip's place in its drive (the first, 0, is left out)
+    dh   seconds missing before the clip (clips the camera made that are
+         not in the library)
+    dvt  dvd  dvg   the drive's own title, description and tags, dvp and
+         dvs its flags (private, sensitive level), on one of its clips
+         (see drives.annotate: only the admin's records hold those of a
+         drive with a hidden clip)
     h    1 for a hidden picture (server, for the admin only; never exported)
     ed   1 when the owner edited the title, description or tags (server,
          for the admin only; see image_edits.py)
+    fav  1 for one of the owner's favorites   rt   its rating, 1-5 stars
+    al   the ids of the albums it is in [] (manual albums; see albums.py)
+         (the server; an export only with its "marks" option, which also
+         renumbers the albums)
     ds   1 when described                 v4   1 when the description comes
                                                from the older version 4
                                                prompt (only d, s, o, g and c)
@@ -83,16 +106,23 @@ import heapq
 import itertools
 import json
 import math
+import operator
 import os
 import re
+import sqlite3
+import struct
 import sys
 import threading
 import time
 
+import albums
 import common
 import db
+import drives
+import gps_check
 import image_edits
 import imageinfo
+import looks
 import not_duplicates
 import prompts
 import videos
@@ -102,7 +132,7 @@ import videos
 INDEX_VERSION = 1
 # Raise when duplicate_groups() or the groups' inputs (see build_records)
 # decide differently, so cached groups are worked out again.
-GROUPS_VERSION = 5
+GROUPS_VERSION = 6
 # dHashes (64 bits) at most this many bits apart are near-duplicates, when
 # both pictures have a capture date to trust and were taken at about the
 # same time (see SAME_TIME_SECONDS) ...
@@ -163,6 +193,51 @@ MAX_CANDIDATES = 256
 # of about that day, until the day has this many; then the day gets a
 # banded index of its own.
 DAY_INDEX_SIZE = 64
+# Looks (looks.py: what a picture looks like to an image model, one vector
+# per picture) stack pictures too (see duplicate_groups). The cut-offs are
+# cosines of two look vectors (each divided by its own length, see
+# _look_cosine), fixed rather than worked out per library: near duplicates
+# came out at about the same cosine in every library, while what two
+# pictures taken at random come to depends on what else a library holds,
+# and a cut-off taken from that changed when a picture was added or hidden.
+# They were set on about 12,000 photos with EmbeddingGemma 2 at 256
+# dimensions (two pictures taken at random: 0.65 to 0.82 by library), by
+# looking at the pairs:
+# - Two pictures taken at most LOOK_STACK_SECONDS apart stack when their
+#   looks are at least LOOK_STACK_COSINE close, however far apart their
+#   dHashes are (a crop, a filter, a re-saved copy, the next shot of a
+#   burst where the subject moved). Pairs that close and that near in time
+#   were nearly always one shot or the same view taken again; a few
+#   minutes apart, half of those from 0.985 to 0.99 were other shots of the
+#   subject (the frog from the side, the next patch of leaves), so ...
+LOOK_STACK_COSINE = 0.985
+LOOK_STACK_SECONDS = 60
+# ... taken up to LOOK_SAME_SECONDS apart they must look the same
+# (SAME_PICTURE_COSINE); taken further apart, only their dHashes can stack
+# them (the same guitar 80 minutes later, re-framed, came out at 0.994).
+LOOK_SAME_SECONDS = 600
+# Two pictures whose looks are at most LOOK_APART close are not duplicates,
+# however close their dHashes are (pressed coins, casino chips or the sides
+# of a mug photographed one by one on the same cloth come out at 0.75 to
+# 0.85), nor are two taken more than LOOK_STACK_SECONDS apart whose looks
+# are at most LOOK_APART_LATER close (other coins and the other side of the
+# mug a few minutes later, up to 0.93). Taken within a minute, true bursts
+# of a dark or moving scene came out at 0.86 to 0.93, and a black-and-white
+# copy (without a date) at 0.91: so alike things photographed within one
+# minute (or without times to compare) may still stack.
+LOOK_APART = 0.85
+LOOK_APART_LATER = 0.93
+# "Same picture, any date" (the Duplicates page, look_copies): pictures whose
+# looks are at least this close, whatever their dates: a copy saved again,
+# edited a little or sent and saved back (an edited copy of a painting came
+# out at 0.990; at 0.988 there were other poses of one photo session).
+SAME_PICTURE_COSINE = 0.990
+# look_copies compares a picture only with the leaders that share one band
+# of this many signs of its look with it ...
+LOOK_BAND_BITS = 14
+# ... when there are more than this many pictures (fewer are compared one by
+# one: the signs need many pictures to say something).
+LOOK_BAND_MIN = 200
 # How many built /api/index answers IndexService keeps (one per ETag).
 MEMO_SIZE = 4
 # A fast setting: the answer is built again after every change, and its
@@ -248,13 +323,30 @@ def _load_info(text):
 
 
 def export_settings(export_options=None):
-    """The privacy switches of an export: {"file_names", "folders", "location"} (all off by default).
+    """The privacy switches of an export: {"file_names", "folders", "location", "marks"}
+    (all off by default).
 
     file_names: records keep the file name (n); folders: the folder (f);
-    location: the "has GPS" flag (gp), landmarks and the location guess.
+    location: the "has GPS" flag (gp), landmarks and the location guess;
+    marks: favorites, ratings and album places (fav, rt, al).
     """
     options = export_options if isinstance(export_options, dict) else {}
-    return {key: options.get(key) is True for key in ("file_names", "folders", "location")}
+    return {key: options.get(key) is True
+            for key in ("file_names", "folders", "location", "marks")}
+
+
+def add_marks(record, marks):
+    """Add a picture's marks ((favorite, rating, [album ids]), see albums.for_libraries)
+    to its record: fav, rt and al, each only when set."""
+    if not marks:
+        return
+    favorite, rating, album_ids = marks
+    if favorite:
+        record["fav"] = 1
+    if rating:
+        record["rt"] = rating
+    if album_ids:
+        record["al"] = list(album_ids)
 
 
 def _extended_words(info, location):
@@ -274,13 +366,16 @@ def _extended_words(info, location):
 
 
 def record_for_row(row, for_export=False, export_options=None, info=None, edit=None,
-                   owner=False):
+                   owner=False, marks=None, gps_ignored=False):
     """The compact search record of one images row (see the module notes for the keys).
 
     row needs the columns of _INDEX_COLUMNS; info is its parsed description
     when the caller already has it; edit the owner's edit of the picture
     (image_edits), laid over the description. owner: the record is for the
-    admin, who is told which pictures are edited (ed).
+    admin, who is told which pictures are edited (ed) and whose position
+    the GPS check set aside (gps_ignored: gx). marks: the picture's
+    (favorite, rating, album ids) (albums.for_libraries); an export keeps
+    them only with its "marks" option.
     """
     options = export_settings(export_options) if for_export else None
     record = {"i": row["id"], "l": row["library_id"]}
@@ -299,8 +394,13 @@ def record_for_row(row, for_export=False, export_options=None, info=None, edit=N
     if edited:
         info = image_edits.apply(info if described else None, edit)
     if (described or edited) and isinstance(info, dict):
+        # (An export without the location: no GPS position written out in
+        # the text either, as a dashcam prints it over its video.)
+        scrub = for_export and not options["location"]
         for key, field in _TEXT_FIELDS:
             value = _text(info.get(field))
+            if value and scrub:
+                value = imageinfo.scrub_positions(value)
             if value:
                 record[key] = value
         for key, field in _LIST_FIELDS:
@@ -345,6 +445,8 @@ def record_for_row(row, for_export=False, export_options=None, info=None, edit=N
                 and math.isfinite(lat) and math.isfinite(lon)):
             record["gp"] = 1
         add_place(record, row)
+        if record.get("co") and "gp" not in record:
+            record["pe"] = 1            # (a place without a position: an estimate)
     if row["width"]:
         record["w"] = row["width"]
     if row["height"]:
@@ -357,6 +459,10 @@ def record_for_row(row, for_export=False, export_options=None, info=None, edit=N
         record["h"] = 1
     if edited and owner and not for_export:
         record["ed"] = 1
+    if gps_ignored and owner and not for_export:
+        record["gx"] = 1
+    if marks and (not for_export or options["marks"]):
+        add_marks(record, marks)
     if described:
         record["ds"] = 1
         if row["prompt_ver"] <= 4:
@@ -381,9 +487,54 @@ def add_video(record, row):
         record["dr"] = max(0.1, math.floor(duration * 10) / 10)
     facts = _load_info(row["vexif"]) if "vexif" in row.keys() else None
     facts = facts.get("video") if isinstance(facts, dict) else None
-    codec = _text(facts.get("codec")) if isinstance(facts, dict) else ""
+    facts = facts if isinstance(facts, dict) else {}
+    is_360 = "projection" in row.keys() and row["projection"] == imageinfo.PROJECTION_DUAL_FISHEYE
+    codec = _text(facts.get("codec"))
+    if is_360:
+        # The codec the player gets: a 360 video plays its LRV, or its
+        # original when that holds both lenses in one stream; lens streams
+        # play only as a playable copy (none: the page asks the server).
+        lrv = facts.get("lrv") if isinstance(facts.get("lrv"), dict) else {}
+        codec = _text(lrv.get("codec")) or (codec if facts.get("lenses") == "frame" else "")
     if codec:
         record["vc"] = codec[:20]
+    if is_360:
+        geometry = fisheye_record(facts.get("fisheye"))
+        if geometry:
+            record["fx"] = geometry
+
+
+def fisheye_record(geometry):
+    """A 360 video's lens geometry (videos.Video360.fisheye) checked for a record's fx, or None.
+
+    Only finite numbers in the expected shapes pass (the player stitches
+    the frames with them).
+    """
+    if not isinstance(geometry, dict):
+        return None
+
+    def numbers(value, count):
+        if (not isinstance(value, list) or len(value) != count
+                or not all(isinstance(item, (int, float)) and not isinstance(item, bool)
+                           and math.isfinite(item) for item in value)):
+            return None
+        return [float(item) for item in value]
+
+    lens = geometry.get("lens")
+    lenses = [numbers(item, 3) for item in lens] if isinstance(lens, list) and len(lens) == 2 \
+        else [None]
+    gain = geometry.get("gain")
+    gains = [numbers(item, 3) for item in gain] if isinstance(gain, list) and len(gain) == 2 \
+        else [None]
+    turn, fill = numbers(geometry.get("turn"), 2), numbers(geometry.get("fill"), 2)
+    fov, blend = numbers([geometry.get("fov")], 1), numbers([geometry.get("blend")], 1)
+    if None in lenses or None in gains or None in (turn, fill, fov, blend):
+        return None
+    if geometry.get("front") not in (0, 1) or not 90 < fov[0] < 360:
+        return None
+    return {"lens": lenses, "fov": fov[0], "turn": turn, "front": geometry["front"],
+            "mirror": geometry.get("mirror") is True, "blend": blend[0], "gain": gains,
+            "fill": fill}
 
 
 def add_place(record, row):
@@ -407,7 +558,11 @@ def picture_record(conn, image_id, edit=None):
     """
     row = conn.execute("SELECT %s FROM images WHERE id = ? AND missing_since IS NULL"
                        % _INDEX_COLUMNS, (image_id,)).fetchone()
-    return record_for_row(row, edit=edit, owner=True) if row is not None else None
+    if row is None:
+        return None
+    return record_for_row(row, edit=edit, owner=True,
+                          marks=albums.picture_marks(conn, image_id),
+                          gps_ignored=gps_check.is_ignored(conn, image_id))
 
 
 def record_tags(tags):
@@ -434,12 +589,17 @@ def build_records(conn, config, library_ids, for_export=False, export_options=No
     export too). Missing pictures are never included. Hidden pictures are
     included (with h: 1) unless include_hidden is False or for_export is
     set; an export never contains them. Records with hidden pictures are
-    the admin's, and they also mark the edited pictures (ed). for_export
+    the admin's, and they also mark the edited pictures (ed) and those
+    whose position the GPS check set aside (gx). for_export
     also leaves out what an export must not hold unless export_options
-    allow it (see export_settings and the module notes). Duplicate groups
+    allow it (see export_settings and the module notes): its records carry
+    the owner's marks (fav, rt, al with the database's album ids) only
+    with the "marks" option. Duplicate groups
     (dg) are added per library, split where the owner said pictures are
     not duplicates (see not_duplicates.py); use_cache=False works them out
-    again instead of using the cached groups.
+    again instead of using the cached groups. The groups use the pictures'
+    look vectors when data/image_vectors.db has them (group_looks). The
+    clips of drives get dv, dx and dh (see drives.annotate).
     """
     library_ids = _configured_ids(config, library_ids)
     if not library_ids:
@@ -450,13 +610,19 @@ def build_records(conn, config, library_ids, for_export=False, export_options=No
                             "" if with_hidden else " AND hidden = 0"))
     records = []
     edits = image_edits.for_libraries(conn, library_ids)
+    marks = (albums.for_libraries(conn, library_ids)
+             if not for_export or export_settings(export_options)["marks"] else {})
+    # (Only the admin is told whose positions the GPS check set aside.)
+    gps_ignored = gps_check.ignored_ids(conn, library_ids) if with_hidden else set()
     kept_apart = not_duplicates.pairs()
     keys = {}                   # image id -> not_duplicates.unit_key (when needed)
     # library id -> [(id, dhash, content hash, trusted date taken, aspect ratio)]
     items = collections.defaultdict(list)
+    wanted = {}                 # image id -> its look key (looks.kind_of), for group_looks
     for row in conn.execute(sql, library_ids):
         record = record_for_row(row, for_export, export_options, edit=edits.get(row["id"]),
-                                owner=with_hidden)
+                                owner=with_hidden, marks=marks.get(row["id"]),
+                                gps_ignored=row["id"] in gps_ignored)
         records.append(record)
         if not row["hidden"]:
             # (No dHash: only exact copies of it are grouped.)
@@ -465,13 +631,25 @@ def build_records(conn, config, library_ids, for_export=False, export_options=No
                 (row["id"], dhash, row["content_hash"],
                  trusted_date(row["taken_at"], row["taken_source"]),
                  aspect_ratio(row["width"], row["height"])))
+            key = look_key(row, record)
+            if key is not None:
+                wanted[row["id"]] = key
             if kept_apart:
                 keys[row["id"]] = not_duplicates.unit_key(row["id"], row["content_hash"])
+    vectors = group_looks(wanted)
     groups = []
     for library_id in library_ids:
         if items.get(library_id):
+            if vectors:
+                items[library_id] = [item + (vectors.get(item[0]),)
+                                     for item in items[library_id]]
             groups.extend(library_groups(library_id, items[library_id], use_cache=use_cache))
     apply_groups(records, not_duplicates.split_groups(groups, keys, kept_apart))
+    # Runs of video clips recorded one after the other (drives.py).
+    min_clips = drives.settings(config)["min_clips"]
+    for library_id in library_ids:
+        drives.annotate(records, drives.library_drives(conn, library_id, config or {}),
+                        library_id, min_clips, owner=with_hidden)
     return records
 
 
@@ -642,17 +820,141 @@ def _second(moment):
 
 
 def _item(item):
-    """(image id, dhash, content hash, trusted date, aspect ratio or None) of an item.
+    """(image id, dhash, content hash, trusted date, aspect ratio or None, look vector
+    bytes or None) of an item.
 
-    The trusted date and the aspect ratio may be left out (no date; any shape).
+    The trusted date, the aspect ratio and the look vector may be left out
+    (no date; any shape; no look).
     """
     taken = item[3] if len(item) > 3 else ""
     aspect = item[4] if len(item) > 4 else None
     if (isinstance(aspect, bool) or not isinstance(aspect, (int, float))
             or not math.isfinite(aspect) or aspect <= 0):
         aspect = None
+    look = item[5] if len(item) > 5 else None
+    look = bytes(look) if isinstance(look, (bytes, bytearray, memoryview)) and look else None
     return (int(item[0]), item[1] or "", item[2] or "", taken or "",
-            float(aspect) if aspect is not None else None)
+            float(aspect) if aspect is not None else None, look)
+
+
+def look_key(row, record):
+    """The look a picture is grouped by, (content hash, looks.KIND_PHOTO), or None.
+
+    row is its images row (content_hash, media, projection), record its
+    search record. Only ordinary pictures have one: not documents,
+    screenshots or videos (exact_copies_only), whose looks are alike
+    whatever they say or show, nor 360-degree photos, whose look is that of
+    their front view only.
+    """
+    if exact_copies_only(record) or not row["content_hash"]:
+        return None
+    kind = looks.kind_of(row)
+    return (row["content_hash"], kind) if kind == looks.KIND_PHOTO else None
+
+
+def group_looks(wanted):
+    """{image id: look vector bytes} of the pictures wanted ({image id: (content hash,
+    kind)}, see looks.kind_of) that have one in data/image_vectors.db.
+
+    Only vectors of the store's length count. {} when there is no store (or it
+    cannot be read): the groups then go by the dHashes alone.
+    """
+    if not wanted:
+        return {}
+    try:
+        store = looks.connect(create=False)
+    except sqlite3.Error:
+        return {}
+    if store is None:
+        return {}
+    try:
+        current = looks.meta(store)
+        found = looks.vectors_for(store, wanted.values())
+    except sqlite3.Error:
+        return {}
+    finally:
+        store.close()
+    size = current["dims"] or current["native_dims"]
+    result = {}
+    for image_id, key in wanted.items():
+        vec = found.get(key)
+        if vec is not None and size and len(vec) == size:
+            result[image_id] = vec
+    return result
+
+
+_ZEROS = {}                 # vector length -> a tuple of that many zeros (for math.dist)
+
+
+def _look(vec):
+    """(the signed numbers of a look vector, its length) of vector bytes, or None
+    (no vector, or one of length 0)."""
+    if not vec:
+        return None
+    numbers = struct.unpack("%db" % len(vec), vec)
+    zeros = _ZEROS.get(len(numbers))
+    if zeros is None:
+        zeros = _ZEROS.setdefault(len(numbers), (0,) * len(numbers))
+    length = math.dist(numbers, zeros)
+    return (numbers, length) if length > 0 else None
+
+
+def _look_cosine(first, second):
+    """The cosine of two look vectors (_look's pairs; -2.0 when their lengths differ).
+
+    The vectors are unit length times 127 rounded to whole numbers, so their
+    lengths are 127 give or take about 1.5%: the dot product is divided by
+    their actual lengths, not by 127 squared, which would add noise as large
+    as the steps between the cut-offs above. math.dist works in C on every
+    Python this runs on: the dot product is half of |a|^2 + |b|^2 - |a - b|^2.
+    """
+    if len(first[0]) != len(second[0]):
+        return -2.0
+    distance = math.dist(first[0], second[0])
+    return ((first[1] * first[1] + second[1] * second[1] - distance * distance)
+            / (2.0 * first[1] * second[1]))
+
+
+def _shapes_fit(first, second, tolerance):
+    """True if two groups' shapes ([narrowest, widest] aspect ratios, or None) fit:
+    every two of their aspect ratios at most tolerance apart (see same_shape)."""
+    if first is None or second is None:
+        return True
+    return same_shape(min(first[0], second[0]), max(first[1], second[1]), tolerance)
+
+
+def _look_second(moment, crowd):
+    """The capture second of a moment (see _second) for the look rules, or None: also
+    when it is a day alone, or a second that crowd (a Counter of seconds) holds
+    BURST_GROUPS or more of."""
+    second = _second(moment)
+    if second is None or crowd.get(second, 0) >= BURST_GROUPS:
+        return None
+    return second
+
+
+def _any_apart(first, second, apart):
+    """True if a picture of first and one of second ([(moment, _look())]) look too
+    different to be duplicates (apart None: never): their looks at most apart
+    close, or at most LOOK_APART_LATER close when both have a capture time
+    and those are more than LOOK_STACK_SECONDS apart."""
+    if apart is None:
+        return False
+    later = max(apart, LOOK_APART_LATER)
+    for moment, one in first:
+        second_one = _second(moment)
+        for when, other in second:
+            value = _look_cosine(one, other)
+            if value <= -2.0:
+                continue
+            if value <= apart:
+                return True
+            if value <= later and second_one is not None:
+                second_other = _second(when)
+                if (second_other is not None
+                        and abs(second_one - second_other) > LOOK_STACK_SECONDS):
+                    return True
+    return False
 
 
 class _BandIndex:
@@ -705,10 +1007,16 @@ class _Grouper:
     Each group also keeps the narrowest and widest shape (aspect ratio) of
     its pictures: a picture only joins a group it fits with all of them
     (_fits; see SHAPE_TOLERANCE).
+
+    With look vectors, no picture joins a group by its dHash when it and
+    any picture of the group look too different (_apart); and groups()
+    puts together the groups of about one moment whose representatives'
+    looks are close enough (_look_stacks).
     """
 
     def __init__(self, threshold=DUPLICATE_THRESHOLD, undated_threshold=UNDATED_THRESHOLD,
-                 burst_threshold=BURST_THRESHOLD, shape_tolerance=SHAPE_TOLERANCE):
+                 burst_threshold=BURST_THRESHOLD, shape_tolerance=SHAPE_TOLERANCE,
+                 look_threshold=None, look_apart=None):
         threshold = int(threshold)
         if threshold > 8:
             raise ValueError("the banded index finds distances up to 8 bits only")
@@ -716,6 +1024,8 @@ class _Grouper:
         self.undated_threshold = min(int(undated_threshold), threshold)
         self.burst_threshold = max(int(burst_threshold), threshold)
         self.shape_tolerance = float(shape_tolerance)
+        self.look_threshold = None if look_threshold is None else float(look_threshold)
+        self.look_apart = None if look_apart is None else float(look_apart)
         self.probes = _probes(threshold)
         self.undated_probes = _probes(self.undated_threshold)
         self.representatives = []               # dealt hashes
@@ -723,6 +1033,10 @@ class _Grouper:
         self.anchors = []                       # per group: its first trusted moment or None
         self.members = []                       # [ids] per representative
         self.shapes = []                        # per group: [narrowest, widest] or None
+        self.looks = []                         # per representative: _look() or None
+        # per group: (moment, _look()) of each unit (identical files) with a look
+        self.unit_looks = []
+        self.unit_counts = []                   # per group: how many units it holds
         self.everyone = _BandIndex()
         self.exact = {}                         # dealt hash -> [representative index]
         self.loose = _BandIndex()
@@ -730,10 +1044,15 @@ class _Grouper:
         self.day_bands = {}                     # anchor day -> _BandIndex
         self.seconds = {}                       # capture second -> [representative index]
         self.alone = []                         # [ids] per unit that groups only as copies
-        # unit key -> ("g" | "a", index, dhash or None, moment or None, aspect or None)
+        self.alone_info = []                    # per such unit: (moment, aspect, _look())
+        # unit key -> ("g" | "a", index, dhash or None, moment or None, aspect or None,
+        #              look vector bytes or None)
         self.units = {}
         self.max_id = None
         self.limited = 0                        # lookups cut short by MAX_CANDIDATES
+        self.look_matches = 0                   # groups put into another by their looks
+        self.look_singles = 0                   # ... of them a single picture of a burst
+        self.look_vetoes = 0                    # dHash matches turned down by the looks
 
     def _buckets(self, bands, dealt, probes):
         """The lists of representatives that probes bring up in bands (a _BandIndex).
@@ -784,12 +1103,25 @@ class _Grouper:
                 return self.burst_threshold, 0
         return self.threshold, 0
 
-    def _nearest(self, dealt, moment, aspect):
+    def _apart(self, index, moment, look):
+        """True if a picture taken at moment (or None) whose look is look (or None) and
+        any picture of group index look too different to be duplicates, however
+        close their dHashes (_any_apart: every picture of the group counts, not
+        just its first, so a picture turned down by one group does not then
+        bring two different things together in another)."""
+        if look is None or self.look_apart is None:
+            return False
+        if _any_apart([(moment, look)], self.unit_looks[index], self.look_apart):
+            self.look_vetoes += 1
+            return True
+        return False
+
+    def _nearest(self, dealt, moment, aspect, look=None):
         """The representative a picture joins (see duplicate_groups), or None."""
         representatives = self.representatives
         if moment is None:
             for index in self.exact.get(dealt, ()):
-                if self._fits(index, aspect):
+                if self._fits(index, aspect) and not self._apart(index, moment, look):
                     return index
             best, best_distance = None, self.undated_threshold + 1
             for bucket in self._buckets(self.everyone, dealt, self.undated_probes):
@@ -798,7 +1130,7 @@ class _Grouper:
                     # The nearest one; of equally near ones, the oldest.
                     if ((distance < best_distance or (distance == best_distance
                                                       and best is not None and index < best))
-                            and self._fits(index, aspect)):
+                            and self._fits(index, aspect) and not self._apart(index, moment, look)):
                         best, best_distance = index, distance
             return best
         # The groups of about the same day (the day before, the day itself,
@@ -828,7 +1160,7 @@ class _Grouper:
                 limit, rank = self._rule(index, moment)
                 # Dated representatives first; then the nearest; then the oldest.
                 if (distance <= limit and (rank, distance, index) < best_key
-                        and self._fits(index, aspect)):
+                        and self._fits(index, aspect) and not self._apart(index, moment, look)):
                     best, best_key = index, (rank, distance, index)
         if best_key[0] == 0:
             return best
@@ -837,7 +1169,7 @@ class _Grouper:
             for index in bucket:
                 distance = _bits(dealt ^ representatives[index])
                 if (distance <= self.undated_threshold and (1, distance, index) < best_key
-                        and self._fits(index, aspect)):
+                        and self._fits(index, aspect) and not self._apart(index, moment, look)):
                     best, best_key = index, (1, distance, index)
         return best
 
@@ -854,15 +1186,18 @@ class _Grouper:
             for other in group_ids:
                 bands.add(self.representatives[other], other)
 
-    def _start_group(self, dealt, moment, aspect, ids):
-        """Start a group of ids whose first picture has the dealt hash, moment and
-        aspect ratio; its index."""
+    def _start_group(self, dealt, moment, aspect, ids, look=None):
+        """Start a group of ids whose first picture has the dealt hash, moment,
+        aspect ratio and look (_look() or None); its index."""
         index = len(self.representatives)
         self.representatives.append(dealt)
         self.when.append(moment)
         self.anchors.append(None)
         self.members.append(list(ids))
         self.shapes.append([aspect, aspect] if aspect is not None else None)
+        self.looks.append(look)
+        self.unit_looks.append([(moment, look)] if look is not None else [])
+        self.unit_counts.append(1)
         self.everyone.add(dealt, index)
         self.exact.setdefault(dealt, []).append(index)
         second = _second(moment)
@@ -878,9 +1213,10 @@ class _Grouper:
         """Add items; returns False when they cannot be added.
 
         Items are (image id, dhash, content hash[, trusted date[, aspect
-        ratio]]); the trusted date is "" or a capture date to trust,
-        "YYYY-MM-DDTHH:MM:SS" or "YYYY-MM-DD" (see trusted_date()); the
-        aspect ratio is width / height as displayed, or None when unknown.
+        ratio[, look vector]]]); the trusted date is "" or a capture date to
+        trust, "YYYY-MM-DDTHH:MM:SS" or "YYYY-MM-DD" (see trusted_date()); the
+        aspect ratio is width / height as displayed, or None when unknown;
+        the look vector its bytes (looks.py), or None.
         """
         items = sorted(_item(item) for item in items)
         if not items:
@@ -891,7 +1227,8 @@ class _Grouper:
         first_hash = {}
         first_moment = {}
         first_aspect = {}
-        for image_id, dhash, content_hash, taken, aspect in items:
+        first_look = {}
+        for image_id, dhash, content_hash, taken, aspect, look in items:
             key = ("c", content_hash) if content_hash else ("i", image_id)
             value = parse_dhash(dhash)
             moment = _moment(taken)
@@ -899,10 +1236,15 @@ class _Grouper:
             if known is not None:
                 if known[2] is None and value is not None:
                     return False
-                if known[0] == "g" and known[3] is None and moment is not None:
+                if known[5] is None and look is not None:
                     return False
-                if known[0] == "g" and known[4] is None and aspect is not None:
-                    return False
+                # (Dates and shapes count for groups, and for the looks of
+                # pictures that only group as copies by their dHashes.)
+                if known[0] == "g" or known[5] is not None:
+                    if known[3] is None and moment is not None:
+                        return False
+                    if known[4] is None and aspect is not None:
+                        return False
                 continue
             fresh.setdefault(key, [])
             if first_hash.get(key) is None:
@@ -911,8 +1253,10 @@ class _Grouper:
                 first_moment[key] = moment
             if first_aspect.get(key) is None:
                 first_aspect[key] = aspect
+            if first_look.get(key) is None:
+                first_look[key] = look
         # Nothing has been changed so far; from here on add() cannot fail.
-        for image_id, _dhash, content_hash, _taken, _aspect in items:
+        for image_id, _dhash, content_hash, _taken, _aspect, _vec in items:
             key = ("c", content_hash) if content_hash else ("i", image_id)
             known = self.units.get(key)
             if known is not None:
@@ -923,16 +1267,23 @@ class _Grouper:
             value = first_hash.get(key)
             moment = first_moment.get(key)
             aspect = first_aspect.get(key)
+            vec = first_look.get(key)
+            look = _look(vec) if (vec and (self.look_threshold is not None
+                                           or self.look_apart is not None)) else None
             if value is None or _low_detail(value):
-                self.units[key] = ("a", len(self.alone), value, moment, aspect)
+                self.units[key] = ("a", len(self.alone), value, moment, aspect, vec)
                 self.alone.append(ids)
+                self.alone_info.append((moment, aspect, look))
                 continue
             dealt = _deal_bands(value)
-            best = self._nearest(dealt, moment, aspect)
+            best = self._nearest(dealt, moment, aspect, look)
             if best is None:
-                best = self._start_group(dealt, moment, aspect, ids)
+                best = self._start_group(dealt, moment, aspect, ids, look)
             else:
                 self.members[best].extend(ids)
+                self.unit_counts[best] += 1
+                if look is not None:
+                    self.unit_looks[best].append((moment, look))
                 if moment is not None and self.anchors[best] is None:
                     self.loose.remove(self.representatives[best], best)
                     self._anchor(best, moment)
@@ -942,30 +1293,152 @@ class _Grouper:
                         self.shapes[best] = [aspect, aspect]
                     else:
                         shape[0], shape[1] = min(shape[0], aspect), max(shape[1], aspect)
-            self.units[key] = ("g", best, value, moment, aspect)
+            self.units[key] = ("g", best, value, moment, aspect, vec)
         self.max_id = items[-1][0]
         return True
 
+    def _look_stacks(self):
+        """The members ([ids]) of every group, then of every unit that groups only
+        as copies (alone), with those whose looks are alike put together (see
+        duplicate_groups, "Looks").
+
+        Two passes. First leader clustering again, one level up: the groups
+        and the units alone (pictures with little detail, whose dHash says
+        little, are among them) are taken by their first picture, and each
+        whose representative has a look and a capture time (_look_second)
+        joins the leader whose look is closest to its own among those whose
+        representative was taken at most LOOK_STACK_SECONDS from it with a
+        cosine of at least look_threshold, or at most LOOK_SAME_SECONDS from
+        it with one of at least SAME_PICTURE_COSINE, if every shape of the
+        two fits and no picture of the one looks too different from one of
+        the other (_any_apart); else it leads. A group that joins comes
+        whole, and leaders do not change, so the dHash groups stay as they
+        are and nothing chains. Then a single picture (one unit: a picture
+        and its identical files) still on its own joins the stack holding a
+        picture taken at most BURST_SECONDS from it whose look is at least
+        SAME_PICTURE_COSINE close (the next frame of a burst whose first
+        frame was too far off), by the same shape and look rules: it brings
+        nothing else along and is not compared with in turn, so this does
+        not chain either.
+        """
+        members = [list(ids) for ids in self.members] + [list(ids) for ids in self.alone]
+        if self.look_threshold is None:
+            return members
+        reps = self.looks + [info[2] for info in self.alone_info]
+        moments = self.when + [info[0] for info in self.alone_info]
+        shapes = ([list(shape) if shape is not None else None for shape in self.shapes]
+                  + [[info[1], info[1]] if info[1] is not None else None
+                     for info in self.alone_info])
+        unit_looks = ([list(found) for found in self.unit_looks]
+                      + [[(info[0], info[2])] if info[2] is not None else []
+                         for info in self.alone_info])
+        counts = self.unit_counts + [1] * len(self.alone)
+        # (A second that this many groups and units started in is no moment:
+        # a camera whose clock was never set; see BURST_GROUPS.)
+        crowd = collections.Counter(_second(moment) for moment in moments)
+        seconds = [_look_second(moment, crowd) for moment in moments]
+        order = sorted(range(len(members)), key=lambda unit: members[unit][0])
+        rank = {unit: place for place, unit in enumerate(order)}
+        near_by = max(1, int(LOOK_STACK_SECONDS))
+        span = max(near_by, int(LOOK_SAME_SECONDS))
+        wide = max(self.look_threshold, SAME_PICTURE_COSINE)
+        leaders = {}                            # second // span -> [(second, leading unit)]
+        self.look_matches = self.look_singles = 0
+
+        def join(best, unit):
+            members[best].extend(members[unit])
+            members[unit] = []
+            if shapes[unit] is not None:
+                shapes[best] = (list(shapes[unit]) if shapes[best] is None
+                                else [min(shapes[best][0], shapes[unit][0]),
+                                      max(shapes[best][1], shapes[unit][1])])
+            unit_looks[best].extend(unit_looks[unit])
+            unit_looks[unit] = []
+            counts[best] += counts[unit]
+            counts[unit] = 0
+
+        def better(unit, other, value, best, best_value):
+            # The closest; of equally close ones, the oldest; if they fit.
+            return ((best is None or value > best_value
+                     or (value == best_value and rank[other] < rank[best]))
+                and _shapes_fit(shapes[other], shapes[unit], self.shape_tolerance)
+                and not _any_apart(unit_looks[unit], unit_looks[other], self.look_apart))
+
+        for unit in order:
+            look, second = reps[unit], seconds[unit]
+            if look is None or second is None:
+                continue
+            slot = second // span
+            near = []
+            for key in (slot - 1, slot, slot + 1):
+                for other_second, other in leaders.get(key, ()):
+                    if abs(other_second - second) <= span:
+                        near.append((abs(other_second - second), rank[other], other))
+            if len(near) > MAX_CANDIDATES:
+                # (Only with very many pictures of about one moment.)
+                near.sort()
+                del near[MAX_CANDIDATES:]
+                self.limited += 1
+            best, best_value = None, None
+            for gap, _rank, other in near:
+                value = _look_cosine(look, reps[other])
+                # (Taken further apart, they must look the same.)
+                if (value >= (self.look_threshold if gap <= near_by else wide)
+                        and better(unit, other, value, best, best_value)):
+                    best, best_value = other, value
+            if best is None:
+                leaders.setdefault(slot, []).append((second, unit))
+            else:
+                self.look_matches += 1
+                join(best, unit)
+        # Single pictures: through any picture of a stack taken in the same burst.
+        burst = {}                              # second -> [(look, stack)] of the stacks
+        for stack in order:
+            if counts[stack] > 1:
+                for moment, look in unit_looks[stack]:
+                    second = _look_second(moment, crowd)
+                    if second is not None:
+                        burst.setdefault(second, []).append((look, stack))
+        for unit in order:
+            look, second = reps[unit], seconds[unit]
+            if counts[unit] != 1 or look is None or second is None:
+                continue
+            best, best_value = None, None
+            for near in range(second - BURST_SECONDS, second + BURST_SECONDS + 1):
+                for other_look, stack in burst.get(near, ()):
+                    value = _look_cosine(look, other_look)
+                    if value >= wide and better(unit, stack, value, best, best_value):
+                        best, best_value = stack, value
+            if best is not None:
+                self.look_matches += 1
+                self.look_singles += 1
+                join(best, unit)
+        return members
+
     def groups(self):
         """The groups of two or more pictures: sorted id lists, sorted by first id."""
-        result = [sorted(ids) for ids in self.members + self.alone if len(ids) > 1]
+        result = [sorted(ids) for ids in self._look_stacks() if len(ids) > 1]
         result.sort(key=lambda ids: ids[0])
         return result
 
 
 def duplicate_groups(items, threshold=DUPLICATE_THRESHOLD, undated_threshold=UNDATED_THRESHOLD,
-                     burst_threshold=BURST_THRESHOLD, shape_tolerance=SHAPE_TOLERANCE):
+                     burst_threshold=BURST_THRESHOLD, shape_tolerance=SHAPE_TOLERANCE,
+                     look_threshold=LOOK_STACK_COSINE, look_apart=LOOK_APART):
     """Near-duplicate groups: lists of image ids (sorted, two or more each), sorted by first id.
 
     items are (image id, dhash text, content hash, trusted date, aspect
-    ratio) tuples of one library. The trusted date is the capture date
-    "YYYY-MM-DDTHH:MM:SS" (or the day alone, "YYYY-MM-DD") when it comes
-    from EXIF data or the file name, else "" (see trusted_date()); the
-    aspect ratio is width / height as displayed (aspect_ratio()), or None
-    when unknown. An item of three counts as one without a date, one of
-    four as one of unknown shape. Exact copies (the same non-empty content
-    hash) are always one group. Otherwise two pictures go together when
-    their dHashes are close enough, by these rules:
+    ratio, look vector) tuples of one library. The trusted date is the
+    capture date "YYYY-MM-DDTHH:MM:SS" (or the day alone, "YYYY-MM-DD")
+    when it comes from EXIF data or the file name, else "" (see
+    trusted_date()); the aspect ratio is width / height as displayed
+    (aspect_ratio()), or None when unknown; the look vector the picture's
+    signed-byte vector from data/image_vectors.db (bytes, see looks.py), or
+    None. An item of three counts as one without a date, one of four as
+    one of unknown shape, one of five as one without a look. Exact copies
+    (the same non-empty content hash) are always one group. Otherwise two
+    pictures go together when their dHashes are close enough, or their
+    looks, by these rules:
 
     - Dates: when both pictures have a trusted date, they must have been
       taken on the same calendar day, or at most SAME_TIME_SECONDS apart
@@ -1001,8 +1474,30 @@ def duplicate_groups(items, threshold=DUPLICATE_THRESHOLD, undated_threshold=UND
       never grouped unless they are identical files. It joins the nearest
       group it fits.
     - Pictures with little detail (see LOW_DETAIL_BITS) and pictures
-      without a valid dHash (build_records leaves it out for documents
-      and screenshots) only group as exact copies.
+      without a valid dHash (build_records leaves it out for documents,
+      screenshots and videos, and gives those no look) only group as
+      exact copies by their dHashes (a picture with little detail may
+      still stack by its look).
+    - Looks: a picture never joins a group by its dHash when its look and
+      the look of any picture in the group are too different (_any_apart:
+      a cosine of at most look_apart, LOOK_APART, or of at most
+      LOOK_APART_LATER for two taken more than LOOK_STACK_SECONDS apart):
+      alike things photographed one by one on the same plain background
+      have close dHashes. Once the pictures are grouped by their dHashes,
+      groups (a picture alone is a group of one) whose representatives
+      have looks and capture times become one when those were taken at
+      most LOOK_STACK_SECONDS apart and their looks have a cosine of at
+      least look_threshold (LOOK_STACK_COSINE), or at most
+      LOOK_SAME_SECONDS apart with looks at least SAME_PICTURE_COSINE
+      close, if all their shapes fit and no two of their pictures look too
+      different: leader clustering again, one level up, so a dHash group
+      always stays whole and nothing chains; and a single picture left on
+      its own joins a stack holding a picture of the same burst
+      (BURST_SECONDS) whose look is at least SAME_PICTURE_COSINE close (see
+      _Grouper._look_stacks). Pictures without a capture time (no trusted
+      date, a day alone, or a second that BURST_GROUPS groups share) never
+      group by their look: nothing says they are of one moment. None turns
+      look_threshold or look_apart off.
 
     Representatives are never found by comparing every pair, nor by
     sorting the hashes (sorting misses pairs that differ in a high bit).
@@ -1019,9 +1514,132 @@ def duplicate_groups(items, threshold=DUPLICATE_THRESHOLD, undated_threshold=UND
     nearest-looking ones are compared and the rest are not, which keeps
     the time linear.
     """
-    grouper = _Grouper(threshold, undated_threshold, burst_threshold, shape_tolerance)
+    grouper = _Grouper(threshold, undated_threshold, burst_threshold, shape_tolerance,
+                       look_threshold, look_apart)
     grouper.add(items)
     return grouper.groups()
+
+
+def _sign_order(dims):
+    """A fixed shuffled order of dims vector positions (Park-Miller, seed 4242)."""
+    order = list(range(dims))
+    seed = 4242
+    for index in range(dims - 1, 0, -1):
+        seed = seed * 48271 % 2147483647
+        other = seed % (index + 1)
+        order[index], order[other] = order[other], order[index]
+    return order
+
+
+def look_copies(items, threshold=None, banded=True):
+    """Groups of pictures that look the same, whenever they were taken (the
+    Duplicates page's "Same picture, any date").
+
+    items are (image id, content hash, aspect ratio or None, look vector
+    bytes) of the pictures to compare (of one library or of several).
+    Identical files (one content hash) are one unit. Leader clustering, as duplicate_groups: units are taken
+    by their first id, and each joins the leader whose look is closest to
+    its own, if their cosine is at least threshold (SAME_PICTURE_COSINE)
+    and every shape of the two fits (SHAPE_TOLERANCE); else it leads a
+    group of its own. Returns sorted id lists of two or more, sorted by
+    first id.
+
+    Leaders are not compared one by one (that takes minutes on ten
+    thousand pictures in Python): each look is turned into signs, one per
+    number of the vector (above the items' mean in that place, or not),
+    dealt in a fixed shuffled order into bands of LOOK_BAND_BITS signs,
+    and a unit is only compared with the leaders that share all the signs
+    of at least one band with it. Two looks at 0.99 differ in about one
+    sign in thirteen, so they share a band of 14 nearly always (about 99.9
+    times in 100 with 18 bands, as looks of 256 numbers have), while two
+    unrelated pictures differ in about half their signs and share one of
+    the bands about once in a thousand. The signs are taken against the
+    mean, so they need a varied set: with LOOK_BAND_MIN pictures or fewer
+    every leader is compared, and a library made mostly of one look (a
+    webcam's thousand frames of one view) may miss a few of its copies.
+    banded=False compares every leader (the tests check that both agree).
+    """
+    threshold = SAME_PICTURE_COSINE if threshold is None else float(threshold)
+    units = collections.OrderedDict()           # content key -> [ids, aspect, look bytes]
+    for image_id, content_hash, aspect, vec in sorted(items, key=lambda item: item[0]):
+        if not vec:
+            continue
+        key = ("c", content_hash) if content_hash else ("i", image_id)
+        unit = units.get(key)
+        if unit is None:
+            if (isinstance(aspect, bool) or not isinstance(aspect, (int, float))
+                    or not math.isfinite(aspect) or aspect <= 0):
+                aspect = None
+            units[key] = [[image_id], aspect, bytes(vec)]
+        else:
+            unit[0].append(image_id)
+    dims = max((len(unit[2]) for unit in units.values()), default=0)
+    entries = []
+    looks = []
+    for unit in units.values():
+        look = _look(unit[2]) if len(unit[2]) == dims else None
+        if look is not None:
+            entries.append(unit)
+            looks.append(look)
+    if len(entries) < 2:
+        return [sorted(unit[0]) for unit in entries if len(unit[0]) > 1]
+    bands = []
+    banded = banded and dims >= LOOK_BAND_BITS and len(entries) > LOOK_BAND_MIN
+    if banded:
+        # (The mean of each place, and per place which byte values are above it.)
+        means = [sum(column) / len(looks) for column in zip(*(look[0] for look in looks))]
+        order = _sign_order(dims)
+        tables = []
+        for place in order:
+            tables.append(bytes(1 if (value - 256 if value > 127 else value) > means[place] else 0
+                                for value in range(256)))
+        pick = operator.itemgetter(*order)
+        count = max(1, dims // LOOK_BAND_BITS)
+        for unit in entries:
+            signs = bytes(map(operator.getitem, tables, pick(unit[2])))
+            bands.append([signs[band * LOOK_BAND_BITS:(band + 1) * LOOK_BAND_BITS]
+                          for band in range(count)])
+    leaders = []                                # unit index of every leader
+    indexes = collections.defaultdict(list)     # (band, signs) -> [leader number]
+    members = []                                # per leader: [ids]
+    shapes = []                                 # per leader: [narrowest, widest] or None
+    for index, unit in enumerate(entries):
+        if banded:
+            seen = set()
+            candidates = []
+            for band, signs in enumerate(bands[index]):
+                for number in indexes.get((band, signs), ()):
+                    if number not in seen:
+                        seen.add(number)
+                        candidates.append(number)
+        else:
+            candidates = range(len(leaders))
+        shape = [unit[1], unit[1]] if unit[1] is not None else None
+        best, best_value = None, threshold
+        for number in candidates:
+            value = _look_cosine(looks[index], looks[leaders[number]])
+            # The closest one; of equally close ones, the oldest.
+            if ((value > best_value or (value == best_value and (best is None or number < best)))
+                    and _shapes_fit(shapes[number], shape, SHAPE_TOLERANCE)):
+                best, best_value = number, value
+        if best is None:
+            number = len(leaders)
+            leaders.append(index)
+            members.append(list(unit[0]))
+            shapes.append(shape)
+            if banded:
+                for band, signs in enumerate(bands[index]):
+                    indexes[(band, signs)].append(number)
+            continue
+        members[best].extend(unit[0])
+        if shape is not None:
+            if shapes[best] is None:
+                shapes[best] = shape
+            else:
+                shapes[best] = [min(shapes[best][0], shape[0]), max(shapes[best][1], shape[1])]
+    result = [sorted(ids) for ids in members if len(ids) > 1]
+    result.sort(key=lambda ids: ids[0])
+    return result
 
 
 def _date_number(record):
@@ -1033,13 +1651,18 @@ def _date_number(record):
 def cover_key(record):
     """Sort key of a group member as its cover (the largest key wins).
 
-    Best aesthetic, then sharpness, then the most pixels, then a picture
-    with a camera name (an original rather than a copy that lost its
-    EXIF data), then the oldest date (a re-saved or forwarded copy is
-    dated by its file), then the lowest id (found first).
+    The one the owner marked (albums.py: a favorite, then the higher
+    rating, then one in an album; as the Duplicates page's best, see
+    duplicates.rank_members; records carry the marks on the server, and in
+    an export only with its "marks" option), then the best aesthetic, then
+    sharpness, then the most pixels, then a picture with a camera name (an
+    original rather than a copy that lost its EXIF data), then the oldest
+    date (a re-saved or forwarded copy is dated by its file), then the
+    lowest id (found first).
     """
     taken = _date_number(record)
-    return (record.get("q") or 0, record.get("sh") or 0,
+    return (1 if record.get("fav") else 0, record.get("rt") or 0, 1 if record.get("al") else 0,
+            record.get("q") or 0, record.get("sh") or 0,
             (record.get("w") or 0) * (record.get("hgt") or 0),
             1 if record.get("cm") else 0,
             -taken if taken is not None else -10 ** 15,
@@ -1072,17 +1695,20 @@ def apply_groups(records, groups):
 
 
 def _fingerprint_start():
-    return hashlib.sha1(("groups %d %d %d %d %d %d %d %d %d %d %r\n" % (
+    return hashlib.sha1(("groups %d %d %d %d %d %d %d %d %d %d %r %r %r %r %r %r %r\n" % (
         GROUPS_VERSION, DUPLICATE_THRESHOLD, UNDATED_THRESHOLD, BURST_THRESHOLD, BURST_SECONDS,
         BURST_GROUPS, SAME_TIME_SECONDS, LOW_DETAIL_BITS, MAX_CANDIDATES,
-        DAY_INDEX_SIZE, SHAPE_TOLERANCE)).encode("ascii"))
+        DAY_INDEX_SIZE, SHAPE_TOLERANCE, LOOK_STACK_COSINE, LOOK_STACK_SECONDS, LOOK_SAME_SECONDS,
+        LOOK_APART, LOOK_APART_LATER, SAME_PICTURE_COSINE)).encode("ascii"))
 
 
 def _fingerprint_line(item):
-    image_id, dhash, content_hash, taken, aspect = item
-    return ("%d %s %s %s %s\n" % (image_id, dhash, content_hash, taken,
-                                  "-" if aspect is None else repr(aspect))
-            ).encode("utf-8", "replace")
+    image_id, dhash, content_hash, taken, aspect, look = item
+    line = ("%d %s %s %s %s %d\n" % (image_id, dhash, content_hash, taken,
+                                     "-" if aspect is None else repr(aspect),
+                                     len(look) if look else 0)).encode("utf-8", "replace")
+    # (The look's bytes themselves: a rebuilt look changes the groups too.)
+    return line + look if look else line
 
 
 def _fingerprints(items, upto):
@@ -1143,15 +1769,16 @@ def _write_groups_file(path, fingerprint, groups):
 def library_groups(library_id, items, use_cache=True):
     """The duplicate groups of one library's pictures, worked out only when they changed.
 
-    items are (image id, dhash, content hash, trusted date, aspect ratio)
-    of the library's present, visible pictures (see duplicate_groups). The groups
-    are remembered in memory and in data/cache/groups-<library id>.json,
-    keyed by a digest of exactly those inputs (_fingerprints): a new
-    description, a rename or a new quality score never makes them be
-    worked out again; a new, changed, hidden or removed picture does.
-    When the only change is new pictures (a scan found more), only those
-    are added to the groups in memory (see _Grouper); anything else works
-    them out from scratch. The result must not be changed.
+    items are (image id, dhash, content hash, trusted date, aspect ratio,
+    look vector) of the library's present, visible pictures (see
+    duplicate_groups). The groups are remembered in memory and in
+    data/cache/groups-<library id>.json, keyed by a digest of exactly those
+    inputs (_fingerprints): a new description, a rename or a new quality
+    score never makes them be worked out again; a new, changed, hidden or
+    removed picture does, and so does a new look. When the only change is
+    new pictures (a scan found more), only those are added to the groups
+    in memory (see _Grouper); anything else works them out from scratch.
+    The result must not be changed.
     """
     items = sorted(_item(item) for item in items)
     found = None
@@ -1188,7 +1815,7 @@ def library_groups(library_id, items, use_cache=True):
 def _full_grouper(items):
     """A _Grouper holding all of items: the groups worked out from scratch."""
     grouper = _Grouper(DUPLICATE_THRESHOLD, UNDATED_THRESHOLD, BURST_THRESHOLD,
-                       SHAPE_TOLERANCE)
+                       SHAPE_TOLERANCE, LOOK_STACK_COSINE, LOOK_APART)
     grouper.add(items)
     return grouper
 
@@ -1219,17 +1846,36 @@ def data_state(conn, library_ids):
     return [[value if value is not None else 0 for value in row] for row in rows]
 
 
-def index_etag(conn, libraries, include_hidden, state=None):
+def drives_key(config=None):
+    """What the drives in the records depend on beyond the images rows: their settings
+    (config's) and their descriptions (data/drives.json)."""
+    return [drives.version(), sorted(drives.settings(config).items())]
+
+
+def index_etag(conn, libraries, include_hidden, state=None, *, marks=None,
+               config=None, looks_state=False):
     """The ETag (hex digits) of the /api/index answer for libraries ({id: name}).
 
-    state is data_state() of the libraries when the caller already has it.
+    state is data_state() of the libraries when the caller already has it;
+    marks (keyword only) albums.data_state() of them (worked out when
+    missing: the owner's marks and albums, in a fixed order); config (keyword
+    only) the configuration the records are built with (its drive settings);
+    looks_state (keyword only) looks.store_key(), which the groups depend on
+    (worked out when not given).
     """
     if state is None:
         state = data_state(conn, libraries)
+    if marks is None:
+        marks = albums.data_state(conn, libraries)
+    if looks_state is False:
+        looks_state = looks.store_key()
     key = [INDEX_VERSION, GROUPS_VERSION, DUPLICATE_THRESHOLD, UNDATED_THRESHOLD,
            BURST_THRESHOLD, BURST_SECONDS, BURST_GROUPS, SAME_TIME_SECONDS, LOW_DETAIL_BITS,
            SHAPE_TOLERANCE, prompts.PROMPT_VER, bool(include_hidden), not_duplicates.version(),
            [[library_id, name] for library_id, name in libraries.items()], state]
+    key.append(marks)
+    key.append(drives_key(config))
+    key.append(looks_state)
     return hashlib.sha1(json.dumps(key, separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
 
 
@@ -1293,16 +1939,15 @@ class IndexService:
             except Exception:
                 return None
 
-    def state(self, conn, library_ids):
-        """data_state() of the libraries, computed again only after the database changed."""
-        key = tuple(library_ids)
+    def _cached(self, key, compute):
+        """compute(), remembered under key until the database changes."""
         # Read the counter first: a commit made while the state is worked
         # out then shows up as a new counter next time.
         version = self._data_version()
         with self._lock:
             if version is not None and version == self._version and key in self._states:
                 return self._states[key]
-        state = data_state(conn, library_ids)
+        state = compute()
         with self._lock:
             if version != self._version:
                 self._version = version
@@ -1310,6 +1955,17 @@ class IndexService:
             if version is not None:
                 self._states[key] = state
         return state
+
+    def state(self, conn, library_ids):
+        """data_state() of the libraries, computed again only after the database changed."""
+        library_ids = list(library_ids)
+        return self._cached(tuple(library_ids), lambda: data_state(conn, library_ids))
+
+    def marks_state(self, conn, library_ids):
+        """albums.data_state() of the libraries (the owner's marks and albums), likewise."""
+        library_ids = list(library_ids)
+        return self._cached(("marks",) + tuple(library_ids),
+                            lambda: albums.data_state(conn, library_ids))
 
     def close(self):
         """Close the watching connection (it is opened again when needed)."""
@@ -1331,6 +1987,8 @@ class IndexService:
     def _library_records(self, conn, config, library_id, include_hidden, row):
         """[(image id, record JSON)] of one library, built again only when its state row changed."""
         key = (library_id, bool(include_hidden))
+        # (Drive descriptions and settings change the drives' records too.)
+        row = (row, json.dumps(drives_key(config)))
         with self._lock:
             found = self._libraries.get(key)
             if found is not None and found[0] == row:
@@ -1345,13 +2003,16 @@ class IndexService:
                 self._libraries.popitem(last=False)
         return pieces
 
-    def compressed_body(self, conn, config, libraries, include_hidden, etag, state=None):
+    def compressed_body(self, conn, config, libraries, include_hidden, etag, state=None, *,
+                        marks=None, looks_state=False):
         """The gzip-compressed JSON answer for etag, built if it is not remembered.
 
-        state is the data_state() the ETag was made from (worked out when
-        missing); the records of a library are reused while its row is
-        the same. The records are in id order, as build_records() gives
-        them.
+        state is the data_state() the ETag was made from, marks (keyword
+        only) the albums.data_state() and looks_state (keyword only) the
+        looks.store_key() (all worked out when missing); the records of a
+        library are reused while its rows of the first two, and the third,
+        are the same. The records are in id order, as build_records() gives
+        them; the answer also lists the albums (albums.index_albums).
         """
         data = self._remembered(etag)
         if data is not None:
@@ -1362,18 +2023,27 @@ class IndexService:
                 return data
             if state is None:
                 state = data_state(conn, list(libraries))
-            # (Pictures kept apart as not duplicates change the groups too.)
+            if marks is None:
+                marks = albums.data_state(conn, list(libraries))
+            if looks_state is False:
+                looks_state = looks.store_key()
+            # (Pictures kept apart as not duplicates, and new looks, change the
+            # groups too.)
             apart = not_duplicates.version()
-            rows = {row[0]: tuple(row) + (apart,) for row in state}
+            marked = marks.get("libraries", {})
+            seen = json.dumps(looks_state)
+            rows = {row[0]: tuple(row) + (apart, tuple(marked.get(row[0]) or ()), seen)
+                    for row in state}
             lists = [self._library_records(conn, config, library_id, include_hidden,
                                            rows.get(library_id))
                      for library_id in libraries]
             lists = [pieces for pieces in lists if pieces]
             merged = lists[0] if len(lists) == 1 else heapq.merge(*lists)
-            text = '{"version":%d,"generated":%d,"libraries":%s,"records":[%s]}' % (
+            text = '{"version":%d,"generated":%d,"libraries":%s,"albums":%s,"records":[%s]}' % (
                 INDEX_VERSION, int(time.time()),
                 _json([{"id": library_id, "name": name}
                        for library_id, name in libraries.items()]),
+                _json(albums.index_albums(conn, list(libraries), include_hidden)),
                 ",".join(piece for _image_id, piece in merged))
             data = gzip.compress(utf8(text), GZIP_LEVEL, mtime=0)
             self.builds += 1
@@ -1394,13 +2064,17 @@ class IndexService:
         as both hold the same records.
         """
         state = self.state(conn, list(libraries))
-        etag = index_etag(conn, libraries, include_hidden, state)
+        marks = self.marks_state(conn, list(libraries))
+        looks_state = looks.store_key()
+        etag = index_etag(conn, libraries, include_hidden, state, marks=marks,
+                          config=config, looks_state=looks_state)
         sent = etag + "-gzip" if accept_gzip else etag
         headers = {"ETag": '"%s"' % sent, "Cache-Control": "private, no-cache",
                    "Vary": "Accept-Encoding", "X-Content-Type-Options": "nosniff"}
         if etag_matches is not None and (etag_matches(etag) or etag_matches(etag + "-gzip")):
             return 304, b"", headers
-        data = self.compressed_body(conn, config, libraries, include_hidden, etag, state)
+        data = self.compressed_body(conn, config, libraries, include_hidden, etag, state,
+                                    marks=marks, looks_state=looks_state)
         if accept_gzip:
             headers["Content-Encoding"] = "gzip"
             return 200, data, headers

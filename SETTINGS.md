@@ -44,7 +44,11 @@ The same variable is honored by every script.
     "zenith_fill_deg": 0,
     "ffmpeg": "",
     "video_frames": 4,
+    "video_sheet_check": true,
     "video_proxies": { "enabled": false, "height": 720, "crf": 26 },
+    "drives": { "slack": 20, "min_clips": 3 },
+    "drive_previews": { "enabled": false, "speed": 60, "height": 720 },
+    "gps_check": { "enabled": true },
     "libraries": [ { ... }, { ... } ]
 }
 ```
@@ -619,6 +623,17 @@ A `data/image_vectors.db` written by a newer version of the program is
 never changed: there are no looks until that version is used again (or the
 file is deleted).
 
+The kept looks also stack duplicates on the search page and the Duplicates
+page, with "Same picture, any date" there (see "Duplicates by look" in the
+README). That needs no setting: it uses whatever looks are kept, even of an
+older recipe, and the endpoint may be off. The cut-offs are the same for
+every library and were set for EmbeddingGemma 2 at 256 dimensions; another
+model may need others (they are constants in `search_index.py`:
+`LOOK_STACK_COSINE`, `LOOK_STACK_SECONDS`, `LOOK_SAME_SECONDS`,
+`LOOK_APART`, `LOOK_APART_LATER`, `SAME_PICTURE_COSINE`). Deleting
+`data/image_vectors.db` puts the stacks back as the dHashes alone make
+them.
+
 ## reader_threads
 
 How many images the scanner reads and decodes at the same time (1 to 32,
@@ -652,11 +667,15 @@ something). At most 30. Panoramas the camera stitched itself, and other
 
 After a change, the next scan stitches the 360-degree photos in the index
 again (their previews, panoramas and thumbnails; descriptions are kept).
+The fills apply to 360-degree videos too: to their posters and contact
+sheets (made again the same way), and to the viewer, which fills the
+poles of each frame as it plays.
 
-## Videos: ffmpeg, video_frames, video_proxies
+## Videos: ffmpeg, video_frames, video_sheet_check, video_proxies
 
 Videos (`.mov`, `.mp4`, `.m4v`, `.3gp`, `.3g2`, `.avi`, `.mkv`, `.webm`,
-`.wmv`, `.mts`, `.m2ts`, `.mpg`, `.mpeg`) are indexed when the programs
+`.wmv`, `.mts`, `.m2ts`, `.mpg`, `.mpeg`, and Insta360 360-degree videos,
+`.insv`) are indexed when the programs
 `ffmpeg` and `ffprobe` (which come together in every ffmpeg download) can be
 found, and the library's `videos` setting is on (see README, "Videos").
 
@@ -675,7 +694,25 @@ found, and the library's `videos` setting is on (see README, "Videos").
   larger one). After a change of `video_frames`, the next scan (or **Build
   previews**) makes the sheets of the videos already indexed again, which
   reads each video once more. A very short video's sheet may hold fewer
-  frames; the model is told how many it holds.
+  frames; the model is told how many it holds, and that the title and
+  description are about what happens in the video, never about the frames
+  or the grid (prompt version 6: videos described before it are out of
+  date, see README, "Upgrading").
+- `video_sheet_check` - `true` (the default) checks every new description
+  of a video or a drive for words about the contact sheet instead of the
+  video ("four frames show ...", "the top-left panel", "in each frame",
+  "a sequence of dashcam footage"; English only) and then asks the same
+  endpoint once more, with one more sentence in the prompt: one extra
+  answer at most (the request waits out rate limits like any other),
+  counted in the tokens and the cost. The second answer is kept when it
+  is free of such words, otherwise the one with fewer of them (the first
+  on a tie, or when the second was cut off and the first was not); the
+  provenance says `"reasked": "sheet"` (not when the second request got
+  no answer: then it stays out of date). Current video and drive
+  descriptions with such words that were not asked again count as out of
+  date (**Re-describe out of date**, `scan.py --redescribe-stale`).
+  `false` sends no second request and counts none of them as out of
+  date.
 - `video_proxies` - playable copies, off by default. Browsers play H.264
   videos, but many cannot play HEVC (most phones' format in recent years)
   or older formats (AVI, WMV, MPEG-4 Part 2). With `"enabled": true`, the
@@ -688,7 +725,109 @@ found, and the library's `videos` setting is on (see README, "Videos").
   the next run (a moved or renamed video keeps its copy; deleting a
   library's indexed data deletes its copies); the Manage page shows how
   much space they take. Encoding takes about as long as the video plays,
-  or longer.
+  or longer. A 360-degree video plays its LRV and needs no copy; one
+  without an LRV (there when the job runs) gets a copy with both lenses
+  side by side, `height` pixels tall and twice as wide (the viewer
+  stitches it as it plays), whatever their codec: no browser plays two
+  lens streams, or two files, as one video.
+
+When a video was taken has no setting: it comes from the video's own
+metadata and its file name (see README, "Videos"). A dashcam (or another
+camera that knows no time zone) writes its clock's time as if it were
+UTC; its videos take the time in their names, and the next scan reads
+the dates of videos an older version dated hours off that way again
+(ffprobe only, once per video).
+
+## Drives: drives, drive_previews
+
+A drive is a run of video clips a camera recorded one after the other (a
+dashcam's one-minute files; see README, "Drives"). Both settings are
+optional.
+
+- `drives` - how drives are found: `{"slack": 20, "min_clips": 3}`.
+  `slack` (0 to 600 seconds, default 20) is how long after one clip ended
+  the next one may start; `min_clips` (2 or more, default 3) how many
+  clips a drive has at least. Clips are taken from one folder, with names
+  of the same pattern (every run of digits counts as one), of the same
+  size and codec, and every clip of a drive but the last is as long as
+  the other clips of its recording (at least 30 s): a shorter one ends
+  the drive. A change shows on the search page at once; descriptions of
+  drives that changed are made again by the next describe run.
+- `drive_previews` - sped-up previews, off by default:
+  `{"enabled": false, "speed": 60, "height": 720}`. With `"enabled": true`,
+  the Manage page offers **Make sped-up drives (N)** for a library with
+  drives: a job that writes an H.264 copy of each drive, `speed` times
+  faster (2 to 600, default 60), at most `height` pixels on its short side
+  (144 to 1080, default 720), 30 frames a second and without sound, into
+  `data/drive-previews/<library id>/`. The viewer plays it on request (or
+  by itself where the clips cannot be played). Previews of drives that
+  changed or are gone, or of other settings, are removed by the next run;
+  deleting a library's indexed data deletes them too.
+
+## gps_check
+
+The GPS check sets aside GPS positions that cannot be where a picture was
+taken (see README, "Positions that cannot be right"). It runs after every
+scan, **Build previews** and **Add place names** (also one that was
+stopped) and before an export with locations, over the pictures of every
+library, and decides again each time; a change of these settings takes
+effect with the next of those (**Use this location anyway** and **Ignore
+location** in the viewer at once). All keys are optional:
+
+```
+"gps_check": {
+    "enabled": true,
+    "max_speed": 1300,
+    "window_hours": 12,
+    "neighbours": 4,
+    "stale_minutes": 5,
+    "repeat_hours": 1,
+    "across_libraries": true,
+    "estimate_places": false,
+    "estimate_minutes": 30
+}
+```
+
+- `enabled` - `false` turns the check off: every position it set aside
+  comes back with the next run. Your own choices in the viewer still
+  apply.
+- `max_speed` - km/h (300 to 5000, default 1300: an airliner with the jet
+  stream behind it): a picture is too far from another when this speed is
+  not enough to get from one to the other in the time between them (less
+  1 km and the accuracy each position states, plus 2 minutes for the
+  clocks). Lower values start to set aside real positions taken from an
+  aeroplane.
+- `window_hours` - how far in time (1 to 72, default 12) pictures count
+  as neighbours.
+- `neighbours` - how many of the pictures taken nearest in time vote (2 to
+  9, default 4): a position is set aside when more than half of them, and
+  at least 2, are too far away. Copies of one shot count once.
+- `stale_minutes` - a GPS fix that is older than the picture by more than
+  this many minutes (1 to 240, default 5) is set aside when the speed it
+  states would have taken the camera more than 2 km away in that time, or
+  when it is more than 15 minutes old (a fix of a phone standing still
+  stays right for a while). Only cameras that save the time of the fix
+  (most phones) can tell, and only those whose other pictures mostly have
+  fresh fixes. Without the picture's time zone every offset it may have
+  had must make the fix that old.
+- `repeat_hours` - a camera without a GPS receiver of its own that saves
+  no GPS time and no accuracy and gave exactly the same position to
+  pictures taken more than this many hours apart (0.25 to 72, default 1),
+  with no other position in between and no week without a picture, is
+  reporting its last known position: such a position is never a
+  reference for others, and it is set aside when more than half of the
+  pictures compared contradict it, even if that is only one.
+- `across_libraries` - pictures of all libraries are neighbours of each
+  other (default `true`: a phone in one library vouches for a camera in
+  another). Set `false` when your libraries hold the pictures of people
+  who travel apart.
+- `estimate_places` - give a picture whose position was set aside the
+  place that the pictures taken within `estimate_minutes` (1 to 240,
+  default 30) agree on, when they all name the same town (default
+  `false`). It has no position (it is not on the map); the viewer says
+  "estimated from pictures taken around the same time". Searches by place
+  find it, and an export publishes it only when it publishes locations,
+  like every place name.
 
 ## libraries
 
@@ -856,6 +995,26 @@ A list of folders to scan. Each library is one object:
     their vectors, and the query prefix. Visitors who choose **Words** never
     download the model; with their browser's data saver on, a button asks
     first.
+  - `album` - an album id (default `null`: the whole library): only the
+    pictures of that manual album (see "Favorites, ratings and albums" in
+    the README) are published, those of this library; the rules above
+    still leave out what they leave out. The Export dialog lists the
+    albums by name (`export.py --album NAME` takes a name or an id). A
+    smart album cannot be used: **Copy to a new album** on the Albums page
+    makes a manual album of its pictures. An export whose album was
+    deleted stops and says so (an album's id is never given to another
+    album).
+  - `marks` - `true` also publishes which pictures are your favorites,
+    their ratings and your albums (the names of the albums that hold
+    published pictures, in their order, and the smart albums with their
+    searches as you saved them, without a library choice), so
+    `is:favorite`, `rating:` and `album:` work in the site; default
+    `false`: none of it is published, not even the name of the album the
+    export is limited to. A smart album whose search cannot be published
+    is left out: one limited to another library, one with `folder:`,
+    `file:`, `place:` or `has:gps` (or the Place filter) while
+    `folders`, `file_names` or `location` is off, one with `lib:`, and one
+    that looks for pictures like one that is not published.
 
 A library removed from the file is not deleted from the database: its images
 stay there, unused, until you delete them or attach them to a library again
