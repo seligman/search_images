@@ -46,13 +46,22 @@ choice), and so are the words of its drive (written from its frames too). A
 home_km of 0 turns all of this off. Titles and descriptions are published as
 written (the review step lists the pictures).
 
+The trip's story (trip_stories.py) goes only with the "story" option (off
+by default; never a hidden story) and the location option (it names the
+trip's places, which go only with it): a paragraph on each day of data/trips.js
+("story": its text, the links [#id] to its pictures made the export's ids),
+without the sentences that name people (unless "people_names" is on, and
+then but for the people the export publishes: export.published_names), a
+town of the home area, or link a picture the export does not publish or
+publishes as at home (trip_stories.export_days).
+
 The options of a trip's last export are kept in data/trips.json (trips.py)
 and are the next export's defaults; the export's state in
 data/exports/state/ goes by "trip:<the trip's key>", so a trip whose first
 day moves keeps its folder and picture ids.
 
-    python export.py --trip ID [--out DIR] [--home-km KM] [the options of a
-                     library export: --location --routes ...]
+    python export.py --trip ID [--out DIR] [--home-km KM] [--story] [the
+                     options of a library export: --location --routes ...]
 """
 
 import collections
@@ -72,10 +81,11 @@ import tracks
 import trips
 
 # Options of a trip export besides export.DEFAULT_OPTIONS: home_km is 0 (off) or one of
-# HOME_KM_STEPS, sizes each twice the one before, so that their grids nest.
+# HOME_KM_STEPS, sizes each twice the one before, so that their grids nest; story: the
+# trip's story (trip_stories.py) goes too.
 HOME_KM = 10
 HOME_KM_STEPS = (5, 10, 20, 40, 80, 160)
-TRIP_DEFAULTS = {"home_km": HOME_KM}
+TRIP_DEFAULTS = {"home_km": HOME_KM, "story": False}
 # The key a trip export's state goes by (export._Export.owner_key).
 KEY_PREFIX = export.TRIP_OWNER_PREFIX
 # The trip's id in the export.
@@ -179,8 +189,8 @@ class HomeArea:
 # Options
 
 def trip_options(saved=None, overrides=None):
-    """A trip export's options checked: export.validate_options' (saved, then overrides)
-    and home_km. An album cannot be chosen (the trip's pictures go). Raises
+    """A trip export's options checked: export.validate_options' (saved, then overrides),
+    home_km and story. An album cannot be chosen (the trip's pictures go). Raises
     export.OptionsError naming every bad option."""
     saved = dict(saved) if isinstance(saved, dict) else {}
     if overrides is not None and not isinstance(overrides, dict):
@@ -197,6 +207,13 @@ def trip_options(saved=None, overrides=None):
         else:
             errors["home_km"] = ("must be one of %s kilometres, or 0 (home is not kept out)"
                                  % ", ".join(str(step) for step in HOME_KM_STEPS))
+    story = saved.pop("story", False) is True
+    if "story" in overrides:
+        value = overrides.pop("story")
+        if isinstance(value, bool):
+            story = value
+        else:
+            errors["story"] = "must be true or false"
     if overrides.get("album") is not None:
         errors["album"] = "cannot be chosen for a trip: the trip's pictures go"
     overrides.pop("album", None)
@@ -210,6 +227,7 @@ def trip_options(saved=None, overrides=None):
         raise export.OptionsError(errors)
     options["album"] = None
     options["home_km"] = home_km
+    options["story"] = story
     return options
 
 
@@ -225,6 +243,8 @@ def options_to_save(options):
     saved.pop("album", None)
     if options.get("home_km", HOME_KM) != HOME_KM:
         saved["home_km"] = options["home_km"]
+    if options.get("story"):
+        saved["story"] = True
     return saved
 
 
@@ -470,6 +490,7 @@ class _TripExport(export._Export):
         self.at_home_ids = set()        # pictures whose town is not named (see records)
         self.withheld = set()           # clips of drives that lose their words
         self.trip_data = None
+        self.story_days = 0             # days of the trip's story published
 
     def select(self):
         chosen = []
@@ -615,8 +636,39 @@ class _TripExport(export._Export):
                 "days": day_list, "other": [picture.xid for picture in other]}
         if units and units[-1]:
             view["other_looks"] = unit_xids(units[-1])
+        if self.options.get("story"):
+            if location:
+                self.add_story(day_list, published)
+            else:
+                self.ctx.log("The trip's story is not published: it names the trip's places, "
+                             "which go only with the location option.", "warn")
         return {"enabled": True, "best_per_day": trips.settings(self.config)["best_per_day"],
                 "trips": [view]}
+
+    def add_story(self, day_list, published):
+        """The trip's story on its days (the "story" option: see the module notes)."""
+        import trip_stories
+        home = None
+        at_home = set(self.at_home_ids)
+        if self.area is not None:
+            home = trip_stories.Home(self.conn, self.built.home, self.area.km, towns=self.towns)
+            at_home.update(picture.id for picture in self.trip.pictures + self.trip.other
+                           if near_home(picture, self.area, self.towns))
+        # (Names only of the people the export publishes, as manifest.names: not of
+        # one whose pictures are all left out.)
+        names = export.published_names(self.conn, self.library_ids, published, self.options)
+        days = trip_stories.export_days(
+            self.conn, self.config, self.built, self.trip,
+            {picture.row["id"]: picture.xid for picture in published},
+            names, home=home, at_home=at_home)
+        texts = {entry["date"]: entry["text"] for entry in days}
+        for entry in day_list:
+            if texts.get(entry["date"]):
+                entry["story"] = texts[entry["date"]]
+        self.story_days = sum(1 for entry in day_list if entry.get("story"))
+        if not self.story_days:
+            self.ctx.log("The trip's story is not published: it has none (or it is hidden, or "
+                         "nothing of it could go). Write it on the trip's page.", "warn")
 
     def placed(self, pictures):
         """_Placed of published pictures for the places of the trip (home is no place it
@@ -648,6 +700,8 @@ class _TripExport(export._Export):
         result = export._Export.summary(self, counts, pictures, removed=removed,
                                         zip_file=zip_file, stopped=stopped)
         result.update(library_id=None, trip=self.trip.id, title=self.title)
+        if self.options.get("story"):
+            result["story_days"] = self.story_days
         return result
 
 
@@ -721,7 +775,9 @@ def export_info(conn, config, trip_id):
     """A trip's export for the export dialog: {"trip": trip_summary, "options" (the last
     export's, every default filled in), "default_output", "last" (export.last_export, or
     None), "meaning" {available, reason}, "home" (whether home was found), "libraries"
-    (the names of the libraries its pictures are in)}."""
+    (the names of the libraries its pictures are in), "story" (trip_stories.export_status:
+    {available, hidden, days})}."""
+    import trip_stories
     built, trip, libraries = load(conn, config, trip_id)
     options = trip_options(built.export_options(trip))
     status = export.meaning_status(config, options)
@@ -730,7 +786,8 @@ def export_info(conn, config, trip_id):
             "last": export.last_export(owner_key(built, trip)),
             "meaning": {"available": status["available"], "reason": status["reason"]},
             "home": built.home is not None,
-            "libraries": [common.library_label(library) for library in libraries]}
+            "libraries": [common.library_label(library) for library in libraries],
+            "story": trip_stories.export_status(conn, config, built, trip)}
 
 
 def save_options(conn, config, trip_id, options):
@@ -756,6 +813,8 @@ def main_cli(args, cli_options):
             options = cli_options(args, trip_options(built.export_options(trip)))
             if getattr(args, "home_km", None) is not None:
                 options["home_km"] = args.home_km
+            if getattr(args, "story", None) is not None:
+                options["story"] = args.story
             ctx = jobs.ConsoleContext("export")
             with ctx.stop_on_ctrl_c():
                 summary = export_trip(ctx, conn, config, trip.id, args.out, options,

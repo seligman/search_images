@@ -22,6 +22,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -489,6 +490,10 @@ FINISHED_STATES = ("done", "failed", "cancelled", "interrupted")
 TWIN_STATES = ("queued", "running", "paused")
 # The stage of a job that waits for another process (scan.py) to finish.
 WAITING_STAGE = "waiting for another scan to finish"
+# Kinds of job that are no library's, though their library_id is NULL as for a job of
+# every library: the library cards of the Manage page do not show them as their last job
+# (latest_by_library). (maps: the street maps, street_maps.py.)
+NO_LIBRARY_KINDS = ("delete_library", "delete_faces", "trip_stories", "maps")
 # How the server's jobs name themselves when they hold the WorkerLock.
 WEB_JOB_LABEL = "web server job"
 LOG_LINES = 1000            # log lines kept for the browser (all jobs together)
@@ -519,6 +524,10 @@ STAGE_LABELS = {
     "faces": "Finding faces",
     "people": "Grouping faces into people",
     "delete faces": "Deleting face data",
+    "street maps size": "Checking the size of the street maps",
+    "street maps download": "Downloading the street maps",
+    "street maps file": "Writing the street maps file",
+    "stories": "Writing trip stories",
 }
 # The job queue lives in data/jobs.db, a database of its own: a running scan
 # keeps index.db's write lock almost all the time, and adding, pausing or
@@ -1000,15 +1009,16 @@ class JobManager:
             return self._current is not None and self._current["job"]["id"] == job_id
 
     def latest_by_library(self):
-        """{library id or None: its latest job} (None: jobs for every library); deletions (of
-        a library's data, or of the face data) left out, and so are the exports of trips (of
+        """{library id or None: its latest job} (None: jobs for every library); left out are
+        the jobs that are no library's (NO_LIBRARY_KINDS: deletions of a library's data or
+        of the face data, the trips' stories, the street maps) and the exports of trips (of
         no one library, see trip_export.py)."""
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT * FROM jobs WHERE id IN (SELECT MAX(id) FROM jobs WHERE kind NOT IN "
-                "('delete_library', 'delete_faces') AND NOT (kind = 'export' AND "
-                "library_id IS NULL) GROUP BY library_id)").fetchall()
+                "(%s) AND NOT (kind = 'export' AND library_id IS NULL) GROUP BY library_id)"
+                % ",".join("?" * len(NO_LIBRARY_KINDS)), NO_LIBRARY_KINDS).fetchall()
         finally:
             conn.close()
         return {row["library_id"]: job_record(row) for row in rows}
@@ -1258,6 +1268,13 @@ class JobManager:
         state, error, summary = None, "", {}
         acquired = False
         try:
+            # First the command line that does the same (see log_command).
+            try:
+                command_config = self.config_loader()
+            except Exception:
+                command_config = {}
+            log_command(ctx, job["kind"], dict(job["params"], library_id=job["library_id"]),
+                        command_config)
             acquired = self._wait_for_lock(current, label)
             if not acquired:
                 if current["state"] == "cancelling":
@@ -1433,7 +1450,7 @@ class JobManager:
                     warnings=0, errors=0)
         return view
 
-    def snapshot(self, since_seq=0, names=None):
+    def snapshot(self, since_seq=0, names=None, config=None):
         """The state of the job system for the browser.
 
         {"current": the running (or waiting) job with its progress, or None,
@@ -1443,7 +1460,8 @@ class JobManager:
         last) job, "lock": lock_status(), "manager": {"running", "message"}}.
         A job that another server runs is shown as current with "remote":
         True (and only the progress it saves now and then). names ({library
-        id: name}) fills in each job's "library".
+        id: name}) fills in each job's "library"; with config, each job also
+        gets its "command" (job_command_line; "" when it has none).
         """
         names = names or {}
         self._cleanup_abort()
@@ -1477,6 +1495,10 @@ class JobManager:
             if job is not None:
                 library_id = job["library_id"]
                 job["library"] = names.get(library_id, library_id) if library_id else ""
+                if config is not None:
+                    job["command"] = job_command_line(
+                        job["kind"], dict(job.get("params") or {}, library_id=library_id),
+                        config)
                 if job.get("started") and job.get("finished"):
                     job["duration"] = max(0.0, job["finished"] - job["started"])
         lines, seq = self.buffer.since(since_seq)
@@ -1514,8 +1536,13 @@ def job_libraries(config, params):
     """The libraries a job works on: its library, or every enabled library.
 
     Raises JobError when the job's library is gone from the settings or
-    disabled.
+    disabled. (params "library_ids", from the command line's repeated
+    --library, names several.)
     """
+    library_ids = params.get("library_ids")
+    if library_ids and not params.get("library_id"):
+        return [library for library_id in library_ids
+                for library in job_libraries(config, {"library_id": library_id})]
     library_id = params.get("library_id")
     if not library_id:
         return [library for library in common.enabled_libraries(config) if library.get("id")]
@@ -1785,9 +1812,9 @@ def run_places(ctx, conn, config, params, helper=None):
     the place index from them (the only network use), then look up every
     picture again; "redo": look up every picture again. Without either,
     only pictures not looked up yet. A place index made by another version
-    of this program is built again from the downloaded files first (then
-    every picture is looked up again). The pictures of every library are
-    looked up, enabled or not: it only touches the database, and the
+    of this program (or a missing one) is built again from the downloaded
+    files first (then every picture is looked up again). The pictures of
+    every library are looked up, enabled or not: it only touches the database, and the
     Manage page counts them all (places.status). Raises JobError when
     there are no place names (or the download fails). The GPS check
     (gps_check.run) follows, and the local times (local_times.py: the
@@ -1802,6 +1829,10 @@ def run_places(ctx, conn, config, params, helper=None):
                 return summary
         else:
             rebuilt = places.rebuild_if_needed(ctx)
+            if (rebuilt is None and not os.path.isfile(places.places_db_path())
+                    and places.have_files()):
+                # (The index was deleted, the downloaded files are there.)
+                rebuilt = places.build(ctx=ctx)
             if rebuilt is not None:
                 summary["index"] = rebuilt
         if places.shared() is None:
@@ -1920,6 +1951,47 @@ def run_delete_faces(ctx, conn, config, params, helper=None):
     return result
 
 
+def run_maps(ctx, conn, config, params, helper=None):
+    """Street maps (street_maps.py): check the size of a download (kept in
+    data/maps/plan.json), or with params "download" download them -- from the file
+    "source" the size check named, refused when it has grown well past "expect_bytes"
+    (the size the owner agreed to), or when it is street_maps.LARGE_BYTES or more
+    without "allow_large". Raises JobError."""
+    import street_maps
+    try:
+        found = street_maps.plan(conn, config, ctx, source=params.get("source") or None)
+        street_maps.save_plan(found)
+        if not params.get("download"):
+            ctx.log(street_maps.plan_words(found))
+            return {"plan": street_maps.public_plan(found)}
+        expect = params.get("expect_bytes")
+        return street_maps.download(conn, config, ctx, found=found, expect_bytes=expect
+                                    if isinstance(expect, int) and expect > 0 else None,
+                                    allow_large=params.get("allow_large") is True)
+    except street_maps.Stopped:
+        return {"stopped": True}
+    except street_maps.MapsError as error:
+        raise JobError(str(error))
+    except OSError as error:
+        raise JobError("A street maps file could not be written or read: %s"
+                       % common.redact(error))
+
+
+def run_trip_stories(ctx, conn, config, params, helper=None):
+    """Write the stories of the trips (trip_stories.write_stories): params "trip" (one
+    trip's id; default every trip that is not hidden) and "redo" (also the stories that
+    are up to date). Raises JobError for an unknown trip."""
+    import trips
+    import trip_stories
+    try:
+        return trip_stories.write_stories(ctx, conn, config,
+                                          trip_id=params.get("trip") or None,
+                                          redo=bool(params.get("redo")))
+    except trips.TripError as error:
+        raise JobError("%s (Trips are listed on the Trips page, or by python trips.py "
+                       "--list.)" % error)
+
+
 RUNNERS = {
     "scan": run_scan,
     "describe": run_describe,
@@ -1936,4 +2008,433 @@ RUNNERS = {
     "faces": run_faces,
     "group_faces": run_group_faces,
     "delete_faces": run_delete_faces,
+    "maps": run_maps,
+    "trip_stories": run_trip_stories,
 }
+
+
+# ---------------------------------------------------------------------------
+# Command lines: the command that does what a job does. A job's first log
+# line is "Command line: python scan.py --library Family ..." (or
+# NO_COMMAND and why), and the command line tools log the same line when
+# they start, so a job started on a page can be run again unattended (a
+# scheduled task, say). README: Automating.
+
+COMMAND_PREFIX = "Command line: "
+NO_COMMAND = "No command line for this job (see README)"
+# cmd.exe takes command lines of up to 8191 characters.
+COMMAND_LIMIT = 8000
+# Arguments that PowerShell and cmd both pass on as they are typed; any
+# other is put in double quotes.
+_PLAIN_ARGUMENT_RE = re.compile(r"^[A-Za-z0-9_./:=+\\-]+$")
+# Characters that PowerShell and cmd read differently inside double quotes
+# ($ and ` are PowerShell's, and so are the curly double quotes, which it
+# takes for straight ones; % is cmd's, " ends the quotes), and control
+# characters: an argument holding one cannot be typed alike in both.
+_UNTYPABLE_RE = re.compile(r'["$`%\u201c\u201d\u201e\x00-\x1f\x7f]')
+# What _UNTYPABLE_RE finds, in words.
+_UNTYPABLE_WORDS = "$, `, %, \" or a curly double quote"
+# The switch of every command line tool that names the folder of config.json and data/,
+# as the SETTINGS_BASE environment variable does (use_settings_base): a job's command
+# line ends with it when that is not the program folder, so it runs as it is.
+SETTINGS_BASE_SWITCH = "--settings-base"
+
+
+class NoCommand(Exception):
+    """No command line does what this job does; the message says why."""
+
+
+def typable(text):
+    """True when text can be one argument of a command line typed alike in PowerShell and
+    cmd (see quote_argument)."""
+    return isinstance(text, str) and _UNTYPABLE_RE.search(text) is None
+
+
+def quote_argument(text):
+    """text as one argument of a command line that PowerShell and cmd pass on alike (a
+    POSIX shell too, but for a backslash or ! in it): as it is when it holds only
+    letters, digits and _ . / : = + \\ -, otherwise in double quotes, with the
+    backslashes that end it doubled (or they would escape the closing quote). Raises
+    NoCommand for text that cannot be typed alike: an
+    empty argument (Windows PowerShell drops it), a $, `, % or " character or a curly
+    double quote, a control character, or quoted text ending in a backslash without a
+    space in it (Windows PowerShell passes that on unquoted)."""
+    if not isinstance(text, str) or not text:
+        raise NoCommand("an argument would be empty")
+    if not typable(text):
+        raise NoCommand("%s holds a character that PowerShell and cmd read differently "
+                        "(%s)" % (_shown(text), _UNTYPABLE_WORDS))
+    if _PLAIN_ARGUMENT_RE.match(text):
+        return text
+    trailing = len(text) - len(text.rstrip("\\"))
+    if trailing and not any(char.isspace() for char in text):
+        raise NoCommand("%s ends in a backslash" % _shown(text))
+    return '"%s%s"' % (text, "\\" * trailing)
+
+
+def _shown(text):
+    """text for a message ("the value ..."): without control characters, shortened."""
+    text = re.sub(r"[\x00-\x1f\x7f]", "?", text)
+    return "the value " + (text if len(text) <= 60 else text[:57] + "...")
+
+
+def command_text(tool, args):
+    """"python tool args..." with each argument quoted (quote_argument). Raises NoCommand
+    when an argument cannot be typed, or the line would be longer than COMMAND_LIMIT."""
+    text = " ".join(["python", tool] + [quote_argument(arg) for arg in args])
+    if len(text) > COMMAND_LIMIT:
+        raise NoCommand("the command line would be %d characters long (cmd takes about %d)"
+                        % (len(text), COMMAND_LIMIT))
+    return text
+
+
+def option_tokens(name, value):
+    """The arguments that give an option a value: [name, value], or ["name=value"] when the
+    value is empty or starts with "-" (argparse would take it for an option)."""
+    value = str(value)
+    if not value or value.startswith("-"):
+        return ["%s=%s" % (name, value)]
+    return [name, value]
+
+
+def library_argument(config, library_id):
+    """How a command line names a library: its name when --library NAME finds it, the name
+    can be typed and is plain ASCII (other letters reach the tool garbled from a batch
+    file or script saved in another code page than the console's), else its id (ids are
+    ASCII, and stay when the library is renamed)."""
+    for library in config.get("libraries", []) if isinstance(config, dict) else []:
+        if isinstance(library, dict) and library.get("id") == library_id:
+            name = library.get("name")
+            if (isinstance(name, str) and name.strip() and typable(name) and name.isascii()
+                    and common.get_library(config, name) is library):
+                return name
+            break
+    return library_id
+
+
+def _library_tokens(config, params):
+    library_id = params.get("library_id")
+    if not library_id:
+        return []
+    return option_tokens("--library", library_argument(config, library_id))
+
+
+def _number(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _limit_tokens(params):
+    return option_tokens("--limit", params["limit"]) if _number(params.get("limit")) else []
+
+
+def _switches(params, names):
+    """The switches ((param, switch) pairs) of the params that are true."""
+    return [switch for name, switch in names if params.get(name)]
+
+
+def _describe_tokens(params):
+    tokens = _switches(params, (("retry_failed", "--retry-failed"),
+                                ("redescribe_stale", "--redescribe-stale")))
+    tokens += _limit_tokens(params)
+    if params.get("endpoint"):
+        tokens += option_tokens("--endpoint", params["endpoint"])
+    return tokens
+
+
+_MASS_REMOVAL = (("allow_mass_removal", "--allow-mass-removal"),)
+
+
+def _scan_command(params, config):
+    return "scan.py", (["--no-describe"] + _library_tokens(config, params)
+                       + _switches(params, _MASS_REMOVAL))
+
+
+def _process_command(params, config):
+    return "scan.py", (_library_tokens(config, params) + _describe_tokens(params)
+                       + _switches(params, _MASS_REMOVAL))
+
+
+def _describe_command(params, config):
+    tokens = ["--no-scan"] + _library_tokens(config, params) + _describe_tokens(params)
+    ids = params.get("ids")
+    if isinstance(ids, list):
+        ids = [str(image_id) for image_id in ids if _number(image_id)]
+        if not ids:
+            raise NoCommand("it names no pictures")
+        tokens += ["--ids", ",".join(ids)]
+        if params.get("force"):
+            tokens.append("--force")
+    elif params.get("force"):
+        raise NoCommand("force goes with ids")
+    return "scan.py", tokens
+
+
+def _refine_command(params, config):
+    return "scan.py", (["--refine"] + _library_tokens(config, params)
+                       + _switches(params, (("retry_failed", "--retry-failed"),))
+                       + _limit_tokens(params))
+
+
+def _embed_command(params, config):
+    return "scan.py", ["--embed"] + _library_tokens(config, params) + _limit_tokens(params)
+
+
+def _image_embed_command(params, config):
+    return "scan.py", (["--embed-images"] + _library_tokens(config, params)
+                       + _limit_tokens(params)
+                       + _switches(params, (("rebuild", "--rebuild-looks"),)))
+
+
+def _library_mode(switch):
+    """The command of a job that only takes a library: scan.py switch [--library NAME]."""
+    def build(params, config):
+        return "scan.py", [switch] + _library_tokens(config, params)
+    return build
+
+
+def _delete_library_command(params, config):
+    library_id = params.get("library_id")
+    if not library_id:
+        raise NoCommand("no library was given")
+    return "scan.py", (option_tokens("--delete-library-data", library_id)
+                       + option_tokens("--confirm-name", params.get("confirm_name") or ""))
+
+
+def _folder(path):
+    """An output folder for a command line: without the separator that may end it (but a
+    drive's own, as in X:\\)."""
+    stripped = path.rstrip("\\/")
+    if not stripped or stripped.endswith(":"):
+        return path
+    return stripped
+
+
+def _export_command(params, config):
+    trip = params.get("trip")
+    if trip:
+        tokens = option_tokens("--trip", trip)
+    elif params.get("library_id"):
+        tokens = _library_tokens(config, params)
+    else:
+        raise NoCommand("an export is made of one library or one trip")
+    if params.get("out_dir"):
+        tokens += option_tokens("--out", _folder(params["out_dir"]))
+    options = params.get("options")
+    if options:
+        import export
+        try:
+            tokens += export.options_arguments(options, trip=bool(trip))
+        except ValueError as error:
+            raise NoCommand(str(error))
+    return "export.py", tokens
+
+
+def _places_command(params, config):
+    return "make_places.py", _switches(params, (("download", "--download"),
+                                                ("redo", "--redo")))
+
+
+def _faces_command(params, config):
+    return "people.py", (_library_tokens(config, params) + _limit_tokens(params)
+                         + _switches(params, (("retry_failed", "--retry-failed"),)))
+
+
+def _group_faces_command(params, config):
+    return "people.py", ["--group"]
+
+
+def _trip_stories_command(params, config):
+    tokens = ["--stories"]
+    if params.get("trip"):
+        tokens += option_tokens("--trip", params["trip"])
+    return "trips.py", tokens + _switches(params, (("redo", "--redo"),))
+
+
+def _maps_command(params, config):
+    import street_maps
+    return "street_maps.py", street_maps.command_args(params)
+
+
+def _delete_faces_command(params, config):
+    return "people.py", ["--delete-all", "--yes"]
+
+
+# The command line of each kind of job: kind -> (build(params, config) -> (tool,
+# [arguments]), the params it knows besides library_id). A job whose params hold
+# another one has none. Every kind of RUNNERS is here or in NO_COMMAND_KINDS (a
+# test makes sure).
+COMMAND_BUILDERS = {
+    "scan": (_scan_command, ("allow_mass_removal",)),
+    "describe": (_describe_command, ("retry_failed", "redescribe_stale", "limit", "endpoint",
+                                     "ids", "force")),
+    "refine": (_refine_command, ("limit", "retry_failed")),
+    "embed": (_embed_command, ("limit",)),
+    "image_embed": (_image_embed_command, ("limit", "rebuild")),
+    "process": (_process_command, ("allow_mass_removal", "retry_failed", "redescribe_stale",
+                                   "limit", "endpoint")),
+    "previews": (_library_mode("--previews"), ()),
+    "delete_library": (_delete_library_command, ("confirm_name",)),
+    "export": (_export_command, ("options", "out_dir", "trip", "trip_title")),
+    "places": (_places_command, ("download", "redo")),
+    "proxies": (_library_mode("--proxies"), ()),
+    "drive_previews": (_library_mode("--drive-previews"), ()),
+    "faces": (_faces_command, ("limit", "retry_failed")),
+    "group_faces": (_group_faces_command, ()),
+    "delete_faces": (_delete_faces_command, ("confirm",)),
+    "trip_stories": (_trip_stories_command, ("trip", "redo", "trip_title")),
+    "maps": (_maps_command, ("download", "expect_bytes", "source", "allow_large")),
+}
+# Kinds of job that no command line does: kind -> why (logged after NO_COMMAND).
+NO_COMMAND_KINDS = {}
+
+
+def job_command(kind, params, config):
+    """(tool, [arguments]) of the command line that does what a job of this kind with these
+    params does (params as JobManager gives them to the runner: with "library_id"), with
+    --settings-base DIR at the end when the settings are not in the program folder
+    (settings_base_tokens). Raises NoCommand when there is none."""
+    params = dict(params or {})
+    if kind in NO_COMMAND_KINDS:
+        raise NoCommand(NO_COMMAND_KINDS[kind])
+    if kind not in COMMAND_BUILDERS:
+        raise NoCommand("no tool runs a %s job" % kind)
+    build, known = COMMAND_BUILDERS[kind]
+    unknown = sorted(name for name in params if name != "library_id" and name not in known)
+    if unknown:
+        raise NoCommand("no switch gives %s" % ", ".join(unknown))
+    tool, args = build(params, config if isinstance(config, dict) else {})
+    return tool, list(args) + settings_base_tokens()
+
+
+def command_message(kind, params, config):
+    """A job's first log line: COMMAND_PREFIX and the command line, or NO_COMMAND and why.
+    Never raises."""
+    try:
+        return COMMAND_PREFIX + command_text(*job_command(kind, params, config))
+    except NoCommand as error:
+        return "%s: %s." % (NO_COMMAND, error)
+    except Exception as error:
+        return "%s: %s." % (NO_COMMAND, common.redact(error))
+
+
+def job_command_line(kind, params, config):
+    """The command line of a job (command_text), or "" when there is none."""
+    try:
+        return command_text(*job_command(kind, params, config))
+    except Exception:
+        return ""
+
+
+def add_settings_base_argument(parser):
+    """Give a command line tool's parser the switch --settings-base DIR (see
+    use_settings_base)."""
+    parser.add_argument(SETTINGS_BASE_SWITCH, metavar="DIR",
+                        help="the folder of config.json and data/ (the settings and data), "
+                             "instead of the SETTINGS_BASE environment variable or the "
+                             "program folder; the command lines of jobs end with it when "
+                             "the settings are not in the program folder")
+
+
+def use_settings_base(parser, args):
+    """Make --settings-base DIR (args.settings_base) the SETTINGS_BASE of this run, before
+    anything reads the settings; parser.error (exit status 2) when DIR holds no
+    config.json (a mistyped folder would otherwise be a fresh, empty one)."""
+    folder = getattr(args, "settings_base", None)
+    if folder is None:
+        return
+    folder = os.path.abspath(os.path.expanduser(folder))
+    if not os.path.isfile(os.path.join(folder, "config.json")):
+        parser.error("%s %s: there is no config.json there" % (SETTINGS_BASE_SWITCH, folder))
+    os.environ["SETTINGS_BASE"] = folder
+
+
+def missing_settings():
+    """What a command line tool says when the settings folder holds no config.json (a
+    command run without the --settings-base of its job, say), or ""."""
+    if os.path.isfile(common.config_path()):
+        return ""
+    return ("There are no settings in %s (no config.json): run settings.py first, or give "
+            "the folder of the settings with %s DIR (or the SETTINGS_BASE environment "
+            "variable)." % (common.settings_base(), SETTINGS_BASE_SWITCH))
+
+
+def _default_settings_base():
+    return (os.path.normcase(common.settings_base())
+            == os.path.normcase(os.path.abspath(common.BASE_DIR)))
+
+
+def settings_base_tokens():
+    """The arguments that end a command line when the settings and data are not in the
+    program folder: [--settings-base, the folder] (so the line runs as it is, from a
+    terminal or a scheduled task, without SETTINGS_BASE set); [] when they are, or when
+    the folder cannot be typed alike in PowerShell and cmd (settings_base_note)."""
+    if _default_settings_base():
+        return []
+    tokens = option_tokens(SETTINGS_BASE_SWITCH, common.settings_base())
+    try:
+        for token in tokens:
+            quote_argument(token)
+    except NoCommand:
+        return []
+    return tokens
+
+
+def settings_base_note():
+    """What a command line needs besides itself, or "": when the settings and data are not
+    in the program folder and their folder cannot be given as --settings-base (it holds a
+    character PowerShell and cmd read differently), the SETTINGS_BASE environment
+    variable set to it."""
+    if _default_settings_base() or settings_base_tokens():
+        return ""
+    return ("The command line needs the environment variable SETTINGS_BASE set to %s (where "
+            "the settings and data are; the folder cannot be typed alike in PowerShell and "
+            "cmd as --settings-base; see Automating in the README)." % common.settings_base())
+
+
+def _without_settings_base(args):
+    """args without --settings-base and its folder, in each form argparse takes
+    (--settings-base DIR, --settings-base=DIR, the switch shortened: --settings DIR)."""
+    result, skip = [], False
+    for index, arg in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if arg == "--":
+            result.extend(args[index:])
+            break
+        name = arg.split("=", 1)[0]
+        if len(name) >= 5 and name.startswith("--") and SETTINGS_BASE_SWITCH.startswith(name):
+            skip = "=" not in arg
+            continue
+        result.append(arg)
+    return result
+
+
+def log_command(ctx, kind, params, config):
+    """Log the command line of a job (command_message) and, when needed, the SETTINGS_BASE
+    note: the first lines of every job."""
+    ctx.log(command_message(kind, params, config))
+    note = settings_base_note()
+    if note:
+        ctx.log(note)
+
+
+def log_tool_command(ctx, tool, argv=None):
+    """Log the command line a command line tool was started with, as a job logs its own
+    (log_command): "Command line: python tool args" (argv: its arguments, default
+    sys.argv[1:]; the settings folder as --settings-base DIR at the end, however it was
+    given) and the SETTINGS_BASE note. ctx None: printed as a ConsoleContext prints."""
+    args = _without_settings_base(list(sys.argv[1:] if argv is None else argv))
+    args += settings_base_tokens()
+    try:
+        text = command_text(tool, args)
+    except NoCommand:
+        # (Typed somehow: shown as near to that as can be.)
+        text = " ".join(["python", tool] + [arg if _PLAIN_ARGUMENT_RE.match(arg) else
+                                            '"%s"' % arg for arg in args])
+    if ctx is None:
+        ctx = ConsoleContext(os.path.splitext(tool)[0])
+    ctx.log(COMMAND_PREFIX + text)
+    note = settings_base_note()
+    if note:
+        ctx.log(note)

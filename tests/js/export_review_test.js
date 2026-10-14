@@ -260,6 +260,14 @@ test("counts, size and details in words", function () {
     assert.ok(R.OPTIONS.album.label && R.OPTIONS.marks.hint);
     // The Location option says that it publishes the place names.
     assert.ok(/town, region and country/.test(R.OPTIONS.location.hint));
+    // A trip's story goes with the location only (it names the trip's places).
+    assert.ok(/^With Location/.test(R.OPTIONS.story.hint));
+    options = defaults();
+    options.story = true;
+    assert.ok(!/story/.test(R.detailsText(options)), R.detailsText(options));
+    options.location = true;
+    assert.ok(/The trip's story goes too, a paragraph a day, without the sentences that name /
+        .test(R.detailsText(options)), R.detailsText(options));
     // Only this computer can open the site the command serves (export.py's
     // own server, which lets videos be moved in): the export's own command.
     assert.strictEqual(R.serveCommand("C:\\Photos\\Family"),

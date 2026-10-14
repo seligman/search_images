@@ -2550,6 +2550,747 @@ test("10k pictures by meaning: 256-number vectors compared under 15 ms", functio
     assert.ok(result.total > 0);
 });
 
+/* ---------- Per-term coverage ---------------------------------------------- */
+
+// A vector along one axis only (a word's own meaning, apart from the query's).
+function axisVector(axis) {
+    var values = [];
+    for (var k = 0; k < MEANING_DIMS; k++) {
+        values.push(k === axis ? 1 : 0);
+    }
+    return byteVector(values);
+}
+
+test("the texts a query embeds: the whole query, then each free word", function () {
+    assert.deepStrictEqual(SearchCore.meaningTexts("anna turtle"), ["anna turtle", "anna",
+                                                                    "turtle"]);
+    // Small words are skipped, relation words need no vector of their own.
+    assert.deepStrictEqual(SearchCore.meaningTexts("sunset over the sea"),
+                           ["sunset over the sea", "sunset", "sea"]);
+    // One free word: the query alone; filters, phrases and -words are no free words.
+    assert.deepStrictEqual(SearchCore.meaningTexts("turtle"), ["turtle"]);
+    assert.deepStrictEqual(SearchCore.meaningTexts("turtle year:2019 \"green sea\" -dog"),
+                           ["turtle green sea"]);
+    assert.deepStrictEqual(SearchCore.meaningTexts("year:2019"), []);
+    assert.deepStrictEqual(SearchCore.meaningTexts("similar:4 turtle"), []);
+    // The words of a clause that names someone or somewhere are a name.
+    assert.strictEqual(SearchCore.meaningText("person:\"Anna Lopez\" OR anna turtle"), "turtle");
+    assert.strictEqual(SearchCore.meaningText("place:lisbon OR lisbon tram ride"), "tram ride");
+    assert.deepStrictEqual(SearchCore.meaningTexts("person:Anna OR anna turtle beach"),
+                           ["turtle beach", "turtle", "beach"]);
+});
+
+// Pictures in a person's folder, turtles elsewhere: "anna turtle".
+function annaIndex() {
+    var records = [
+        {i: 1, t: "Sea turtle in a tank", g: ["turtle", "tank"], f: "Anna's trip",
+         dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Turtle painted on a garden wall", g: ["turtle", "wall"], dk: "2020-01-02",
+         ds: 1},
+        {i: 3, t: "Birthday mug", g: ["mug"], f: "Anna's trip", dk: "2020-01-03", ds: 1},
+        {i: 4, t: "Green reptile swimming", g: ["reptile"], f: "Anna's trip", dk: "2020-01-04",
+         ds: 1},
+        {i: 5, t: "Painted shell pattern", g: ["pattern"], dk: "2020-01-05", ds: 1}
+    ];
+    return meaningIndex(records, {1: closeTo(0.9), 2: closeTo(0.88, 2), 3: closeTo(0.2, 3),
+                                  4: closeTo(0.92, 4), 5: closeTo(0.85, 5)});
+}
+
+test("per-term coverage: a name is covered by its words only, never by meaning", function () {
+    var index = annaIndex();
+    // (The query means turtles: a first name adds next to nothing to it.)
+    var words = {anna: axisVector(7), turtle: QUERY};
+    var result = index.search("anna turtle", {vector: QUERY, termVectors: words});
+    // The turtle in her folder; the reptile in her folder found by meaning;
+    // not the painted turtle or the pattern (nothing of Anna there), nor her mug
+    // (nothing of a turtle).
+    assert.deepStrictEqual(result.items, [1, 4]);
+    assert.deepStrictEqual(result.byMeaning, [4]);
+    assert.deepStrictEqual(result.meaning.terms, [
+        {text: "anna", name: true, relation: false, meaning: true, unknown: false},
+        {text: "turtle", name: false, relation: false, meaning: true, unknown: false}]);
+    // A function gives the vectors as well; without them the name is still
+    // known by its words (only in folder names).
+    function given(text) {
+        return words[text] || null;
+    }
+    assert.deepStrictEqual(index.search("anna turtle", {vector: QUERY, termVectors: given}).items,
+                           [1, 4]);
+    assert.deepStrictEqual(index.search("anna turtle", {vector: QUERY}).items, [1, 4]);
+    // One word: as before (the painted one is a turtle).
+    assert.deepStrictEqual(index.search("turtle", {vector: QUERY, termVectors: words}).items
+                           .slice().sort(), [1, 2, 4, 5]);
+    // Words only: as before.
+    assert.deepStrictEqual(index.search("anna turtle", {vector: QUERY, termVectors: words,
+                                                        meaning: "words"}).items, [1]);
+});
+
+test("per-term coverage: a word lacking needs its own meaning", function () {
+    var records = [
+        {i: 1, t: "Red car", g: ["red", "car"], dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Blue car", g: ["blue", "car"], dk: "2020-01-02", ds: 1},
+        {i: 3, t: "Crimson sedan", g: ["crimson", "sedan"], dk: "2020-01-03", ds: 1}
+    ];
+    var index = meaningIndex(records, {1: closeTo(0.9, 3), 2: closeTo(0.88, 2),
+                                       3: closeTo(0.8, 3)});
+    var words = {red: axisVector(3), car: QUERY};
+    var result = index.search("red car", {vector: QUERY, termVectors: words});
+    // The crimson sedan (a car by its words) is red by meaning; the blue
+    // car is not.
+    assert.deepStrictEqual(result.items, [1, 3]);
+    assert.deepStrictEqual(result.byMeaning, [3]);
+    // Without the words' vectors: as before (the whole query's meaning).
+    assert.deepStrictEqual(index.search("red car", {vector: QUERY}).items, [1, 2, 3]);
+    // A vector of another size counts as none.
+    assert.deepStrictEqual(index.search("red car", {vector: QUERY, termVectors: {
+        red: new Int8Array(3), car: QUERY}}).items, [1, 2, 3]);
+});
+
+test("per-term coverage: words of position need no covering", function () {
+    var records = [
+        {i: 1, t: "Sunset at sea", g: ["sunset", "sea"], dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Sunset behind the hills", g: ["sunset", "hills"], dk: "2020-01-02", ds: 1}
+    ];
+    var index = meaningIndex(records, {1: closeTo(0.9, 4), 2: closeTo(0.85, 2)});
+    var words = {sunset: QUERY, sea: axisVector(4)};
+    var result = index.search("sunset over the sea", {vector: QUERY, termVectors: words});
+    // "over" is in no description: the sunset at sea is found by meaning;
+    // the hills are no sea.
+    assert.deepStrictEqual(result.items, [1]);
+    assert.deepStrictEqual(result.byMeaning, [1]);
+    assert.deepStrictEqual(result.meaning.terms.map(function (term) {
+        return term.text + (term.relation ? " (position)" : "");
+    }), ["sunset", "over (position)", "sea"]);
+});
+
+test("a name is a name by where it is: folders, file names, text, places, dates", function () {
+    // A word in the descriptions of most pictures with it is no name, even
+    // when a folder has it too.
+    var records = [
+        {i: 1, t: "Cactus garden", g: ["cactus"], f: "Cactus", dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Cactus flower", g: ["cactus"], dk: "2020-01-02", ds: 1},
+        {i: 3, t: "Pot", f: "Cactus", dk: "2020-01-03", ds: 1},
+        {i: 4, t: "Desert plant", g: ["plant"], dk: "2020-01-04", ds: 1},
+        {i: 5, t: "Kitchen", n: "brunoway_01.jpg", dk: "2020-01-05", ds: 1},
+        {i: 6, t: "Cactus with a sign", g: ["cactus"], o: "Brunoway", dk: "2020-01-06", ds: 1}
+    ];
+    var index = meaningIndex(records, {1: closeTo(0.9), 2: closeTo(0.88, 2), 3: closeTo(0.2, 3),
+                                       4: closeTo(0.92, 4), 5: closeTo(0.1, 5),
+                                       6: closeTo(0.5, 5)});
+    var result = index.search("cactus brunoway", {vector: QUERY,
+                                                  termVectors: {cactus: QUERY,
+                                                                brunoway: axisVector(7)}});
+    var names = {};
+    result.meaning.terms.forEach(function (term) {
+        names[term.text] = term.name;
+    });
+    assert.deepStrictEqual(names, {cactus: false, brunoway: true});
+    // (Picture 6 has both: brunoway in its text.)
+    assert.deepStrictEqual(result.items, [6]);
+});
+
+test("a smart album's search goes by the vectors of its words too", function () {
+    var index = annaIndex();
+    var words = {"anna turtle": QUERY, anna: axisVector(7), turtle: QUERY};
+    var asked = [];
+    var albums = [{id: 1, name: "Anna's turtles", kind: "smart", query: "anna turtle"}];
+    var result = index.search("album:\"Anna's turtles\"", {albums: albums,
+                                                             vectorFor: function (text) {
+                                                                 asked.push(text);
+                                                                 return words[text] || null;
+                                                             }});
+    assert.deepStrictEqual(asked, ["anna turtle", "anna", "turtle"]);
+    assert.deepStrictEqual(result.items.slice().sort(), [1, 4]);
+    // Until all of them have come, by its words alone.
+    var partial = index.search("album:\"Anna's turtles\"", {albums: albums,
+                                                              vectorFor: function (text) {
+                                                                  return text === "anna" ? null
+                                                                      : words[text];
+                                                              }});
+    assert.deepStrictEqual(partial.items, [1]);
+});
+
+/* ---------- Plain language (interpret) ------------------------------------- */
+
+var PEOPLE = [{id: 1, name: "Anna Lopez", label: "Anna Lopez", ids: [1, 2]},
+              {id: 2, name: "", label: "Person 2", ids: [3]},
+              {id: 3, name: "Bruno", label: "Bruno", ids: [4], hidden: true},
+              {id: 4, name: "Siena", label: "Siena", ids: [5]},
+              {id: 5, name: "Rose", label: "Rose", ids: [6]}];
+
+function plainRecords() {
+    var records = [
+        {i: 1, t: "Anna at the beach", g: ["beach"], dk: "2024-11-03", ci: "Lisbon",
+         rg: "Lisbon District", co: "Portugal", cc: "PT", ds: 1},
+        {i: 2, t: "Anna with a tram", g: ["tram"], dk: "2019-06-20", ci: "Lisbon",
+         rg: "Lisbon District", co: "Portugal", cc: "PT", ds: 1},
+        {i: 3, t: "Beach umbrellas", g: ["beach"], dk: "2024-11-05", f: "Anna Lopez", ds: 1},
+        {i: 4, t: "Old bridge", g: ["bridge"], dk: "2016-04-10", ci: "Siena", rg: "Tuscany",
+         co: "Italy", cc: "IT", ds: 1},
+        {i: 5, t: "Dinner", g: ["dinner"], dk: "2026-07-14", ci: "Port Ellis",
+         rg: "California", co: "United States", cc: "US", ds: 1},
+        {i: 6, t: "Garden", g: ["garden"], dk: "2015-12-24", ds: 1}
+    ];
+    for (var k = 0; k < 6; k++) {
+        records.push({i: 20 + k, t: "Rose " + k, g: ["rose", "flower"], dk: "2025-08-0" + (k + 1),
+                      ds: 1});
+    }
+    return records;
+}
+
+function understood(index, text, options) {
+    var opts = {people: PEOPLE, today: "2026-10-13"};
+    Object.keys(options || {}).forEach(function (key) {
+        opts[key] = options[key];
+    });
+    return index.interpret(text, opts);
+}
+
+test("plain language: a person, a place and a date become filters", function () {
+    var index = SearchCore.prepare(plainRecords());
+    var answer = understood(index, "anna at the beach in lisbon november 2024");
+    assert.strictEqual(answer.query, "person:\"Anna Lopez\" OR anna at the beach " +
+                       "place:lisbon OR lisbon date:2024-11");
+    assert.deepStrictEqual(answer.parts.map(function (part) {
+        return [part.kind, part.label, part.text, part.key];
+    }), [["person", "Person: Anna Lopez", "anna", "anna"],
+         ["place", "Place: Lisbon", "in lisbon", "lisbon"],
+         ["date", "Taken: November 2024", "november 2024", "november 2024"]]);
+    assert.strictEqual(answer.rest, "at the beach");
+    assert.ok(answer.changed);
+    assert.deepStrictEqual(answer.choices, []);
+    // Her pictures and those with the name, on the beach, in Lisbon, then.
+    assert.deepStrictEqual(index.search(answer.query).items, [1]);
+    // What it became is understood as it is (a smart album saves it so).
+    var again = understood(index, answer.query);
+    assert.strictEqual(again.query, answer.query);
+    assert.deepStrictEqual([again.parts, again.choices], [[], []]);
+    // The search box text as typed is never changed: start and end say
+    // where each part is.
+    var part = answer.parts[1];
+    assert.strictEqual(answer.text.slice(part.start, part.end), "in lisbon");
+    // Her last name, her name with 's, and her whole name.
+    assert.strictEqual(understood(index, "lopez").query, "person:\"Anna Lopez\" OR lopez");
+    assert.strictEqual(understood(index, "anna's beach").query,
+                       "person:\"Anna Lopez\" OR anna beach");
+    assert.strictEqual(understood(index, "Anna Lopez beach").query,
+                       "person:\"Anna Lopez\" OR \"anna lopez\" beach");
+    // Her pictures rank with the strongest word matches, before a folder
+    // that only has her name.
+    assert.deepStrictEqual(index.search(understood(index, "anna beach").query).items, [1, 3]);
+});
+
+test("plain language: what is never interpreted", function () {
+    var index = SearchCore.prepare(plainRecords());
+    ["anna OR beach", "anna or beach", "-anna beach", "\"anna\" beach", "tag:anna",
+     "person:Anna", "beach 1984", "may", "summer beach", "Person 2", "bruno"]
+        .forEach(function (text) {
+            var answer = understood(index, text);
+            assert.strictEqual(answer.query, text, text);
+            assert.deepStrictEqual(answer.parts, [], text);
+        });
+    // Without people (visitors, an export without names): no person.
+    assert.strictEqual(index.interpret("anna beach", {today: "2026-10-13"}).query, "anna beach");
+    // Turned off, or everything as typed.
+    assert.strictEqual(understood(index, "anna in lisbon", {plain: false}).query,
+                       "anna in lisbon");
+    assert.strictEqual(understood(index, "anna in lisbon", {typed: "*"}).query, "anna in lisbon");
+    // One part as typed (a chip's x): it says so in kept.
+    var kept = understood(index, "anna in lisbon", {typed: ["anna"]});
+    assert.strictEqual(kept.query, "anna place:lisbon OR lisbon");
+    assert.deepStrictEqual(kept.kept, ["anna"]);
+    assert.deepStrictEqual(understood(index, "beach", {typed: ["anna"]}).kept, []);
+    // A date as typed stays whole (not "november 2024" after all).
+    var month = understood(index, "beach in november 2024", {typed: ["in november 2024"]});
+    assert.strictEqual(month.query, "beach in november 2024");
+    assert.deepStrictEqual(month.kept, ["in november 2024"]);
+    assert.strictEqual(understood(index, "beach in november 2024").parts[0].key,
+                       "in november 2024");
+    // Never throws.
+    [null, undefined, "", "   ", "\"", "-", "OR", "in", "since", "last", "between 2015 and",
+     new Array(400).join("anna ")].forEach(function (text) {
+        assert.strictEqual(typeof understood(index, text).query, "string");
+    });
+});
+
+test("plain language: dates in words, relative to today", function () {
+    var index = SearchCore.prepare(plainRecords());
+    function query(text, today) {
+        return understood(index, text, today ? {today: today} : {}).query;
+    }
+    // (A year alone: taken then, or with the year in its words -- a folder
+    // "2019 Taxes" of scans whose only date is the file's.)
+    assert.strictEqual(query("beach 2019"), "beach date:2019 OR 2019");
+    assert.strictEqual(query("in 2019"), "date:2019 OR 2019");
+    assert.strictEqual(query("beach 2018"), "beach 2018");    // (no picture then)
+    assert.strictEqual(query("2015-2019"), "date:2015..2019");
+    assert.strictEqual(query("between 2019 and 2015"), "date:2015..2019");
+    assert.strictEqual(query("from 2015 to 2019"), "date:2015..2019");
+    assert.strictEqual(query("2015 to 2019"), "date:2015..2019");
+    assert.strictEqual(query("may 2019"), "date:2019-05");
+    assert.strictEqual(query("november of 2024"), "date:2024-11");
+    assert.strictEqual(query("in the spring of 2016"), "date:2016-03..2016-05");
+    assert.strictEqual(query("summer 2019"), "date:2019-06..2019-08");
+    assert.strictEqual(query("fall 2019"), "date:2019-09..2019-11");
+    // (The winter that ends in that year.)
+    assert.strictEqual(query("winter 2016"), "date:2015-12..2016-02");
+    assert.strictEqual(query("since 2019"), "date:2019..");
+    assert.strictEqual(query("after 2019"), "date:2020..");
+    assert.strictEqual(query("after march 2019"), "date:2019-04..");
+    assert.strictEqual(query("before 2019"), "date:..2018");
+    assert.strictEqual(query("before january 2019"), "date:..2018-12");
+    assert.strictEqual(query("last year"), "date:2025");
+    assert.strictEqual(query("this year"), "date:2026");
+    assert.strictEqual(query("last month"), "date:2026-09");
+    assert.strictEqual(query("this month"), "date:2026-10");
+    assert.strictEqual(query("last month", "2026-01-15"), "date:2025-12");
+    // (Weeks from Monday; 2026-10-13 is a Tuesday.)
+    assert.strictEqual(query("last week"), "date:2026-10-05..2026-10-11");
+    assert.strictEqual(query("this week"), "date:2026-10-12..2026-10-13");
+    assert.strictEqual(query("yesterday"), "date:2026-10-12");
+    // The latest one that is over.
+    assert.strictEqual(query("last november"), "date:2025-11");
+    assert.strictEqual(query("last september"), "date:2026-09");
+    assert.strictEqual(query("last october"), "date:2025-10");
+    assert.strictEqual(query("last summer"), "date:2026-06..2026-08");
+    assert.strictEqual(query("last summer", "2026-07-01"), "date:2025-06..2025-08");
+    assert.strictEqual(query("this summer"), "date:2026-06..2026-08");
+    assert.strictEqual(query("this winter"), "date:2025-12..2026-02");
+    assert.strictEqual(query("this winter", "2026-12-20"), "date:2026-12..2027-02");
+    assert.strictEqual(query("last winter", "2026-01-20"), "date:2024-12..2025-02");
+    // The chip says the dates.
+    assert.strictEqual(understood(index, "last summer").parts[0].label,
+                       "Taken: June \u2013 August 2026");
+    assert.strictEqual(understood(index, "since 2019").parts[0].label, "Taken: since 2019");
+    assert.strictEqual(understood(index, "before 2019").parts[0].label, "Taken: until 2018");
+});
+
+test("date: finds the pictures taken then, from one date to another", function () {
+    var records = [
+        {i: 1, dk: "2019-05-31"}, {i: 2, dk: "2019-06-01"}, {i: 3, dk: "2019-08-31"},
+        {i: 4, dk: "2019-09-01"}, {i: 5, dk: "2019-07-04", du: 1}, {i: 6}
+    ];
+    function ids(query) {
+        return items(records, query, {sort: "oldest"});
+    }
+    assert.deepStrictEqual(ids("date:2019-06..2019-08"), [2, 3]);
+    assert.deepStrictEqual(ids("date:2019"), [1, 2, 3, 4]);
+    assert.deepStrictEqual(ids("date:2019-06"), [2]);
+    assert.deepStrictEqual(ids("date:2019-06.."), [2, 3, 4]);
+    assert.deepStrictEqual(ids("date:..2019-05"), [1]);
+    assert.deepStrictEqual(ids("taken:2019-05-31"), [1]);
+    // (A file's time is no date taken: date: leaves it out, as on:.)
+    assert.deepStrictEqual(ids("-date:2019-06..2019-08"), [1, 5, 4, 6]);
+    ["date:2019-13", "date:soon", "date:2019..2018", "date:.."].forEach(function (query) {
+        var result = search(records, query);
+        assert.strictEqual(result.total, 0, query);
+        assert.ok(/date:.* is not understood/.test(result.warnings.join(" ")), query);
+    });
+});
+
+test("plain language: a word that may be several things is asked about", function () {
+    var index = SearchCore.prepare(plainRecords());
+    // A person and a town of the same name.
+    var answer = understood(index, "siena bridge");
+    assert.strictEqual(answer.query, "siena bridge");
+    assert.deepStrictEqual(answer.parts, []);
+    assert.strictEqual(answer.choices.length, 1);
+    var choice = answer.choices[0];
+    assert.deepStrictEqual([choice.text, choice.key, choice.start, choice.end],
+                           ["siena", "siena", 0, 5]);
+    assert.deepStrictEqual(choice.options.map(function (option) {
+        return [option.kind, option.label, option.query];
+    }), [["person", "Person: Siena", "person:Siena OR siena"],
+         ["place", "Place: Siena", "place:siena OR siena"],
+         ["words", "the word \u201csiena\u201d", null]]);
+    // "in" makes it the place, "with" the person.
+    assert.strictEqual(understood(index, "bridge in siena").query,
+                       "bridge place:siena OR siena");
+    assert.strictEqual(understood(index, "dinner with siena").query,
+                       "dinner person:Siena OR siena");
+    // A name that is also a common word of the pictures (six roses).
+    var rose = understood(index, "rose");
+    assert.strictEqual(rose.query, "rose");
+    assert.deepStrictEqual(rose.choices[0].options.map(function (option) {
+        return option.kind;
+    }), ["person", "words"]);
+    assert.strictEqual(understood(index, "with rose").query, "person:Rose OR rose");
+    // Kept as typed: not asked again.
+    assert.deepStrictEqual(understood(index, "rose", {typed: ["rose"]}).choices, []);
+});
+
+test("plain language: places of the records, other names of countries", function () {
+    var index = SearchCore.prepare(plainRecords());
+    assert.strictEqual(understood(index, "dinner in port ellis").query,
+                       "dinner place:\"port ellis\" OR \"port ellis\"");
+    assert.strictEqual(understood(index, "tuscany").parts[0].label, "Place: Tuscany");
+    var usa = understood(index, "usa dinner");
+    assert.strictEqual(usa.query, "place:usa OR usa dinner");
+    assert.strictEqual(usa.parts[0].label, "Place: United States");
+    assert.deepStrictEqual(index.search(usa.query).items, [5]);
+    // A place no picture was taken in is a word.
+    assert.strictEqual(understood(index, "paris").query, "paris");
+});
+
+test("plain language in an export: published names are looked for as words", function () {
+    var index = SearchCore.prepare(plainRecords());
+    var answer = index.interpret("anna beach", {names: ["Anna Lopez"], today: "2026-10-13"});
+    assert.strictEqual(answer.query, "\"anna\" beach");
+    assert.strictEqual(answer.parts[0].label, "Person: Anna Lopez");
+    // (Quoted: never found by meaning.)
+    assert.strictEqual(SearchCore.meaningText(answer.query), "anna beach");
+    assert.deepStrictEqual(SearchCore.meaningTexts(answer.query), ["anna beach"]);
+});
+
+/* An export with its "people_names" option (export.add_people_names): Anna
+   is a tag of her pictures (lower case), six at the beach and three with
+   turtles; a turtle mosaic with nothing of her is as close to "anna turtle"
+   as her turtles are. */
+function publishedIndex() {
+    var records = [];
+    var vectors = {};
+    for (var k = 1; k <= 6; k++) {
+        records.push({i: k, t: "Beach day " + k, g: ["beach", "anna"], dk: "2024-06-0" + k,
+                      ds: 1});
+        vectors[k] = closeTo(0.2, 3);
+    }
+    [0.9, 0.88, 0.86].forEach(function (cos, k) {
+        records.push({i: 7 + k, t: "Sea turtle in a tank " + k, g: ["turtle", "tank", "anna"],
+                      dk: "2024-07-0" + (k + 1), ds: 1});
+        vectors[7 + k] = closeTo(cos, 2);
+    });
+    records.push({i: 10, t: "Sea turtle mosaic on a tiled floor", g: ["turtle", "mosaic"],
+                  dk: "2024-08-01", ds: 1});
+    vectors[10] = closeTo(0.87, 4);
+    return meaningIndex(records, vectors);
+}
+
+test("plain language in an export: a published name is a name, though it is a tag",
+     function () {
+         // (The names are tags of five or more pictures: not a common word.)
+         var index = publishedIndex();
+         var answer = index.interpret("anna turtle", {names: ["Anna"], today: "2026-10-13"});
+         assert.deepStrictEqual(answer.choices, []);
+         assert.strictEqual(answer.query, "\"anna\" turtle");
+         assert.strictEqual(answer.parts[0].label, "Person: Anna");
+         // Shown as understood: the mosaic has nothing of Anna.
+         var words = {anna: axisVector(7), turtle: QUERY};
+         var options = {vector: QUERY, termVectors: words, names: ["Anna"]};
+         assert.deepStrictEqual(index.search(answer.query, options).items.slice().sort(),
+                                [7, 8, 9]);
+         // Searched as typed (the words alone, "Search the words as typed"): the
+         // name is covered by its words only, never by meaning.
+         var typed = index.search("anna turtle", options);
+         assert.deepStrictEqual(typed.items.slice().sort(), [7, 8, 9]);
+         assert.deepStrictEqual(typed.meaning.terms.map(function (term) {
+             return [term.text, term.name];
+         }), [["anna", true], ["turtle", false]]);
+         // (A library's own tag is what its pictures show: the same records
+         // without published names find the mosaic by meaning.)
+         assert.ok(index.search("anna turtle", {vector: QUERY, termVectors: words}).items
+                   .indexOf(10) >= 0);
+         // A smart album of the export searches the same way.
+         var albums = [{id: 1, name: "Turtles", kind: "smart", query: "anna turtle"}];
+         var album = index.search("album:Turtles", {albums: albums, names: ["Anna"],
+                                                    vectorFor: function (text) {
+                                                        return text === "anna turtle" ? QUERY
+                                                            : words[text] || null;
+                                                    }});
+         assert.deepStrictEqual(album.items.slice().sort(), [7, 8, 9]);
+     });
+
+test("plain language in an export: a published name that is a common word is asked about",
+     function () {
+         // Rose, a published name, and six roses whose titles say so.
+         var records = [{i: 1, t: "Garden party", g: ["garden", "rose"], dk: "2024-06-01",
+                         ds: 1}];
+         for (var k = 0; k < 6; k++) {
+             records.push({i: 2 + k, t: "Red rose " + k, g: ["rose", "flower"],
+                           dk: "2024-06-0" + (k + 2), ds: 1});
+         }
+         var index = SearchCore.prepare(records);
+         var answer = index.interpret("rose", {names: ["Rose"], today: "2026-10-13"});
+         assert.strictEqual(answer.choices.length, 1);
+         assert.deepStrictEqual(answer.choices[0].options.map(function (option) {
+             return option.kind;
+         }), ["person", "words"]);
+     });
+
+/* ---------- Plain language and per-term coverage: review fixes ------------ */
+
+test("per-term coverage: a word next to the others, judged by the pictures with them all",
+     function () {
+         // "red sports car": a red coupe says "car" and "red", not "sports";
+         // the word's own vector means sports games, not a car.
+         function cars(full) {
+             var records = [];
+             var vectors = {};
+             if (full) {
+                 [0.9, 0.88, 0.86].forEach(function (cos, k) {
+                     records.push({i: 1 + k, t: "Red sports car " + k, g: ["red", "sports", "car"],
+                                   dk: "2020-01-01", ds: 1});
+                     vectors[1 + k] = closeTo(cos, 2);
+                 });
+             }
+             records.push({i: 4, t: "Red coupe", g: ["red", "car", "coupe"], dk: "2020-01-02",
+                           ds: 1});
+             vectors[4] = closeTo(0.85, 2);
+             records.push({i: 5, t: "Red car in a garage", g: ["red", "car", "garage"],
+                           dk: "2020-01-03", ds: 1});
+             vectors[5] = closeTo(0.66, 4);
+             records.push({i: 6, t: "Sports day on a field", g: ["sports", "field"],
+                           dk: "2020-01-04", ds: 1});
+             vectors[6] = closeTo(0.8, 5);
+             return meaningIndex(records, vectors, 600);
+         }
+         var words = {red: axisVector(5), sports: axisVector(3), car: axisVector(2)};
+         var options = {vector: QUERY, termVectors: words};
+         // The coupe is as close to the whole query as the sports cars: it
+         // stays; the car in the garage is not, and the field has no car.
+         var result = cars(true).search("red sports car", options);
+         assert.deepStrictEqual(result.items, [1, 2, 3, 4]);
+         assert.deepStrictEqual(result.byMeaning, [4]);
+         // With no picture of all the words, each part must be seen: "sports"
+         // by its own meaning, which the coupe does not have.
+         assert.deepStrictEqual(cars(false).search("red sports car", options).items, []);
+     });
+
+test("per-term coverage: a word no picture has (a misspelling) is not checked", function () {
+    var records = [
+        {i: 1, t: "Waterfall on a hike", g: ["waterfall", "hike", "trail"], dk: "2020-01-01", ds: 1},
+        {i: 2, t: "Waterfront path", g: ["waterfront", "path"], dk: "2020-01-02", ds: 1}
+    ];
+    var index = meaningIndex(records, {1: closeTo(0.9, 2), 2: closeTo(0.5, 3)});
+    // (The misspelling's own vector is spelling noise: like the waterfront.)
+    var result = index.search("waterfal hike", {vector: QUERY,
+                                                termVectors: {waterfal: axisVector(3),
+                                                              hike: QUERY}});
+    assert.deepStrictEqual(result.items, [1]);
+    assert.deepStrictEqual(result.meaning.terms.map(function (term) {
+        return [term.text, term.unknown];
+    }), [["waterfal", true], ["hike", false]]);
+});
+
+test("per-term coverage: a word whose pictures stand far out needs more than z 2", function () {
+    // Five puppies (their own word's vector finds them far out); a snowy
+    // yard that only leans a little towards puppies is no puppy in the snow.
+    var records = [];
+    var vectors = {};
+    for (var k = 0; k < 5; k++) {
+        records.push({i: 1 + k, t: "Puppy " + k, g: ["puppy"], dk: "2020-01-01", ds: 1});
+        vectors[1 + k] = byteVector([0.3, 0, 0, 0.95, 0, 0, 0, 0]);
+    }
+    records.push({i: 9, t: "Snowy yard", g: ["snow", "yard"], dk: "2020-02-01", ds: 1});
+    vectors[9] = byteVector([0.9, 0, 0, 0.4, 0, 0, 0, 0]);
+    var index = meaningIndex(records, vectors);
+    var puppy = index.cosineStats(axisVector(3));
+    function z(id) {
+        var r = index.position[String(id)];
+        return (puppy.values[r] - puppy.mean) / puppy.std;
+    }
+    // (The yard is above z 2 for "puppy", far below the puppies.)
+    assert.ok(z(9) > 2 && z(9) < z(1) - 2.5, z(9) + " " + z(1));
+    var result = index.search("puppy snow", {vector: QUERY,
+                                             termVectors: {puppy: axisVector(3), snow: QUERY}});
+    assert.deepStrictEqual(result.items, []);
+});
+
+test("per-term coverage: a folder's word that pictures show is no name", function () {
+    // Ten pictures in "Wood Carving" (one says "carving"), all much like
+    // the word; a carved wooden sculpture elsewhere is close to it too.
+    var records = [];
+    var vectors = {};
+    for (var k = 0; k < 10; k++) {
+        records.push({i: 1 + k, t: "Woodcarver at work " + k, g: k ? ["wood", "woodcarver"]
+                      : ["wood", "carving"], f: "Wood Carving", dk: "2020-01-01", ds: 1});
+        vectors[1 + k] = closeTo(0.95, 2);
+    }
+    records.push({i: 20, t: "Carved wooden sculpture", g: ["wood", "sculpture"], dk: "2020-01-02",
+                  ds: 1});
+    vectors[20] = closeTo(0.78, 3);
+    var index = meaningIndex(records, vectors, 1000);
+    var result = index.search("wood carving", {vector: QUERY,
+                                               termVectors: {wood: axisVector(4),
+                                                             carving: QUERY}});
+    var named = {};
+    result.meaning.terms.forEach(function (term) {
+        named[term.text] = term.name;
+    });
+    assert.deepStrictEqual(named, {wood: false, carving: false});
+    assert.ok(result.items.indexOf(20) >= 0, JSON.stringify(result.items));
+    assert.deepStrictEqual(result.byMeaning, [20]);
+});
+
+test("the texts a query embeds are as many as /api/embed takes at most", function () {
+    var texts = SearchCore.meaningTexts("red car blue truck green bus yellow bike old house " +
+                                        "white barn");
+    assert.strictEqual(SearchCore.MEANING_TEXTS, 9);
+    assert.strictEqual(texts.length, SearchCore.MEANING_TEXTS);
+    assert.deepStrictEqual(texts.slice(0, 3), ["red car blue truck green bus yellow bike old " +
+                                               "house white barn", "red", "car"]);
+});
+
+test("plain language: a year typed is the date taken or the year in the words", function () {
+    var records = [
+        {i: 1, t: "Christmas tree", g: ["christmas", "tree"], dk: "2011-12-24", ds: 1},
+        {i: 2, t: "Christmas card scan", g: ["christmas", "card"], f: "Christmas 2011", ds: 1},
+        {i: 3, t: "Christmas lights", g: ["christmas", "lights"], f: "Christmas 2011",
+         dk: "2019-03-01", du: 1, ds: 1},
+        {i: 4, t: "Holiday dinner", g: ["dinner"], dk: "2011-12-20", ds: 1},
+        {i: 5, t: "Christmas morning", g: ["christmas"], dk: "2015-12-25", ds: 1}
+    ];
+    var index = SearchCore.prepare(records);
+    var answer = index.interpret("christmas 2011", {today: "2026-10-13"});
+    assert.strictEqual(answer.query, "christmas date:2011 OR 2011");
+    assert.deepStrictEqual(index.search(answer.query, {sort: "oldest"}).items.slice().sort(),
+                           [1, 2, 3]);
+    // (Only a year typed: "last year" is the date alone.)
+    assert.strictEqual(index.interpret("christmas last year", {today: "2012-06-01"}).query,
+                       "christmas date:2011");
+    // The words of a date are no words meaning looks for.
+    assert.strictEqual(SearchCore.meaningText(answer.query), "christmas");
+});
+
+test("plain language: since, after and before a relative date; years with a dash", function () {
+    var index = SearchCore.prepare(plainRecords());
+    function query(text) {
+        return understood(index, text).query;
+    }
+    assert.strictEqual(query("since last year"), "date:2025..");
+    assert.strictEqual(query("beach after last year"), "beach date:2026..");
+    assert.strictEqual(query("snow since last summer"), "snow date:2026-06..");
+    assert.strictEqual(query("beach before this year"), "beach date:..2025");
+    assert.strictEqual(query("beach since yesterday"), "beach date:2026-10-12..");
+    assert.strictEqual(query("after last month"), "date:2026-10..");
+    assert.strictEqual(query("before last week"), "date:..2026-10-04");
+    assert.strictEqual(understood(index, "since last year").parts[0].label, "Taken: since 2025");
+    // "2015 - 2019" typed with spaces, as "2015-2019".
+    assert.strictEqual(query("2015 - 2019 beach"), "date:2015..2019 beach");
+    assert.strictEqual(understood(index, "2015 - 2019 beach").rest, "beach");
+});
+
+test("plain language: us is a small word, US the country", function () {
+    var records = plainRecords();
+    records.push({i: 30, t: "Beach day", g: ["beach"], dk: "2025-08-10", ds: 1});
+    var index = SearchCore.prepare(records);
+    ["pictures of us at the beach", "show us the beach", "kids with us"].forEach(function (text) {
+        var answer = understood(index, text);
+        assert.strictEqual(answer.query, text, text);
+        assert.deepStrictEqual(answer.parts, [], text);
+    });
+    var us = understood(index, "dinner in US");
+    assert.strictEqual(us.query, "dinner place:us OR us");
+    assert.strictEqual(us.parts[0].label, "Place: United States");
+});
+
+test("plain language: a place named like what pictures show is asked about", function () {
+    var records = [];
+    for (var k = 0; k < 6; k++) {
+        records.push({i: 10 + k, t: "Sunset over the Atlantic Ocean " + k,
+                      g: ["sunset", "ocean", "atlantic"], dk: "2021-01-0" + (k + 1), ds: 1});
+    }
+    for (k = 0; k < 4; k++) {
+        records.push({i: 1 + k, t: "Street " + k, g: ["street"], dk: "2020-01-0" + (k + 1),
+                      ci: "Atlantic", rg: "Iowa", co: "United States", cc: "US", ds: 1});
+        records.push({i: 20 + k, t: "Lake view " + k, g: ["lake"], dk: "2022-01-0" + (k + 1),
+                      ci: "Fuji", rg: "Shizuoka", co: "Japan", cc: "JP", ds: 1});
+        records.push({i: 30 + k, t: "Pier " + k, g: ["pier"], dk: "2023-01-0" + (k + 1),
+                      ci: "Red Hill", rg: "South Australia", co: "Australia", cc: "AU", ds: 1});
+    }
+    for (k = 0; k < 6; k++) {
+        records.push({i: 40 + k, t: "Red hill above a beach " + k, g: ["red", "hill", "beach"],
+                      dk: "2024-01-0" + (k + 1), ds: 1});
+    }
+    var index = SearchCore.prepare(records);
+    function asked(text, wanted) {
+        var answer = index.interpret(text, {today: "2026-10-13"});
+        assert.strictEqual(answer.query, text, text);
+        assert.deepStrictEqual(answer.choices.map(function (choice) {
+            return choice.text;
+        }), [wanted], text);
+        assert.deepStrictEqual(answer.choices[0].options.map(function (option) {
+            return option.kind;
+        }), ["place", "words"], text);
+    }
+    // As many pictures say "atlantic" as were taken in the town.
+    asked("sunset over the atlantic", "atlantic");
+    asked("atlantic ocean waves", "atlantic");
+    // Both words are what pictures show.
+    asked("red hill beach", "red hill");
+    // "Mount" before it: the mountain more likely than the town.
+    asked("mount fuji", "fuji");
+    // "In" makes it the place; a town no picture says is taken.
+    assert.strictEqual(index.interpret("street in atlantic", {today: "2026-10-13"}).query,
+                       "street place:atlantic OR atlantic");
+    assert.strictEqual(index.interpret("fuji lake", {today: "2026-10-13"}).query,
+                       "place:fuji OR fuji lake");
+});
+
+test("plain language: someone named like a month is asked about", function () {
+    var records = plainRecords();
+    records.push({i: 31, t: "Picnic", g: ["picnic"], dk: "2019-06-10", ds: 1});
+    var index = SearchCore.prepare(records);
+    var people = PEOPLE.concat([{id: 6, name: "June Smith", label: "June Smith", ids: [31]}]);
+    var answer = understood(index, "june 2019", {people: people});
+    assert.strictEqual(answer.query, "june 2019");
+    assert.deepStrictEqual(answer.choices[0].options.map(function (option) {
+        return [option.kind, option.label, option.query];
+    }), [["date", "Taken: June 2019", "date:2019-06"],
+         ["person", "Person: June Smith (2019)", "person:\"June Smith\" OR june date:2019 OR 2019"],
+         ["words", "the words " + String.fromCharCode(0x201c) + "june 2019" +
+          String.fromCharCode(0x201d), null]]);
+    // Without a year: the person or the word, asked; "with" makes it the person.
+    assert.deepStrictEqual(understood(index, "photos in june", {people: people}).choices[0]
+                           .options.map(function (option) {
+                               return option.kind;
+                           }), ["person", "words"]);
+    assert.strictEqual(understood(index, "picnic with june", {people: people}).query,
+                       "picnic person:\"June Smith\" OR june");
+    // Nobody called June: the month.
+    assert.strictEqual(understood(index, "june 2019").query, "date:2019-06");
+});
+
+test("plain language: small parts of names are no names on their own", function () {
+    var index = SearchCore.prepare(plainRecords());
+    var people = [{id: 7, name: "Ana de la Cruz", label: "Ana de la Cruz", ids: [1]},
+                  {id: 8, name: "Pieter van Dijk", label: "Pieter van Dijk", ids: [2]}];
+    ["la beach", "dinner in la", "van at the beach"].forEach(function (text) {
+        assert.strictEqual(understood(index, text, {people: people}).query, text, text);
+    });
+    assert.strictEqual(understood(index, "cruz beach", {people: people}).query,
+                       "person:\"Ana de la Cruz\" OR cruz beach");
+    assert.strictEqual(understood(index, "pieter van dijk", {people: people}).query,
+                       "person:\"Pieter van Dijk\" OR \"pieter van dijk\"");
+});
+
+test("plain language: the rest of the search as typed (others)", function () {
+    var index = SearchCore.prepare(plainRecords());
+    var answer = understood(index, "anna tag:beach -dog");
+    assert.strictEqual(answer.others, "tag:beach -dog");
+    assert.strictEqual(answer.rest, "");
+    answer = understood(index, "lisbon \"red car\" OR boat");
+    assert.strictEqual(answer.query, "place:lisbon OR lisbon \"red car\" OR boat");
+    assert.strictEqual(answer.others, "\"red car\" OR boat");
+    assert.strictEqual(understood(index, "cat AND dog 2019").others, "");
+});
+
+test("a person's pictures before pictures with the name written in them", function () {
+    var records = plainRecords();
+    records.push({i: 32, t: "Mug with Anna on it", g: ["mug", "anna"], o: "Anna",
+                  dk: "2024-01-01", ds: 1});
+    var index = SearchCore.prepare(records);
+    var answer = understood(index, "anna");
+    var found = index.search(answer.query, {people: PEOPLE}).items;
+    assert.deepStrictEqual(found.slice(0, 2).sort(), [1, 2]);
+    assert.ok(found.indexOf(32) > 1, JSON.stringify(found));
+});
+
+test("the dates pictures were taken on: first and last", function () {
+    var index = SearchCore.prepare(plainRecords());
+    assert.deepStrictEqual(index.takenSpan(), {from: "2015-12-24", to: "2026-07-14"});
+    assert.strictEqual(SearchCore.prepare([{i: 1, t: "x"}]).takenSpan(), null);
+});
+
 /* ---------- Run ------------------------------------------------------------ */
 
 var failures = 0;

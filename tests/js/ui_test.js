@@ -47,7 +47,8 @@ test("the address keeps a search and reads it back", function () {
                            year: ["2019"]},
                  group: false, size: "l", hidden: true, junk: true, sensitive: "show",
                  ids: "5-2.2", view: "-17.5,179.9,4", from: "2019-03", to: "2019-05-14",
-                 by: "meaning", drives: false, pick: "Trip: Lakes, day 2"};
+                 by: "meaning", drives: false, pick: "Trip: Lakes, day 2",
+                 typed: "anna,last summer"};
     var query = SITE.searchState.params(state);
     var back = SITE.searchState.read("?" + query);
     assert.deepStrictEqual(back, state);
@@ -706,6 +707,21 @@ test("the meaning of a query: ready, starting, too many, not set up", function (
         }).then(function (answer) {
             assert.deepStrictEqual(answer, {state: "off", error: "Search by meaning is off"});
         });
+    }).then(function () {
+        // A query and its words (SearchCore.meaningTexts): one request.
+        var several = vectorFetch({"/api/embed": [
+            {status: 200, body: {model: "m", dims: 2, vec: "BQU=", vecs: ["BQU=", "BgY="]}}]},
+                                  counter);
+        return withFetch(several, function () {
+            return new Promise(function (resolve) {
+                site.queryVector(["red & car", "red"], resolve);
+            });
+        });
+    }).then(function (answer) {
+        assert.deepStrictEqual(answer.vecs, ["BQU=", "BgY="]);
+        assert.strictEqual(answer.vec, "BQU=");
+        assert.strictEqual(counter.urls[counter.urls.length - 1],
+                           "/api/embed?q=red%20%26%20car&q=red");
     }).then(function () {
         // An export has no model to ask, and loads no vectors without the option.
         var exported = loadSite({mode: "static", data: "data/", page: "search"}, "file:");
@@ -2702,6 +2718,8 @@ test("in the viewer a drive's route shows in the pane, with the speed on the str
     var savedRoutes = global.ROUTES;
     var realLoad = SITE.loadRoutes;
     var asked = 0;
+    // (The route map's ground: streets.js, loaded before routes.js by the pages.)
+    global.STREETS = require(path.join(STATIC, "streets.js"));
     global.ROUTES = require(path.join(STATIC, "routes.js"));
     SITE.loadRoutes = function (callback) {
         asked += 1;
@@ -3669,6 +3687,7 @@ test("on a phone a drive's route map is drawn when the pane opens, under the tit
     });
     var savedRoutes = global.ROUTES;
     var realLoad = SITE.loadRoutes;
+    global.STREETS = require(path.join(STATIC, "streets.js"));
     global.ROUTES = require(path.join(STATIC, "routes.js"));
     var realSchedule = ROUTES.MiniMap.prototype.schedule;
     var scheduled = 0;

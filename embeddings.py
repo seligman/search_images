@@ -141,6 +141,11 @@ OCR_CHARS = 500
 SCALE = 127
 # A query longer than this (characters) is cut.
 QUERY_CHARS = 1000
+# Texts one /api/embed request may ask for at once (a query and its words:
+# search-core.js meaningTexts, MEANING_TEXTS); more is a 400. A request counts
+# against QUERY_BURST once per QUERY_TEXTS_PER_TOKEN texts the model must embed.
+QUERY_TEXTS = 9
+QUERY_TEXTS_PER_TOKEN = 3
 # Seconds a query embedding may take.
 QUERY_TIMEOUT = 20
 # Query vectors remembered by the web server.
@@ -1442,14 +1447,15 @@ class QueryEmbedder:
             self._servers = local_server.default_manager()
         return self._servers
 
-    def allow(self, client):
-        """True when the client may have one more query embedded now (token bucket)."""
+    def allow(self, client, cost=1.0):
+        """True when the client may have one more query (costing cost tokens) embedded
+        now (token bucket)."""
         now = self._clock()
         with self._lock:
             tokens, when = self._buckets.pop(client, (self._burst, now))
             tokens = min(self._burst, tokens + max(0.0, now - when) * self._rate)
-            allowed = tokens >= 1.0
-            self._buckets[client] = (tokens - 1.0 if allowed else tokens, now)
+            allowed = tokens >= cost
+            self._buckets[client] = (tokens - cost if allowed else tokens, now)
             while len(self._buckets) > 4096:
                 self._buckets.popitem(last=False)
         return allowed
@@ -1462,7 +1468,12 @@ class QueryEmbedder:
         meaning is not set up; 429 when the client asks too often; 503
         {"state": "starting" (ask again soon) | "off" | "unavailable",
         "error"} when there is no vector now. The error says why only to
-        the admin.
+        the admin. text may also be a list of texts (a query and its words,
+        search-core.js meaningTexts), embedded in one call: then 200 also has
+        "vecs", the vector of each in order ("vec" is the first's); 400 when
+        one of them is empty or there are more than QUERY_TEXTS. Every
+        QUERY_TEXTS_PER_TOKEN texts the model must embed count as one query
+        against the client's QUERY_BURST.
         """
         status, payload = self._answer(config, text, client)
         state = payload.get("state")
@@ -1484,8 +1495,12 @@ class QueryEmbedder:
         endpoint, problem = endpoint_for(config, options)
         if endpoint is None:
             return 404, {"state": "off", "error": problem}
-        text = " ".join((text or "").split())[:QUERY_CHARS]
-        if not text:
+        several = isinstance(text, (list, tuple))
+        if several and len(text) > QUERY_TEXTS:
+            return 400, {"error": "At most %d texts at once." % QUERY_TEXTS}
+        texts = [" ".join((item or "").split())[:QUERY_CHARS]
+                 for item in (text if several else [text])]
+        if not texts or not all(texts):
             return 400, {"error": "There is nothing to look for."}
         model, dims = model_key(endpoint, options), options["dims"]
         try:
@@ -1495,14 +1510,32 @@ class QueryEmbedder:
         current = read_meta()
         made = (current["model"], current["dims"], current["native_dims"],
                 current["served"], current["recipe"]) if current else None
-        key = (client, model, dims, options["query_prefix"], made, text)
+
+        def key_of(item):
+            return (client, model, dims, options["query_prefix"], made, item)
+
+        known = {}
         with self._lock:
-            found = self._cache.get(key)
-            if found is not None:
-                self._cache.move_to_end(key)
-        if found is not None:
-            return 200, {"model": model, "dims": found[1], "vec": found[0]}
-        if not self.allow(client):
+            for item in texts:
+                found = self._cache.get(key_of(item))
+                if found is not None:
+                    self._cache.move_to_end(key_of(item))
+                    known[item] = found
+
+        def answer():
+            vecs = [known[item][0] for item in texts]
+            payload = {"model": model, "dims": known[texts[0]][1], "vec": vecs[0]}
+            if several:
+                payload["vecs"] = vecs
+            return 200, payload
+
+        missing = []
+        for item in texts:
+            if item not in known and item not in missing:
+                missing.append(item)
+        if not missing:
+            return answer()
+        if not self.allow(client, float(-(-len(missing) // QUERY_TEXTS_PER_TOKEN))):
             return 429, {"error": "Too many searches at once; try again in a moment."}
         servers = self._manager()
         state, message = servers.start_for_queries(config, endpoint["name"])
@@ -1512,11 +1545,14 @@ class QueryEmbedder:
         if state != "ready":
             return 503, {"state": state, "error": message}
         try:
-            reply = llm.embed(endpoint, [options["query_prefix"] + text],
+            reply = llm.embed(endpoint, [options["query_prefix"] + item for item in missing],
                               model=options["model"] or None, timeout=QUERY_TIMEOUT,
                               extra=how.extra())
             vectors, native, served = vectors_of(reply, how)
-            vector = quantize(vectors[0], dims)
+            if len(vectors) != len(missing):
+                raise ValueError("the endpoint answered with %d vectors for %d texts"
+                                 % (len(vectors), len(missing)))
+            quantized = [quantize(vector, dims) for vector in vectors]
         except llm.ProviderError as error:
             if error.status == 503:
                 return 503, {"state": "starting", "error": "The embedding model is loading."}
@@ -1532,13 +1568,14 @@ class QueryEmbedder:
                     "The model of the embedding endpoint %s changed since the pictures were "
                     "embedded (%s): update search by meaning on the Manage page."
                     % (endpoint["name"], changed))}
-        encoded = base64.b64encode(vector).decode("ascii")
         with self._lock:
             self.requests += 1
-            self._cache[key] = (encoded, len(vector))
+            for item, vector in zip(missing, quantized):
+                known[item] = (base64.b64encode(vector).decode("ascii"), len(vector))
+                self._cache[key_of(item)] = known[item]
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
-        return 200, {"model": model, "dims": len(vector), "vec": encoded}
+        return answer()
 
 
 def query_ready(config, store_meta):

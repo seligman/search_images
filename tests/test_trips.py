@@ -619,6 +619,29 @@ class EditTest(TripData, support.TempBaseMixin, unittest.TestCase):
         self.assertEqual(sorted(stored["trips"]), ["away-20240303"])
         self.assertTrue(self.trips_now()["away-20240302"].hidden)
 
+    def test_an_id_the_trip_had_still_finds_it(self):
+        # (As a command line logged before the trip's first day moved names it.)
+        add(self.conn, PHONE, "mar/earlier.jpg", "2024-03-02T12:00:00", position=FAR,
+            place=FAR_PLACE)
+        built = trips.build(self.conn, self.config, self.libs)
+        # No change of it is kept: by the day its old id names, which it still holds.
+        self.assertEqual(built.get("away-20240303").id, "away-20240302")
+        for gone in ("away-20240305", "away-19990101", "away-20240303.20240304"):
+            with self.assertRaises(trips.TripError):
+                built.get(gone)
+        # Its export kept: by the key its changes know it by, also once it no longer
+        # holds that day.
+        trips.record_export(self.conn, self.config, self.libs, "away-20240302", {"zip": True})
+        self.conn.execute("UPDATE images SET missing_since = 1 WHERE taken_at LIKE "
+                          "'2024-03-02%' OR taken_at LIKE '2024-03-03%'")
+        self.conn.commit()
+        built = trips.build(self.conn, self.config, self.libs)
+        moved = built.get("away-20240302")
+        self.assertEqual((moved.id, built.key(moved)), ("away-20240304", "away-20240302"))
+        import trip_export
+        self.assertEqual(trip_export.load(self.conn, self.config, "away-20240302")[1].id,
+                         "away-20240304")
+
     def test_a_broken_file_is_kept_aside(self):
         common.ensure_dir(os.path.dirname(trips.path()))
         with open(trips.path(), "w", encoding="utf-8") as handle:
@@ -661,7 +684,8 @@ class PagesTest(TripData, AdminFixture, unittest.TestCase):
         self.assertEqual((config["page"], config.get("trip")), ("trips", None))
         self.assertEqual(re.findall(r'<script[^>]*\ssrc="([^"]+)"', html),
                          ["/static/site.js", "/static/shell.js", "/static/search-core.js",
-                          "/static/routes.js", "/static/viewer.js", "/static/map.js",
+                          "/static/streets.js", "/static/routes.js", "/static/viewer.js",
+                          "/static/map.js",
                           "/static/trips.js"])
         self.assertIn('href="/static/trips.css"', html)
         html = self.client.get("/trip/away-20240303").get_data(as_text=True)
@@ -753,14 +777,15 @@ class ScriptTest(unittest.TestCase):
         self.assertIn("module.exports = TRIPS;", self.read("trips.js"))
 
     def test_the_map_parts_are_shared(self):
-        # The trip map draws with the map page's tiles and pins, and the route lines
-        # of routes.js -- one copy of each.
+        # The trip map draws with the map page's ground (streets.js: the world image
+        # and the street maps) and pins, and the route lines of routes.js -- one copy
+        # of each.
         trips_js = self.read("trips.js")
-        for name in ("MAP.TileLayer", "MAP.drawPins", "MAP.cluster", "MAP.fitView",
-                     "ROUTES.strokeLines", "ROUTES.lines"):
+        for name in ("STREETS.Basemap", "MAP.drawPins", "MAP.cluster", "MAP.fitView",
+                     "MAP.project", "ROUTES.strokeLines", "ROUTES.lines"):
             self.assertIn(name, trips_js)
         self.assertNotIn("drawImage", trips_js)
-        self.assertIn("TileLayer: TileLayer", self.read("map.js"))
+        self.assertIn("Basemap: Basemap", self.read("streets.js"))
         self.assertIn("strokeLines: strokeLines", self.read("routes.js"))
 
     @unittest.skipIf(NODE is None, "Node.js is not installed")

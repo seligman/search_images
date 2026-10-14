@@ -41,7 +41,7 @@ NODE_TESTS = os.path.join(support.REPO, "tests", "js", "ui_test.js")
 MAP_TESTS = os.path.join(support.REPO, "tests", "js", "map_test.js")
 NODE = shutil.which("node")
 SCRIPTS = ("site.js", "viewer.js", "app.js", "detail.js", "map.js", "duplicates.js",
-           "embed-engine.js", "embed-kernel.js", "albums.js")
+           "embed-engine.js", "embed-kernel.js", "albums.js", "streets.js", "street-maps.js")
 
 
 def read(*parts):
@@ -372,7 +372,8 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
     def test_search_page_loads_the_engine_and_the_viewer_first(self):
         html = self.page("/?q=beach&type=photo#id=3")
         self.assertEqual(scripts_of(html), ["/static/site.js", "/static/shell.js",
-                                            "/static/search-core.js", "/static/routes.js",
+                                            "/static/search-core.js", "/static/streets.js",
+                                            "/static/routes.js",
                                             "/static/viewer.js",
                                             "/static/app.js"])
         for element in ("query", "syntax-help", "sort", "group", "size", "facets",
@@ -386,7 +387,8 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
     def test_detail_page_uses_the_viewer(self):
         html = self.page("/detail?id=12&q=dog")
         self.assertEqual(scripts_of(html), ["/static/site.js", "/static/shell.js",
-                                            "/static/search-core.js", "/static/routes.js",
+                                            "/static/search-core.js", "/static/streets.js",
+                                            "/static/routes.js",
                                             "/static/viewer.js",
                                             "/static/detail.js"])
         for element in ("back", "detail-stage", "detail-tools", "detail-info",
@@ -397,7 +399,8 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
     def test_map_page_searches_too(self):
         html = self.page("/map?q=beach&view=10,20,3")
         self.assertEqual(scripts_of(html), ["/static/site.js", "/static/shell.js",
-                                            "/static/search-core.js", "/static/routes.js",
+                                            "/static/search-core.js", "/static/streets.js",
+                                            "/static/routes.js",
                                             "/static/viewer.js",
                                             "/static/map.js"])
         for element in ("map-search", "map-status", "map-canvas", "map-message", "map-panel",

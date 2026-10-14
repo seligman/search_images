@@ -16,6 +16,10 @@
                                    albums option; albums.index_albums on
                                    the server, an export's manifest.albums
                                    with its "marks" option, else []).
+                                   An export also gives names: the names of
+                                   people it publishes (its "people_names"
+                                   option, manifest.names), for SearchCore's
+                                   interpret; null without them.
      SITE.loadRecord(id, callback) the full record of one picture (server:
                                    /api/image/<id>, with info, exif,
                                    provenance, ...; an export: what it
@@ -36,6 +40,10 @@
                                    places, ...}]} (server: /api/trips; an
                                    export: data/trips.js, SEARCH_DATA.trips,
                                    when manifest.trips names it), or null.
+     SITE.loadTripStory(id, callback)  a trip's story (trip_stories.py) from
+                                   the server, /api/trips/<id>/story: {trip,
+                                   days: [{date, text}], ...}, or null (an
+                                   export's is on its trip's days: story).
      SITE.compactRecord(detail)    a full record as a compact search record.
      SITE.loadVectors(callback)    the meaning vectors of the pictures, as
                                    SearchCore.decodeVectors makes them
@@ -49,7 +57,11 @@
                                    they changed, callback(null) when not.
      SITE.queryVector(text, callback, progress)  the meaning vector of
                                    what was typed: callback({state: "ready",
-                                   model, dims, vec (base64)}) or callback({
+                                   model, dims, vec (base64)}); text may be
+                                   a list (a query and its words,
+                                   SearchCore.meaningTexts): then also vecs,
+                                   one per text (one request to the server);
+                                   or callback({
                                    state: "starting" (ask again soon) | "off"
                                    | "unavailable" | "busy", error}). The
                                    server asks /api/embed. An export with the
@@ -81,8 +93,10 @@
      SITE.peopleForSearch(onLoaded, hidden)  the people a page's searches
                                    need for person: (also in the smart
                                    albums they name): an object whose
-                                   want(text) loads them (loadPeople, once)
-                                   when text has a person: term, and calls
+                                   want(text, words) loads them (loadPeople,
+                                   once) when text has a person: term, or
+                                   with words true any word (plain-language
+                                   search may find a name in it), and calls
                                    onLoaded(people) when they have come
                                    (never before want returns);
                                    options(opts) sets SearchCore.search's
@@ -134,6 +148,11 @@
                                    one: detail.drive.preview); null in an
                                    export
      SITE.tileUrl(z, x, y), SITE.tilesMax(), SITE.tileSize()   map tiles
+     SITE.streets()                the street maps ({url, v}: where their
+                                   index and tile scripts are, see
+                                   streets.js and street_maps.py; /maps/ on
+                                   the server, maps/ in an export with them),
+                                   or null
 
    SITE.shuffleSeed(renew) is the seed of the "shuffle" sort: one per
    browser tab (a new one with renew).
@@ -166,7 +185,7 @@
    Search state in the address (SITE.searchState)
      read(search)  -> {q, lib, sort, filters: {group: [values]}, group,
                        size, hidden, junk, sensitive, ids, view, from, to,
-                       by, drives}
+                       by, drives, typed}
                        from a query string (default: the page's)
      params(state) -> the query string for a state ("" when all default)
      The facet selections use the group names of SearchCore.FACETS as
@@ -181,7 +200,9 @@
      "YYYY", "YYYY-MM" or "YYYY-MM-DD"). by is how words are looked for:
      "words", "meaning", or "" (words and meaning, SearchCore's meaning
      option). drives is false when the clips of drives are shown one by
-     one ("Fold drives" off: drives=0).
+     one ("Fold drives" off: drives=0). typed lists the parts of q that
+     plain-language search leaves as typed words (SearchCore.interpret's
+     typed option: "*" for all of them, else keys joined by commas).
 
    SITE.idList.encode(ids, records) -> the ids value for a list of picture
      ids; SITE.idList.decode(text, records) -> {ids: [...], stale} (stale:
@@ -258,11 +279,17 @@ var SITE = (function () {
     var DATE_KEY_RE = /^\d{4}(?:-(?:0[1-9]|1[0-2])(?:-(?:0[1-9]|[12]\d|3[01]))?)?$/;
     // "lat,lon,zoom" of the map (see readView).
     var VIEW_RE = /^(-?\d{1,3}(?:\.\d{1,8})?),(-?\d{1,3}(?:\.\d{1,8})?),(\d{1,2})$/;
+    // The most texts embedded at once (SearchCore.MEANING_TEXTS; the
+    // server's /api/embed takes as many: embeddings.QUERY_TEXTS).
+    var MEANING_TEXTS = 9;
+    // The parts of a query left as typed (SearchCore.interpret): "*", or
+    // keys (lower-case words) joined by commas.
+    var TYPED_RE = /^(?:\*|[0-9a-z\u00c0-\uffff ]{1,80}(?:,[0-9a-z\u00c0-\uffff ]{1,80}){0,19})$/;
 
     function emptyState() {
         return {q: "", lib: "", sort: "", filters: {}, group: true, size: "",
                 hidden: false, junk: false, sensitive: "", ids: "", view: "", from: "", to: "",
-                by: "", drives: true, pick: ""};
+                by: "", drives: true, pick: "", typed: ""};
     }
 
     // A map view from an address: "lat,lon,zoom" with the latitude within
@@ -319,6 +346,8 @@ var SITE = (function () {
         });
         var by = params.get("by");
         state.by = BY.indexOf(by) >= 0 ? by : "";
+        var typed = params.get("typed") || "";
+        state.typed = state.q && TYPED_RE.test(typed) ? typed : "";
         return state;
     }
 
@@ -377,6 +406,9 @@ var SITE = (function () {
         });
         if (state.by && BY.indexOf(state.by) >= 0) {
             params.set("by", state.by);
+        }
+        if (state.q && typeof state.typed === "string" && TYPED_RE.test(state.typed)) {
+            params.set("typed", state.typed);
         }
         return params.toString();
     }
@@ -1152,6 +1184,9 @@ var SITE = (function () {
                     generated: manifest.generated || null,
                     libraries: manifest.libraries || (manifest.library ? [manifest.library] : []),
                     albums: Array.isArray(manifest.albums) ? manifest.albums : [],
+                    names: Array.isArray(manifest.names) ? manifest.names.filter(function (name) {
+                        return typeof name === "string" && name !== "";
+                    }) : null,
                     records: records,
                     manifest: manifest
                 };
@@ -1352,8 +1387,10 @@ var SITE = (function () {
         var asked = false;
         var settled = false;
         return {
-            want: function (text) {
-                if (asked || !PERSON_TERM.test(String(text || ""))) {
+            // (words: plain-language search may find a person's name in any word.)
+            want: function (text, words) {
+                text = String(text || "");
+                if (asked || !(PERSON_TERM.test(text) || (words === true && /\S/.test(text)))) {
                     return false;
                 }
                 asked = true;
@@ -1448,6 +1485,19 @@ var SITE = (function () {
     function refreshTrips(callback) {
         tripsPromise = null;
         loadTrips(callback);
+    }
+
+    function loadTripStory(id, callback) {
+        if (isStatic || !cfg.api) {
+            callback(null);
+            return;
+        }
+        getJson(cfg.api + "/trips/" + encodeURIComponent(id) + "/story").then(function (value) {
+            callback(value && typeof value === "object" && Array.isArray(value.days) ? value
+                : null);
+        }, function () {
+            callback(null);
+        });
     }
 
     /* ---------- Meaning vectors ---------------------------------------------- */
@@ -1764,15 +1814,31 @@ var SITE = (function () {
             : typeof btoa === "function" ? btoa(text) : Buffer.from(bytes).toString("base64");
     }
 
-    function embedNow(meaning, text, callback) {
-        var answer;
-        try {
-            var vector = browserMeaning.engine.query(text);
-            answer = {state: "ready", model: meaning.id, dims: vector.length, vec: base64(vector)};
-        } catch (error) {
-            answer = {state: "unavailable", error: "Search by meaning could not run."};
+    /* (texts: one text, or several: then vecs too, see queryVector -- at
+       most SearchCore.MEANING_TEXTS, as the server takes; each is a pass of
+       the model, so the page gets a turn between them.) */
+    function embedNow(meaning, texts, callback) {
+        var list = (Array.isArray(texts) ? texts : [texts]).slice(0, MEANING_TEXTS);
+        var vectors = [];
+        function next() {
+            try {
+                vectors.push(browserMeaning.engine.query(list[vectors.length]));
+            } catch (error) {
+                callback({state: "unavailable", error: "Search by meaning could not run."});
+                return;
+            }
+            if (vectors.length < list.length) {
+                setTimeout(next, 0);
+                return;
+            }
+            var answer = {state: "ready", model: meaning.id, dims: vectors[0].length,
+                          vec: base64(vectors[0])};
+            if (Array.isArray(texts)) {
+                answer.vecs = vectors.map(base64);
+            }
+            callback(answer);
         }
-        callback(answer);
+        next();
     }
 
     function meaningFailed(state, message) {
@@ -1886,7 +1952,11 @@ var SITE = (function () {
             }, 0);
             return;
         }
-        fetch(cfg.api + "/embed?q=" + encodeURIComponent(text), {credentials: "same-origin"})
+        var asked = (Array.isArray(text) ? text.slice(0, MEANING_TEXTS) : [text])
+            .map(function (one) {
+                return "q=" + encodeURIComponent(one);
+            }).join("&");
+        fetch(cfg.api + "/embed?" + asked, {credentials: "same-origin"})
             .then(function (response) {
                 return response.json().catch(function () {
                     return {};
@@ -1990,6 +2060,11 @@ var SITE = (function () {
         tileSize: function () {
             return cfg.tileSize || 256;
         },
+        streets: function () {
+            var info = cfg.streets;
+            return info && typeof info === "object" && typeof info.url === "string" && info.url
+                ? {url: info.url, v: typeof info.v === "string" ? info.v : ""} : null;
+        },
         loadIndex: loadIndex,
         refreshIndex: refreshIndex,
         loadRecord: loadRecord,
@@ -1997,6 +2072,7 @@ var SITE = (function () {
         loadRoutes: loadRoutes,
         loadTrips: loadTrips,
         refreshTrips: refreshTrips,
+        loadTripStory: loadTripStory,
         loadVectors: loadVectors,
         refreshVectors: refreshVectors,
         attachVectors: attachVectors,

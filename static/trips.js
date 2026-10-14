@@ -44,10 +44,18 @@
    history entry of its own: Back closes it. Moving between the list and a
    trip within the page puts the focus on the new page's title.
 
+   The trip's story (trip_stories.py: a paragraph a day written by a
+   language model from the trip's facts) shows in the days' sections, its
+   links to pictures ([#id]) as small pictures that open the viewer; the
+   server's comes from SITE.loadTripStory, an export's is on its trip's days
+   (story). The admin writes it (the trip_stories job, after a look at what
+   it takes: /trips/stories/plan), edits, hides or deletes it, and writes
+   the stories of every trip from the list.
+
    TRIPS holds the parts without a page (dates in words, the best pictures,
-   the searches of a trip and of its days), run by the tests under Node
-   (tests/js/trips_test.js). Pages are built with DOM calls and textContent
-   only (never innerHTML).
+   the searches of a trip and of its days, the story's parts and words), run
+   by the tests under Node (tests/js/trips_test.js). Pages are built with DOM
+   calls and textContent only (never innerHTML).
 */
 var TRIPS = (function () {
     "use strict";
@@ -713,6 +721,147 @@ var TRIPS = (function () {
         return ids;
     }
 
+    /* ---------- The trip's story (trip_stories.py) ------------------------- */
+
+    // The parts of a paragraph of a story: its text and its links to pictures
+    // ([#id]: the id of a picture, or in an export its export id), in order:
+    // [{text: "..."}, {id: "123"}, ...].
+    function storyParts(text) {
+        var parts = [];
+        var pattern = /\[#([0-9A-Za-z]{1,40})\]/g;
+        var at = 0;
+        var match;
+        text = String(text || "");
+        while ((match = pattern.exec(text)) !== null) {
+            if (match.index > at) {
+                parts.push({text: text.slice(at, match.index)});
+            }
+            parts.push({id: match[1]});
+            at = pattern.lastIndex;
+        }
+        if (at < text.length) {
+            parts.push({text: text.slice(at)});
+        }
+        return parts;
+    }
+
+    // {date: paragraph} of a trip's story: the server's (loaded: the answer of
+    // /api/trips/<id>/story), or an export's (on its trip's days: story).
+    function storyDays(trip, loaded) {
+        var result = {};
+        if (loaded && Array.isArray(loaded.days)) {
+            loaded.days.forEach(function (day) {
+                if (day && isText(day.date) && isText(day.text)) {
+                    result[day.date] = day.text;
+                }
+            });
+            return result;
+        }
+        ((trip && trip.days) || []).forEach(function (day) {
+            if (day && isText(day.date) && isText(day.story)) {
+                result[day.date] = day.story;
+            }
+        });
+        return result;
+    }
+
+    function money(value) {
+        return "$" + (value >= 1 ? value.toFixed(2) : value >= 0.01 ? value.toFixed(3)
+            : value.toFixed(4));
+    }
+
+    // What a trip_stories job would do, in words, from its plan (the admin's
+    // /trips/stories/plan): ["2 trips: Lakes, Island.", "With big (model m), on this
+    // computer: about 3,400 tokens of text; no picture is sent.", ...].
+    function planWords(plan) {
+        var lines = [];
+        var chosen = (plan && plan.trips) || [];
+        if (chosen.length) {
+            lines.push(plural(chosen.length, "story", "stories") + " to write: " +
+                       chosen.slice(0, 5).map(function (item) {
+                           return item.title;
+                       }).join(", ") + (chosen.length > 5 ? ", \u2026" : "") + ".");
+        } else {
+            lines.push("No story to write.");
+        }
+        ((plan && plan.endpoints) || []).forEach(function (entry) {
+            var words = "With " + entry.name + (entry.model ? " (model " + entry.model + ")" : "");
+            if (entry.local) {
+                words += ", on this computer: about " + plural(entry.tokens_in, "token") +
+                    " of text to read and " + Number(entry.tokens_out).toLocaleString("en-US") +
+                    " to write.";
+            } else {
+                words += ": about " + plural(entry.tokens_in, "token") + " of text " +
+                    "(without the names of people) sent to " +
+                    (entry.host || "the service") + " and " +
+                    Number(entry.tokens_out).toLocaleString("en-US") + " written back, " +
+                    (typeof entry.cost === "number" ? "about " + money(entry.cost) + "."
+                        : "at a cost not known (the endpoint has no prices).");
+            }
+            lines.push(words);
+        });
+        ((plan && plan.problems) || []).forEach(function (item) {
+            lines.push(item.title + ": " + item.problem);
+        });
+        var skipped = (plan && plan.skipped) || {};
+        var kept = [];
+        if (skipped.current) {
+            kept.push(plural(skipped.current, "story", "stories") + " up to date");
+        }
+        if (skipped.edited) {
+            kept.push(plural(skipped.edited, "story", "stories") + " you edited");
+        }
+        if (skipped.empty) {
+            kept.push(plural(skipped.empty, "trip") + " with nothing to tell");
+        }
+        if (kept.length) {
+            lines.push("Left as they are: " + kept.join(", ") + ".");
+        }
+        if (chosen.length) {
+            lines.push("Only text goes to the model (places, dates, the pictures' titles, " +
+                       "descriptions and tags, and the names of people only to a model on " +
+                       "this computer or your network): never a picture, nothing hidden and " +
+                       "nothing near home.");
+        }
+        return lines;
+    }
+
+    // How a trip's story came about, in words (the admin's /api/trips/<id>/story):
+    // "Written 13 October 2026 with big-model on this computer \u00b7 edited by you".
+    function storyStateWords(story) {
+        if (!story) {
+            return "";
+        }
+        if (story.state === "missing") {
+            return "No story yet.";
+        }
+        if (story.state === "empty") {
+            return "Nothing to write a story from: the trip's pictures are hidden, private " +
+                "or near home.";
+        }
+        var bits = [];
+        var made = typeof story.made === "number" && story.made > 0 ? new Date(story.made * 1000)
+            : null;
+        var first = made ? "Written " + made.getDate() + " " + MONTHS[made.getMonth()] + " " +
+            made.getFullYear() : "Written";
+        if (story.model) {
+            first += " with " + story.model + (story.local ? " on this computer" : "");
+        } else if (!made) {
+            first = "Written by you";
+        }
+        bits.push(first);
+        if (story.edited && (story.model || made)) {
+            bits.push("edited by you");
+        }
+        if (story.hidden) {
+            bits.push("hidden: only you see it");
+        }
+        if (story.state === "stale") {
+            bits.push("out of date: " + (story.reasons || []).join("; "));
+        }
+        return bits.join(DOT);
+    }
+
     /* ---------- The trip's map ---------------------------------------------- */
 
     /* A map of a trip: its drive routes (lines), its located pictures (pins;
@@ -721,7 +870,10 @@ var TRIPS = (function () {
        wheel, a double click and two fingers zoom; the keys: arrows move it,
        + and - zoom, 0 fits it again, Enter opens the pin nearest the middle.
        A click on a pin opens its pictures (onPin(ids)), on a line the clip
-       there (onRoute(hit)). options: {points, lines (ROUTES.lines'), onPin,
+       there (onRoute(hit)). Its ground is the map page's (STREETS.Basemap:
+       the world image, and the street maps where there are any, credited
+       in a corner while they show; it zooms and fits as deep as they go, as
+       the map page does). options: {points, lines (ROUTES.lines'), onPin,
        onRoute}. */
     function TripMap(options) {
         var el = SHELL.el;
@@ -729,8 +881,13 @@ var TRIPS = (function () {
         this.options = options;
         this.TILE = SITE.tileSize();
         var tilesMax = SITE.tilesMax();
+        var streets = SITE.streets();
         this.tileZoom = tilesMax === null ? 3 : Math.max(0, tilesMax);
-        this.maxZoom = Math.max(this.tileZoom + 4, 10);
+        this.baseMaxZoom = Math.max(this.tileZoom + 4, 10);
+        this.maxZoom = Math.max(this.baseMaxZoom,
+                                streets ? MAP.FIT_STREETS + STREETS.OVERZOOM : 0);
+        this.fitZoom = streets ? MAP.FIT_STREETS : this.tileZoom;
+        this.streetsKnown = !streets;
         this.view = {lat: 0, lon: 0, zoom: 1, w: 0, h: 0};
         this.groups = {zoom: -1, list: []};
         this.pins = [];
@@ -750,11 +907,13 @@ var TRIPS = (function () {
                                             "aria-label": "Map of the trip. Arrow keys move " +
                                             "it, plus and minus zoom, 0 shows all of it, Enter " +
                                             "opens the pictures of the pin nearest the middle."}});
-        this.tiles = new MAP.TileLayer({tileUrl: SITE.tileUrl, tileSize: this.TILE,
-                                        tileZoom: this.tileZoom, ocean: "#1a2c3d",
-                                        onLoad: function () {
-                                            self.schedule();
-                                        }});
+        this.tiles = new STREETS.Basemap({tileUrl: SITE.tileUrl, tileSize: this.TILE,
+                                          tileZoom: this.tileZoom, ocean: "#1a2c3d",
+                                          streets: streets, onLoad: function () {
+                                              self.streetsChanged();
+                                              self.schedule();
+                                          }});
+        this.credit = STREETS.creditNode("p", "map-streets-credit trip-map-credit", streets);
         function zoomButton(text, label, step) {
             return el("button", {type: "button", className: "trip-map-zoom", text: text,
                                  title: label, attrs: {"aria-label": label},
@@ -767,15 +926,15 @@ var TRIPS = (function () {
                                      }
                                  }}});
         }
-        this.node = el("div", {className: "trip-map"}, [
-            this.canvas,
-            el("div", {className: "trip-map-tools"}, [
-                zoomButton("+", "Zoom in (+)", 1),
-                zoomButton("\u2212", "Zoom out (-)", -1),
-                zoomButton("\u2922", "Show the whole trip (0)", 0)
-            ])
+        this.tools = el("div", {className: "trip-map-tools"}, [
+            zoomButton("+", "Zoom in (+)", 1),
+            zoomButton("\u2212", "Zoom out (-)", -1),
+            zoomButton("\u2922", "Show the whole trip (0)", 0)
         ]);
+        this.node = el("div", {className: "trip-map"}, [this.canvas, this.tools, this.credit]);
         this.listen();
+        // (Another map of the page may have loaded the street maps' index already.)
+        this.streetsChanged();
         if (typeof ResizeObserver === "function") {
             new ResizeObserver(function () {
                 self.resize();
@@ -806,9 +965,48 @@ var TRIPS = (function () {
         return list;
     };
 
+    /* The street maps' index is in (or could not be loaded): zoom as deep as
+       they go, and fit again unless the map was moved since. */
+    TripMap.prototype.streetsChanged = function () {
+        if (this.streetsKnown) {
+            return;
+        }
+        var deepest = this.tiles.maxZoom();
+        if (deepest !== null && !this.tiles.ready()) {
+            return;
+        }
+        this.streetsKnown = true;
+        this.maxZoom = Math.max(this.baseMaxZoom, deepest === null ? 0 : deepest);
+        this.fitZoom = deepest === null ? this.tileZoom
+            : Math.max(this.tileZoom, this.tiles.fitZoom());
+        if (this.fitted && this.view.w) {
+            this.fit();
+        } else if (this.view.zoom > this.maxZoom) {
+            this.set(this.view.lat, this.view.lon, this.maxZoom);
+        }
+    };
+
+    /* How far in a fit goes: as far as the street maps have tiles at some of
+       the trip's places (see the map page's fitLimit). */
+    TripMap.prototype.fitLimit = function (points) {
+        var limit = Math.min(this.maxZoom, this.fitZoom);
+        if (!this.tiles.ready()) {
+            return limit;
+        }
+        var deepest = -1;
+        for (var k = 0; k < points.length && deepest < limit; k++) {
+            var z = this.tiles.coveredZoom(points[k].lat, points[k].lon);
+            if (z !== null && z > deepest) {
+                deepest = z;
+            }
+        }
+        return deepest >= 0 ? Math.max(this.tileZoom, Math.min(limit, deepest)) : this.tileZoom;
+    };
+
     TripMap.prototype.fit = function () {
-        var found = MAP.fitView(this.allPoints(), this.view.w, this.view.h, this.TILE, 0,
-                                Math.min(this.maxZoom, 15), 36);
+        var points = this.allPoints();
+        var found = MAP.fitView(points, this.view.w, this.view.h, this.TILE, 0,
+                                this.fitLimit(points), 36);
         if (found) {
             this.set(found.lat, found.lon, found.zoom);
         } else {
@@ -821,18 +1019,20 @@ var TRIPS = (function () {
         var view = this.view;
         view.zoom = Math.max(0, Math.min(this.maxZoom, Math.round(zoom)));
         var w = this.width();
-        var y = (90 - lat) / 180 * (w / 2);
+        var y = MAP.project(lat, 0, w).y;
         var top = view.h / 2;
-        var bottom = w / 2 - view.h / 2;
-        y = bottom < top ? w / 4 : Math.max(top, Math.min(bottom, y));
-        view.lat = 90 - y * 180 / (w / 2);
+        var bottom = w - view.h / 2;
+        y = bottom < top ? w / 2 : Math.max(top, Math.min(bottom, y));
+        view.lat = MAP.unproject(0, y, w).lat;
         view.lon = MAP.normalizeLon(lon);
         this.schedule();
     };
 
     TripMap.prototype.panBy = function (dx, dy) {
         var w = this.width();
-        this.set(this.view.lat + dy * 180 / (w / 2), this.view.lon - dx * 360 / w, this.view.zoom);
+        var centre = MAP.project(this.view.lat, this.view.lon, w);
+        var moved = MAP.unproject(centre.x - dx, centre.y - dy, w);
+        this.set(moved.lat, moved.lon, this.view.zoom);
     };
 
     TripMap.prototype.zoomAt = function (sx, sy, zoom) {
@@ -890,7 +1090,14 @@ var TRIPS = (function () {
         ctx.fillStyle = "#1a2c3d";
         ctx.fillRect(0, 0, view.w, view.h);
         var at = this.corner();
-        this.tiles.draw(ctx, view.zoom, at.left, at.top, view.w, view.h);
+        var clear = [STREETS.clearOf(this.tools, this.canvas),
+                     STREETS.clearOf(this.credit, this.canvas)];
+        var drawn = this.tiles.draw(ctx, view.zoom, at.left, at.top, view.w, view.h, clear);
+        var creditWas = this.credit.hidden;
+        this.credit.hidden = !drawn.streets;
+        if (creditWas && !this.credit.hidden) {
+            this.schedule();            // (names placed clear of it next time)
+        }
         // The routes: each line on the copy of the world nearest the middle.
         var middle = at.left + view.w / 2;
         this.drawn = (this.options.lines || []).map(function (line) {
@@ -909,13 +1116,17 @@ var TRIPS = (function () {
         this.pins = MAP.screenPins(this.groups.list, at.left, at.top, view.w, view.h, at.w);
         MAP.drawPins(ctx, this.pins);
         if (document.activeElement === this.canvas && this.byKey) {
-            ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
-            ctx.lineWidth = 2;
+            // (White on a dark edge: seen on the light street maps too.)
             ctx.beginPath();
             ctx.moveTo(view.w / 2 - 8, view.h / 2);
             ctx.lineTo(view.w / 2 + 8, view.h / 2);
             ctx.moveTo(view.w / 2, view.h / 2 - 8);
             ctx.lineTo(view.w / 2, view.h / 2 + 8);
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = "rgba(12, 17, 24, 0.85)";
+            ctx.stroke();
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
             ctx.stroke();
         }
     };
@@ -1298,6 +1509,270 @@ var TRIPS = (function () {
             return (trips && trips.trips || []).slice();
         }
 
+        /* The story (trip_stories.py): a paragraph in each day's section, its
+           links to pictures as small pictures that open the viewer; for the
+           admin a bar to write it (a job), edit, hide or delete it. */
+
+        var stories = {};           // trip id -> /api/trips/<id>/story's answer (null: loading)
+
+        function loadStory(trip, again) {
+            if (SITE.isStatic || !SITE.loadTripStory) {
+                return;
+            }
+            if (!again && Object.prototype.hasOwnProperty.call(stories, trip.id)) {
+                return;
+            }
+            stories[trip.id] = again ? stories[trip.id] || null : null;
+            SITE.loadTripStory(trip.id, function (answer) {
+                stories[trip.id] = answer || {trip: trip.id, days: []};
+                if (wanted === trip.id) {
+                    fillStory(trip);
+                }
+            });
+        }
+
+        function storyOf(trip) {
+            return SITE.isStatic ? null : stories[trip.id] || null;
+        }
+
+        function storyLink(rec, cited) {
+            var words = VIEWER.altText(rec);
+            return el("button", {type: "button", className: "story-pic", title: words,
+                                 attrs: {"aria-label": "Picture: " + words},
+                                 on: {click: function () {
+                                     showViewer(cited, rec.i);
+                                 }}}, [
+                el("img", {src: SITE.thumbUrl(rec), alt: "", loading: "lazy", draggable: false})
+            ]);
+        }
+
+        // A paragraph of the story, its links as small pictures (those the page
+        // shows; the viewer opens on the paragraph's pictures).
+        function storyParagraph(text) {
+            var parts = storyParts(text);
+            var cited = [];
+            parts.forEach(function (part) {
+                var rec = part.id ? get(part.id) : null;
+                if (rec && shown(rec, adminOn) && cited.indexOf(rec.i) < 0) {
+                    cited.push(rec.i);
+                }
+            });
+            var node = el("p", {className: "trip-story"});
+            parts.forEach(function (part, index) {
+                if (part.text !== undefined) {
+                    node.appendChild(document.createTextNode(part.text));
+                    return;
+                }
+                var rec = get(part.id);
+                if (!rec || !shown(rec, adminOn)) {
+                    return;
+                }
+                // (A mark right after a picture stays on its line: no "." alone on the next.)
+                var next = parts[index + 1];
+                var mark = next && next.text !== undefined
+                    ? /^[.,;:!?)\u201d\u2019"']+/.exec(next.text) : null;
+                if (mark) {
+                    next.text = next.text.slice(mark[0].length);
+                    node.appendChild(el("span", {className: "story-pic-tail"},
+                                        [storyLink(rec, cited), mark[0]]));
+                } else {
+                    node.appendChild(storyLink(rec, cited));
+                }
+            });
+            return node;
+        }
+
+        function fillStory(trip) {
+            var story = storyOf(trip);
+            var texts = storyDays(trip, story);
+            (trip.days || []).forEach(function (day) {
+                var slot = byId("story-" + day.date);
+                if (!slot) {
+                    return;
+                }
+                clear(slot);
+                if (texts[day.date]) {
+                    slot.appendChild(storyParagraph(texts[day.date]));
+                }
+                slot.classList.toggle("is-hidden", Boolean(story && story.hidden));
+            });
+            var bar = byId("trip-story-bar");
+            if (bar) {
+                clear(bar);
+                if (adminOn && story && story.state) {
+                    storyBar(bar, trip, story);
+                }
+                bar.hidden = !bar.firstChild;
+            }
+        }
+
+        function storyBar(bar, trip, story) {
+            var has = story.state !== "missing" && story.state !== "empty";
+            bar.appendChild(el("h2", {className: "trip-story-title", text: "Story"}));
+            bar.appendChild(el("p", {className: "trip-story-state" +
+                                     (story.state === "stale" ? " is-stale" : ""),
+                                     text: storyStateWords(story) + (has ? "" : " A language " +
+                                         "model can write one from the trip's facts (text " +
+                                         "only, no pictures).")}));
+            var actions = el("div", {className: "trip-story-actions"});
+            if (story.state !== "empty") {
+                actions.appendChild(el("button", {
+                    type: "button", className: "button small" + (has ? "" : " primary"),
+                    text: has ? "Write again" : "Write the story",
+                    title: has ? "A new story from the trip's facts (replaces this one)"
+                        : "Ask the language model for a story of the trip",
+                    on: {click: function () {
+                        writeStories(trip, has);
+                    }}}));
+            }
+            actions.appendChild(el("button", {type: "button", className: "button small",
+                                              text: has ? "Edit\u2026" : "Write your own\u2026",
+                                              on: {click: function () {
+                                                  editStory(trip, story);
+                                              }}}));
+            if (has) {
+                actions.appendChild(el("button", {
+                    type: "button", className: "button small",
+                    text: story.hidden ? "Show" : "Hide",
+                    title: story.hidden ? "Show the story to everyone who sees the trip"
+                        : "Only you see it (and no export publishes it)",
+                    on: {click: function () {
+                        changeStory(trip, {hidden: !story.hidden}, story.hidden
+                            ? "The story shows again." : "The story is hidden.");
+                    }}}));
+                actions.appendChild(el("button", {
+                    type: "button", className: "button small subtle", text: "Delete",
+                    on: {click: function () {
+                        SHELL.confirm({title: "Delete the story?", danger: true,
+                                       message: "The story of " + trip.title + " is deleted " +
+                                           "(the pictures are not touched). Write stories " +
+                                           "writes a new one.",
+                                       confirmText: "Delete"}).then(function (yes) {
+                            if (yes) {
+                                changeStory(trip, {forget: true}, "The story is deleted.");
+                            }
+                        });
+                    }}}));
+            }
+            bar.appendChild(actions);
+        }
+
+        function changeStory(trip, body, message) {
+            return SHELL.admin("/trips/" + encodeURIComponent(trip.id) + "/story", body)
+                .then(function (reply) {
+                    stories[trip.id] = reply.story;
+                    if (message) {
+                        SHELL.toast(message, "ok");
+                    }
+                    if (wanted === trip.id) {
+                        fillStory(trip);
+                    }
+                    return reply;
+                }, function () {
+                    return null;
+                });
+        }
+
+        function editStory(trip, story) {
+            var texts = storyDays(trip, story);
+            var box = SHELL.modal({title: "The story of " + trip.title, wide: true});
+            box.body.appendChild(el("p", {className: "field-hint", text: "A paragraph a day " +
+                "(a day left empty has none). [#123] links picture 123: keep, move or delete " +
+                "them. The story stays as you write it: Write stories leaves it alone."}));
+            var areas = [];
+            (trip.days || []).forEach(function (day) {
+                var number = trip.start ? dayCount(trip.start, day.date) : 1;
+                var area = el("textarea", {className: "input trip-story-edit", rows: 4,
+                                           value: texts[day.date] || "", maxLength: 3000});
+                areas.push({date: day.date, area: area});
+                box.body.appendChild(SHELL.field("Day " + number + DOT + dayWords(day.date),
+                                                 area).node);
+            });
+            box.button("Cancel", "", box.close);
+            box.button("Save", "primary", function () {
+                changeStory(trip, {days: areas.map(function (item) {
+                    return {date: item.date, text: item.area.value};
+                })}, "Saved the story.").then(function (reply) {
+                    if (reply) {
+                        box.close();
+                    }
+                });
+            });
+        }
+
+        var FINISHED = ["done", "failed", "cancelled", "interrupted"];
+
+        // Call done(job) once the job has finished (the header's indicator shows it
+        // meanwhile).
+        function watchJob(jobId, done) {
+            function look() {
+                SHELL.admin("/jobs?log=0", undefined, {quiet: true}).then(function (snapshot) {
+                    var found = null;
+                    [snapshot.current].concat(snapshot.queue || [], snapshot.recent || [])
+                        .forEach(function (job) {
+                            if (job && job.id === jobId && !found) {
+                                found = job;
+                            }
+                        });
+                    if (found && FINISHED.indexOf(found.state) >= 0) {
+                        done(found);
+                    } else {
+                        window.setTimeout(look, 3000);
+                    }
+                }, function () {
+                    window.setTimeout(look, 10000);
+                });
+            }
+            window.setTimeout(look, 1500);
+        }
+
+        // Write the story of a trip (redo: again) or of every trip that needs one
+        // (trip null), after showing what it takes (plan).
+        function writeStories(trip, redo) {
+            var query = (trip ? "?trip=" + encodeURIComponent(trip.id) + "&" : "?") +
+                (redo ? "redo=1" : "redo=0");
+            SHELL.admin("/trips/stories/plan" + query).then(function (plan) {
+                var lines = planWords(plan);
+                if (!plan.trips.length) {
+                    SHELL.toast(lines.join(" "), "info");
+                    return;
+                }
+                SHELL.confirm({
+                    title: trip ? (redo ? "Write the story again?" : "Write the story?")
+                        : "Write the trips' stories?",
+                    message: lines.map(function (line) {
+                        return el("p", {text: line});
+                    }).concat(trip && redo && (storyOf(trip) || {}).edited
+                        ? [el("p", {className: "field-hint",
+                                    text: "Your edits of this story are replaced."})] : []),
+                    confirmText: "Write"
+                }).then(function (yes) {
+                    if (!yes) {
+                        return;
+                    }
+                    var params = {redo: Boolean(redo)};
+                    if (trip) {
+                        params.trip = trip.id;
+                    }
+                    SHELL.admin("/jobs", {kind: "trip_stories", library_id: null,
+                                          params: params}).then(function (reply) {
+                        SHELL.toast((trip ? "Writing the story" : "Writing the stories") +
+                                    " (the header shows how it goes).", "info");
+                        watchJob(reply.job.id, function (job) {
+                            var words = SHELL.jobs.summary(job);
+                            SHELL.toast((job.state === "done" ? "" : SHELL.jobs.state(job.state) +
+                                         ": ") + (words || job.error || "finished") + ".",
+                                        job.state === "done" ? "ok" : "warn");
+                            stories = {};
+                            if (wanted) {
+                                render();
+                            }
+                        });
+                    }, function () {});
+                });
+            }, function () {});
+        }
+
         /* The list */
 
         function card(trip) {
@@ -1351,6 +1826,15 @@ var TRIPS = (function () {
             document.title = "Trips - " + (SITE.title || "Image Search");
             byId("trips-back").hidden = true;
             clear(byId("trips-actions"));
+            if (adminOn && trips.enabled && sortedTrips().length) {
+                byId("trips-actions").appendChild(el("button", {
+                    type: "button", className: "button", text: "Write stories\u2026",
+                    title: "A story for each trip that has none or an out-of-date one, " +
+                        "written by a language model from the trip's facts",
+                    on: {click: function () {
+                        writeStories(null, false);
+                    }}}));
+            }
             setHead("Trips", adminOn
                 ? "Journeys found in the pictures: libraries whose folder is named like a trip " +
                   "(a date first), and runs of days away from home. Open one to rename, hide, " +
@@ -1605,6 +2089,8 @@ var TRIPS = (function () {
             if (day.places && day.places.length) {
                 section.appendChild(placesLine(day.places));
             }
+            section.appendChild(el("div", {className: "trip-story-slot",
+                                           id: "story-" + day.date}));
             section.appendChild(el("p", {className: "trip-day-facts",
                                          text: factsWords(facts(ids, get))}));
             section.appendChild(strip(ids, trips.best_per_day || 6, "Day " + number, day.looks));
@@ -1681,6 +2167,11 @@ var TRIPS = (function () {
                     }).join(" \u2192 ")
                 ]));
             }
+            if (adminOn) {
+                body.appendChild(el("section", {className: "card trip-story-card",
+                                                id: "trip-story-bar", hidden: true,
+                                                attrs: {"aria-label": "Story"}}));
+            }
             var others = shownIds(trip.other);
             var withLinks = (trip.days || []).length > DAY_LINKS_FROM;
             if (withLinks) {
@@ -1697,6 +2188,8 @@ var TRIPS = (function () {
             if (others.length) {
                 body.appendChild(otherSection(trip, others));
             }
+            fillStory(trip);
+            loadStory(trip);
         }
 
         /* Changes (admin) */
@@ -1990,7 +2483,11 @@ var TRIPS = (function () {
         tripPoints: tripPoints,
         fitPoints: fitPoints,
         tripLooks: tripLooks,
-        tripIds: tripIds
+        tripIds: tripIds,
+        storyParts: storyParts,
+        storyDays: storyDays,
+        planWords: planWords,
+        storyStateWords: storyStateWords
     };
 })();
 

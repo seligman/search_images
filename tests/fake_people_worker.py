@@ -4,10 +4,11 @@
 It speaks the real protocol (people_worker.serve) with a backend that
 "detects" faces drawn as solid squares: a face is a square of colour
 (255, 0, 32 * k), k = 1..7 being who it is, and its vector says k (two
-squares of one colour are the same person, in any picture). The test
-face people.py draws (people.probe_picture) is found as one face in its
-middle. Draw the pictures as PNG, or as JPEG of good quality: the
-colours are matched with some slack.
+squares of one colour are the same person, in any picture; a picture
+looked at in tiles finds a square in each tile it is in, as a whole or a
+part). The test face people.py draws (people.probe_picture) is found as
+one face in its middle. Draw the pictures as PNG, or as JPEG of good
+quality: the colours are matched with some slack.
 
 The top-left pixel of a picture makes the helper misbehave:
 (0, 255, 0) ends the program, (0, 0, 255) makes the picture fail,
@@ -89,13 +90,33 @@ class FakeBackend:
             time.sleep(60)
         return image, image.width, image.height
 
+    def scaled(self, image, width, height):
+        if (width, height) == image.size:
+            return image
+        return image.resize((width, height), self.Image.NEAREST)
+
     def detect(self, image, width, height):
         if image.getpixel((1, 1)) == PROBE_BACKGROUND:
             if MODE == "noprobe":
                 return []
             side = min(width, height) * 0.5
             return [self._row(width / 2.0 - side / 2, height / 2.0 - side / 2, side, side)]
-        scaled = image.resize((width, height), self.Image.NEAREST)
+        return self._squares(self.scaled(image, width, height))
+
+    def detect_part(self, image, x, y, width, height):
+        return self._squares(image.crop((x, y, x + width, y + height)))
+
+    def crop(self, image, box, edge, margin):
+        x, y, w, h = box
+        side = max(w, h) * (1 + 2 * margin)
+        middle_x, middle_y = x + w / 2.0, y + h / 2.0
+        face = image.crop((int(round(middle_x - side / 2)), int(round(middle_y - side / 2)),
+                           int(round(middle_x + side / 2)), int(round(middle_y + side / 2))))
+        out = io.BytesIO()
+        face.resize((edge, edge)).save(out, "JPEG", quality=85)
+        return out.getvalue()
+
+    def _squares(self, scaled):
         red, green, blue = scaled.split()
         red = red.point(lambda value: 255 if value > 200 else 0)
         green = green.point(lambda value: 255 if value < 60 else 0)

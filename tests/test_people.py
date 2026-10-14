@@ -496,8 +496,10 @@ class PeopleFixture(support.TempBaseMixin):
                              projection="equirectangular")
 
     def configure(self, people_settings=None, libraries=None, **extra):
+        # (The videos of these tests are looked at by their poster, the preview, as
+        # before videos were looked at in frames: see test_people_video.)
         values = {"enabled": True, "python": sys.executable, "models_dir": "models",
-                  "workers": 1}
+                  "workers": 1, "frames": 0}
         values.update(people_settings or {})
         if libraries is None:
             libraries = [support.library("Family", self.family, id="lib_family1"),
@@ -759,11 +761,15 @@ class UpdateTest(PeopleFixture, unittest.TestCase):
         counted = people.counts(self.conn, self.config, ["lib_family1", "lib_trips01"])
         self.assertEqual(counted["lib_family1"], {"pictures": 3, "done": 3, "faces": 3,
                                                   "with_faces": 2, "pending": 0, "failed": 0,
-                                                  "changed": 0})
+                                                  "changed": 0, "full": 0, "full_pending": 0,
+                                                  "videos": 0, "video_pending": 0,
+                                                  "skipped": 0})
         # The copy in the other library shares the faces of its content.
         self.assertEqual(counted["lib_trips01"], {"pictures": 3, "done": 1, "faces": 2,
                                                   "with_faces": 1, "pending": 2, "failed": 0,
-                                                  "changed": 0})
+                                                  "changed": 0, "full": 0, "full_pending": 0,
+                                                  "videos": 0, "video_pending": 0,
+                                                  "skipped": 0})
         status = people.status(self.config)
         self.assertEqual((status["stored"], status["pictures"], status["faces"]), (True, 3, 3))
         self.configure({"python": ""})

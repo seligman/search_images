@@ -54,7 +54,9 @@ owner put faces in together.
                   with), grouped_at
 
 All of it lives in data/faces.db (people.py), with the faces: it is never
-exported, never sent anywhere, and Delete face data deletes it. The search
+exported, never sent anywhere (but for the names of the people of a trip, to
+the model writing its story when that runs on this computer or the local
+network: trip_stories.py), and Delete face data deletes it. The search
 page (person:"Name"), the viewer's pane (the names) and the People page
 get it from the server (search_data, picture_view, list_people): the admin
 always, others (LAN visitors) only with "visitors": true in config.json's
@@ -71,6 +73,7 @@ import collections
 import datetime
 import heapq
 import io
+import json
 import math
 import operator
 import re
@@ -969,9 +972,9 @@ def mark_not_face(store, face_ids, not_face=True, now=None):
 # ---------------------------------------------------------------------------
 # Pictures of the faces (index.db)
 
-def _visible_pictures(conn, library_ids, include_hidden):
+def _visible_pictures(conn, library_ids, include_hidden, videos=None):
     """{(content hash, kind): [image ids]} (one query: hidden pictures left out unless
-    include_hidden)."""
+    include_hidden). videos, a set, gets the ids of the videos among them."""
     library_ids = list(library_ids)
     found = collections.defaultdict(list)
     for start in range(0, len(library_ids), ID_CHUNK):
@@ -984,6 +987,8 @@ def _visible_pictures(conn, library_ids, include_hidden):
             kind = people.looked_at(row)
             if kind is not None:
                 found[(row["content_hash"], kind)].append(row["id"])
+                if videos is not None and people.is_video(row):
+                    videos.add(row["id"])
     return found
 
 
@@ -1016,8 +1021,9 @@ def may_see(config, admin):
 
 def search_data(store, conn, config, library_ids, admin, include_hidden_people=False):
     """The /api/people answer: {"version", "people": [{"id", "name", "label", "cover"
-    (a face id), "faces", "ids" (the pictures, in id order), "hidden" (only with
-    include_hidden_people)}]}, by name, then the unnamed by how many pictures.
+    (a face id), "faces", "ids" (the pictures, in id order), "videos" (how many of
+    them are videos), "hidden" (only with include_hidden_people)}]}, by name, then the
+    unnamed by how many pictures.
 
     The admin gets every person (hidden ones too with include_hidden_people) in
     every present picture of the libraries; others only the named people that
@@ -1026,7 +1032,8 @@ def search_data(store, conn, config, library_ids, admin, include_hidden_people=F
     answer = {"version": 1, "people": []}
     if store is None:
         return answer
-    pictures = _visible_pictures(conn, library_ids, include_hidden=admin)
+    video_ids = set()
+    pictures = _visible_pictures(conn, library_ids, include_hidden=admin, videos=video_ids)
     persons = {row[0]: row for row in store.execute(
         "SELECT id, name, hidden, cover FROM people")}
     found = collections.defaultdict(lambda: {"ids": set(), "faces": 0, "best": None})
@@ -1053,7 +1060,8 @@ def search_data(store, conn, config, library_ids, admin, include_hidden_people=F
         person = persons[person_id]
         item = {"id": person_id, "name": person[1], "label": label(person_id, person[1]),
                 "cover": entry.get("cover") or entry["best"], "faces": entry["faces"],
-                "ids": sorted(entry["ids"])}
+                "ids": sorted(entry["ids"]),
+                "videos": sum(1 for image_id in entry["ids"] if image_id in video_ids)}
         if include_hidden_people and admin:
             item["hidden"] = bool(person[2])
         listed.append(item)
@@ -1074,9 +1082,12 @@ def state_key(store):
 
 def picture_view(store, conn, row, config, admin):
     """The people of one picture for its details (/api/image), or None: {"names": [{"id",
-    "label", "named"}] (hidden people left out), and for the admin "faces": [{"id",
-    "x", "y", "w", "h" (fractions of the picture, upright), "person" (id or null),
-    "label", "quality", "hidden" (true for a hidden person's)}]}.
+    "label", "named", and of a video "at": the seconds into it each was seen at (the
+    frames looked at, see people.video_faces), in order}] (hidden people left out), and
+    for the admin "faces": [{"id", "x", "y", "w", "h" (fractions of the picture,
+    upright; of a video, of its frame at "at"), "person" (id or null), "label",
+    "quality", "hidden" (true for a hidden person's), "at" (a video's: seconds, or
+    null for a face of its poster)}]}.
     Others than the admin get only the named people that are not hidden (and only with
     "visitors": true)."""
     if store is None or not may_see(config, admin):
@@ -1085,21 +1096,26 @@ def picture_view(store, conn, row, config, admin):
     if kind is None or not row["content_hash"]:
         return None
     faces = store.execute(
-        "SELECT f.id, f.x, f.y, f.w, f.h, f.quality, fp.person_id, p.name, p.hidden FROM faces f "
-        "LEFT JOIN face_people fp ON fp.face_id = f.id LEFT JOIN people p ON p.id = "
-        "fp.person_id WHERE f.content_hash = ? AND f.kind = ? AND f.id NOT IN (SELECT face_id "
-        "FROM face_marks WHERE not_face) ORDER BY f.x, f.id", (row["content_hash"], kind)
-    ).fetchall()
+        "SELECT f.id, f.x, f.y, f.w, f.h, f.quality, fp.person_id, p.name, p.hidden, f.at, "
+        "f.seen FROM faces f LEFT JOIN face_people fp ON fp.face_id = f.id LEFT JOIN people p "
+        "ON p.id = fp.person_id WHERE f.content_hash = ? AND f.kind = ? AND f.id NOT IN "
+        "(SELECT face_id FROM face_marks WHERE not_face) ORDER BY f.x, f.id",
+        (row["content_hash"], kind)).fetchall()
+    video = people.is_video(row)
     names = []
-    seen = set()
+    seen = {}
     boxes = []
     for face in faces:
         person_id, name, hidden = face[6], face[7] or "", bool(face[8])
         shown = person_id is not None and not hidden and (admin or name)
         if shown and person_id not in seen:
-            seen.add(person_id)
-            names.append({"id": person_id, "label": label(person_id, name),
-                          "named": bool(name)})
+            seen[person_id] = {"id": person_id, "label": label(person_id, name),
+                               "named": bool(name)}
+            if video:
+                seen[person_id]["at"] = []
+            names.append(seen[person_id])
+        if shown and video:
+            seen[person_id]["at"].extend(moments(face[9], face[10]))
         if admin:
             box = {"id": face[0], "x": round(face[1], 5), "y": round(face[2], 5),
                    "w": round(face[3], 5), "h": round(face[4], 5), "person": person_id,
@@ -1107,7 +1123,12 @@ def picture_view(store, conn, row, config, admin):
                    "quality": round(face[5], 3)}
             if hidden:
                 box["hidden"] = True
+            if video:
+                box["at"] = face[9]
             boxes.append(box)
+    for item in names:
+        if "at" in item:
+            item["at"] = sorted(set(item["at"]))
     names.sort(key=lambda item: (0 if item["named"] else 1, name_key(item["label"])))
     view = {"names": names}
     if admin:
@@ -1143,7 +1164,8 @@ def person_faces(store, person_id):
 
 def person_view(store, conn, config, person_id, library_ids):
     """The People page's view of one person: {"person": person_info(), "faces": [{"id",
-    "quality", "owner", "image" (a picture it is in, or null when none is shown)}] best
+    "quality", "owner", "image" (a picture it is in, or null when none is shown), and of
+    a video's face "at" (the second it was seen at: where the video starts)}] best
     first -- but the best face of every moment (moment_sets) before the second of any,
     so a burst does not fill the top --, "similar": [{"id", "label", "cover", "faces",
     "score"}] (people whose faces look most like its own: maybe the same person)}."""
@@ -1158,10 +1180,14 @@ def person_view(store, conn, config, person_id, library_ids):
         (later if sets[key] in seen else first).append(row)
         seen.add(sets[key])
     faces = []
+    times = _face_times(store, [row[0] for row in rows])
     for face_id, _person_id, content_hash, kind, quality, owner in first + later:
         ids = pictures.get((content_hash, kind))
-        faces.append({"id": face_id, "quality": round(quality, 3), "owner": bool(owner),
-                      "image": ids[0] if ids else None})
+        face = {"id": face_id, "quality": round(quality, 3), "owner": bool(owner),
+                "image": ids[0] if ids else None}
+        if times.get(face_id) is not None:
+            face["at"] = times[face_id]
+        faces.append(face)
     options = people.settings(config)
     sums = _sums(store)
     similar = []
@@ -1198,7 +1224,8 @@ def _cover_of(store, person_id):
 
 def other_faces(store, conn, library_ids, which="other", offset=0, limit=OTHER_FACES_LIMIT):
     """Faces in no person ("other", best first) or marked "not a face" ("not_face"):
-    {"faces": [{"id", "quality", "image"}], "total"}. Only the faces of pictures shown."""
+    {"faces": [{"id", "quality", "image", "at" (a video's face: see person_view)}],
+    "total"}. Only the faces of pictures shown."""
     pictures = _visible_pictures(conn, library_ids, include_hidden=True)
     if which == "not_face":
         sql = ("SELECT f.id, f.content_hash, f.kind, f.quality FROM faces f JOIN face_marks m "
@@ -1214,7 +1241,36 @@ def other_faces(store, conn, library_ids, which="other", offset=0, limit=OTHER_F
             listed.append({"id": face_id, "quality": round(quality, 3), "image": ids[0]})
     offset = max(0, int(offset))
     limit = max(1, min(OTHER_FACES_LIMIT, int(limit)))
-    return {"faces": listed[offset:offset + limit], "total": len(listed), "offset": offset}
+    page = listed[offset:offset + limit]
+    times = _face_times(store, [face["id"] for face in page])
+    for face in page:
+        if times.get(face["id"]) is not None:
+            face["at"] = times[face["id"]]
+    return {"faces": page, "total": len(listed), "offset": offset}
+
+
+def _face_times(store, face_ids):
+    """{face id: the second of its video it was seen at (people.py's "at")} of the faces
+    of videos among face_ids."""
+    found = {}
+    face_ids = list(face_ids)
+    for start in range(0, len(face_ids), ID_CHUNK):
+        part = face_ids[start:start + ID_CHUNK]
+        for face_id, at in store.execute("SELECT id, at FROM faces WHERE at IS NOT NULL AND "
+                                         "id IN (%s)" % ",".join("?" * len(part)), part):
+            found[face_id] = at
+    return found
+
+
+def moments(at, seen):
+    """The seconds of a video a face was seen at (its "seen", else its "at"; none for a
+    face of a poster found before the frames were looked at)."""
+    if seen:
+        try:
+            return [round(float(item[0]), 3) for item in json.loads(seen)]
+        except (TypeError, ValueError, IndexError):
+            pass
+    return [round(float(at), 3)] if at is not None else []
 
 
 def status(store, config):

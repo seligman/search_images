@@ -562,8 +562,8 @@ class ExportTest(ExportFixture):
             if not source.startswith("data:")]
         self.assertEqual([source.split("?")[0] for source in sources],
                          ["assets/style.css", "assets/site.js", "assets/shell.js",
-                          "assets/search-core.js", "assets/routes.js", "assets/viewer.js",
-                          "assets/app.js"])
+                          "assets/search-core.js", "assets/streets.js", "assets/routes.js",
+                          "assets/viewer.js", "assets/app.js"])
         for source in sources:
             rel, version = source.split("?v=")
             with open(os.path.join(out, rel), "rb") as handle:

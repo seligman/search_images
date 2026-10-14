@@ -98,7 +98,9 @@
        controls turns that off and on (remembered in this browser).
        A 360 photo or video opens at its opening view (rec.ov, see
        opening_views.py and format.openingView; the front without one), and
-       stage.reset() returns there.
+       stage.reset() returns there. stage.seekTo(seconds, soft) moves a
+       video (not a drive) to that moment, now or once its player can (soft:
+       only while it has not been played or moved yet).
    VIEWER.stageUrls(rec, detail) the addresses stage.show wants.
    VIEWER.renderInfo(box, record, detail, context)  the information pane:
        title, date, place, camera, description and text with the search words
@@ -125,7 +127,12 @@
        admin's pane also has "Show faces", which draws the boxes of its
        faces over the picture (a layer of its own over context.stage's
        picture, following its place and zoom; each box names its person and
-       opens it on the People page), kept on for the next pictures.
+       opens it on the People page), kept on for the next pictures. Of a
+       video, each name is followed by the moments that person was seen at
+       (its frames looked at), which move the video there (stage.seekTo);
+       a video opened by a search that names one of its people (person:,
+       or the name's words: format.personMoment) starts at that person's
+       first moment, and one opened with startAt {id, seconds} there.
    VIEWER.marks: favorite(ids, on, get), rate(ids, stars, get) (each
        resolves when the server has them; the records are changed in
        place), picker({ids, get, albums, mode ("add" or "remove"),
@@ -332,6 +339,147 @@ var VIEWER = (function () {
     function rawUrl(raw) {
         var url = raw && typeof raw === "object" && typeof raw.url === "string" ? raw.url : "";
         return /^\/raw\/[0-9]+$/.test(url) || /^raws\/[a-z0-9]+\.[a-z0-9]+$/.test(url) ? url : "";
+    }
+
+    /* Where a video found by a search for one of its people starts: the first
+       moment (its "at", see people_groups.picture_view) of the first of its
+       people (names: the full record's people.names) that the query names, or
+       null. A person: term names one as search finds people (SearchCore.
+       findPerson): person:#<id>, its name or "Person 12" (any case, accents
+       and punctuation aside), or the start of the name of only one of the
+       video's named people; and a named one's words as they stand in the
+       query do too (not an unnamed one's "person 12"). query: the text, or
+       SearchCore.parse()'s result (its person: terms, not negated ones). */
+    function personMoment(names, query) {
+        var text = query;
+        var values = null;
+        if (query && typeof query === "object") {
+            text = query.text;
+            if (Array.isArray(query.terms)) {
+                values = [];
+                query.terms.forEach(function (term) {
+                    if (term && term.filter && term.filter.kind === "person" && !term.neg &&
+                            typeof term.filter.value === "string") {
+                        values.push(term.filter.value);
+                    }
+                });
+            }
+        }
+        if (!Array.isArray(names) || typeof text !== "string" || !text) {
+            return null;
+        }
+        if (values === null) {
+            values = personValues(text);
+        }
+        var seen = names.filter(function (person) {
+            return person && Array.isArray(person.at) && person.at.length &&
+                typeof person.at[0] === "number" && typeof person.label === "string";
+        });
+        var chosen = {};
+        values.forEach(function (value) {
+            var wanted = nameKey(value);
+            var byId = /^#(\d{1,18})$/.exec(String(value).replace(/^\s+|\s+$/g, ""));
+            var exact = seen.filter(function (person) {
+                return byId ? String(person.id) === byId[1] : nameKey(person.label) === wanted;
+            });
+            var starts = byId || !wanted ? [] : seen.filter(function (person) {
+                return person.named && nameKey(person.label).indexOf(wanted) === 0;
+            });
+            var found = exact.length ? exact[0] : starts.length === 1 ? starts[0] : null;
+            if (found) {
+                chosen[String(found.id)] = true;
+            }
+        });
+        // (The words besides the person: terms, which say who they name above.)
+        var words = " " + nameKey(text.replace(personPattern(), "$1 ")) + " ";
+        for (var k = 0; k < seen.length; k++) {
+            var person = seen[k];
+            if (chosen[String(person.id)] || (person.named && nameKey(person.label) &&
+                    words.indexOf(" " + nameKey(person.label) + " ") >= 0)) {
+                return person.at[0];
+            }
+        }
+        return null;
+    }
+
+    // A name as personMoment compares it: lower case, without accents, quotes
+    // and punctuation ("D'Arcy" and "d arcy", "J. R. Smith" and "j r smith"
+    // are the same), single spaces.
+    function nameKey(text) {
+        text = String(text === null || text === undefined ? "" : text).toLowerCase();
+        if (text.normalize) {
+            text = text.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        }
+        return text.replace(/["'`,;:.!?()\[\]{}\u2018\u2019\u201c\u201d]+/g, " ")
+            .replace(/\s+/g, " ").replace(/^ | $/g, "");
+    }
+
+    // The person: terms of a query's text (person:Name, person:"Full name",
+    // person:#12; -person:... leaves out): 2, the minus; 3 to 5, the value.
+    function personPattern() {
+        return /(^|[\s(])(-?)person:(?:"([^"]*)"?|\u201c([^\u201d]*)\u201d?|([^\s"\u201c]+))/gi;
+    }
+
+    // The values of the person: terms of a query's text that are not negated.
+    function personValues(text) {
+        var values = [];
+        var pattern = personPattern();
+        var match;
+        while ((match = pattern.exec(text)) !== null) {
+            var value = match[3] !== undefined ? match[3] : match[4] !== undefined ? match[4]
+                : match[5];
+            if (!match[2] && value) {
+                values.push(value);
+            }
+        }
+        return values;
+    }
+
+    /* The query a page searched with, for personMoment: with plain-language
+       search (SearchCore.interpret, where the page has it; options.plain
+       false: off), the typed text as it was understood -- a person's name
+       typed as words is a person: term --, the people being the picture's
+       named ones (names: its people.names); else the text as typed.
+       options.typed: the parts left as typed (the address's "typed": "*", or
+       keys joined by commas). core: SearchCore (default: the page's). */
+    function searchedQuery(text, rec, names, options, core) {
+        options = options || {};
+        if (core === undefined) {
+            core = typeof SearchCore !== "undefined" ? SearchCore : null;
+        }
+        if (typeof text !== "string" || !text || !rec || options.plain === false || !core ||
+                typeof core.interpret !== "function") {
+            return text;
+        }
+        var people = (Array.isArray(names) ? names : []).filter(function (person) {
+            return person && person.named && typeof person.label === "string";
+        }).map(function (person) {
+            return {id: person.id, name: person.label, label: person.label, ids: [rec.i],
+                    hidden: false};
+        });
+        var typed = options.typed === "*" ? "*" : typeof options.typed === "string" &&
+            options.typed ? options.typed.split(",") : [];
+        try {
+            var answer = core.interpret([rec], text, {people: people, typed: typed,
+                                                      plain: true});
+            return answer && typeof answer.query === "string" ? answer.query : text;
+        } catch (error) {
+            return text;
+        }
+    }
+
+    // A moment of a video: "0:07", "1:02:03" -- whole seconds rounded down,
+    // as a player shows where it is (and the People page, people.js, too).
+    function momentText(seconds) {
+        seconds = number(seconds);
+        if (seconds === null || seconds < 0) {
+            return "";
+        }
+        var total = Math.floor(seconds);
+        var hours = Math.floor(total / 3600);
+        var minutes = Math.floor((total % 3600) / 60);
+        var rest = total % 60;
+        return (hours ? hours + ":" + two(minutes) : String(minutes)) + ":" + two(rest);
     }
 
     // The length of a video: "0:24", "12:05", "1:02:03" ("" when unknown):
@@ -1136,6 +1284,9 @@ var VIEWER = (function () {
         rawText: rawText,
         rawUrl: rawUrl,
         durationText: durationText,
+        personMoment: personMoment,
+        searchedQuery: searchedQuery,
+        momentText: momentText,
         codecName: codecName,
         canPlayVideo: canPlayVideo,
         videoFacts: videoFacts,
@@ -1875,6 +2026,51 @@ var VIEWER = (function () {
         return true;
     };
 
+    // A moment of the video shown (a person seen there): now when its player
+    // can, else once it has loaded (startTime: see seekWhenReady); soft: only
+    // while the video has not been played or moved. False for no video (or
+    // a drive, whose clips have moments of their own).
+    Stage.prototype.seekTo = function (seconds, soft) {
+        if (typeof seconds !== "number" || !isFinite(seconds) || seconds < 0 || this.drive ||
+                !this.rec || !this.rec.mv) {
+            return false;
+        }
+        var video = this.video;
+        if (soft && (this.moved || (video && (!video.paused || video.currentTime > 0.05)))) {
+            return false;
+        }
+        this.moved = !soft;
+        if (video && video.readyState >= 1) {
+            this.startTime = null;
+            try {
+                video.currentTime = seconds;
+            } catch (error) {
+                // (Not seekable.)
+            }
+            return true;
+        }
+        this.startTime = seconds;
+        return true;
+    };
+
+    // A new player of the video shown: to startTime (seekTo) once it knows its
+    // length.
+    Stage.prototype.seekWhenReady = function (video) {
+        var self = this;
+        video.addEventListener("loadedmetadata", function () {
+            if (self.video !== video || typeof self.startTime !== "number") {
+                return;
+            }
+            var at = self.startTime;
+            self.startTime = null;
+            try {
+                video.currentTime = at;
+            } catch (error) {
+                // (Not seekable: from the start.)
+            }
+        });
+    };
+
     // Is a video playing (for Space)? Toggles play and pause; false when no video.
     Stage.prototype.togglePlay = function () {
         var video = this.video;
@@ -1963,6 +2159,7 @@ var VIEWER = (function () {
             }
         });
         video.src = urls.video;
+        this.seekWhenReady(video);
         this.box.insertBefore(video, this.note);
         this.video = video;
         this.img.hidden = true;
@@ -2196,6 +2393,7 @@ var VIEWER = (function () {
             }
         });
         video.src = urls.video;
+        this.seekWhenReady(video);
         this.video = video;
         this.videoFrame = function () {
             frame();
@@ -2265,6 +2463,7 @@ var VIEWER = (function () {
             });
         }
         video.src = urls.video;
+        this.seekWhenReady(video);
         var box = el("div", {className: "stage-fisheye"}, [video]);
         this.box.insertBefore(box, this.note);
         this.fisheyeBox = box;
@@ -2412,6 +2611,8 @@ var VIEWER = (function () {
             return;
         }
         this.mode = "image";
+        this.startTime = null;      // (seekTo)
+        this.moved = false;
         // (A 360 picture opens at its opening view, see openingView.)
         this.view = openingView(rec);
         this.zoom = 1;
@@ -6025,13 +6226,22 @@ var VIEWER = (function () {
             return "";
         }
         var row = el("div", {className: "info-chips info-people"});
+        // (A video's people: the moments each was seen at, which move it there.)
+        var moments = rec.mv && !context.drive && context.stage && context.stage.seekTo;
         names.forEach(function (person) {
             var node = chip(person.label, "q", personSearch(person), context,
                             "Show all pictures of " + person.label);
             if (!person.named) {
                 node.classList.add("is-unnamed");
             }
-            row.appendChild(node);
+            if (moments && Array.isArray(person.at) && person.at.length) {
+                // (A line of its own: the name, then its moments.)
+                row.classList.add("has-moments");
+                row.appendChild(el("span", {className: "info-person"},
+                                   [node, momentButtons(person, context.stage)]));
+            } else {
+                row.appendChild(node);
+            }
         });
         if (!names.length) {
             row.appendChild(el("span", {className: "muted", text: faces.length === 1
@@ -6053,6 +6263,50 @@ var VIEWER = (function () {
             row.appendChild(toggle);
         }
         return row;
+    }
+
+    // The moments of a video a person was seen at, each a button that moves the
+    // video there: MOMENTS_SHOWN of them, and "+3" shows the others.
+    var MOMENTS_SHOWN = 6;
+
+    function momentButtons(person, stage) {
+        var box = el("span", {className: "info-moments",
+                              attrs: {"aria-label": person.label + " in the video at"}});
+        var button = function (seconds) {
+            var text = momentText(seconds) || "0:00";
+            var node = el("button", {type: "button", className: "info-moment", text: text,
+                                     title: "Show " + person.label + " at " + text});
+            node.addEventListener("click", function () {
+                stage.seekTo(seconds);
+            });
+            return node;
+        };
+        person.at.slice(0, MOMENTS_SHOWN).forEach(function (seconds) {
+            box.appendChild(button(seconds));
+        });
+        var rest = person.at.slice(MOMENTS_SHOWN);
+        if (rest.length) {
+            var more = el("button", {type: "button", className: "info-moment is-more",
+                                     text: "+" + rest.length,
+                                     title: "Show the other " + rest.length + " moments of " +
+                                         person.label,
+                                     attrs: {"aria-label": "Show the other " + rest.length +
+                                                           " moments"}});
+            more.addEventListener("click", function () {
+                var first = null;
+                rest.forEach(function (seconds) {
+                    var node = button(seconds);
+                    first = first || node;
+                    box.insertBefore(node, more);
+                });
+                box.removeChild(more);
+                if (first && first.focus) {
+                    first.focus();
+                }
+            });
+            box.appendChild(more);
+        }
+        return box;
     }
 
     function facesWanted() {
@@ -6083,20 +6337,35 @@ var VIEWER = (function () {
         var stage = context.stage;
         var faces = admin() && detail && detail.people && Array.isArray(detail.people.faces)
             ? detail.people.faces : [];
-        if (faceLayer && faceLayer.stage === stage && faceLayer.rec === rec && faces.length &&
-                facesWanted()) {
+        // (The face the address asks for -- the People page's link to a face, on the
+        // details page: context.face -- is drawn and marked, "Show faces" on or not,
+        // and a wide picture's pan view goes to it.)
+        var chosen = typeof context.face === "number" ? context.face : null;
+        var shown = facesWanted() ? faces : faces.filter(function (face) {
+            return face.id === chosen;
+        });
+        var key = chosen + ":" + shown.map(function (face) {
+            return face.id;
+        }).join(",");
+        if (faceLayer && faceLayer.stage === stage && faceLayer.rec === rec && shown.length &&
+                faceLayer.key === key) {
             faceLayer.place();
             return;
         }
         dropFaceBoxes();
-        if (!hasDocument || !stage || !stage.img || !faces.length || !facesWanted() ||
+        if (!hasDocument || !stage || !stage.img || !shown.length ||
                 stage.rec !== rec || stage.mode !== "image" || rec.mv || rec.p === "360") {
             return;
         }
         var layer = el("div", {className: "face-layer"});
-        faces.forEach(function (face) {
+        var marked = null;
+        shown.forEach(function (face) {
             var box = el("div", {className: "face-box" + (face.person ? "" : " is-unknown") +
-                                 (face.hidden ? " is-hidden" : "")});
+                                 (face.hidden ? " is-hidden" : "") +
+                                 (face.id === chosen ? " is-chosen" : "")});
+            if (face.id === chosen) {
+                marked = face;
+            }
             box.style.left = (100 * face.x) + "%";
             box.style.top = (100 * face.y) + "%";
             box.style.width = (100 * face.w) + "%";
@@ -6116,7 +6385,8 @@ var VIEWER = (function () {
             layer.appendChild(box);
         });
         stage.box.appendChild(layer);
-        var current = {stage: stage, rec: rec, layer: layer, observer: null};
+        var current = {stage: stage, rec: rec, layer: layer, observer: null, key: key,
+                       panned: !marked};
         current.place = function () {
             if (faceLayer !== current) {
                 return;
@@ -6124,6 +6394,12 @@ var VIEWER = (function () {
             if (stage.rec !== rec || stage.mode !== "image" || stage.img.hidden) {
                 dropFaceBoxes();
                 return;
+            }
+            if (!current.panned && stage.filling && stage.base && stage.base.w > 1 &&
+                    typeof stage.panTo === "function") {
+                // (Once laid out: a wide picture's pan view to the face asked for.)
+                current.panned = true;
+                stage.panTo(marked.x + marked.w / 2);
             }
             var outer = stage.box.getBoundingClientRect();
             var shown = stage.img.getBoundingClientRect();
@@ -6873,7 +7149,8 @@ var VIEWER = (function () {
         if (!lightbox.routeMap) {
             lightbox.routeMap = new ROUTES.MiniMap({tileUrl: SITE.tileUrl,
                                                     tileSize: SITE.tileSize(),
-                                                    tilesMax: SITE.tilesMax()});
+                                                    tilesMax: SITE.tilesMax(),
+                                                    streets: SITE.streets()});
         }
         lightbox.routeSpec = spec;
         lightbox.routeMap.show(route, id);
@@ -7101,6 +7378,12 @@ var VIEWER = (function () {
         lightbox.title.textContent = titleOf(rec);
         renderPane(rec, null);
         lightbox.stage.show(rec, urls);
+        // (A video, not a drive, opened at a moment: open's startAt.)
+        var startAt = lightbox.startAt;
+        if (startAt && startAt.id === id && rec.mv && !lightbox.driveSpec) {
+            lightbox.startAt = null;
+            lightbox.stage.seekTo(startAt.seconds);
+        }
         showBarMarks(rec);
         showStackNote(rec);
         var token = ++lightbox.detailToken;
@@ -7113,6 +7396,12 @@ var VIEWER = (function () {
                     }
                     // (A video may have a playable copy; a drive a sped-up preview.)
                     lightbox.stage.videoDetail(detail);
+                    // (A video found by a search for one of its people: where that
+                    // person is, unless it was played or moved already.)
+                    if (rec.mv && !lightbox.driveSpec && detail.people) {
+                        lightbox.stage.seekTo(personMoment(detail.people.names,
+                                                           lightbox.options.query), true);
+                    }
                 }
             });
         }

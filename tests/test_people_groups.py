@@ -523,7 +523,8 @@ class GroupTest(StoreMixin, unittest.TestCase):
     def test_an_older_store_is_brought_up_to_date(self):
         path = self.base.join("data", "old-faces.db")
         conn = sqlite3.connect(path)
-        for statement in people._SCHEMA[:-5]:
+        # (Version 1: without the people, and the faces' pictures of version 3.)
+        for statement in people._SCHEMA[:-6]:
             conn.execute(statement)
         conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)",
                          (("version", "1"), ("epoch", "e"), ("generation", "3")))
@@ -533,8 +534,8 @@ class GroupTest(StoreMixin, unittest.TestCase):
                      (b"\0" * 512,))
         conn.commit()
         conn.close()
-        self.assertIsNone(people.connect(path, create=False))
-        upgraded = people.connect(path)
+        # (Reading it brings it up to date too: only tables are added.)
+        upgraded = people.connect(path, create=False)
         try:
             self.assertEqual(people.meta(upgraded)["version"], people.FACES_VERSION)
             self.assertEqual(people.meta(upgraded)["faces"], 1)
@@ -880,6 +881,24 @@ class ServerTest(ViewsMixin, unittest.TestCase):
         self.assertTrue(albums.people_searches_shown(None, True))
         self.assertFalse(albums.people_searches_shown({"people": {"visitors": True}}, False))
 
+    def test_a_plain_language_album_shows_its_words_to_visitors(self):
+        # (Saved from a plain-language search: the person is an alternative to the
+        # words typed. Visitors who cannot see People get the words.)
+        import albums
+        albums.create_album(self.conn, "At the beach", kind="smart",
+                            query='person:"Ann" OR ann beach')
+        albums.create_album(self.conn, "With Ann", kind="smart", query='person:"Ann" beach')
+        self.conn.commit()
+
+        def listed(client):
+            return {album["name"]: album["query"] for album in
+                    client.get("/api/index").get_json()["albums"]}
+        self.assertEqual(listed(self.client), {"At the beach": 'person:"Ann" OR ann beach',
+                                               "With Ann": 'person:"Ann" beach'})
+        self.assertEqual(listed(self.visitor), {"At the beach": "ann beach"})
+        self.visitors(True)
+        self.assertEqual(listed(self.visitor)["At the beach"], 'person:"Ann" OR ann beach')
+
     def test_the_faces_route_says_when_the_person_went(self):
         gone = self.admin("/people/faces", {"action": "not_face", "faces": "all",
                                             "person": self.bob}).get_json()
@@ -1150,6 +1169,20 @@ class ExportTest(support.TempBaseMixin, unittest.TestCase):
             self.assertNotIn("Not her", manifest)
             if not people_names:
                 self.assertNotIn(b"zelda", self.text_of(out).lower())
+
+    def test_a_plain_language_album_goes_as_its_words_with_names(self):
+        import albums
+        albums.create_album(self.conn, "At the beach", kind="smart",
+                            query='person:"Zelda Quorn" OR zelda picture')
+        self.conn.commit()
+        out = self.export(marks=True)
+        with open(os.path.join(out, "data", "manifest.js"), encoding="utf-8") as handle:
+            self.assertNotIn("At the beach", handle.read())
+        self.assertNotIn(b"zelda", self.text_of(out).lower())
+        out = self.export(marks=True, people_names=True)
+        from test_export import read_manifest
+        published = {album["name"]: album for album in read_manifest(out)["albums"]}
+        self.assertEqual(published["At the beach"]["query"], "zelda picture")
 
     def test_names_go_only_with_the_option_and_only_as_tags(self):
         from test_export import read_records

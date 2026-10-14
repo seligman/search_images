@@ -341,8 +341,9 @@
             fmt.plural(people.pictures, "picture") + " looked at" + (people.people
                 ? ", " + fmt.plural(people.people, "person", "people") + " (" +
                   fmt.number(people.named || 0) + " named)" : "") + ", kept on this computer " +
-            "only (data/faces.db: never sent anywhere, nor exported but for the names with " +
-            "an export's People's names option)." : "No faces found yet.";
+            "(data/faces.db). Only the names ever leave it: to the model that writes trip " +
+            "stories when that runs on this computer or your network, and in an export " +
+            "with its People's names option." : "No faces found yet.";
         var text = !people.enabled ? "People is off; face data from before is kept: " + kept
             : people.ready ? "People: " + kept : "People cannot find faces: " + people.problem;
         var actions = [];
@@ -703,19 +704,14 @@
         var facesInfo = lib.faces;
         var peopleSetup = (state && state.people) || {};
         if (facesInfo && facesInfo.pictures && (peopleSetup.enabled || facesInfo.done)) {
-            // "Faces: 7 in 4 pictures (4 of 7 pictures looked at; 3 to look at: ...)."
+            // "Faces: 7 in 4 pictures (4 of 7 pictures looked at). 3 to look at, ..."
+            // (Wide panoramas and very large pictures are looked at in full size,
+            // videos in several frames; the clips of dashcams' drives are skipped:
+            // SHELL.facesNote.)
             card.appendChild(el("p", {className: "card-note faces-line"}, [
                 "Faces: ",
                 el("strong", {text: fmt.number(facesInfo.faces)}),
-                " in " + fmt.plural(facesInfo.with_faces, "picture") + " (" +
-                    fmt.number(facesInfo.done) + " of " + fmt.plural(facesInfo.pictures,
-                                                                    "picture") +
-                    " looked at" + (peopleSetup.enabled && facesInfo.pending ? "; " +
-                     fmt.number(facesInfo.pending) + " to look at, a job for the processor" +
-                     (facesInfo.changed ? " (" + fmt.number(facesInfo.changed) +
-                      " of them again, for the current settings)" : "") : "") +
-                    (facesInfo.failed ? "; " + fmt.number(facesInfo.failed) +
-                     " could not be looked at" : "") + ")."
+                SHELL.facesNote(facesInfo, Boolean(peopleSetup.enabled))
             ]));
         }
         var refining = lib.refine_info || {};
@@ -1510,12 +1506,17 @@
                     }, {key: "recent-dismiss-" + job.id})
                 ]);
             }
+            // (The command line that does the same: jobs.py log_command.)
+            var command = job.command ? copyCommandButton(job.command, "recent-command-" +
+                                                          job.id, "Copy command line") : null;
             list.appendChild(el("li", null, [
                 el("span", {className: "pill " + stateClass(job.state), text: J.state(job.state)}),
                 el("div", {className: "job-body"}, [
                     el("div", {className: "job-title", text: J.title(job)}),
-                    meta.length ? el("div", {className: "job-meta", text: meta.join(" \u00b7 ")})
-                        : null,
+                    meta.length || command ? el("div", {className: "job-meta"}, [
+                        meta.join(" \u00b7 "), meta.length && command ? " \u00b7 " : "",
+                        command
+                    ]) : null,
                     job.error ? el("div", {className: job.state === "interrupted" ? "job-meta"
                         : "job-error", text: job.error}) : null,
                     actions
@@ -1537,10 +1538,29 @@
         return true;
     }
 
+    // A job's first log line names the command that does the same (jobs.py
+    // log_command): shown as code, with a button that copies it.
+    var COMMAND_PREFIX = "Command line: ";
+
+    function copyCommandButton(command, key, text, className) {
+        return button(text || "Copy", className || "subtle small command-copy", function () {
+            SHELL.copyText(command).then(function (ok) {
+                SHELL.toast(ok ? "Command line copied." : "The command line could not be " +
+                            "copied.", ok ? "ok" : "error", 3);
+            });
+        }, {key: key, title: "Copy the command line, to run this job again from a " +
+            "terminal or a scheduled task (see Automating in the README)"});
+    }
+
     function logNode(line) {
-        return el("div", {className: "log-line " + (line.level || "info")}, [
+        var message = String(line.message || "");
+        var command = message.indexOf(COMMAND_PREFIX) === 0 ?
+            message.slice(COMMAND_PREFIX.length) : "";
+        return el("div", {className: "log-line " + (line.level || "info") +
+                          (command ? " log-command" : "")}, [
             el("span", {className: "log-time", text: fmt.clock(line.time)}),
-            line.message
+            command ? [COMMAND_PREFIX, el("code", {text: command}), " ",
+                       copyCommandButton(command, "log-copy-" + line.seq)] : message
         ]);
     }
 
@@ -2741,26 +2761,88 @@
             // What each picture carries
             var details = {};
             var detailList = el("div", {className: "export-choices two"});
-            // (Estimated places and drive routes go only with the location.)
+            // (Estimated places, drive routes and street maps go only with the location.)
             function estimatedAvailability() {
                 details.estimated_places.input.disabled = !details.location.input.checked;
                 details.routes.input.disabled = !details.location.input.checked;
+                streetsAvailability(null);
+                // (So does a trip's story, which names its places.)
+                if (details.story && ((lib.export_info || {}).story || {}).available) {
+                    details.story.input.disabled = !details.location.input.checked;
+                }
             }
             // (People's names only where there are people, or the option is on.)
             var people = (state && state.people) || {};
-            ["file_names", "folders", "location", "estimated_places", "routes", "similar",
-             "meaning", "looks", "marks", "people_names"].filter(function (key) {
+            // (A trip's export: its story too, trip_stories.py.)
+            var detailKeys = ["file_names", "folders", "location", "estimated_places", "routes",
+                              "street_maps", "similar", "meaning", "looks", "marks",
+                              "people_names"]
+                .concat(lib.trip ? ["story"] : []);
+            detailKeys.filter(function (key) {
                 return key !== "people_names" || people.stored || people.enabled ||
                     opts.people_names;
             }).forEach(function (key) {
                 details[key] = check(R.OPTIONS[key].label, opts[key], R.OPTIONS[key].hint);
-                if (key === "location") {
+                if (key === "location" || key === "street_maps") {
                     details[key].input.addEventListener("change", estimatedAvailability);
                 }
                 details[key].input.addEventListener("change", changed);
                 detailList.appendChild(details[key].node);
             });
+            // Street maps: how far around each place, and how detailed (when on).
+            var streetKm = el("select", {className: "input export-street-km"});
+            [2, 5, 10, 20].forEach(function (km) {
+                streetKm.appendChild(el("option", {value: String(km), text: km + " km"}));
+            });
+            var streetZoom = el("select", {className: "input export-street-zoom"});
+            [[15, "Buildings (zoom 15)"], [14, "Streets (zoom 14)"],
+             [12, "Main roads (zoom 12)"]].forEach(function (pair) {
+                streetZoom.appendChild(el("option", {value: String(pair[0]), text: pair[1]}));
+            });
+            [[streetKm, opts.street_km], [streetZoom, opts.street_zoom]].forEach(function (pair) {
+                if (!pair[0].querySelector('option[value="' + Number(pair[1]) + '"]')) {
+                    pair[0].appendChild(el("option", {value: String(pair[1]),
+                                                      text: String(pair[1])}));
+                }
+                pair[0].value = String(pair[1]);
+                pair[0].addEventListener("change", changed);
+            });
+            var streetsRow = el("div", {className: "field-grid export-streets"}, [
+                field(R.OPTIONS.street_km.label, streetKm, {hint: R.OPTIONS.street_km.hint})
+                    .node,
+                field(R.OPTIONS.street_zoom.label, streetZoom,
+                      {hint: R.OPTIONS.street_zoom.hint}).node
+            ]);
+            var streetsReason = el("span", {className: "field-hint field-reason", hidden: true});
+            details.street_maps.node.lastChild.appendChild(streetsReason);
+            var streetsKnown = null;
+            function streetsAvailability(found) {
+                if (found) {
+                    streetsKnown = found;
+                }
+                var input = details.street_maps.input;
+                var downloaded = !streetsKnown || streetsKnown.available !== false;
+                input.disabled = !details.location.input.checked || !downloaded;
+                streetsReason.textContent = downloaded ? "" : "Not available: no street maps " +
+                    "were downloaded (Manage page, Street maps).";
+                streetsReason.hidden = downloaded;
+                streetsRow.hidden = input.disabled || !input.checked;
+            }
             estimatedAvailability();
+            // The trip's story: only when it has one that is not hidden (else off, with
+            // the reason; the saved choice is kept).
+            if (details.story) {
+                var story = (lib.export_info || {}).story || {};
+                if (!story.available) {
+                    details.story.input.disabled = true;
+                    details.story.input.checked = false;
+                    details.story.node.lastChild.appendChild(el("span", {
+                        className: "field-hint field-reason",
+                        text: story.hidden ? "Not available: the story is hidden (show it on " +
+                            "the trip's page)." : "Not available: the trip has no story yet " +
+                            "(write it on the trip's page)."}));
+                }
+            }
             // Home (a trip's export): the squares around it that nothing shows. A
             // choice of the sizes the server takes (trip_export.HOME_KM_STEPS), so
             // that "off" is only ever chosen, never what an empty field means.
@@ -2807,6 +2889,7 @@
             body.appendChild(el("fieldset", {className: "group"}, [
                 el("legend", {text: "Also publish"}),
                 detailList,
+                streetsRow,
                 fields.home_km ? fields.home_km.node : null,
                 detailsLine,
                 el("p", {className: "field-hint", text: "Never published: where the pictures " +
@@ -2895,6 +2978,8 @@
                         : HOME_KM_DEFAULT;
                 }
                 result.raw_files = withRaws.input.checked;
+                result.street_km = Number(streetKm.value) || opts.street_km;
+                result.street_zoom = Number(streetZoom.value) || opts.street_zoom;
                 return result;
             }
 
@@ -2908,6 +2993,7 @@
                 scheduleCount(function (reply) {
                     meaningAvailability((reply.counts || {}).meaning);
                     rawAvailability((reply.counts || {}).raws);
+                    streetsAvailability((reply.counts || {}).street_maps);
                     countLine(reply);
                 });
             };
@@ -3051,6 +3137,10 @@
             var routesNote = R.routesText(counts);
             if (routesNote) {
                 holder.appendChild(el("p", {className: "muted", text: routesNote}));
+            }
+            var streetsNote = R.streetsText(counts, opts);
+            if (streetsNote) {
+                holder.appendChild(el("p", {className: "muted", text: streetsNote}));
             }
             var overlayNote = R.overlayText(counts);
             if (overlayNote) {
@@ -3307,6 +3397,20 @@
                 el("li", {text: "After describing more pictures, export again: only what " +
                     "changed is written, and pictures left out since are removed."})
             ]));
+            if (job.command) {
+                // (The same export as a command, for a scheduled task: jobs.py.)
+                box.body.appendChild(el("div", {className: "field"}, [
+                    el("span", {className: "field-label", text: "Command line"}),
+                    el("div", {className: "export-copy"}, [
+                        el("code", {className: "export-path", text: job.command}),
+                        copyCommandButton(job.command, "export-command", "Copy", "subtle small")
+                    ]),
+                    el("span", {className: "field-hint", text: "Run in the program folder, " +
+                        "it exports again with these options (it names the folder of the " +
+                        "settings with --settings-base when they are not in the program " +
+                        "folder): a scheduled task can do that. See Automating in the README."})
+                ]));
+            }
             if (!summary.count || summary.failed) {
                 box.button("Back to the options", "", optionsView);
             }

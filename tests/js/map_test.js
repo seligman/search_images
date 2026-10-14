@@ -1,7 +1,10 @@
 /* Tests for the parts of static/map.js that need no page: the projection
    and the repeating world, grouping pictures into pins (also across the
    date line, and the same wherever the map is panned to), the pin under
-   the pointer, the wheel, and fitting the view to the pictures.
+   the pointer, the wheel, and fitting the view to the pictures; and of the
+   map page (the real scripts on the made-up DOM of app_meaning_test.js,
+   with a fake fetch() for the server's answers): a search that names a
+   person fits their pictures once the people are in.
 
    Run by tests/test_ui_scripts.py, or directly: node tests/js/map_test.js
    Prints one line per test and exits with status 1 when any test fails.
@@ -35,13 +38,24 @@ function screenXs(lon, view, screenW) {
 
 /* ---------- Projection and the repeating world ---------------------------- */
 
-test("the world is twice as wide as tall and grows twice per zoom", function () {
+test("the world is square (Web Mercator) and grows twice per zoom", function () {
     assert.strictEqual(MAP.worldWidth(TILE, 0), 512);
     assert.strictEqual(MAP.worldWidth(TILE, 3), 4096);
     var width = MAP.worldWidth(TILE, 2);
-    assert.deepStrictEqual(MAP.project(90, -180, width), {x: 0, y: 0});
-    assert.deepStrictEqual(MAP.project(0, 0, width), {x: 1024, y: 512});
-    assert.deepStrictEqual(MAP.project(-90, 90, width), {x: 1536, y: 1024});
+    near(MAP.project(MAP.MAX_LAT, -180, width).x, 0);
+    near(MAP.project(MAP.MAX_LAT, -180, width).y, 0, 1e-6);
+    assert.deepStrictEqual(MAP.project(0, 0, width), {x: 1024, y: 1024});
+    near(MAP.project(-MAP.MAX_LAT, 90, width).x, 1536);
+    near(MAP.project(-MAP.MAX_LAT, 90, width).y, 2048, 1e-6);
+    // The poles are left out: further north (or south) is on the edge.
+    assert.strictEqual(MAP.project(89.9, 10, width).y, MAP.project(MAP.MAX_LAT, 10, width).y);
+    assert.strictEqual(MAP.project(-90, 10, width).y, MAP.project(-MAP.MAX_LAT, 10, width).y);
+    // A degree of latitude is as tall as a degree of longitude is wide at
+    // the equator, and twice as tall at 60 degrees.
+    var equator = MAP.project(-0.5, 0, width).y - MAP.project(0.5, 0, width).y;
+    near(equator, width / 360, 1e-3);
+    var sixty = MAP.project(59.5, 0, width).y - MAP.project(60.5, 0, width).y;
+    near(sixty / equator, 2, 2e-3);
     // lon 180 is the date line again: x 0, not x = width.
     assert.strictEqual(MAP.project(10, 180, width).x, 0);
     [[51.5, -0.12], [-33.86, 151.2], [64.1, -21.9], [-17.7, 179.99], [0, -180]].forEach(function (p) {
@@ -391,16 +405,22 @@ test("a sideways swipe pans and never zooms", function () {
 
 test("the view fits the pictures, the short way round the world", function () {
     var view = MAP.fitView(points([[-17, 179.9], [-18, -179.9]]), 1400, 800, TILE, 0, 6, 40);
-    near(view.lat, -17.5);
+    // (The middle in Web Mercator: a little nearer the pole than the
+    // middle latitude.)
+    near(view.lat, -17.5, 2e-3);
+    assert.ok(view.lat < -17.5, String(view.lat));
     assert.ok(Math.abs(Math.abs(view.lon) - 180) < 1e-9, String(view.lon));
     assert.strictEqual(view.zoom, 6);
     // Europe: the view is around it, not around the whole world.
     var europe = MAP.fitView(points([[48.85, 2.35], [52.52, 13.4], [41.9, 12.5], [38.7, -9.1]]),
                              1400, 800, TILE, 0, 6, 40);
     assert.ok(europe.lon > 0 && europe.lon < 5, String(europe.lon));
-    near(europe.lat, (38.7 + 52.52) / 2, 1e-9);
-    // 22.5 degrees across fit 1,320 px at zoom 5 (1,024 px), not at 6.
-    assert.strictEqual(europe.zoom, 5);
+    var width5 = MAP.worldWidth(TILE, 5);
+    near(MAP.project(europe.lat, 0, width5).y,
+         (MAP.project(38.7, 0, width5).y + MAP.project(52.52, 0, width5).y) / 2, 1e-6);
+    // 22.5 degrees across would fit 1,320 px at zoom 5 (1,024 px), but its
+    // 14 degrees of latitude take 906 px there, more than 720: zoom 4.
+    assert.strictEqual(europe.zoom, 4);
     assert.strictEqual(MAP.fitView(points([[48.85, 2.35], [38.7, -9.1], [52.52, 13.4]]),
                                    1400, 800, TILE, 0, 3, 40).zoom, 3);
     // All over the world: zoomed out.
@@ -466,7 +486,7 @@ test("a chip of the viewer opens a new search, without the timeline's dates", fu
     assert.strictEqual(state.from, "2019");
 });
 
-/* ---------- Tiles and pins on a canvas (shared with the trip pages) ----------------- */
+/* ---------- Pins on a canvas (shared with the trip pages; the tiles: streets_test.js) - */
 
 // A canvas context that writes down what is drawn.
 function recorder() {
@@ -487,56 +507,15 @@ function named(ctx, name) {
     });
 }
 
-test("the tile layer draws the tiles of a view, stand-ins and the sea", function () {
-    var made = [];
-    global.Image = function () {
-        made.push(this);
-    };
-    try {
-        var asked = [];
-        var loads = 0;
-        var layer = new MAP.TileLayer({tileUrl: function (z, x, y) {
-            asked.push(z + "/" + x + "/" + y);
-            return "tile/" + z + "/" + x + "/" + y + ".jpg";
-        }, tileSize: TILE, tileZoom: 1, ocean: "#123456", onLoad: function () {
-            loads += 1;
-        }});
-        // Zoom 0: the world is 512 px wide; a view of 600 px from x -50 sees four
-        // columns, each tile asked for once.
-        var ctx = recorder();
-        assert.strictEqual(layer.draw(ctx, 0, -50, 0, 600, 256), 0);
-        assert.deepStrictEqual(asked, ["0/1/0", "0/0/0"]);
-        assert.strictEqual(named(ctx, "fillRect").length, 4);
-        assert.strictEqual(ctx.fillStyle, "#123456");
-        // A tile that arrives is drawn (and asks for a new drawing).
-        made[1].onload();
-        assert.strictEqual(loads, 1);
-        ctx = recorder();
-        layer.draw(ctx, 0, 0, 0, 512, 256);
-        // (Column 0 twice: the world repeats; column 1 is still the sea.)
-        assert.strictEqual(named(ctx, "drawImage").length, 2);
-        assert.strictEqual(named(ctx, "drawImage")[0][1], made[1]);
-        assert.strictEqual(named(ctx, "fillRect").length, 1);
-        // Past the tiles' detail: stretched, fainter, and a loaded coarser tile
-        // stands in for one still loading (a part of it, nine arguments).
-        ctx = recorder();
-        assert.strictEqual(layer.draw(ctx, 3, 0, 0, 256, 256), 2);
-        var stand = named(ctx, "drawImage");
-        assert.ok(stand.length >= 1 && stand[0].length === 10, JSON.stringify(stand[0]));
-        assert.strictEqual(ctx.globalAlpha, 1);
-    } finally {
-        delete global.Image;
-    }
-});
-
 test("pins: red for one, blue with a count for more, hollow for estimated places", function () {
     var ctx = recorder();
     MAP.drawPins(ctx, [{sx: 10, sy: 10, r: 7, group: {count: 1, estimated: 0}},
                        {sx: 50, sy: 50, r: 12, group: {count: 1234, estimated: 0}},
                        {sx: 90, sy: 90, r: 9, group: {count: 3, estimated: 3, picked: true}}]);
     assert.strictEqual(named(ctx, "fill").length, 3);
-    // The picked pin's ring, the white edges, and the hollow pin's two rings.
-    assert.strictEqual(named(ctx, "stroke").length, 5);
+    // The picked pin's ring (on a dark edge: seen on light street maps too), the
+    // white edges, and the hollow pin's two rings.
+    assert.strictEqual(named(ctx, "stroke").length, 6);
     assert.deepStrictEqual(named(ctx, "fillText").map(function (call) {
         return call[1];
     }), ["1,234", "3"]);
@@ -544,20 +523,235 @@ test("pins: red for one, blue with a count for more, hollow for estimated places
     assert.strictEqual(named(ctx, "restore").length, 1);
 });
 
+/* ---------- The map page ---------------------------------------------------------- */
+
+var fs = require("fs");
+var vm = require("vm");
+var FAKE = require(path.join(__dirname, "app_meaning_test.js"));
+var ROOT = path.join(__dirname, "..", "..");
+var MAP_PAGE = fs.readFileSync(path.join(ROOT, "templates", "map.html"), "utf8");
+var MAP_SCRIPTS = ["site.js", "shell.js", "search-core.js", "streets.js", "routes.js",
+                   "viewer.js", "map.js"].map(function (name) {
+    return {name: name, code: fs.readFileSync(path.join(ROOT, "static", name), "utf8")};
+});
+
+// Made-up pictures: Cleo's two (around 45 N 10 E), and others far away.
+var MAP_RECORDS = [
+    {i: 1, l: "lib", t: "Harbour", g: ["harbour"], dk: "2024-05-01", ds: 1},
+    {i: 2, l: "lib", t: "Canal", g: ["canal"], dk: "2024-05-02", ds: 1},
+    {i: 3, l: "lib", t: "Desert", g: ["desert"], dk: "2024-05-03", ds: 1},
+    {i: 4, l: "lib", t: "Forest", g: ["forest"], dk: "2024-05-04", ds: 1}
+];
+var MAP_POINTS = [{id: 1, lat: 45.0, lon: 10.0}, {id: 2, lat: 45.02, lon: 10.03},
+                  {id: 3, lat: -30.0, lon: 140.0}, {id: 4, lat: 10.0, lon: -60.0}];
+var MAP_PEOPLE = [{id: 1, name: "Cleo", label: "Cleo", cover: null, faces: 2, ids: [1, 2]}];
+
+function mapResponse(body) {
+    var text = JSON.stringify(body);
+    return Promise.resolve({
+        ok: body !== null,
+        status: body !== null ? 200 : 404,
+        headers: {get: function () {
+            return null;
+        }},
+        json: function () {
+            return Promise.resolve(JSON.parse(text));
+        }
+    });
+}
+
+/* The admin's map page at an address (searchText: its ?... part). page.urls:
+   the addresses it wrote; page.views() their views ([lat, lon, zoom]). */
+function mapPage(searchText) {
+    var urls = [];
+    var document = FAKE.makeDocument();
+    var config = {mode: "server", page: "map", api: "/api", tiles: "/tile", tilesMax: 8,
+                  adminApi: "/api/admin", libraries: ["Example"],
+                  libraryList: [{id: "lib", name: "Example"}],
+                  capabilities: {admin: true, static: false, people: true}};
+    FAKE.parseBody(document, MAP_PAGE, config);
+    var canvas = document.getElementById("map-canvas");
+    canvas.getContext = function () {
+        // (A context that draws nothing.)
+        return new Proxy({}, {get: function (target, name) {
+            if (name === "measureText") {
+                return function (text) {
+                    return {width: String(text).length * 6};
+                };
+            }
+            if (!(name in target)) {
+                target[name] = function () {};
+            }
+            return target[name];
+        }, set: function () {
+            return true;
+        }});
+    };
+    canvas.getBoundingClientRect = function () {
+        return {top: 0, left: 0, right: 1000, bottom: 700, width: 1000, height: 700};
+    };
+    function storage() {
+        var items = {};
+        return {
+            getItem: function (key) {
+                return Object.prototype.hasOwnProperty.call(items, key) ? items[key] : null;
+            },
+            setItem: function (key, value) {
+                items[key] = String(value);
+            },
+            removeItem: function (key) {
+                delete items[key];
+            }
+        };
+    }
+    function fetch(url) {
+        var plain = String(url).split("?")[0];
+        if (plain === "/api/index") {
+            return mapResponse({version: 1, libraries: [{id: "lib", name: "Example"}],
+                                albums: [], records: MAP_RECORDS});
+        }
+        if (plain === "/api/locations") {
+            return mapResponse(MAP_POINTS);
+        }
+        if (plain === "/api/people") {
+            // (The people come a moment after the pictures' first search.)
+            return new Promise(function (resolve) {
+                setTimeout(resolve, 40);
+            }).then(function () {
+                return mapResponse({version: 1, people: MAP_PEOPLE});
+            });
+        }
+        if (plain === "/api/routes") {
+            return mapResponse({routes: []});
+        }
+        return mapResponse(null);
+    }
+    function Image() {
+        this.complete = false;
+    }
+    var context = {
+        document: document,
+        navigator: {userAgent: "test", connection: {saveData: false}, clipboard: null,
+                    maxTouchPoints: 0},
+        location: {search: searchText || "", hash: "", pathname: "/map", protocol: "http:",
+                   href: "http://127.0.0.1:5000/map" + (searchText || ""),
+                   origin: "http://127.0.0.1:5000"},
+        history: {state: null, scrollRestoration: "auto", pushState: function (state, title,
+                                                                             url) {
+            this.state = state;
+            urls.push(String(url));
+        }, replaceState: function (state, title, url) {
+            this.state = state;
+            urls.push(String(url));
+        }, back: function () {}},
+        localStorage: storage(),
+        sessionStorage: storage(),
+        innerWidth: 1000,
+        innerHeight: 760,
+        scrollY: 0,
+        devicePixelRatio: 1,
+        scrollTo: function () {},
+        matchMedia: function () {
+            return {matches: false, addEventListener: function () {}, addListener: function () {},
+                    removeEventListener: function () {}, removeListener: function () {}};
+        },
+        requestAnimationFrame: function (callback) {
+            return setTimeout(callback, 0);
+        },
+        cancelAnimationFrame: clearTimeout,
+        getComputedStyle: function () {
+            return {getPropertyValue: function () {
+                return "";
+            }};
+        },
+        setTimeout: setTimeout,
+        clearTimeout: clearTimeout,
+        setInterval: setInterval,
+        clearInterval: clearInterval,
+        console: {log: function () {}, warn: function () {}, error: function () {}},
+        URLSearchParams: URLSearchParams,
+        URL: URL,
+        Image: Image,
+        fetch: fetch
+    };
+    context.window = context;
+    context.addEventListener = function () {};
+    context.removeEventListener = function () {};
+    vm.createContext(context);
+    MAP_SCRIPTS.forEach(function (script) {
+        vm.runInContext(script.code, context, {filename: script.name});
+    });
+    return {
+        document: document,
+        urls: urls,
+        views: function () {
+            return urls.map(function (url) {
+                var view = new URLSearchParams(url.split("?")[1] || "").get("view");
+                return view ? view.split(",").map(Number) : null;
+            }).filter(Boolean);
+        }
+    };
+}
+
+// The page's view once the people are in and the address has been written
+// after them (a view is written 250 ms after it changes).
+function settledView(page) {
+    return FAKE.waitFor(function () {
+        return /Cleo/.test(page.document.getElementById("map-search").textContent);
+    }).then(function () {
+        return new Promise(function (resolve) {
+            setTimeout(resolve, 400);
+        });
+    }).then(function () {
+        var views = page.views();
+        return views[views.length - 1];
+    });
+}
+
+function nearCleo(view) {
+    return Math.abs(view[0] - 45.01) < 0.5 && Math.abs(view[1] - 10.015) < 0.5 && view[2] >= 6;
+}
+
+test("a search naming a person fits her pictures once the people are in", function () {
+    return Promise.all(["?q=cleo", "?q=person:%22Cleo%22", "?q=cleo+harbour"].map(
+        function (address) {
+            var page = mapPage(address);
+            return settledView(page).then(function (view) {
+                assert.ok(view && nearCleo(view), address + " -> " + JSON.stringify(view));
+            });
+        }));
+});
+
+test("a view from the address that shows none of her pictures is fitted to them", function () {
+    var away = mapPage("?q=cleo&view=-40,-60,6");
+    var shown = mapPage("?q=cleo&view=45,10,4");
+    return settledView(away).then(function (view) {
+        assert.ok(view && nearCleo(view), JSON.stringify(view));
+        return settledView(shown);
+    }).then(function (view) {
+        // (Her pictures are in sight: the view stays as the address had it.)
+        assert.deepStrictEqual(view, [45, 10, 4]);
+    });
+});
+
 /* ---------- Running -------------------------------------------------------------------- */
 
+// (A test may return a promise: the map page's tests wait for the page.)
 var failures = 0;
-tests.forEach(function (entry) {
-    try {
-        entry.body();
-        console.log("ok - " + entry.name);
-    } catch (error) {
-        failures += 1;
-        console.log("FAIL - " + entry.name);
-        console.log(String(error && error.stack || error).split("\n").map(function (line) {
-            return "    " + line;
-        }).join("\n"));
-    }
+tests.reduce(function (chain, entry) {
+    return chain.then(function () {
+        return Promise.resolve().then(entry.body).then(function () {
+            console.log("ok - " + entry.name);
+        }, function (error) {
+            failures += 1;
+            console.log("FAIL - " + entry.name);
+            console.log(String(error && error.stack || error).split("\n").map(function (line) {
+                return "    " + line;
+            }).join("\n"));
+        });
+    });
+}, Promise.resolve()).then(function () {
+    console.log((tests.length - failures) + " of " + tests.length + " passed");
+    // (The pages' timers would keep Node waiting.)
+    process.exit(failures ? 1 : 0);
 });
-console.log((tests.length - failures) + " of " + tests.length + " passed");
-process.exitCode = failures ? 1 : 0;

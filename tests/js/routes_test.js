@@ -197,11 +197,19 @@ test("the place on a line nearest the pointer says the clip and the moment", fun
 test("a small map fits the route", function () {
     var box = {south: -41.3, north: -41.2, west: -150.4, east: -150.2};
     var zoom = ROUTES.fitZoom(box, 300, 170, 256, 14, 16);
-    // The box's 0.2 degrees of longitude take at most 272 of the 300 pixels.
+    // The box's 0.2 degrees of longitude take at most 272 of the 300 pixels,
+    // its 0.1 degrees of latitude (Web Mercator, as the map page) at most 142
+    // of the 170, and one of them all of it.
     var world = 256 * Math.pow(2, zoom + 1);
-    assert.ok(0.2 / 360 * world <= 272 + 1e-6);
-    assert.ok(0.1 / 180 * world / 2 <= 142 + 1e-6);
-    near(Math.max(0.2 / 360 * world / 272, 0.1 / 180 * world / 2 / 142), 1, 1e-9);
+    function y(lat) {
+        var r = lat * Math.PI / 180;
+        return (1 - Math.log(Math.tan(Math.PI / 4 + r / 2)) / Math.PI) / 2 * world;
+    }
+    var across = 0.2 / 360 * world;
+    var tall = y(-41.3) - y(-41.2);
+    assert.ok(across <= 272 + 1e-6);
+    assert.ok(tall <= 142 + 1e-6);
+    near(Math.max(across / 272, tall / 142), 1, 1e-9);
     // A car that stood still: as far in as allowed.
     assert.strictEqual(ROUTES.fitZoom({south: 1, north: 1, west: 2, east: 2}, 300, 170, 256,
                                       14, 16), 16);

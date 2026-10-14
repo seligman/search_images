@@ -3,8 +3,13 @@
    picture stage (zoom, or the 360-degree view) and information pane
    (viewer.js). The search the picture was found with travels along in the
    address (q, filters, ...), so "Back to search" and the chips lead back
-   to it. The admin marks the picture here as in the viewer (F, 1-5, 0, A),
-   and chooses where a 360 picture opens ("Open here").
+   to it. A video starts at at=<seconds> when the address has it (the People
+   page's faces of videos), else where a person the search names is seen
+   (VIEWER.format.personMoment, the search as the search page understood
+   it: VIEWER.format.searchedQuery); the admin's face=<id> (the People page's
+   link to a face of a picture) marks that face on it (a wide picture's pan
+   view goes there). The admin marks the picture here as in the viewer (F,
+   1-5, 0, A), and chooses where a 360 picture opens ("Open here").
 */
 (function () {
     "use strict";
@@ -16,6 +21,11 @@
     var params = new URLSearchParams(window.location.search);
     var rawId = params.get("id") || "";
     var wantedId = /^\d+$/.test(rawId) ? Number(rawId) : rawId;
+    var rawAt = params.get("at");
+    var startAt = rawAt !== null && /^\d{1,7}(\.\d{1,3})?$/.test(rawAt) ? Number(rawAt) : null;
+    // (face=<id>: the People page's link to a face of a picture, marked on it.)
+    var rawFace = params.get("face");
+    var faceId = rawFace !== null && /^[0-9]{1,15}$/.test(rawFace) ? Number(rawFace) : null;
     var search = SITE.searchState.read();
     var adminOn = Boolean(SITE.capabilities.admin) && !SITE.capabilities.static;
 
@@ -106,6 +116,14 @@
             // (A 360 video's level track.)
             stage.videoDetail(detail);
         }
+        if (rec.mv) {
+            // (A moment of the video: the address's, else a person the search names.)
+            var seenNames = detail && detail.people ? detail.people.names : null;
+            stage.seekTo(startAt !== null ? startAt : VIEWER.format.personMoment(
+                seenNames, VIEWER.format.searchedQuery(search.q, rec, seenNames, {
+                    typed: search.typed, plain: (SITE.capabilities || {}).plain !== false})),
+                         startAt === null);
+        }
 
         var visibility = {library: search.lib || "", hidden: adminOn && search.hidden,
                           sensitive: search.sensitive || undefined, junk: search.junk};
@@ -167,6 +185,7 @@
                 render();
             },
             stage: stage,
+            face: faceId,
             onOpening: function () {
                 stage.reset();
                 render();

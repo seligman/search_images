@@ -508,6 +508,38 @@ def searches_person(query):
     return any(term["field"] == "person" for term in query_terms(query))
 
 
+# An OR between two terms, as search-core reads it (OR, |, || or a lower-case or).
+_OR_AFTER_RE = re.compile(r"\s+(?:OR|or|\|\||\|)\s+(?=\S)")
+
+
+def alternative_spans(query, fields):
+    """The spans (start, stop) of the field terms of fields (say "person", "place") that
+    are an alternative to the words after them: plain-language search writes a name it
+    understood as 'person:"Anna Lopez" OR anna' or "place:lisbon OR lisbon" (search-core.js
+    interpret), so a smart album saved then keeps them. A span runs from the term through
+    the OR, so that the words are what is left without it. A term not followed by OR
+    and a word, or negated, is none."""
+    text = query if isinstance(query, str) else ""
+    spans = []
+    for term in query_terms(text):
+        if term["field"] not in fields or term["neg"]:
+            continue
+        match = _OR_AFTER_RE.match(text, term["end"])
+        if match is None or _FIELD_TERM_RE.match(text, match.end()):
+            continue
+        spans.append((term["start"], match.end()))
+    return spans
+
+
+def without_alternatives(query, fields):
+    """A search without the person:/place: alternatives of fields (alternative_spans):
+    'person:"Anna Lopez" OR anna beach' is "anna beach" where People is not shown."""
+    text = query if isinstance(query, str) else ""
+    for start, stop in sorted(alternative_spans(text, fields), reverse=True):
+        text = text[:start] + text[stop:]
+    return text
+
+
 def index_albums(conn, library_ids, include_hidden=True, person_searches=True):
     """The albums as the /api/index answer lists them, by name.
 
@@ -519,7 +551,9 @@ def index_albums(conn, library_ids, include_hidden=True, person_searches=True):
     when it can show something there: a manual album with a picture in the
     answer, a smart album not limited to other (say disabled) libraries.
     Without person_searches (see people_searches_shown) the smart albums
-    whose search names a person (person:) are left out.
+    whose search names a person (person:) are left out -- unless the person is
+    only an alternative to the words typed (plain-language search's 'person:"Anna
+    Lopez" OR anna', alternative_spans): then they are listed searching the words.
     """
     library_ids = list(library_ids)
     rows = conn.execute("SELECT %s FROM albums" % _ALBUM_COLUMNS).fetchall()
@@ -558,7 +592,10 @@ def index_albums(conn, library_ids, include_hidden=True, person_searches=True):
             if not include_hidden and not smart_in_libraries(album["options"], library_ids):
                 continue
             if not person_searches and searches_person(row["query"]):
-                continue        # (a person's name: People is not shown here)
+                # (A person's name: People is not shown here. Its words still are.)
+                album["query"] = without_alternatives(row["query"], ("person",))
+                if searches_person(album["query"]):
+                    continue
         result.append(album)
     return result
 
@@ -823,7 +860,7 @@ FIELD_NAMES = {
     "is": "is", "place": "place", "places": "place", "on": "on", "similar": "similar",
     "like": "similar", "look": "look", "looks": "look", "rating": "rating",
     "rated": "rating", "stars": "rating", "album": "album", "albums": "album",
-    "person": "person",
+    "person": "person", "date": "date", "taken": "date",
 }
 QUOTE_CHARS = "\"\u201c\u201d\u201e"
 _FIELD_TERM_RE = re.compile(r"([A-Za-z]{1,12}):")

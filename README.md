@@ -75,6 +75,11 @@ or, on Windows (in PowerShell, `$env:SETTINGS_BASE = "c:\path\to\data"`):
     set SETTINGS_BASE=c:\path\to\data
     python serve.py
 
+`scan.py`, `export.py`, `people.py`, `make_places.py`, `trips.py` and
+`serve.py` also take the folder as `--settings-base FOLDER` (`python
+scan.py --settings-base "c:\path\to\data"`), as the command lines of jobs do
+(see [Automating](#automating)).
+
 ## Quick start
 
 1. Start the server and open the address it prints
@@ -343,13 +348,32 @@ Options:
   20 of each kind per library, then a count).
 - `--allow-mass-removal` marks files missing even when most of a library
   seems to have vanished.
+- `--previews`, `--proxies` and `--drive-previews` only build the missing
+  previews, make the playable copies of videos, or make the sped-up
+  previews of drives, as **Build previews**, **Make playable copies** and
+  **Make sped-up drives** on the Manage page do (`--library` works with
+  them).
+- `--no-scan --ids "12,34"` describes only those pictures (their ids), as
+  the viewer's **Describe now** does; with `--force` it describes them
+  again even when they have a description (**Describe again**).
+- `--delete-library-data ID --confirm-name NAME` deletes the indexed data
+  of a library that is no longer in the settings, as **Delete...** on the
+  Manage page does (and **Remove** with its data): `ID` is its id, `NAME`
+  the name stored with it, to confirm.
+
+- `--settings-base FOLDER` uses the settings and data in that folder, as
+  the `SETTINGS_BASE` environment variable does (see [Where your settings
+  and data are kept](#where-your-settings-and-data-are-kept)).
+
+Each run starts by printing the command line it was given, as the jobs of
+the Manage page start their logs (see [Automating](#automating)).
 
 `scan.py` exits with 0 when it finished or was stopped as asked (see
 below; 130 after a second Ctrl+C), 1 when it could not start (another job
 is running, or an `abort` file is already there) or the describe step
 stopped early (a rejected key, or no usable endpoint left), and 2 for a
-settings problem (an unknown `--endpoint`, say), so scheduled runs can
-tell them apart.
+settings problem (an unknown `--endpoint`, no settings or no library in
+the settings folder, say), so scheduled runs can tell them apart.
 
 To stop a long scan early, press Ctrl+C, or create a file named `abort` in
 the data folder (`data/abort`), or one named `abort` or `abort.txt` in the
@@ -603,7 +627,8 @@ or a position far from the fixes around it) and repeats are left out.
   dot where the clip that plays is, and the speed there on the strip
   ("Clip 12 of 65 · 11:04 / 1:04:30 · 52 km/h"); neither while the clip
   had no fix (before the first, after the last). Both need nothing but the
-  map's tiles, so they work offline and in an export.
+  map's tiles (and the [street maps](#street-maps), when you downloaded
+  them), so they work offline and in an export.
 - Routes and the clips' positions are location data. Other computers see
   them as they see positions (never those of hidden clips); an export
   publishes them only with **Location** and **Drive routes**, and leaves
@@ -890,7 +915,8 @@ the page header or the filters.
   click it to play the drive from there (see [Routes](#routes-a-dashcams-gps)).
   The map uses
   a small bundled world image; run `python make_tiles.py` once for a
-  detailed one (see [Other tools](#other-tools)).
+  detailed one (see [Other tools](#other-tools)), and download the [street
+  maps](#street-maps) around your pictures to zoom in to street level.
 - While some pictures are not described yet, a note above the results says
   how many: they can only be found by file name, date and camera until then.
 - When nothing matches, the page says what left the pictures out (a filter,
@@ -944,6 +970,11 @@ about it.
 - `year:2019`, `year:2015-2019` - taken in those years
 - `before:2019-06`, `after:2019` - taken before June 2019, or from 2020 on
   (`YYYY`, `YYYY-MM` or `YYYY-MM-DD`)
+- `date:2019-06..2019-08` (or `taken:`) - taken from June to August 2019,
+  both included (`date:2019`, `date:2019-05`, `date:2019-05-14`;
+  `date:2019..` from 2019 on, `date:..2018` until the end of 2018); dates
+  from the camera or the file name only, as the timeline (what plain
+  language writes for a date)
 - `has:text`, `has:gps` - with text in the picture, with a GPS position
   (also a video's from its GPS track)
   (also `has:people`, `has:animals`)
@@ -986,6 +1017,72 @@ about it.
   **More like this** searches; see below)
 - `look:1234` - the pictures that look most like picture 1234, closest
   first (what **Looks like this** searches; see below)
+
+### Plain language
+
+The search box also understands names and dates written as you would say
+them: `anna at the beach in lisbon last summer` searches for Anna's
+pictures, taken in Lisbon from June to August, that show a beach. Above
+the results, chips say how the search was understood -- `Searching for`
+**Person: Anna Lopez ×** **Place: Lisbon ×** **Taken: June – August 2026
+×** "at the beach" by words and meaning -- and the box keeps what you
+typed. What it understands, in the plain words of a search (not in quotes,
+fields, `-words` or next to `OR`):
+
+- **People**: the name of a person in [People](#people) (named, not
+  hidden), or a whole word of it (`anna`, `lopez`, `anna's`; the first or
+  last word, or another one longer than three letters, never `de`, `la`
+  or `van` alone), where the page shows People (always to you on this
+  computer; to others only with `"visitors": true`). It finds the pictures
+  People found that person in, and the pictures with the name in their
+  words (a folder named after her): `person:"Anna Lopez" OR anna`, her own
+  pictures first.
+- **Places**: the name of a town, region or country the pictures were
+  taken in (by their GPS position or an estimated place; also `usa`, `uk`
+  and the other names of countries -- `US` only in capitals: `us` is a
+  word), after `in`, `at`, `near`, ... or alone: the pictures taken there,
+  and those with the name in their words: `place:lisbon OR lisbon`.
+- **Dates**: a year pictures were taken in (`2019`; `1984` stays a word
+  when no picture is from then), `2015-2019` (or `2015 - 2019`), `between
+  2015 and 2019`, `from 2015 to 2019`, a month or season with its year
+  (`November 2024`, `the spring of 2016`), `last year`, `this month`,
+  `last week`, `yesterday`, `last November` (the latest November that is
+  over), `this summer`, `last winter`, and `since`, `after` or `before`
+  any of them (`since 2019`, `before March 2020`, `since last summer`,
+  `after last year`). Dates count from today: when no picture is from the
+  dates asked for, the page says so (and how new the newest is). Seasons
+  are those north of the equator (spring is March to May, summer June to
+  August, fall or autumn September to November); winter 2016 is December
+  2015 to February 2016. They become `date:` filters; a year typed alone
+  also finds the pictures with it in their words (`date:2005 OR 2005`: a
+  scan in the folder "2005 Taxes" has only the file's date).
+
+Everything else is searched as words (and by meaning, see below). Each
+chip's **×** searches that part as typed words instead, and **Search the
+words as typed** does it for all of them, for that search (the address
+remembers both, so a link or a reload shows the same search; **Words as
+typed ×** and **As typed: anna ×** undo them; a new search is understood
+again). When a part understood leaves no pictures, the page says which,
+with a button that searches it as typed or leaves it out. A name that
+could be a person or a place (someone called Siena, and a picture taken
+in Siena), several people's, a person named like a month (`june 2019`:
+someone called June, or June 2019?), or also a common word of your
+pictures' descriptions (someone called Rose, and pictures of roses; a town
+called Atlantic, and pictures of the Atlantic Ocean; Red Hill, whose words
+pictures show) is not taken but asked about, and so is a place after `the`
+or after `mount`, `lake`, `river`, ... (`mount fuji`): the buttons
+write the choice into the search box (`in siena` is always the place,
+`with siena` the person). **Save as album** saves the search as
+understood (`person:"Anna Lopez" OR anna beach date:2026-06..2026-08`), so
+the album keeps finding the same pictures; where People is not shown (to
+visitors without it) the album searches the words typed for the person
+instead, an export publishes it only with the names of people (as words),
+and an export without places searches the words typed for a place. The
+map follows the search as understood too. A published site understands
+the places and dates of its pictures, and the names of people only when
+it publishes them (its `people_names` option); the search tips say what
+the page understands. To turn plain language off, set `"plain_language":
+false` in `config.json` (see [SETTINGS.md](SETTINGS.md)).
 
 ### Search by meaning
 
@@ -1040,7 +1137,22 @@ A switch next to the sort order chooses how a search goes:
   (a typo, say) a line says so and offers a spelling that has matches.
   Names, places, years, file names and words read in a picture mean
   little to the model: when the pictures with such a word are not what
-  the model makes of it, the search goes by the words alone.
+  the model makes of it, the search goes by the words alone. With two or
+  more words, a picture found by meaning must cover each word: by having
+  it, or by meaning that word on its own (each word is embedded too, in
+  the same request; up to eight words); a word that is a name -- found
+  mostly in folder and file names, places, dates or the text in pictures,
+  not in what descriptions say, and not what the model makes of the word
+  -- only by having it. A word means more next to the others than alone
+  (a red coupe is a `red sports car`, waves on rocks are `waves
+  crashing on rocks`): so a picture that lacks only one word also stays when pictures
+  with all the words are found and it is about as close to the whole
+  search as they are. So `anna turtle` shows the turtles of Anna's folder
+  (or of her pictures, with People), not every turtle; `red car` a crimson
+  sedan but not a blue car; `dog playing in snow` no dog indoors; small
+  words of position (`over`, `near`, `behind`, ...) and a word no picture
+  has (a typo) need no covering. A chip over the results names the words
+  searched by their words only.
 - **Meaning**: by meaning alone, closest first, words or not; a line
   above the results says how many pictures have the words.
 
@@ -1264,19 +1376,25 @@ people or more, under the Creative Commons Attribution 4.0 licence); they
 are not part of this program. Download them once with **Download place
 names** at the foot of the Manage page, or with
 
-    python make_places.py
+    python make_places.py --download
 
 Either fetches three files (about 10 MB) from geonames.org into
 `data/places/`, builds the place index `data/places/places.db` from them,
 and then looks up the place of every picture with a GPS position. That is
 the only time anything goes over the network for place names: looking up a
 place happens on this computer, and nothing about your pictures is sent.
-`make_places.py --from DIR` builds the index from the files downloaded by
+Without `--download`, `make_places.py` downloads nothing (as **Add place
+names**): it looks up the pictures not looked up yet (the index is built
+again from the files in `data/places/` when it needs to be), and says so
+when there are no place names yet. `make_places.py --from DIR` builds the
+index from the files downloaded by
 hand (`cities1000.zip`, `admin1CodesASCII.txt` and `countryInfo.txt` from
 https://download.geonames.org/export/dump/), `--redo` looks up every
 picture again, and `--lookup LAT LON` prints the place of a position (and
-its time zone). The index keeps each town's time zone too, for [times in
-the local time of the place](#times-in-the-local-time-of-the-place).
+its time zone). After naming the places it runs the GPS check and works
+out the local times, as the Manage page's buttons do. The index keeps
+each town's time zone too, for [times in the local time of the
+place](#times-in-the-local-time-of-the-place).
 
 A picture's place is the town nearest to its position, by great-circle
 distance: "Albufeira, Algarve, Portugal (3 km)" in the viewer. When the
@@ -1296,6 +1414,86 @@ see them like the GPS positions (see [Searching from other
 computers](#searching-from-other-computers)), and an export publishes them
 only when it publishes locations, with the GeoNames credit at the foot of
 its pages.
+
+### Street maps
+
+The map, the trips' maps and the viewer's map of a drive show the world
+image (see `make_tiles.py` in [Other tools](#other-tools)) as far as it
+has detail. Past that -- from zoom 9, about 50 km across a map tile, on --
+they can show **street maps**, down to single
+buildings, where you downloaded them: OpenStreetMap data, in the vector
+tiles of the [Protomaps](https://protomaps.com) basemap, drawn in the
+browser in a light or a dark style as the page's theme is, with the names
+of towns, streets and waters. Only the area around your pictures is
+downloaded, once; after that nothing goes over the network for them: the
+server answers the pages' requests for map tiles from the data folder, and
+neither it nor an exported site ever asks another site for anything (the
+pages' Content-Security-Policy does not even allow it).
+
+**Street maps** at the foot of the Manage page downloads them, in two
+steps:
+
+1. **Check the size** reads the newest build's table of contents (some MB,
+   no map tiles) and works out what the download is: 20 km around every
+   place of a picture the map shows (GPS positions and estimated places;
+   not those of hidden pictures, as other computers see the area the
+   street maps cover) and 5 km either side of the drive routes, at every
+   zoom down to 15, street level. It shows the size to download and the
+   size kept. Many areas a few km wide come to some hundred MB; a library
+   of pictures from all over a country to a few GB (zoom 14 instead of 15
+   makes it two to three times smaller).
+2. **Download** (after a question that names the size) downloads them as
+   a job, which you can stop; started again, it goes on where it stopped
+   (as long as the build it started with is still there: builds are kept
+   for about a week; else it starts over, and says so first). The maps on
+   the pages show them as soon as it has finished.
+
+Street maps of 5 GB or more (to download or to keep) are not worth it as
+a rule: such a download is refused unless you allow it a second time
+(`--allow-large` on the command line). A download also needs about twice
+the size it keeps free on the disk of the data folder while it runs (the
+tiles, then the map file made of them); it checks that before it starts.
+
+The map's host learns no more than the whole-degree squares (about 111 km
+from south to north) your pictures are in: the table of contents of every
+tile of those squares is read, square by square, and every tile of them
+asked for, and only those around the pictures are kept, so the download
+is larger than what is kept. `"whole_degrees": false` in the
+`street_maps` settings asks only for the tiles kept: a smaller download,
+but then the host can see which areas you downloaded. The same from the
+command line:
+
+    python street_maps.py [--status]       what is there, and how many places of
+                                           pictures have no street map yet
+    python street_maps.py --plan           check the size of a download
+    python street_maps.py --download       download (shows the size and asks
+                                           first; --yes for scripts, with
+                                           --expect-bytes N: refused when it
+                                           has grown well past N bytes)
+    python street_maps.py --remove         delete the street maps
+
+A download started on the Manage page logs the command line that does
+the same (with `--yes` and `--expect-bytes`, the size you agreed to).
+
+New pictures somewhere else? The panel counts the places of pictures that
+have no street map: check the size and download again (the download
+replaces the maps only once it is complete). Where there is no street map,
+the map shows the world image, stretched, with a note; a gap in the most
+detailed tiles is filled from a tile at most three zooms coarser. A search
+is fitted down to street level only where the street maps have tiles at
+its pictures. The maps zoom three steps past their most detailed tiles
+(drawn larger). They are kept in `data/maps/` (see [The data
+folder](#the-data-folder)) and set in `config.json` (`street_maps`, see
+[SETTINGS.md](SETTINGS.md)); the maps that show them credit "© OpenStreetMap
+contributors (ODbL)" in a corner, the licence's name a link to the street
+maps' licence (`/maps/LICENSE.txt` of the server, `maps/LICENSE.txt` of an
+export: the Open Database License, and where to read it), as
+OpenStreetMap asks. An export can include the street maps around the
+pictures it publishes (see [Publishing a library](#publishing-a-library)).
+
+The map is in the Web Mercator projection, as the street maps are (and
+most web maps): a place far from the equator is drawn larger than one near
+it, and the poles (beyond 85 degrees) are not on it.
 
 ### Positions that cannot be right (the GPS check)
 
@@ -1554,6 +1752,98 @@ the hidden ones, and without hidden pictures; they cannot change them.
 What they see of a trip comes from the pictures they may see: its dates,
 its title (unless you gave it one), and whether a run of days away is a
 trip at all. The settings are `trips` in config.json (see SETTINGS.md).
+
+#### Trip stories
+
+A trip can have a short written story: a paragraph a day -- where the day
+went, what happened, who was there and its highlights -- written by a
+language model from the trip's facts. Each paragraph shows in its day's
+section of the trip's page, the pictures it talks about as small pictures
+in the text (a click opens the viewer on them).
+
+The model gets the trip's facts as text, and nothing else: never a
+picture. For each day its date, its places in order, the named people
+seen that day, how many pictures and videos, its drives (from where to
+where, about how far and how long) and its best pictures (six a day, the
+`pictures` setting, chosen as the trip's page chooses them), each with a
+number, its time, kind, town, title, description (shortened), tags and
+the named people in it. It is asked to use only those facts, to name
+people in a sentence of their own, and to put a picture's number in
+square brackets after the words about it (which become the links).
+Never in the facts:
+
+- hidden pictures, pictures with private information or sensitive ones,
+  and ID cards;
+- home: no picture taken in the area around home that a trip's export
+  keeps out (its **Keep home private** size, at least 10 km; see
+  [Publishing a trip](#publishing-a-trip)) or in a town with pictures
+  there, and no drive's end there;
+- people without a name and hidden people (see [People](#people)); no
+  names at all while People is off, or when the model is a cloud
+  endpoint (names go only to a model on this computer or your local
+  network);
+- file names, folders, cameras, positions and the pictures' ids.
+
+What comes back is checked: a picture number that day did not give is
+dropped, and so is any sentence that names a person the facts did not
+(People's other names, or "Person 12", People's word for someone without
+a name) or a town of home. A model can still get things wrong: read the
+story, and **Edit...** it.
+
+Who writes it: the endpoint of the `trip_stories` setting, else the
+**refine** endpoint of the trip's libraries (its own library first, see
+[Refining documents and screenshots](#refining-documents-and-screenshots)),
+else their describe endpoint. A model server of this program (see
+`local_server` in SETTINGS.md) is started for it as for a describe run
+and stopped afterwards, and the job stops before the server's daily stop
+time (resume it later). A long trip is written a few days at a time, each
+request within the `prompt_tokens` setting and the server's context. With
+a cloud endpoint the facts are sent to the service as text, without the
+names of people (its stories name nobody); before a job starts, the page
+shows about how many tokens go and what they cost (with the endpoint's
+prices).
+
+**Write stories...** on the Trips page writes the stories of the trips
+that have none or an out-of-date one (a trip whose days changed, a
+quarter of whose pictures changed, with other people named, or one of
+whose linked pictures was hidden or deleted since), but not those you
+edited, nor hidden trips. On a trip's page the **Story** bar says when
+and with which model it was written, and offers **Write the story** /
+**Write again** (this one, even when you edited it), **Edit...** (a text
+box a day; `[#123]` links picture 123), **Hide** / **Show** (a hidden
+story is yours only, and no export publishes it) and **Delete**. From
+the command line:
+
+    python trips.py --list
+    python trips.py --stories [--trip ID] [--redo]
+
+`--list` shows each trip's id, dates, title and the state of its story;
+`--stories` writes them as **Write stories...** does (one trip with
+`--trip`; with `--redo` also those that are up to date). Stories are kept
+in `data/index.db`.
+
+Other computers see the story of a trip they are shown (see
+[Trips](#trips)) unless it is hidden, without the
+sentences that link a picture hidden since and, unless People is shown
+to them (`visitors` of `people`), without the sentences that name people
+-- and even then a name only while it is the name of one of the story's
+people on the People page (not one renamed, left without a name or
+hidden since, nor after **Delete face data**). A trip's export publishes
+it only with **The trip's story** and **Location** (`--story
+--location`; off by default; see [Publishing a trip](#publishing-a-trip)),
+with names only with **People's names**, and then only of the people the
+export publishes pictures of.
+
+The facts never hold a hidden picture's words, nor its place: the trip's
+title and dates in them are those its other pictures give (as visitors
+see them), unless you named the trip. A name is looked for as a name is
+written (the whole name or its first word, with a capital letter), so a
+sentence about "the hill" stays when someone is called Anna Hill, and "in
+June" or "10 June" is a month. The job writes a story again only when
+you did not edit it meanwhile: one you edit while the job runs is kept.
+A trip whose answers could not be used for some days keeps the
+paragraphs of the other days; the job fails only when no story at all
+could be written (its summary counts the ones that failed).
 
 ### Times in the local time of the place
 
@@ -1825,7 +2115,10 @@ Faces are the most private data this program keeps. They are kept in a
 database of their own, `data/faces.db`, with the people and their names;
 no picture, face or name is sent anywhere (the models run on this
 computer's processor, no graphics card is needed, and no AI model
-describing pictures ever gets a name), no search record holds them, and
+describing pictures ever gets a name) -- but for the names of the people
+of a trip, to the model that writes its story when that model runs on
+this computer or your local network (see [Trip stories](#trip-stories); a
+cloud endpoint never gets a name) -- no search record holds them, and
 no export publishes them -- except the names, as tags, when an export's
 **People's names** option is on. Others who use the search pages from
 another computer (`--host`) see nothing of People unless you allow it
@@ -1901,22 +2194,41 @@ processor: the helpers share the pictures, see `workers` in
 
     python people.py [--library NAME_OR_ID ...] [--limit N] [--retry-failed]
     python people.py --status
+    python people.py --group
 
-Each picture is looked at once, in its stored preview (a video in its
-poster frame; a 360-degree photo or video in its flat preview, keeping
-only the faces near its horizon, where the projection hardly stretches
-them -- the people holding the camera, mostly; the viewer draws no boxes
-on those), at several sizes so that small faces in a crowd and a face
-that fills the picture are both found. Copies of a picture share their faces, and a moved or
-renamed picture keeps them. A run that is stopped keeps what it found; the
-next one goes on. A picture that cannot be read is tried again by the
-next runs, three times (**Retry finding faces** or `--retry-failed`
+(`--group` groups the faces into people again, as **Group faces again** on
+the People page does.)
+
+Each picture is looked at once, in its stored preview (a 360-degree
+photo in its flat preview, keeping only the faces near its horizon, where
+the projection hardly stretches them -- the people holding the camera,
+mostly; the viewer draws no boxes on those), at several sizes so that
+small faces in a crowd and a face that fills the picture are both found.
+A video is looked at in several frames: its poster frame and about one
+every 4 seconds, 12 at most (`frames` in [SETTINGS.md](SETTINGS.md)),
+read from its file with ffmpeg on the processor (a 360-degree video's
+stitched, keeping the faces near the horizon); the faces of one person in
+its frames are kept as one face, with the moments that person was seen
+at (two people who look a little alike stay two; a face seen once and too
+blurred to tell who it is, and the faces past the 32 best of a crowd, are
+left out). The clips of a dashcam's drives are skipped: they mostly show
+other drivers (`drives` in [SETTINGS.md](SETTINGS.md)). Wide panoramas and very large
+pictures are looked at in full size instead, read from their original
+files and looked at in tiles, as the people in a panorama are only a few
+pixels high in its preview (see `full_size` in
+[SETTINGS.md](SETTINGS.md)), which takes much longer per picture; a
+small picture of each face found there is kept with the faces, for the
+People page. Copies of a picture share their faces, and a moved or
+renamed picture keeps them. A run that is stopped keeps what it found;
+the next one goes on. A picture that cannot be read is tried again by
+the next runs, three times (**Retry finding faces** or `--retry-failed`
 tries again after that). Other model files, or settings that change what
-is found, make the next run look at every picture again. Each face keeps
-how sure the detector was and a quality (its size, sharpness and how much
-it faces the camera), as the detector also finds faces in profile, far in
-the background, and things that only look like faces (toys, statues,
-wheels).
+is found, make the next run look at every picture again (or, for a
+setting that only concerns the pictures looked at in full size, or the
+videos, those). Each face keeps how sure the detector was and a quality (its
+size, sharpness and how much it faces the camera), as the detector also
+finds faces in profile, far in the background, and things that only look
+like faces (toys, statues, wheels).
 
 ### People: grouping faces, names and the People page
 
@@ -1982,7 +2294,17 @@ description.) The viewer's
 information pane names the people in the picture (each a link to their
 pictures); **Show faces** there draws the box of every face over the
 picture, with its person's name (a link to the People page), and stays
-on for the next pictures until you hide them.
+on for the next pictures until you hide them. Of a video, each name is
+followed by the moments that person was seen at (`0:06 0:10 0:14`, and
+`+3` shows the others): a click moves the video there; and a video found
+by a search that names one of its people (`person:Ann`,
+`person:"Person 12"`, or a name's words) starts where that person is. On
+the People page a face of a video shows its moment, and its link (a play
+sign and the moment, such as `0:12`) opens the video's page there; the
+link of a face of a picture (**Picture**) opens the picture's page with
+that face marked (a wide panorama's view goes to it: its faces are a few
+pixels across there). A person's count of pictures says how many of them
+are videos.
 
 People is the admin's: the People page, the names and the boxes are only
 on this computer, unless `config.json`'s `people` has `"visitors": true`
@@ -2005,7 +2327,9 @@ touched). When some of it cannot be deleted (the file is open in another
 program, or read-only), it says so and fails: close that program and
 delete it again. Names that an export published with its **People's
 names** option stay in that export, and `person:` searches saved as
-smart albums stay in those albums, until you delete them. Deleting a
+smart albums stay in those albums, until you delete them. The trips'
+stories keep their text (yours to edit), but no name in them is shown to
+others or exported any more: only the names People has. Deleting a
 library's indexed data, or a picture that is gone for good, also deletes
 its faces, and the people (and names) left without a face. To stop
 finding faces, set `"enabled": false` in `config.json`'s `people` (the
@@ -2082,11 +2406,14 @@ cannot write (a full disk, no access) stops at once; both say so in plain
 words.
 
 What is published follows the library's `export` options (see SETTINGS.md),
-which the Export dialog saves. `export.py` can change them for one run:
-`--images` picks the kind of pictures, and the other switches can only
-publish more. To publish less, change the options in the Export dialog (or
-`export` in `config.json`). `serve.py package` always uses the saved
-options.
+which the Export dialog saves. `export.py` can change any of them for one
+run: `--images` picks the kind of pictures, a switch that publishes
+something has a `--no-` form that does not (`--location`,
+`--no-location`; `--include-private`, `--no-include-private`), and
+`--title`, `--credits`, `--max-video-mb`, `--exclude-types`,
+`--include-ids` and `--exclude-ids` set the others (the lists replace the
+saved ones; `none` is an empty list); `python export.py --help` lists
+them all. `serve.py package` always uses the saved options.
 
 - `--images web` (the default) publishes 2048 px pictures (and for wide
   panoramas their larger picture, for phones), `original` the
@@ -2135,11 +2462,27 @@ options.
   overlay prints, whatever the options, so it warns about those filmed
   near where a drive starts or ends (or without a fix) -- hide them to
   leave them out.
-- `--album NAME` (an album's name or id; **Which pictures** in the
-  dialog) publishes only the pictures of that manual album that are in
+- `--album NAME` (an album's name, or its id as `#ID`; **Which pictures**
+  in the dialog; `--no-album` for the whole library) publishes only the
+  pictures of that manual album that are in
   the library, still left out by the rules above when they say so; the
   review counts only those. A smart album cannot be used: **Copy to a
   new album** on the Albums page makes a manual one of its pictures.
+- With `--location` and `--street-maps` (**Street maps** in the dialog,
+  `street_maps` in the saved options; only once the [street
+  maps](#street-maps) are downloaded) the site's maps show streets too,
+  offline and from disk: only the tiles around the published positions
+  (`--street-km`, 1 to 50, default 5 km) and 2 km either side of the
+  published routes, down to zoom `--street-zoom` (10 to 15, default 14:
+  the streets; 15 shows every building and is about three times larger),
+  of those you downloaded (from zoom 9 on: the maps draw the world image
+  below it) -- in a trip's export none that touches the area around home
+  (see [Publishing a trip](#publishing-a-trip)). They go as `maps/` (small
+  scripts the pages load, as the server sends them), with their licence
+  (`maps/LICENSE.txt`) and the OpenStreetMap credit at the foot of the
+  pages and in a corner of the maps. The review says how many tiles go and
+  how large they are (and the free space the export checks for counts
+  them). They show where the pictures are, as the positions do.
 - Your favorites, ratings and album names are published only with
   `--marks` (**Favorites, ratings and albums** in the dialog, `marks` in
   the saved options): then the site's `is:favorite`, `rating:` and
@@ -2155,9 +2498,10 @@ options.
 - The names of people (see [People](#people)) go only with
   `--people-names` (**People's names (as tags)** in the dialog,
   `people_names` in the saved options): then the named people who are not
-  hidden become tags of the pictures they are in. Faces, their boxes, the
-  people's numbers and anything learnt from the faces are never
-  published.
+  hidden become tags of the pictures they are in, and the site's plain
+  language search knows them as names (see [Plain
+  language](#plain-language)). Faces, their boxes, the people's numbers and
+  anything learnt from the faces are never published.
 - Titles, descriptions, tags and the text read from pictures are published
   as the AI model wrote them: they can name people or places a picture
   shows, whatever the options say. Read through what you publish.
@@ -2275,7 +2619,7 @@ page, **Export...** opens the Export dialog of the Manage page for the
 trip. From the command line:
 
     python export.py --trip lib_2b7c9d10 --location --routes
-    python export.py --trip away-20240512 --home-km 20
+    python export.py --trip away-20240512 --home-km 20 --location --story
 
 The trip's id is the end of its page's address (`/trip/<id>`). Its
 pictures are those of the trip in every library (the libraries' names are
@@ -2292,7 +2636,16 @@ the trip was last exported to). Each trip and each library needs a folder
 of its own: an export (of a trip or of a library) into a folder that holds
 another trip's or library's export refuses to start, unless that trip is
 not found any more (or that library is gone from the settings).
-`--home-km` goes only with `--trip`.
+`--home-km` and `--story` go only with `--trip`.
+
+**The trip's story** (`--story`, `story` in its options; off by default)
+publishes the [trip's story](#trip-stories) on its days, unless it is
+hidden, and only with **Location** (it names the trip's places, which
+only Location publishes; without it the dialog leaves the option off):
+without the sentences that name people unless **People's names**
+is on, nor those that name a town of the home area or link a picture the
+site does not publish (or publishes as near home); its links go to the
+site's pictures.
 
 The trip's page in the site holds its title, its dates (the first and
 last day of the published pictures) and those of its days, which
@@ -2327,7 +2680,9 @@ it off (the dialog asks for it by name, so an empty field never does):
   has pictures in the area; estimated places in it are not shown, and
   drive routes are cut at its edge (besides the 500 m left out at both
   ends of every drive), and a RAW file holding a position in it, or whose
-  picture was taken in it, stays home. Home is no place the trip went to: those pictures
+  picture was taken in it, stays home. With **Street maps** no street map
+  tile that touches the area goes (the maps show the world image there, and
+  no name of a place in it). Home is no place the trip went to: those pictures
   are left out of the places of the trip and of its days, and of the
   site's title.
 - Whatever the options, a dashcam's clip whose GPS track enters the area,
@@ -2383,6 +2738,106 @@ sample is sent to that service and paid for.
 The reports contain thumbnails and text from your pictures; keep them
 private.
 
+## Automating
+
+Every job started on a page -- a scan, describe or refine, an update of
+search by meaning or of the looks (with the opening views of 360 photos),
+previews, playable copies and sped-up drives, place names, finding,
+grouping or deleting faces, an export of a library or a trip, deleting a
+library's data, the trips' stories, a size check or download of the street
+maps, and the viewer's **Describe now** --
+writes as the first line of its log the command line that does the same
+thing:
+
+    [10:42:07] Command line: python scan.py --no-describe --library Family
+
+The log on the Manage page shows it with a **Copy** button, each recent
+job has **Copy command line**, the Export dialog shows it when an export
+is done, and the job's log file (`data/logs/job-<id>.log`) starts with it.
+The command line tools print the same line when they start, so their
+output looks alike. Run the command in the program folder (or with the
+whole path of the tool, `python "C:\path\to\Image Database\scan.py"
+...`), by hand or from a batch file, a scheduled task or cron, to do the
+same unattended.
+
+The line works as it is in PowerShell and in cmd (and in a POSIX shell,
+unless an argument holds a backslash or `!`): an argument holding a space
+or another sign is put in double quotes (a list of ids too: `--ids
+"12,34"`). A library goes by its name, or by its id when the name would
+find another library, cannot be typed or is not plain ASCII (an id also
+stays when the library is renamed). A trip goes by its id, which for a
+trip found by its days away is its first day (`away-20240512`): the
+command still finds the trip when an earlier picture moves that day.
+
+When the settings and data are not in the program folder (`SETTINGS_BASE`,
+see [Where your settings and data are kept](#where-your-settings-and-data-are-kept)),
+the command ends with `--settings-base FOLDER`, which each of these tools
+takes, so it runs as it is from any folder, without `SETTINGS_BASE`:
+
+    python scan.py --no-describe --library Family --settings-base "D:\path\to my data"
+
+(Only a folder whose name PowerShell and cmd read differently is left
+out; the next log line then says that the command needs `SETTINGS_BASE`
+set first: in PowerShell `$env:SETTINGS_BASE = "C:\path\to\data"`, in cmd
+`set SETTINGS_BASE=C:\path\to\data`.) A tool run without its settings -- no
+`config.json` in the settings folder -- says so and exits with status 2,
+so a scheduled task does not look as if it worked; so does
+`--settings-base` naming a folder without one.
+
+Saved in a file, a command line with letters beyond plain ASCII in it
+(an output folder or a title with an accent, say) needs the file saved
+the way its shell reads it: a batch file in the console's code page, or
+as UTF-8 with `chcp 65001 >nul` as its first line; a PowerShell script
+for Windows PowerShell 5.1 as UTF-8 with BOM (PowerShell 7 reads UTF-8
+either way). Typed or pasted into a console, it works as it is.
+
+| Job (where it starts) | Command line |
+|---|---|
+| **Scan + describe**, **Process all libraries** | `python scan.py [--library NAME]` (with `--retry-failed`, `--redescribe-stale`, `--limit N`, `--endpoint NAME` and `--allow-mass-removal` when the job had them) |
+| **Scan** | `python scan.py --no-describe [--library NAME]` |
+| **Describe**, **Retry failed**, **Re-describe out of date** | `python scan.py --no-scan [--library NAME] [--retry-failed] [--redescribe-stale]` |
+| **Describe now**, **Describe again** (the viewer) | `python scan.py --no-scan --library NAME --ids ID [--force]` |
+| **Refine documents**, **Retry failed refine** | `python scan.py --refine [--library NAME] [--retry-failed]` |
+| **Update meaning search** | `python scan.py --embed [--library NAME]` |
+| **Update looks**, **Rebuild looks** | `python scan.py --embed-images [--library NAME] [--rebuild-looks]` |
+| **Build previews** | `python scan.py --previews [--library NAME]` |
+| **Make playable copies** | `python scan.py --proxies [--library NAME]` |
+| **Make sped-up drives** | `python scan.py --drive-previews [--library NAME]` |
+| **Remove** a library with its data, **Delete...** unattached data | `python scan.py --delete-library-data ID --confirm-name NAME` |
+| **Export...** of a library | `python export.py --library NAME [--out FOLDER]` |
+| **Export...** of a trip | `python export.py --trip ID [--out FOLDER]` |
+| **Download place names**, **Download again**, **Add place names** | `python make_places.py [--download] [--redo]` (nothing is downloaded without `--download`) |
+| **Find faces**, **Retry finding faces** | `python people.py [--library NAME] [--retry-failed]` |
+| **Group faces again** (People) | `python people.py --group` |
+| **Delete face data** | `python people.py --delete-all --yes` |
+| **Write stories...** (Trips), **Write the story**, **Write again** (a trip) | `python trips.py --stories [--trip ID] [--redo]` |
+| **Check the size** (Manage: Street maps) | `python street_maps.py --plan` |
+| **Download** (Manage: Street maps) | `python street_maps.py --download --yes --expect-bytes N [--allow-large]` (`N`: the size you agreed to) |
+
+The Export dialog saves its options before it exports, so an export's
+command line needs none: `export.py` uses the saved options as the job
+did (`--out` names another folder than the default). A job sent options
+that are not saved (by a program calling the server, say) gets a switch
+for each of them, such as `--no-location` or `--exclude-types "document,video"`.
+
+Some jobs get "No command line for this job (see README)" instead, with
+the reason: one with a value that PowerShell and cmd read differently (a
+`$`, `` ` ``, `%` or `"` in an output folder or an export title, say, or
+a curly double quote, which PowerShell takes for a straight one), one
+whose command line would be longer than cmd takes (about 8,000
+characters: an export sent thousands of chosen pictures), or one with a
+setting no switch gives. Saving those options in the Export dialog (or
+renaming the folder) gives it one again.
+
+`scan.py`, `people.py`, `make_places.py`, `trips.py --stories` and
+`street_maps.py --download` (and `--remove`) take the same lock as the
+server's jobs: one started while a job runs says so and exits with status
+1 at once (a job started on a page waits for the tool to finish instead),
+and one export runs at a time. They exit with 0 when the work is done or
+was stopped as asked (see [From the command line](#from-the-command-line)
+for `scan.py`'s other codes); `export.py` exits as [Publishing a
+library](#publishing-a-library) says.
+
 ## Settings, tools and files
 
 ### Settings
@@ -2434,11 +2889,13 @@ private:
 - `image_vectors.db` - the look vectors of the pictures (see [Looks like
   this](#looks-like-this-and-search-by-a-picture)); safe to delete, but
   making them again takes a long run of the image model.
-- `faces.db` - the faces found in the pictures, the people they were
-  grouped into and their names (only with People, see [People](#people)):
+- `faces.db` - the faces found in the pictures (and a small picture of
+  each face found in a picture looked at in full size or in a video's
+  frames, with the moments of a video it was seen at), the people they
+  were grouped into and their names (only with People, see [People](#people)):
   the most private file here, never exported (but for the names with an
-  export's People's names option); delete it with
-  `python people.py --delete-all`.
+  export's People's names option; what is deleted from it is overwritten,
+  not only let go); delete it with `python people.py --delete-all`.
 - `exports/` - static sites (`exports/<library name>/`) and the list of
   files each export wrote (`exports/state/`).
 - `reports/` - model comparison reports.
@@ -2450,6 +2907,12 @@ private:
   and made again by `make_places.py`.
 - `tiles/` and `blue_marble.jpg` (from `make_tiles.py`), `world_map.png`
   (from `world_map.py`).
+- `maps/` - the street maps (see [Street maps](#street-maps)):
+  `streets.pmtiles`, the tiles, and `streets.json`, what was downloaded
+  (the build, when, how much; no places); `plan.json`, the last size check;
+  and while a download is planned or runs, `cache/` and `download.*`.
+  Not private as such, but the area they cover is where your pictures
+  are; made again by `street_maps.py --download`.
 - `images.db` and `thumbs/` - the database of older versions (see
   [Upgrading](#upgrading-from-an-older-version)).
 - `*.lock` files and `abort` - used while tools run.
@@ -2473,16 +2936,26 @@ failure.
 draws a world map with a pin for each place pictures were taken (by default
 `data/world_map.png`).
 
-    python make_places.py
+    python make_places.py [--download]
 
-downloads the place names and looks up the places of the pictures (see
-[Place names](#place-names)).
+looks up the places of the pictures, with `--download` downloading the
+place names first (see [Place names](#place-names)).
+
+    python street_maps.py --download
+
+downloads the street maps around the places of the pictures (it shows the
+size first; see [Street maps](#street-maps)).
 
     python local_times.py [--list]
 
 shows which pictures get the local time of their place, and why (see
 [Times in the local time of the
 place](#times-in-the-local-time-of-the-place)); it changes nothing.
+
+    python trips.py --list
+
+lists the trips (their ids, dates and titles) and the state of their
+stories; `--stories` writes them (see [Trip stories](#trip-stories)).
 
     python make_tiles.py
 
@@ -2540,10 +3013,17 @@ writes the missing or damaged ones.
   drives (see [Routes](#routes-a-dashcams-gps))
 - `trips.py` - trips: libraries named like a trip and runs of days away
   from home, your changes to them, and the server's answer to `/api/trips`
-  (see [Trips](#trips))
+  (see [Trips](#trips)); `python trips.py --list`, `--stories`
+- `trip_stories.py` - the trips' stories: their facts, the prompt, what
+  comes back, where they are kept, who sees what, and the job that writes
+  them (see [Trip stories](#trip-stories))
 - `places.py` - place names: the GeoNames download, the place index and
   the nearest town of a GPS position (`static/place-names.js` is their
   part of the Manage page)
+- `street_maps.py` - street maps: what to download around the pictures,
+  the download (PMTiles files read and written with the standard library),
+  the server's `/maps/` tiles and an export's (`static/streets.js` draws
+  them, `static/street-maps.js` is their part of the Manage page)
 - `gps_check.py` - the GPS check: positions that cannot be where a
   picture was taken are set aside (see [the GPS
   check](#positions-that-cannot-be-right-the-gps-check))
@@ -2571,6 +3051,8 @@ writes the missing or damaged ones.
   server or from a static export; `search-core.js` is the search engine and
   `viewer.js` the picture viewer, both shared with a static export;
   `routes.js` draws drive routes, for the map and the viewer;
+  `streets.js` draws the maps' ground, the world image and the street
+  maps;
   `embed-engine.js` and `embed-kernel.js` run the embedding model in a
   published site (only there, and only once a search needs it);
   `app.js`, `detail.js` and `map.js` run the search, detail and map pages;
@@ -2729,6 +3211,30 @@ Other changes to be aware of:
   none by their previews, which the describe step then describes. A
   picture's RAW file is kept in its EXIF data (the database's version does
   not change). `"raw": {"enabled": false}` keeps them out, as before.
+- People looks for faces in wide panoramas and very large pictures in full
+  size now, and in videos (several frames of each, read with ffmpeg; the
+  clips of dashcam drives are skipped, and faces found in them before are
+  deleted): see [Finding faces](#finding-faces). The first scan after
+  upgrading (People's `after_scan` is on by default), or the first **Find
+  faces**, looks at those pictures and videos again, reading their
+  original files from the libraries -- which can take a while (minutes for
+  some hundred videos and panoramas) and some GB of memory while it runs;
+  `"after_scan": false` leaves it to **Find faces** (or `python
+  people.py`). Its first use also brings `data/faces.db` up to version 4
+  (the faces, people and names are kept); an older version of this
+  program then shows no People and finds no faces with it, so keep a copy
+  of `faces.db` first if you may go back.
+- Plain-language search is on (see [Plain language](#plain-language)):
+  names of people and places, years, months and seasons typed in a search
+  -- in the search box, the map's and the trips' searches and smart
+  albums -- become filters, shown as chips. `"plain_language": false` in
+  `config.json` searches what is typed as typed, as before.
+- Trip stories (see [Trip stories](#trip-stories)) are kept in a table of
+  their own in `data/index.db`, made on first use (the database's version
+  does not change); none is written until you ask.
+- Street maps are optional and downloaded only when you ask (see [Street
+  maps](#street-maps)); they are kept in `data/maps/`. Without them the
+  maps are as before.
 - `config.json` is now written with non-ASCII characters escaped (`\u00fc`),
   and read as UTF-8. A file saved in the system's encoding still loads, with a
   warning.
@@ -2789,6 +3295,15 @@ sample images are covered by their own licenses, listed in
 `static/worldmap.jpg` is an equirectangular projection derived from NASA's
 Blue Marble imagery and is in the public domain. Source:
 https://commons.wikimedia.org/wiki/File:Equirectangular-projection.jpg
+
+The street maps (downloaded by you, see [Street maps](#street-maps)) are
+OpenStreetMap data, (c) OpenStreetMap contributors, available under the
+Open Database License (https://www.openstreetmap.org/copyright), in the
+tiles of the Protomaps basemap (https://protomaps.com). The land cover of
+their least detailed tiles (zoom 0 to 7, which the maps do not draw) is
+derived from ESA WorldCover, (c) ESA WorldCover project 2020 / Contains
+modified Copernicus Sentinel data (2020) processed by ESA WorldCover
+consortium (CC BY 4.0).
 
 The face models People uses (downloaded by you, see [People](#people))
 are from the OpenCV Zoo, https://github.com/opencv/opencv_zoo: YuNet (Wu,

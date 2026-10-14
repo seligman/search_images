@@ -4,10 +4,11 @@
 
    Coordinates
      - lat/lon: WGS84 degrees.
-     - world pixels at zoom z: the equirectangular projection, the world
-       (tile * 2^(z+1)) wide and half as tall; x grows east from the date
-       line (lon -180), y south from the north pole. The world repeats
-       sideways: x and x + width are the same place.
+     - world pixels at zoom z: the Web Mercator projection (that of the
+       street maps, see streets.js), the world (tile * 2^(z+1)) wide and as
+       tall; x grows east from the date line (lon -180), y south from about
+       85 degrees north (MAX_LAT; the poles are left out). The world
+       repeats sideways: x and x + width are the same place.
      - screen pixels: a place in the canvas.
 
    Pins are grouped (clustered) in world pixels, once per zoom level and
@@ -17,12 +18,22 @@
    across the date line), so pins never overlap. Each pin is drawn on every
    copy of the world that is on the screen.
 
-   Zoom levels are whole numbers. Past the most detailed map tiles the map
-   zooms on with those tiles enlarged (OVERZOOM levels, and at least to
-   zoom 10, about 75 m a pixel; drawn fainter the further they are
-   stretched, with a note), so pictures taken close together still come
-   apart; while a tile loads, a coarser one that is
-   already there stands in for it.
+   Zoom levels are whole numbers. Past the most detailed tiles of the world
+   image the map shows the street maps where they were downloaded
+   (street_maps.py; from STREETS.FROM_ZOOM on; credited to OpenStreetMap,
+   with a link to their licence, in a corner while they show), down to
+   street level and a few zooms past it (as deep as they go: MAX_ZOOM and
+   FIT_ZOOM follow their index once it is in); elsewhere it zooms on with
+   the world image enlarged (OVERZOOM levels, and at least to zoom 10, about
+   75 m a pixel; drawn fainter the further they are stretched, with a
+   note), so pictures taken close together still come apart; while a tile
+   loads, a coarser one that is already there stands in for it. A search's
+   pictures are fitted down to street level only where the street maps
+   have tiles at some of them (else to the world image's detail), and fitted
+   again when the street maps' index comes in after the fit, or the people
+   a search names (person:, or a name plain-language search understood)
+   come after it (unless the map was moved since). Names on the street
+   maps keep clear of the buttons, the credits and the note.
 
    Estimated places (place_estimates.py: pictures without a GPS position
    of their own, points with "e": 1) are drawn as hollow pins (a pin whose
@@ -54,6 +65,8 @@ var MAP = (function () {
     "use strict";
 
     var hasDocument = typeof document !== "undefined" && document !== null;
+    // The map's north and south edges (Web Mercator leaves the poles out).
+    var MAX_LAT = 85.0511287798;
 
     // Pictures are grouped by cells of this many world pixels (a power of
     // two, so the cells fit the world exactly at every zoom).
@@ -62,6 +75,9 @@ var MAP = (function () {
     var GAP = 3;
     var SINGLE_RADIUS = 7;
     var MAX_RADIUS = 20;
+    // With street maps the map fits a search's pictures at most this far in
+    // (and zooms STREETS.OVERZOOM further).
+    var FIT_STREETS = 15;
     // Wheel: this many pixels of a mouse wheel make one zoom step (one
     // notch).
     var WHEEL_STEP = 100;
@@ -106,13 +122,17 @@ var MAP = (function () {
             point.lat >= -90 && point.lat <= 90 && point.lon >= -180 && point.lon <= 180;
     }
 
-    // World pixels (x in [0, width)) of a place.
+    // World pixels (x in [0, width)) of a place (beyond MAX_LAT: on the edge).
     function project(lat, lon, width) {
-        return {x: wrapX((lon + 180) / 360 * width, width), y: (90 - lat) / 180 * (width / 2)};
+        var r = Math.max(-MAX_LAT, Math.min(MAX_LAT, lat)) * Math.PI / 180;
+        return {x: wrapX((lon + 180) / 360 * width, width),
+                y: (1 - Math.log(Math.tan(Math.PI / 4 + r / 2)) / Math.PI) / 2 * width};
     }
 
     function unproject(x, y, width) {
-        return {lat: 90 - y * 180 / (width / 2), lon: normalizeLon(x * 360 / width - 180)};
+        var v = Math.PI * (1 - 2 * y / width);
+        return {lat: Math.atan((Math.exp(v) - Math.exp(-v)) / 2) * 180 / Math.PI,
+                lon: normalizeLon(x * 360 / width - 180)};
     }
 
     // The copy of x (x + k * width) nearest to ref.
@@ -424,16 +444,20 @@ var MAP = (function () {
         var span = 360 - gap;
         var west = gapStart + gap;
         var zoom = minZoom;
+        // (The latitudes in world pixels of a world 1 pixel tall.)
+        var top = project(north, 0, 1).y;
+        var bottom = project(south, 0, 1).y;
         for (var z = minZoom; z <= maxZoom; z++) {
             var width = worldWidth(tile, z);
             if (span / 360 * width <= Math.max(1, screenW - 2 * pad) &&
-                    (north - south) / 180 * (width / 2) <= Math.max(1, screenH - 2 * pad)) {
+                    (bottom - top) * width <= Math.max(1, screenH - 2 * pad)) {
                 zoom = z;
             } else {
                 break;
             }
         }
-        return {lat: (south + north) / 2, lon: normalizeLon(west + span / 2), zoom: zoom};
+        return {lat: unproject(0, (top + bottom) / 2, 1).lat, lon: normalizeLon(west + span / 2),
+                zoom: zoom};
     }
 
     function shortNumber(value) {
@@ -519,107 +543,7 @@ var MAP = (function () {
         return best;
     }
 
-    /* ---------- Tiles and pins on a canvas ------------------------------- */
-
-    /* The map's tiles on a canvas (the map page's, and the trip pages'
-       map, trips.js): options {tileUrl(z, x, y) (null: no tile), tileSize,
-       tileZoom (the most detailed tiles there are), ocean (the colour where
-       there is no tile), onLoad() (a tile arrived: draw again)}.
-       draw(ctx, zoom, left, top, w, h) draws the view whose top left corner
-       is world (left, top) at a whole zoom: the most detailed tiles there
-       are, stretched past that (fainter the further: only a hint of land and
-       sea), a coarser tile already loaded standing in for one that is not;
-       it returns how many levels the tiles are stretched. */
-    function TileLayer(options) {
-        this.options = options || {};
-        this.tile = this.options.tileSize || 256;
-        this.cache = {};
-    }
-
-    TileLayer.prototype.get = function (z, x, y) {
-        var key = z + "/" + x + "/" + y;
-        if (this.cache[key]) {
-            return this.cache[key];
-        }
-        var url = this.options.tileUrl ? this.options.tileUrl(z, x, y) : null;
-        if (!url) {
-            return null;
-        }
-        var onLoad = this.options.onLoad;
-        var img = new Image();
-        var entry = {img: img, loaded: false, failed: false};
-        this.cache[key] = entry;
-        img.onload = function () {
-            entry.loaded = true;
-            if (onLoad) {
-                onLoad();
-            }
-        };
-        img.onerror = function () {
-            entry.failed = true;
-        };
-        img.src = url;
-        return entry;
-    };
-
-    // Part of a coarser tile that is already loaded, in place of one that is not.
-    TileLayer.prototype.fromParent = function (ctx, z, x, y, dx, dy, dw, dh) {
-        for (var up = 1; up <= z; up++) {
-            var n = Math.pow(2, up);
-            var entry = this.cache[(z - up) + "/" + Math.floor(x / n) + "/" + Math.floor(y / n)];
-            if (entry && entry.loaded) {
-                var part = this.tile / n;
-                ctx.drawImage(entry.img, (x % n) * part, (y % n) * part, part, part,
-                              dx, dy, dw, dh);
-                return true;
-            }
-        }
-        return false;
-    };
-
-    TileLayer.prototype.draw = function (ctx, zoom, left, top, w, h) {
-        var tz = Math.max(0, Math.min(zoom, this.options.tileZoom || 0));
-        var size = this.tile * Math.pow(2, zoom - tz);
-        // Tiles stretched far past their detail are only a hint of land and
-        // sea: drawn fainter, over the plain sea colour.
-        var stretch = zoom - tz;
-        ctx.globalAlpha = stretch <= 1 ? 1 : Math.max(0.35, 1 - 0.2 * (stretch - 1));
-        var cols = Math.pow(2, tz + 1);
-        var rows = Math.pow(2, tz);
-        var x0 = Math.floor(left / size);
-        var x1 = Math.floor((left + w) / size);
-        var y0 = Math.max(0, Math.floor(top / size));
-        var y1 = Math.min(rows - 1, Math.floor((top + h) / size));
-        for (var ty = y0; ty <= y1; ty++) {
-            var dy = Math.round(ty * size - top);
-            var dh = Math.round((ty + 1) * size - top) - dy;
-            for (var tx = x0; tx <= x1; tx++) {
-                // The world repeats sideways: column tx is column tx mod cols.
-                var x = ((tx % cols) + cols) % cols;
-                var dx = Math.round(tx * size - left);
-                var dw = Math.round((tx + 1) * size - left) - dx;
-                var entry = this.get(tz, x, ty);
-                if (entry && entry.loaded) {
-                    ctx.drawImage(entry.img, dx, dy, dw, dh);
-                } else if (!this.fromParent(ctx, tz, x, ty, dx, dy, dw, dh)) {
-                    ctx.fillStyle = this.options.ocean || "#1a2c3d";
-                    ctx.fillRect(dx, dy, dw, dh);
-                }
-            }
-        }
-        ctx.globalAlpha = 1;
-        // Keep the cache bounded in long sessions (oldest first; the
-        // coarse levels stay, they stand in for missing tiles).
-        var keys = Object.keys(this.cache);
-        if (keys.length > 500) {
-            for (var k = 0; k < keys.length - 300; k++) {
-                if (Number(keys[k].split("/")[0]) > 2) {
-                    delete this.cache[keys[k]];
-                }
-            }
-        }
-        return stretch;
-    };
+    /* ---------- Pins on a canvas (the ground under them: streets.js) ------ */
 
     /* Pins (screenPins' list) on a canvas: red for one picture, blue with
        the count for a group, hollow for a group of estimated places only,
@@ -632,10 +556,14 @@ var MAP = (function () {
         list.forEach(function (pin) {
             var group = pin.group;
             if (group.picked) {
+                // (A dark edge under it: seen on the light street maps too.)
                 ctx.beginPath();
                 ctx.arc(pin.sx, pin.sy, pin.r + 4, 0, Math.PI * 2);
+                ctx.lineWidth = 5.5;
+                ctx.strokeStyle = "rgba(12, 17, 24, 0.85)";
+                ctx.stroke();
                 ctx.lineWidth = 3;
-                ctx.strokeStyle = "rgba(255, 210, 63, 0.95)";
+                ctx.strokeStyle = "rgba(255, 210, 63, 0.98)";
                 ctx.stroke();
             }
             ctx.beginPath();
@@ -681,7 +609,16 @@ var MAP = (function () {
         var TILE_ZOOM = tilesMax === null ? 3 : Math.max(0, tilesMax);
         var OVERZOOM = 4;
         var MIN_ZOOM = 0;
-        var MAX_ZOOM = Math.max(TILE_ZOOM + OVERZOOM, 10);
+        // (The street maps, when there are any: see STREETS.Basemap. Until their
+        // index is in, they are taken to go to street level; then MAX_ZOOM and
+        // FIT_ZOOM follow it: streetsChanged.)
+        var streets = SITE.streets();
+        var BASE_MAX_ZOOM = Math.max(TILE_ZOOM + OVERZOOM, 10);
+        var MAX_ZOOM = Math.max(BASE_MAX_ZOOM, streets ? FIT_STREETS + STREETS.OVERZOOM : 0);
+        // A search's pictures are fitted at most this far in (see fitLimit).
+        var FIT_ZOOM = streets ? Math.max(TILE_ZOOM, FIT_STREETS) : TILE_ZOOM;
+        // The note shows while this share of the view or more has no street map.
+        var NOTE_SHARE = 0.25;
         var OCEAN = "#1a2c3d";
         var PANEL_PAGE = 120;
         var MOUSE_SLACK = 4;
@@ -700,9 +637,15 @@ var MAP = (function () {
         var statusBar = document.getElementById("map-status");
         var messageBox = document.getElementById("map-message");
         var detailNote = document.getElementById("map-note");
+        var streetsCredit = document.getElementById("map-streets-credit");
+        var streetsLicence = document.getElementById("map-streets-licence");
+        var zoomButtons = document.getElementById("map-zoom");
         var targetNote = document.getElementById("map-target");
 
         var search = SITE.searchState.read();
+        // The search as plain-language search understood it (SearchCore.interpret,
+        // as on the search page: the same people, typed and plain).
+        var interpreted = null;
         var adminOn = Boolean(SITE.capabilities.admin) && !SITE.capabilities.static;
         // "Show estimated places": the admin's default is on (kept for the
         // session when changed).
@@ -754,20 +697,30 @@ var MAP = (function () {
         var view = {lat: 20, lon: 0, zoom: 1, w: 0, h: 0};
         var dpr = 0;
         var ratioQuery = null;
-        var tileLayer = new TileLayer({tileUrl: SITE.tileUrl, tileSize: TILE, tileZoom: TILE_ZOOM,
-                                       ocean: OCEAN, onLoad: function () {
-                                           scheduleDraw();
-                                       }});
+        var basemap = new STREETS.Basemap({tileUrl: SITE.tileUrl, tileSize: TILE,
+                                           tileZoom: TILE_ZOOM, ocean: OCEAN, streets: streets,
+                                           onLoad: function () {
+                                               streetsChanged();
+                                               scheduleDraw();
+                                           }});
+        var streetsKnown = !streets;     // how deep the street maps go is known
+        var autoFitted = false;          // the view is a fit, not moved since
+        if (streetsLicence && streets) {
+            streetsLicence.href = STREETS.licenceUrl(streets);
+        }
+        streetsChanged();
         var records = [];
         var indexById = {};
         var indexLibraries = [];
         var indexAlbums = [];
+        var indexNames = null;
         var searchIndex = null;
         // The people for person: (the search page's, SITE.peopleForSearch): the
-        // search runs again when they come.
+        // search runs again when they come, and a view that is a fit nobody
+        // moved since fits their pictures (the first fit found none of them).
         var peopleSearch = SITE.peopleForSearch(function () {
             if (loadState === "ready") {
-                applySearch(false);
+                applySearch(autoFitted);
             }
         }, adminOn);
         var vectorsWanted = false;
@@ -796,13 +749,12 @@ var MAP = (function () {
         function clampView() {
             var w = width();
             var top = view.h / 2;
-            var bottom = w / 2 - view.h / 2;
+            var bottom = w - view.h / 2;
             if (bottom < top) {
                 view.lat = 0;
             } else {
-                var y = (90 - view.lat) / 180 * (w / 2);
-                y = Math.max(top, Math.min(bottom, y));
-                view.lat = 90 - y * 180 / (w / 2);
+                var y = Math.max(top, Math.min(bottom, project(view.lat, 0, w).y));
+                view.lat = unproject(0, y, w).lat;
             }
             view.lon = normalizeLon(view.lon);
         }
@@ -818,6 +770,7 @@ var MAP = (function () {
             view.lat = lat;
             view.lon = lon;
             view.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(zoom)));
+            autoFitted = false;
             clampView();
             changedView();
         }
@@ -826,7 +779,7 @@ var MAP = (function () {
         function worldView() {
             var zoom = MIN_ZOOM;
             while (zoom < TILE_ZOOM && (worldWidth(TILE, zoom) < view.w ||
-                                        worldWidth(TILE, zoom) / 2 < view.h)) {
+                                        worldWidth(TILE, zoom) < view.h)) {
                 zoom += 1;
             }
             setView(20, 0, zoom);
@@ -837,6 +790,7 @@ var MAP = (function () {
             if (zoom === view.zoom) {
                 return;
             }
+            autoFitted = false;
             var at = corner();
             var anchor = unproject(at.left + sx, at.top + sy, at.w);
             var w = worldWidth(TILE, zoom);
@@ -850,9 +804,12 @@ var MAP = (function () {
         }
 
         function panBy(dx, dy) {
+            autoFitted = false;
             var w = width();
-            view.lon -= dx * 360 / w;
-            view.lat += dy * 180 / (w / 2);
+            var centre = project(view.lat, view.lon, w);
+            var moved = unproject(centre.x - dx, centre.y - dy, w);
+            view.lon = moved.lon;
+            view.lat = moved.lat;
             clampView();
             changedView();
         }
@@ -921,8 +878,67 @@ var MAP = (function () {
         /* Tiles */
 
         function drawTiles(at) {
-            var stretch = tileLayer.draw(ctx, view.zoom, at.left, at.top, view.w, view.h);
-            detailNote.hidden = stretch < 2;
+            var drawn = basemap.draw(ctx, view.zoom, at.left, at.top, view.w, view.h,
+                                     keepClear());
+            // (The note only where the world image is stretched: no street map in a
+            // good part of the view.)
+            var noteWas = detailNote.hidden;
+            detailNote.hidden = drawn.stretch < 2 ||
+                (drawn.streets > 0 && drawn.missing < NOTE_SHARE * drawn.tiles);
+            var creditWas = streetsCredit ? streetsCredit.hidden : true;
+            if (streetsCredit) {
+                streetsCredit.hidden = !drawn.streets;
+            }
+            if ((creditWas && streetsCredit && !streetsCredit.hidden) ||
+                    (noteWas && !detailNote.hidden && drawn.streets)) {
+                // (Shown just now: the names are placed clear of it again.)
+                scheduleDraw();
+            }
+        }
+
+        // The places of the view no name of the street maps goes under: the zoom
+        // buttons, the credits and the note ([[x0, y0, x1, y1]] in view pixels).
+        function keepClear() {
+            if (!streets) {
+                return [];
+            }
+            var box = canvas.getBoundingClientRect();
+            var list = [];
+            // (.map-credit: the street maps' credit, and an export's GeoNames one.)
+            var nodes = [zoomButtons, detailNote].concat(Array.prototype.slice.call(
+                document.querySelectorAll(".map-credit")));
+            nodes.forEach(function (node) {
+                if (!node || node.hidden) {
+                    return;
+                }
+                var r = node.getBoundingClientRect();
+                if (r.width && r.height) {
+                    list.push([r.left - box.left - 2, r.top - box.top - 2,
+                               r.right - box.left + 2, r.bottom - box.top + 2]);
+                }
+            });
+            return list;
+        }
+
+        /* The street maps' index is in (or could not be loaded): how deep the
+           maps go is known now. A fit made before is made again (it may go
+           deeper, or less deep), unless the map was moved since. */
+        function streetsChanged() {
+            if (streetsKnown || !basemap) {
+                return;
+            }
+            var deepest = basemap.maxZoom();
+            if (deepest !== null && !basemap.ready()) {
+                return;                 // (still loading)
+            }
+            streetsKnown = true;
+            MAX_ZOOM = Math.max(BASE_MAX_ZOOM, deepest === null ? 0 : deepest);
+            FIT_ZOOM = deepest === null ? TILE_ZOOM : Math.max(TILE_ZOOM, basemap.fitZoom());
+            if (autoFitted && loadState === "ready") {
+                fit();
+            } else if (view.zoom > MAX_ZOOM) {
+                setView(view.lat, view.lon, MAX_ZOOM);
+            }
         }
 
         /* Pins */
@@ -1019,14 +1035,17 @@ var MAP = (function () {
             stroke(routesDrawn, 5.5, ROUTES.HALO);
             stroke(routesDrawn, 3, ROUTES.LINE);
             if (hoverRoute) {
-                // The clip under the pointer, brighter, and the place on it.
-                stroke(routesDrawn.map(function (line) {
+                // The clip under the pointer, bright on a dark casing (seen on the
+                // world image and the light street maps alike), and the place on it.
+                var hovered = routesDrawn.map(function (line) {
                     return line.filter(function (point) {
                         return point.clip === hoverRoute.clip;
                     });
                 }).filter(function (line) {
                     return line.length;
-                }), 6, "rgba(255, 235, 180, 0.98)");
+                });
+                stroke(hovered, 8.5, ROUTES.CASING);
+                stroke(hovered, 5, ROUTES.CURRENT);
                 ctx.beginPath();
                 ctx.arc(hoverRoute.sx, hoverRoute.sy, 5, 0, Math.PI * 2);
                 ctx.fillStyle = "rgba(214, 58, 58, 0.98)";
@@ -1540,7 +1559,7 @@ var MAP = (function () {
                 get: function (id) {
                     return indexById[id] || null;
                 },
-                query: search.q,
+                query: interpreted ? interpreted.query : search.q,
                 libraryName: libraryName,
                 similar: searchIndex ? function (id) {
                     // ("More like this" goes by meaning once the vectors are
@@ -1899,7 +1918,19 @@ var MAP = (function () {
         // "beach - Type: Photos - Year: 2019": what the search asks for, in words.
         function searchSummary() {
             var parts = [];
-            if (search.q) {
+            if (interpreted && interpreted.changed) {
+                // (Names, places and dates understood, as the search page's chips.)
+                if (interpreted.rest) {
+                    parts.push("\u201c" + interpreted.rest + "\u201d");
+                }
+                if (interpreted.others) {
+                    // (Field words, phrases, -words and OR, as typed.)
+                    parts.push("\u201c" + interpreted.others + "\u201d");
+                }
+                interpreted.parts.forEach(function (part) {
+                    parts.push(part.label);
+                });
+            } else if (search.q) {
                 parts.push("\u201c" + search.q + "\u201d");
             }
             var labels = {};
@@ -1925,12 +1956,30 @@ var MAP = (function () {
         }
 
         function fit() {
-            var spot = fitView(locations, view.w, view.h, TILE, MIN_ZOOM, TILE_ZOOM, 48);
+            var spot = fitView(locations, view.w, view.h, TILE, MIN_ZOOM, fitLimit(), 48);
             if (spot) {
                 setView(spot.lat, spot.lon, spot.zoom);
             } else {
                 worldView();
             }
+            autoFitted = true;
+        }
+
+        /* How far in a fit of the pictures goes: with street maps, as far as
+           they have tiles at some of the pictures (at most FIT_ZOOM; until
+           their index is in, FIT_ZOOM); else the world image's detail. */
+        function fitLimit() {
+            if (!streets || !basemap.ready()) {
+                return FIT_ZOOM;
+            }
+            var deepest = -1;
+            for (var k = 0; k < locations.length && deepest < FIT_ZOOM; k++) {
+                var z = basemap.coveredZoom(locations[k].lat, locations[k].lon);
+                if (z !== null && z > deepest) {
+                    deepest = z;
+                }
+            }
+            return deepest >= 0 ? Math.max(TILE_ZOOM, Math.min(FIT_ZOOM, deepest)) : TILE_ZOOM;
         }
 
         // Some picture (a pin, or a clip on a route) has its middle on the screen.
@@ -1945,11 +1994,16 @@ var MAP = (function () {
         function applySearch(refit) {
             var library = SHELL.library();
             // (person: in the search, or in a smart album it names, needs the people.)
+            var plain = SITE.capabilities.plain !== false;
             peopleSearch.want(search.q + " " + (/(^|\s)-?albums?:/i.test(search.q)
                 ? indexAlbums.map(function (album) {
                     return album && album.kind === "smart" ? String(album.query || "") : "";
-                }).join(" ") : ""));
-            var found = SearchCore.search(searchIndex, search.q, peopleSearch.options({
+                }).join(" ") : ""), plain && search.typed !== "*" && !SITE.isStatic);
+            interpreted = searchIndex.interpret(search.q, {
+                people: peopleSearch.options({}).people, names: indexNames, plain: plain,
+                typed: search.typed === "*" ? "*" : search.typed ? search.typed.split(",") : []
+            });
+            var found = SearchCore.search(searchIndex, interpreted.query, peopleSearch.options({
                 library: library || "", libraries: indexLibraries, filters: search.filters,
                 hidden: adminOn && search.hidden, sensitive: search.sensitive || undefined,
                 junk: search.junk, group: false, sort: search.sort || undefined,
@@ -1986,7 +2040,11 @@ var MAP = (function () {
             if (refit || !placed || (viewFromAddress && locations.length && !pinsInSight())) {
                 fit();
             }
-            viewFromAddress = false;
+            // (While the people the search names are still to come, the view
+            // from the address is checked again when they are here.)
+            if (locations.length || !peopleSearch.options({}).peoplePending) {
+                viewFromAddress = false;
+            }
             if (startPin) {
                 var again = groupAt(groupsNow(), startPin.lat, startPin.lon, width());
                 startPin = null;
@@ -2018,6 +2076,8 @@ var MAP = (function () {
                 indexLibraries = data.libraries || [];
                 // (album: in the search names one of these.)
                 indexAlbums = Array.isArray(data.albums) ? data.albums : [];
+                // (An export's published names, for plain-language search.)
+                indexNames = Array.isArray(data.names) ? data.names : null;
                 searchIndex = SearchCore.prepare(records);
                 SITE.loadLocations(function (loaded) {
                     if (!loaded) {
@@ -2122,6 +2182,8 @@ var MAP = (function () {
     return {
         CELL: CELL,
         GAP: GAP,
+        MAX_LAT: MAX_LAT,
+        FIT_STREETS: FIT_STREETS,
         MAX_RADIUS: MAX_RADIUS,
         worldWidth: worldWidth,
         wrapX: wrapX,
@@ -2137,7 +2199,6 @@ var MAP = (function () {
         hitPin: hitPin,
         WheelZoom: WheelZoom,
         fitView: fitView,
-        TileLayer: TileLayer,
         drawPins: drawPins,
         formatView: formatView,
         parseView: parseView,

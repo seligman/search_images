@@ -60,9 +60,15 @@
         return SearchCore.albumTerm(data.albums, album);
     }
 
-    /* The meaning vector of a smart album's search, asked for of the
-       server; while its model starts, asked again every MEANING_RETRY
-       (MEANING_TRIES times), and the list drawn again when it comes. */
+    /* The meaning vector of a smart album's search (and of its words,
+       SearchCore.meaningTexts), asked for of the server: the texts the
+       albums want while the list is drawn go in one request
+       (SearchCore.MEANING_TEXTS at most each), and the list is drawn again
+       once when they come; while its model starts, asked again every
+       MEANING_RETRY (MEANING_TRIES times). */
+    var textsWanted = [];       // texts for the next request
+    var wantTimer = 0;
+
     function vectorFor(text) {
         if (!vectors || !vectors.query || !text) {
             return null;
@@ -75,23 +81,51 @@
             return null;                        // (asking now)
         }
         vectorTries[text] = -1;
-        SITE.queryVector(text, function (answer) {
+        textsWanted.push({text: text, tries: tries});
+        if (!wantTimer) {
+            wantTimer = window.setTimeout(askVectors, 0);
+        }
+        return null;
+    }
+
+    function askVectors() {
+        wantTimer = 0;
+        var asked = textsWanted.splice(0, SearchCore.MEANING_TEXTS);
+        if (!asked.length) {
+            return;
+        }
+        if (textsWanted.length) {
+            wantTimer = window.setTimeout(askVectors, 0);
+        }
+        var texts = asked.map(function (entry) {
+            return entry.text;
+        });
+        SITE.queryVector(texts.length > 1 ? texts : texts[0], function (answer) {
             answer = answer || {};
-            var vector = answer.state === "ready" && vectors && answer.model === vectors.model &&
-                answer.dims === vectors.dims ? SearchCore.queryVector(answer.vec, vectors.dims)
-                : null;
-            if (vector) {
-                queryVectors[text] = vector;
+            var ready = answer.state === "ready" && vectors && answer.model === vectors.model &&
+                answer.dims === vectors.dims;
+            var encoded = texts.length > 1 ? answer.vecs || [] : [answer.vec];
+            var again = false;
+            var found = false;
+            asked.forEach(function (entry, k) {
+                var vector = ready ? SearchCore.queryVector(encoded[k], vectors.dims) : null;
+                if (vector) {
+                    queryVectors[entry.text] = vector;
+                    found = true;
+                } else if ((answer.state === "starting" || answer.state === "busy") &&
+                           entry.tries + 1 < MEANING_TRIES) {
+                    vectorTries[entry.text] = entry.tries + 1;
+                    again = true;
+                } else {
+                    queryVectors[entry.text] = false;   // (by its words)
+                }
+            });
+            if (found) {
                 render();
-            } else if ((answer.state === "starting" || answer.state === "busy") &&
-                       tries + 1 < MEANING_TRIES) {
-                vectorTries[text] = tries + 1;
+            } else if (again) {
                 window.setTimeout(render, MEANING_RETRY);
-            } else {
-                queryVectors[text] = false;     // (by its words)
             }
         });
-        return null;
     }
 
     // Smart albums that look for pictures like one (look:) need the look

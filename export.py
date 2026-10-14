@@ -19,6 +19,7 @@ disk by double-clicking index.html.
                 [looks-NNN.js SEARCH_LOOKS.push({dims, ids, data, model})]
                 [meaning/model.js meaning/w-NNN.js meaning/LICENSE.txt]
     thumbs/<id>.jpg   images/<id>.<ext>   [panos/<id>.jpg]   [tiles/z/x/y.jpg]
+    [maps/index.js maps/z/x/y.js maps/LICENSE.txt] (with the street_maps option)
     [videos/<id>.mp4] (with the videos option "include")
     [raws/<id>.<ext>] (with the raw_files option)
     [robots.txt]      (unless search engines may index the site)
@@ -84,6 +85,20 @@ position over its video -- one without a fix the last it had, often where
 the drive started -- and the model reads it. Their pictures show it all
 the same: the review counts them (counts.routes "overlay" and "near").
 
+With the location and "street_maps" options (off by default) the street maps
+(street_maps.py, when they were downloaded) go along for the published
+places only: the tiles street_km (default 5) around each published position
+and 2 km either side of the published routes, from the zoom the pages start
+drawing them at (street_maps.DRAWN_FROM) down to street_zoom (default 14),
+that the downloaded maps have -- in a trip's export none that touches the
+home area (the world image shows there). They are written as the server
+sends them (maps/z/x/y.js scripts and maps/index.js, see static/streets.js),
+with the OpenStreetMap credit and licence (maps/LICENSE.txt) at the foot of
+the pages and in a corner of the maps; the review counts them and their
+size, and the free space check counts them too. The site never asks another
+host for anything: every page says so in its Content-Security-Policy
+(EXPORT_CSP).
+
 An export can be limited to one manual album of the owner's (the album
 option, an album id; see albums.py): only the album's pictures of the
 library are candidates, and the privacy rules above still apply to them.
@@ -106,7 +121,9 @@ Faces and their people (people.py, people_groups.py) are never published:
 no face, box or vector, and no name -- unless the "people_names" option is
 on (off by default): then the names of the named people who are not hidden
 become tags of the pictures they are in (people_groups.export_names), so a
-search for a name finds them in the site. Nothing else of People goes.
+search for a name finds them in the site, and the manifest lists them
+(names: published_names) so its plain-language search knows them as names.
+Nothing else of People goes.
 
 A 360-degree photo also goes out with its large panorama (panos/<id>.jpg)
 for the 360 view, and so does a wide photo (images.gets_pano) when the
@@ -145,14 +162,15 @@ Used by the job runner (Manage page), "serve.py package" and its own
 command line:
 
     python export.py --library NAME [--out DIR] [--images web|original|none]
-                     [--location [--estimated-places] [--routes [--routes-trim M]]]
+                     [--location [--estimated-places] [--routes [--routes-trim M]]
+                      [--street-maps [--street-km KM] [--street-zoom Z]]]
                      [--file-names] [--folders]
                      [--include-screenshots] [--include-documents]
                      [--include-undescribed] [--include-private]
                      [--include-sensitive] [--zip] [--album NAME] [--marks]
                      [--people-names]
                      [--raw-files]
-    python export.py --trip ID [--home-km KM] [the same switches]
+    python export.py --trip ID [--home-km KM] [--story] [the same switches]
     python export.py --serve FOLDER [--port 8000]
 
 --trip exports a trip (trips.py) instead: the pictures of its libraries,
@@ -211,6 +229,7 @@ import places
 import prompts
 import raw_photos
 import search_index
+import street_maps
 import tracks
 import videos
 import world_map
@@ -247,8 +266,8 @@ PLACES_CREDIT = ('Place names: <a href="%s">GeoNames</a> (<a href="%s" rel="lice
                                      html.escape(places.LICENSE_URL)))
 MAX_ID_LIST = 100000
 # Scripts and the style sheet every export carries (map.js only with the map).
-ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "routes.js", "viewer.js",
-          "app.js", "detail.js")
+ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "streets.js", "routes.js",
+          "viewer.js", "app.js", "detail.js")
 MAP_ASSETS = ("map.js",)
 # (file in the export, template)
 PAGES = (("index.html", "page.html"), ("detail.html", "detail.html"))
@@ -264,7 +283,8 @@ RESERVED_SLUGS = frozenset(["state", "con", "prn", "aux", "nul"]
                            + ["com%d" % n for n in range(1, 10)]
                            + ["lpt%d" % n for n in range(1, 10)])
 # The folders of an export this tool manages (and may clean up).
-MANAGED_FOLDERS = ("assets", "data", "thumbs", "images", "panos", "tiles", "videos", "raws")
+MANAGED_FOLDERS = ("assets", "data", "thumbs", "images", "panos", "tiles", "videos", "raws",
+                   "maps")
 # The extensions of exported originals (see original_picture).
 ORIGINAL_EXTENSIONS = ("jpg", "png", "gif", "webp")
 # Free space an export leaves on the disk it writes to, at least.
@@ -331,6 +351,10 @@ DEFAULT_OPTIONS = {
     "routes": False,                # with location: drives' routes and the positions of clips
                                     # from their GPS tracks (tracks.py)
     "routes_trim": tracks.DEFAULT_TRIM_METRES,  # metres left out where a drive starts or ends
+    "street_maps": False,           # with location: the street maps (street_maps.py) of the
+                                    # published places and routes
+    "street_km": 5,                 # with street_maps: km around each place (2 along routes)
+    "street_zoom": 14,              # with street_maps: the most detailed zoom
     "file_names": False,
     "folders": False,
     "exclude_types": ["screenshot", "document"],    # photo types left out
@@ -356,6 +380,21 @@ DEFAULT_OPTIONS = {
 _BOOLEAN_OPTIONS = ("location", "file_names", "folders", "exclude_private", "exclude_sensitive",
                     "exclude_undescribed", "zip", "allow_indexing", "similar", "meaning",
                     "looks", "marks", "estimated_places", "routes", "people_names", "raw_files")
+# The street maps an export may carry: km around each published place, and zooms.
+STREET_KM = (1, 50)
+STREET_ZOOMS = (10, 15)
+# The credit at the foot of the pages of an export with street maps.
+STREETS_CREDIT = ('Street maps: &copy; OpenStreetMap contributors '
+                  '(<a href="maps/LICENSE.txt" rel="license">ODbL</a>)')
+# The Content-Security-Policy of every exported page (a <meta> tag; export.py --serve
+# sends it too): scripts, styles, pictures and requests only from the site itself (a
+# browser takes the folder of a site opened from disk for that), so the site never asks
+# another host for anything, whatever its scripts do; WebAssembly for the search by
+# meaning's kernel; no plugins, no <base>, forms only to itself.
+EXPORT_CSP = ("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
+              "connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
+              "style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'; "
+              "object-src 'none'")
 # Where the query model goes (in data/), and the scripts that run it (in assets/).
 MEANING_FOLDER = "meaning"
 MEANING_ASSETS = ("embed-kernel.js", "embed-engine.js")
@@ -539,6 +578,17 @@ def validate_options(options, base=None):
                 errors[key] = "must be a whole number of metres from %d to %d" % tracks.TRIM_RANGE
             else:
                 result[key] = value
+        elif key == "street_maps":
+            if not isinstance(value, bool):
+                errors[key] = "must be true or false"
+            else:
+                result[key] = value
+        elif key in ("street_km", "street_zoom"):
+            low, high = STREET_KM if key == "street_km" else STREET_ZOOMS
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                errors[key] = "must be a whole number from %d to %d" % (low, high)
+            else:
+                result[key] = value
         elif key == "max_video_mb":
             if (isinstance(value, bool) or not isinstance(value, int)
                     or not MAX_VIDEO_MB[0] <= value <= MAX_VIDEO_MB[1]):
@@ -618,6 +668,8 @@ def options_summary(options):
         summary["estimated_places"] = True
     if options["location"] and options["routes"]:
         summary["routes"] = True
+    if options["location"] and options["street_maps"]:
+        summary["street_maps"] = True
     if options["raw_files"]:
         summary["raw_files"] = True
     return summary
@@ -1786,17 +1838,39 @@ def _reasons(record, options, extra=()):
     return flags, active
 
 
+def _people_names(conn, library_id):
+    """{image id: [names]} of the named people who are not hidden (the only thing of
+    People an export may publish: people_groups.export_names)."""
+    import people_groups
+    return people_groups.export_names(conn, library_id)
+
+
 def add_people_names(conn, library_id, records):
     """The "people_names" option: the names of the people in each picture (named, not
-    hidden: people_groups.export_names) become tags of its record (g, lower case like
-    every tag). Nothing else of People is ever published."""
-    import people_groups
-    names = people_groups.export_names(conn, library_id)
+    hidden: _people_names) become tags of its record (g, lower case like every tag).
+    Nothing else of People is ever published."""
+    names = _people_names(conn, library_id)
     for record in records:
         found = names.get(record["i"])
         if found:
             record["g"] = search_index.record_tags(list(record.get("g") or []) + found)
     return records
+
+
+def published_names(conn, library_ids, pictures, options):
+    """The names of the people a site publishes (its "people_names" option: they are
+    tags of their pictures, add_people_names), sorted, for its plain-language search
+    (manifest.names: a name typed is searched as those words, never by meaning); []
+    without the option."""
+    if not options.get("people_names"):
+        return []
+    shown = {picture.row["id"] for picture in pictures}
+    names = set()
+    for library_id in library_ids:
+        for image_id, found in _people_names(conn, library_id).items():
+            if image_id in shown:
+                names.update(found)
+    return sorted(names, key=lambda name: (name.lower(), name))
 
 
 def select_records(conn, config, library, options, only=None, extra=None):
@@ -2374,6 +2448,18 @@ def preview_pictures(conn, config, libraries, options, only=None, extra=None, ho
         "routes": len(track_routes.routes([row["id"] for row in chosen_rows])),
         "overlay": sum(1 for row in chosen_rows if row["id"] in track_routes.related),
         "near": sum(1 for row in chosen_rows if track_routes.near_end(row))}
+    # The street maps that go along (street_levels), and their size.
+    street_on = bool(options["location"] and options["street_maps"])
+    street_available = street_maps.shared.levels_now() is not None
+    levels = {}
+    if street_on and street_available:
+        by_record = {record["i"]: record for record in chosen}
+        levels = street_levels(options, *published_places(
+            conn, library_ids, [(row, by_record[row["id"]]) for row in chosen_rows],
+            track_routes), home=home)
+    street_tiles, street_bytes = street_maps.export_size(levels) if levels else (0, 0)
+    counts["street_maps"] = {"available": street_available, "on": street_on,
+                             "tiles": street_tiles, "bytes": street_bytes}
     vectors = _vector_sizes(conn, library_ids, options,
                             {record["i"] for record in chosen} | flagged_ids,
                             carried=_carried((record["i"], record) for record in published))
@@ -2381,6 +2467,7 @@ def preview_pictures(conn, config, libraries, options, only=None, extra=None, ho
                              {record["i"] for record in chosen} | flagged_ids)
     parts = {"thumbs": 0, "images": 0, "panos": 0, "data": 0, "videos": 0,
              "vectors": 0, "meaning": 0, "looks": 0, "raws": 0}
+    parts["maps"] = street_bytes
     raw_counts = {"total": 0, "included": 0, "location": 0}
     looked = {"vectors": 0, "missing": 0} if options["looks"] else None
     needs_folder = collections.Counter()
@@ -2590,6 +2677,40 @@ def _estimated_location(row, record, estimate):
 
 # The record keys of a picture's own text (search_index's _TEXT_FIELDS).
 RECORD_TEXT_KEYS = (("t", "title"), ("d", "description"), ("o", "text"), ("sc", "scene"))
+
+
+def published_places(conn, library_ids, pairs, routes):
+    """What an export with the location option shows on its map: ([(lat, lon)] of the
+    positions of pairs ([(row, record)], the pictures it publishes) as data/locations.js
+    holds them, [[(lat, lon)]] of the lines of their routes (routes: a _Routes))."""
+    points = []
+    estimates = place_estimates.for_libraries(conn, library_ids)
+    for row, record in pairs:
+        where = _location(row)
+        if where is not None:
+            if routes.position(row):
+                points.append(where)
+            continue
+        estimate = estimates.get(row["id"])
+        point = _estimated_location(row, record, estimate)
+        if point is not None and routes.estimate(estimate):
+            points.append((point["lat"], point["lon"]))
+    lines = [[(lat, lon) for _at, lat, lon, _speed in tracks.decode(clip["p"])]
+             for route in routes.routes([row["id"] for row, _record in pairs])
+             for clip in route["c"]]
+    return points, lines
+
+
+def street_levels(options, points, lines, home=None):
+    """The street map tiles an export carries with its street_maps option
+    (street_maps.export_plan: {zoom: set of (x, y)}): street_km around the places it
+    publishes (points) and 2 km either side of its routes (lines), from the zoom the
+    pages draw them at down to street_zoom, of those downloaded; none that touches home
+    (a trip export's home area). {} without the location and street_maps options."""
+    if not (options["location"] and options["street_maps"]):
+        return {}
+    return street_maps.export_plan(points, lines, options["street_km"],
+                                   options["street_zoom"], home=home)
 
 
 def _scrub_positions(record, keys):
@@ -2889,6 +3010,7 @@ def _guess_own_files(out_dir):
         re.compile(r"^raws/[a-z2-7]{%d}\.(%s)$" % (XID_LENGTH, "|".join(
             extension[1:] for extension in common.RAW_EXTENSIONS))),
         re.compile(r"^tiles/\d+/\d+/\d+\.jpg$"),
+        re.compile(r"^maps/(index\.js|LICENSE\.txt|\d+/\d+/\d+\.js)$"),
     )
     for folder, _dirs, files in os.walk(out_dir):
         rel_folder = os.path.relpath(folder, out_dir).replace(os.sep, "/")
@@ -2978,15 +3100,19 @@ def render_page(template, title, page_title, capabilities, export_id, options,
                           text, count=1)
     if count != 1:
         raise ExportError("The page template %s has no <title>." % template)
+    anchor = '<meta charset="utf-8">'
+    if anchor not in text:
+        raise ExportError("The page template %s has no charset line." % template)
+    text = text.replace(anchor, anchor + '\n<meta http-equiv="Content-Security-Policy" '
+                                          'content="%s">' % html.escape(EXPORT_CSP, quote=False), 1)
     if not options["allow_indexing"]:
-        anchor = '<meta charset="utf-8">'
-        if anchor not in text:
-            raise ExportError("The page template %s has no charset line." % template)
         text = text.replace(anchor, anchor + '\n<meta name="robots" content="noindex, '
                                               'noimageindex">', 1)
     credits = [html.escape(options["credits"])] if options["credits"] else []
     if capabilities.get("places"):
         credits.append(PLACES_CREDIT)
+    if capabilities.get("streets"):
+        credits.append(STREETS_CREDIT)
     if meaning is not None:
         # (Not on the map page, which has no foot and does not use the model.)
         credits.append('Search by meaning: %s<a href="data/%s" rel="license">license</a>' % (
@@ -3736,10 +3862,16 @@ class _Export:
         and the Place filter (location), lib: (the libraries' own names);
         nor when it looks for pictures like one that is not published
         (similar:, look:); nor when it looks for a person (person:: an
-        export holds no people, and the search names one). Returns
+        export holds no people, and the search names one) -- but with
+        people_names on (the names are tags of their pictures then), a person:
+        term that plain-language search wrote as an alternative to the words
+        typed ('person:"Anna Lopez" OR anna', albums.alternative_spans) goes
+        and the words stay; so does such a place: term without location.
+        Returns
         {"options", "changes": {(start, stop):
-        new value} (similar: and look: name the picture by its export id),
-        "albums": the album: terms (album_numbers checks them)}.
+        new value} (similar: and look: name the picture by its export id; ""
+        for an alternative that goes), "albums": the album: terms
+        (album_numbers checks them)}.
         """
         options = dict(album.get("options") or {})
         if not albums.smart_in_libraries(options, self.library_ids):
@@ -3755,9 +3887,16 @@ class _Export:
         else:
             options.pop("filters", None)
         needs = {"folder": "folders", "file": "file_names", "place": "location"}
-        changes = {}
+        query = album.get("query") or ""
+        # (Without people_names a name never goes out, not even as a word.)
+        dropped = albums.alternative_spans(query, [field for field, drop in (
+            ("person", self.options["people_names"]), ("place", not self.options["location"]))
+            if drop])
+        changes = {span: "" for span in dropped}
         named = []
-        for term in albums.query_terms(album.get("query") or ""):
+        for term in albums.query_terms(query):
+            if any(start <= term["start"] < stop for start, stop in dropped):
+                continue        # (an alternative that goes: the words stay)
             field = term["field"]
             value = term["value"].strip()
             if field in ("lib", "person") or (field in needs and not self.options[needs[field]]):
@@ -3828,6 +3967,10 @@ class _Export:
             manifest["meaning"] = meaning
         if self.published_albums:
             manifest["albums"] = self.published_albums
+        names = published_names(self.conn, self.library_ids, pictures, self.options)
+        if names:
+            # (Already tags of the pictures; plain-language search finds them as names.)
+            manifest["names"] = names
         if self.options["location"]:
             points = []
             estimates = place_estimates.for_libraries(self.conn, self.library_ids)
@@ -4052,6 +4195,46 @@ class _Export:
                     self.writer.write(rel, data, sig)
         return serve.FALLBACK_MAX_ZOOM
 
+    def street_levels(self, pictures):
+        """The street map tiles of the published pictures and routes (street_levels)."""
+        return self._street_levels([(picture.row, picture.record) for picture in pictures])
+
+    def _street_levels(self, pairs):
+        if not (self.options["location"] and self.options["street_maps"]):
+            return {}
+        routes = self.track_routes or _Routes(self.conn, self.config, self.library_ids,
+                                              self.options, home=self.home)
+        points, lines = published_places(self.conn, self.library_ids, pairs, routes)
+        return street_levels(self.options, points, lines, home=self.home)
+
+    def street_bytes(self, chosen, rows):
+        """The size of the street maps the chosen records would carry (as the review
+        counts them, before any picture is read), for check_space."""
+        pairs = [(rows[record["i"]], record) for record in chosen if record["i"] in rows]
+        levels = self._street_levels(pairs)
+        return street_maps.export_size(levels)[1] if levels else 0
+
+    def write_streets(self, levels):
+        """Write maps/: the street map tiles of levels (unchanged ones kept), their
+        index and licence. Returns the pages' "streets" setting ({"url", "v"}), or None
+        when there are none."""
+        version = None
+        tiles = 0
+        for rel, make, sig in street_maps.export_files(levels):
+            if rel.startswith("maps/") and rel.count("/") == 3:
+                tiles += 1
+            if sig and self.writer.current(rel, sig):
+                continue
+            data = make()
+            self.writer.write(rel, data, sig)
+            if rel == "maps/index.js":
+                version = _version(data)
+        if version is None:
+            return None
+        self.ctx.log("Street maps: %d tile(s) around the published places (zoom %d and less, "
+                     "%d km around)." % (tiles, max(levels), self.options["street_km"]))
+        return {"url": "maps/", "v": version}
+
     # -- the zip --------------------------------------------------------------
 
     def write_zip(self):
@@ -4161,9 +4344,11 @@ class _Export:
                      "still there they are kept; the others are left out." % (
                          where, needing, len(chosen)), "warn")
 
-    def check_space(self, chosen, rows, sizes):
-        """Raise ExportError when the disk of the folder has too little room for the export."""
-        estimate = _asset_bytes(self.options)
+    def check_space(self, chosen, rows, sizes, extra=0):
+        """Raise ExportError when the disk of the folder has too little room for the export
+        (extra: bytes it writes besides the assets and the pictures' files: the street
+        maps)."""
+        estimate = _asset_bytes(self.options) + extra
         for record in chosen:
             row = rows.get(record["i"])
             if row is not None:
@@ -4200,7 +4385,7 @@ class _Export:
             # Refused before anything is written: the folder and the record
             # of the last export stay as they were.
             self.check_sources(chosen, rows, sizes)
-            self.check_space(chosen, rows, sizes)
+            self.check_space(chosen, rows, sizes, extra=self.street_bytes(chosen, rows))
             self.mark()
             with cache.ThumbStore() as thumbs:
                 self.thumbs = thumbs
@@ -4231,9 +4416,15 @@ class _Export:
             if self.options["marks"]:
                 # (Favorites, ratings and album names were published.)
                 capabilities["marks"] = True
+            if not search_index.plain_language(self.config):
+                capabilities["plain"] = False   # (as the server's pages: app.js plainOn)
             if location and any(record.get("co") for record in records):
                 # Place names (and with them the GeoNames credit, render_page).
                 capabilities["places"] = True
+            levels = self.street_levels(pictures) if location and \
+                self.options["street_maps"] else {}
+            if levels:
+                capabilities["streets"] = True
             files, manifest = self.data_files(pictures, records, capabilities)
             for rel in sorted(files):
                 self.writer.write(rel, files[rel].encode("ascii"))
@@ -4253,6 +4444,10 @@ class _Export:
                 versions[name] = _version(data)
                 self.writer.write("assets/" + name, data)
             tiles_max = self.tiles() if location else None
+            streets = self.write_streets(levels)
+            settings = self.page_settings()
+            if streets is not None:
+                settings = dict(settings or {}, streets=streets)
             for name, template in self.pages():
                 page_title = self.title if name != "map.html" else "Map - %s" % self.title
                 text = render_page(template, self.title, page_title, capabilities,
@@ -4260,7 +4455,7 @@ class _Export:
                                    _version(manifest_bytes),
                                    {"credit": self.meaning_status["credit"]}
                                    if self.meaning is not None else None,
-                                   self.page_settings())
+                                   settings)
                 self.writer.write(name, text.encode("utf-8"))
             if not self.options["allow_indexing"]:
                 # Only heard at the root of a host; the pages say it too.
@@ -4445,31 +4640,144 @@ def export_library(ctx, conn, config, library_id, out_dir=None, options=None, he
 # ---------------------------------------------------------------------------
 # Command line
 
+# The export options that export.py turns on with --name and off with --no-name.
+_SWITCHED_OPTIONS = ("location", "estimated_places", "routes", "file_names", "folders", "zip",
+                     "allow_indexing", "similar", "meaning", "looks", "marks", "people_names",
+                     "raw_files", "street_maps")
+# ... and those it turns off with --include-name (exclude_name) and on with --no-include-name.
+_INCLUDE_SWITCHES = ("undescribed", "private", "sensitive")
+# The value of a list switch (--exclude-types, --include-ids, --exclude-ids) for an empty list.
+NONE_ARGUMENT = "none"
+
+
 def _cli_options(args, library, current=None):
     """The options the command line switches change (the saved ones are the base;
-    current: the options they change, default the library's)."""
+    current: the options they change, default the library's). options_arguments
+    makes the switches of options."""
     options = {}
     if args.images:
         options["images"] = args.images
-    for name in ("location", "file_names", "folders", "zip", "marks", "estimated_places",
-                 "routes", "people_names", "raw_files"):
-        if getattr(args, name, False):
-            options[name] = True
+    for name in _SWITCHED_OPTIONS:
+        if getattr(args, name, None) is not None:
+            options[name] = getattr(args, name)
     if getattr(args, "routes_trim", None) is not None:
         options["routes_trim"] = args.routes_trim
     if args.videos:
         options["videos"] = args.videos
-    for name in ("undescribed", "private", "sensitive"):
-        if getattr(args, "include_" + name):
-            options["exclude_" + name] = False
+    for name in _INCLUDE_SWITCHES:
+        if getattr(args, "include_" + name, None) is not None:
+            options["exclude_" + name] = not getattr(args, "include_" + name)
+    for name in ("title", "credits", "max_video_mb", "include_ids", "exclude_ids",
+                 "street_km", "street_zoom"):
+        if getattr(args, name, None) is not None:
+            options[name] = getattr(args, name)
+    if getattr(args, "no_album", False):
+        options["album"] = None
     if current is None:
         current = library_options(library)
-    excluded = [kind for kind in current["exclude_types"]
+    typed = getattr(args, "exclude_types", None)
+    excluded = [kind for kind in (current["exclude_types"] if typed is None else typed)
                 if not (kind == "screenshot" and args.include_screenshots)
                 and not (kind == "document" and args.include_documents)]
-    if excluded != current["exclude_types"]:
+    if typed is not None or excluded != current["exclude_types"]:
         options["exclude_types"] = excluded
     return options
+
+
+def _list_argument(text):
+    """The parts of a list switch's value (separated by commas); [] for NONE_ARGUMENT."""
+    if text.strip().lower() == NONE_ARGUMENT:
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def _types_argument(text):
+    """--exclude-types: picture types separated by commas, or "none"."""
+    kinds = _list_argument(text)
+    unknown = [kind for kind in kinds if kind not in EXPORT_KINDS]
+    if unknown:
+        raise argparse.ArgumentTypeError("unknown picture type(s): %s (known: %s)" % (
+            ", ".join(unknown), ", ".join(EXPORT_KINDS)))
+    return kinds
+
+
+def _ids_argument(text):
+    """--exclude-ids: picture ids separated by commas, or "none"."""
+    try:
+        return [int(part) for part in _list_argument(text)]
+    except ValueError:
+        raise argparse.ArgumentTypeError("give picture ids (whole numbers) separated by "
+                                         "commas, or none")
+
+
+def _include_argument(text):
+    """--include-ids: entries separated by commas, each a picture id (published whatever
+    its flags) or ID:FLAG+FLAG (published despite those flags; see _include_list), or
+    "none"."""
+    entries = []
+    for part in _list_argument(text):
+        number, colon, flags = part.partition(":")
+        try:
+            image_id = int(number)
+        except ValueError:
+            raise argparse.ArgumentTypeError("give picture ids, or ID:FLAG+FLAG, separated "
+                                             "by commas (or none)")
+        entries.append([image_id, [flag for flag in flags.split("+") if flag]] if colon
+                       else image_id)
+    return entries
+
+
+def _include_entry(entry):
+    if isinstance(entry, list) and len(entry) == 2:
+        return "%d:%s" % (entry[0], "+".join(entry[1]))
+    return "%d" % entry
+
+
+def options_arguments(options, trip=False):
+    """The switches of export.py that give these options: overrides of the saved ones, as
+    an export job's "options" holds them (_cli_options reads them back). With trip, a
+    trip's (home_km, story, and no album). Raises ValueError naming the options that no
+    switch gives."""
+    tokens = []
+    unknown = []
+    left = dict(options or {})
+    for key in list(DEFAULT_OPTIONS) + ["home_km", "story"]:
+        if key not in left:
+            continue
+        value = left.pop(key)
+        switch = "--" + key.replace("_", "-")
+        if key in _SWITCHED_OPTIONS:
+            tokens.append(switch if value else "--no-" + switch[2:])
+        elif key[len("exclude_"):] in _INCLUDE_SWITCHES and key.startswith("exclude_"):
+            include = "--include-" + key[len("exclude_"):]
+            tokens.append("--no-" + include[2:] if value else include)
+        elif key in ("images", "videos", "routes_trim", "max_video_mb", "title", "credits",
+                     "street_km", "street_zoom"):
+            tokens += jobs.option_tokens(switch, value)
+        elif key == "home_km" and trip:
+            tokens += jobs.option_tokens(switch, value)
+        elif key == "story" and trip:
+            tokens.append(switch if value else "--no-story")
+        elif key == "exclude_types":
+            tokens += [switch, ",".join(value) or NONE_ARGUMENT]
+        elif key == "include_ids":
+            tokens += [switch, ",".join(_include_entry(entry) for entry in value)
+                       or NONE_ARGUMENT]
+        elif key == "exclude_ids":
+            tokens += [switch, ",".join("%d" % image_id for image_id in value)
+                       or NONE_ARGUMENT]
+        elif key == "album" and value is None:
+            if not trip:
+                tokens.append("--no-album")
+        elif key == "album" and not trip:
+            tokens += [switch, "#%d" % value]
+        else:
+            unknown.append(key)
+    unknown += list(left)
+    if unknown:
+        raise ValueError("no switch of export.py gives the export option %s"
+                         % ", ".join(sorted(unknown)))
+    return tokens
 
 
 def serve_command(folder):
@@ -4534,6 +4842,8 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
+        # (As the pages' own <meta> says: nothing from another host.)
+        self.send_header("Content-Security-Policy", EXPORT_CSP)
         super().end_headers()
 
     def copyfile(self, source, outputfile):
@@ -4607,7 +4917,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Export one library as a static website (see README: Publishing a "
                     "library). The library's saved export options are used, changed by "
-                    "the options given here.")
+                    "the options given here. A switch that turns something on has a --no- "
+                    "form that turns it off (--location, --no-location).")
     parser.add_argument("--library", help="the library's name or id (needed for an "
                                            "export, unless --trip)")
     parser.add_argument("--trip", metavar="ID",
@@ -4619,13 +4930,18 @@ def main(argv=None):
                         help="with --trip: the size of the squares around home that are "
                              "never shown (no position, route, town or dashcam clip there; "
                              "default %d km, 0: off)" % trip_export.HOME_KM)
+    parser.add_argument("--story", action=argparse.BooleanOptionalAction,
+                        help="with --trip and --location (the story names the trip's "
+                             "places): the trip's story (written on the trip's page, see "
+                             "trip_stories.py) goes too; it names people only with "
+                             "--people-names (default: off)")
     parser.add_argument("--out", help="output folder (default: data/exports/<library name> "
                                       "in the data folder); it must be empty or an earlier "
                                       "export")
     parser.add_argument("--images", choices=IMAGE_MODES,
                         help="web: 2048 px pictures (default); original: the originals, "
                              "metadata removed; none: thumbnails only")
-    parser.add_argument("--location", action="store_true",
+    parser.add_argument("--location", action=argparse.BooleanOptionalAction,
                         help="include GPS positions, the town, region and country names "
                              "(when place names were downloaded; with a GeoNames credit), "
                              "the map and the AI model's separate landmark and place-guess "
@@ -4633,47 +4949,90 @@ def main(argv=None):
                              "either way, except that without it GPS positions written "
                              "out in them or in the text in the picture, as a dashcam "
                              "prints them, are taken out)")
-    parser.add_argument("--estimated-places", action="store_true",
+    parser.add_argument("--estimated-places", action=argparse.BooleanOptionalAction,
                         help="with --location: also the places estimated for pictures "
                              "without a GPS position of their own (marked as estimated; "
                              "see place_estimates.py)")
-    parser.add_argument("--routes", action="store_true",
+    parser.add_argument("--routes", action=argparse.BooleanOptionalAction,
                         help="with --location: also the routes of drives and the positions "
                              "of clips from their GPS tracks (dashcams; see tracks.py), less "
                              "where each drive starts and ends")
     parser.add_argument("--routes-trim", type=int, metavar="M",
                         help="metres left out of every route where a drive starts and ends "
                              "(default %d)" % tracks.DEFAULT_TRIM_METRES)
-    parser.add_argument("--file-names", action="store_true", help="include file names")
-    parser.add_argument("--folders", action="store_true", help="include folder names")
+    parser.add_argument("--street-maps", action=argparse.BooleanOptionalAction,
+                        help="with --location: the street maps (street_maps.py) around the "
+                             "published places and routes (--no-street-maps: without them)")
+    parser.add_argument("--street-km", type=int, metavar="KM",
+                        help="with --street-maps: kilometres around each place (%d to %d, "
+                             "default %d)" % (STREET_KM + (DEFAULT_OPTIONS["street_km"],)))
+    parser.add_argument("--street-zoom", type=int, metavar="Z",
+                        help="with --street-maps: the most detailed zoom (%d to %d, default "
+                             "%d)" % (STREET_ZOOMS + (DEFAULT_OPTIONS["street_zoom"],)))
+    parser.add_argument("--file-names", action=argparse.BooleanOptionalAction,
+                        help="include file names")
+    parser.add_argument("--folders", action=argparse.BooleanOptionalAction,
+                        help="include folder names")
     parser.add_argument("--include-screenshots", action="store_true",
                         help="include screenshots")
     parser.add_argument("--include-documents", action="store_true",
                         help="include documents")
-    parser.add_argument("--include-undescribed", action="store_true",
+    parser.add_argument("--exclude-types", type=_types_argument, metavar="TYPE,TYPE",
+                        help="the kinds of picture left out, instead of the saved ones "
+                             "(%s; none: leave out none); --include-screenshots and "
+                             "--include-documents then take theirs out of the list"
+                        % ", ".join(EXPORT_KINDS))
+    parser.add_argument("--include-undescribed", action=argparse.BooleanOptionalAction,
                         help="include pictures not described yet (or described by an older "
                              "version), which were not checked for private or sensitive "
                              "content")
-    parser.add_argument("--include-private", action="store_true",
+    parser.add_argument("--include-private", action=argparse.BooleanOptionalAction,
                         help="include pictures flagged as showing private information")
-    parser.add_argument("--include-sensitive", action="store_true",
+    parser.add_argument("--include-sensitive", action=argparse.BooleanOptionalAction,
                         help="include pictures flagged as suggestive, explicit or graphic")
-    parser.add_argument("--zip", action="store_true",
+    parser.add_argument("--zip", action=argparse.BooleanOptionalAction,
                         help="also write <output folder>.zip next to the folder")
     parser.add_argument("--album", metavar="NAME",
-                        help="only the pictures of this manual album (its name, or its id); "
-                             "the privacy options still apply to them")
-    parser.add_argument("--marks", action="store_true",
+                        help="only the pictures of this manual album (its name, or its id "
+                             "as #ID); the privacy options still apply to them")
+    parser.add_argument("--no-album", action="store_true",
+                        help="the whole library, also when the saved options name an album")
+    parser.add_argument("--marks", action=argparse.BooleanOptionalAction,
                         help="also publish favorites, ratings and album names (so "
                              "is:favorite, rating: and album: work in the site)")
-    parser.add_argument("--people-names", action="store_true",
+    parser.add_argument("--people-names", action=argparse.BooleanOptionalAction,
                         help="also publish the names of the people in the pictures (People: "
                              "the named people who are not hidden) as tags; faces never go")
-    parser.add_argument("--raw-files", action="store_true",
+    parser.add_argument("--raw-files", action=argparse.BooleanOptionalAction,
                         help="also publish the camera RAW file of each picture that has one, "
                              "as it is: with every fact the camera wrote in it (the time, "
                              "the camera's serial number; one holding a GPS position only "
                              "with --location)")
+    parser.add_argument("--max-video-mb", type=int, metavar="MB",
+                        help="larger videos keep their poster frame only (default %d)"
+                        % DEFAULT_OPTIONS["max_video_mb"])
+    parser.add_argument("--title", metavar="TEXT",
+                        help="the site's title (default: the library's name)")
+    parser.add_argument("--credits", metavar="TEXT",
+                        help="a line of plain text at the foot of the pages")
+    parser.add_argument("--allow-indexing", action=argparse.BooleanOptionalAction,
+                        help="let search engines index the pages (by default they are asked "
+                             "not to)")
+    parser.add_argument("--similar", action=argparse.BooleanOptionalAction,
+                        help="the meaning vectors, so More like this works (on by default)")
+    parser.add_argument("--meaning", action=argparse.BooleanOptionalAction,
+                        help="the query model too, so typed searches go by meaning (on by "
+                             "default, when it can be used)")
+    parser.add_argument("--looks", action=argparse.BooleanOptionalAction,
+                        help="the look vectors, so Looks like this works (on by default)")
+    parser.add_argument("--include-ids", type=_include_argument, metavar="ID,ID:FLAG+FLAG",
+                        help="the pictures published although their flags would leave them "
+                             "out, instead of the saved ones (as the review step of the "
+                             "Export dialog chooses them: an id, or ID:FLAG+FLAG for one "
+                             "published despite those flags; none: no such pictures)")
+    parser.add_argument("--exclude-ids", type=_ids_argument, metavar="ID,ID",
+                        help="the pictures never published, instead of the saved ones (none: "
+                             "no such pictures)")
     parser.add_argument("--videos", choices=VIDEO_MODES,
                         help="skip: videos are published as their poster frame (default); "
                              "include: also the videos browsers can play (H.264, or a "
@@ -4685,7 +5044,11 @@ def main(argv=None):
                         % SERVE_PORT)
     parser.add_argument("--port", type=int, default=SERVE_PORT,
                         help="the port for --serve (default %d)" % SERVE_PORT)
+    jobs.add_settings_base_argument(parser)
     args = parser.parse_args(argv)
+    jobs.use_settings_base(parser, args)
+    if args.album and args.no_album:
+        parser.error("--album and --no-album do not go together")
     if args.serve:
         try:
             serve_folder(args.serve, args.port)
@@ -4695,13 +5058,17 @@ def main(argv=None):
     if args.home_km is not None and not args.trip:
         parser.error("--home-km only applies with --trip (a library's export has no area "
                      "around home)")
+    if args.story is not None and not args.trip:
+        parser.error("--story only applies with --trip (a library's export has no story)")
     if args.trip:
-        if args.library or args.album:
+        if args.library or args.album or args.no_album:
             parser.error("--trip exports the trip's own pictures: no --library or --album")
+        jobs.log_tool_command(None, "export.py", argv)
         return trip_export.main_cli(args, lambda arguments, current: _cli_options(
             arguments, None, current))
     if not args.library:
         parser.error("--library or --trip is needed (or --serve FOLDER)")
+    jobs.log_tool_command(None, "export.py", argv)
     try:
         db.init()
         config = common.load_config()

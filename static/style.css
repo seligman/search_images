@@ -1534,6 +1534,27 @@ details.more > summary {
     color: var(--danger-fg);
 }
 
+/* A job's command line (jobs.py log_command): in the log, and the Copy buttons
+   there and under the recent jobs, inline with the text */
+.log-line.log-command code {
+    font-family: inherit;
+    color: var(--text);
+    background: var(--surface);
+    border-radius: 4px;
+    padding: 1px 4px;
+}
+
+.button.command-copy {
+    display: inline;
+    min-height: 0;
+    padding: 0 4px;
+    border: none;
+    font-size: inherit;
+    line-height: inherit;
+    white-space: nowrap;
+    vertical-align: baseline;
+}
+
 /* Settings page */
 
 .table-wrap {
@@ -2727,6 +2748,62 @@ button.facet-title::after {
     margin: 0 0 12px;
 }
 
+/* How plain-language search understood the query (app.js renderPlain) */
+#plain-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 8px;
+    font-size: 13px;
+}
+
+.plain-label {
+    color: var(--text-muted);
+}
+
+.plain-words {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 3px 11px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 16px;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+
+.plain-choice {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+}
+
+.plain-ask {
+    color: var(--text-muted);
+}
+
+.plain-option {
+    padding: 3px 11px;
+    border: 1px solid var(--info-border);
+    border-radius: 16px;
+    background: var(--surface);
+    color: var(--info-text);
+    font: inherit;
+    cursor: pointer;
+}
+
+.plain-option:hover {
+    border-color: var(--accent);
+    background: var(--info-soft);
+}
+
+.plain-option:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
 .filter-chip {
     display: inline-flex;
     align-items: center;
@@ -3014,6 +3091,79 @@ button.facet-title::after {
     margin: 8px 0 0;
     color: var(--text-muted);
     font-size: 12px;
+}
+
+/* The street maps panel of the Manage page (street-maps.js) */
+
+.street-maps-status,
+.street-maps-plan,
+.street-maps-job {
+    margin: 8px 0;
+    font-size: 14px;
+}
+
+.street-maps-plan,
+.street-maps-job {
+    color: var(--text-muted);
+}
+
+/* The OpenStreetMap credit in a corner of a map while it shows street maps
+   (streets.js): the map page's (above the GeoNames credit of an export),
+   a trip's map's and the viewer's map of a drive */
+
+#map-credit ~ #map-streets-credit {
+    bottom: 34px;
+}
+
+/* The note keeps clear of the credits below it (on a phone the note is as
+   wide as the map) */
+
+#map-streets-credit:not([hidden]) ~ #map-note {
+    bottom: 40px;
+}
+
+#map-credit ~ #map-streets-credit:not([hidden]) ~ #map-note {
+    bottom: 66px;
+}
+
+#map-credit ~ #map-note {
+    bottom: 40px;
+}
+
+.route-map {
+    position: relative;
+}
+
+.trip-map-credit,
+.route-map-credit {
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    margin: 0;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 11px;
+    opacity: 0.92;
+    pointer-events: none;
+}
+
+.route-map-credit {
+    right: 4px;
+    bottom: 4px;
+    font-size: 10px;
+}
+
+.trip-map-credit[hidden],
+.route-map-credit[hidden] {
+    display: none;
+}
+
+/* (The licence link in a credit: the credit itself lets clicks through.) */
+.trip-map-credit a,
+.route-map-credit a {
+    pointer-events: auto;
 }
 
 /* The grid: blocks placed by app.js, thumbnails inside them */
@@ -4189,6 +4339,30 @@ html.viewer-open body {
     border-color: rgba(255, 255, 255, 0.85);
 }
 
+/* The face the People page's link asked for (detail?face=...): a ring around
+   it that shows even where the face is a few pixels across (a panorama). */
+.face-box.is-chosen {
+    border-style: solid;
+    border-color: #ffd54a;
+}
+
+.face-box.is-chosen::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 44px;
+    height: 44px;
+    margin: -22px 0 0 -22px;
+    border: 3px solid #ffd54a;
+    border-radius: 50%;
+    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.6);
+}
+
+.face-box.is-chosen .face-name {
+    margin-top: 24px;           /* (below the ring) */
+}
+
 .face-name {
     position: absolute;
     left: -2px;
@@ -4221,6 +4395,56 @@ a.face-name:focus-visible {
 .info-people .info-faces[aria-pressed="true"] {
     border-color: var(--accent);
     color: var(--accent);
+}
+
+/* The moments of a video a person was seen at (viewer.js momentButtons): a
+   line for each person, the name and then its moments. */
+.info-people.has-moments .info-person {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+}
+
+.info-moments {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+}
+
+.info-moment {
+    padding: 1px 7px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+}
+
+.info-moment:hover,
+.info-moment:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+/* (Fingers: the moments are buttons as large as the pane's other ones.) */
+@media (pointer: coarse) {
+    .info-moments {
+        gap: 6px;
+    }
+
+    .info-moment {
+        min-width: 44px;
+        min-height: 40px;
+        padding: 4px 10px;
+        border-radius: 20px;
+        font-size: 14px;
+    }
 }
 
 /* A drive in the viewer (viewer.js showDrive): under the stage, a strip

@@ -598,6 +598,17 @@ def record_tags(tags):
     return _phrases(tags, lower=True)
 
 
+def plain_language(config):
+    """False when config.json's "plain_language" is false (or {"enabled": false}): the
+    pages then search what is typed as typed, without understanding the names of people
+    and places or dates in it (search-core.js interpret); on by default. The pages hear
+    it as capabilities.plain, an export made then too."""
+    value = config.get("plain_language") if isinstance(config, dict) else None
+    if isinstance(value, dict):
+        value = value.get("enabled")
+    return value is not False
+
+
 def _configured_ids(config, library_ids):
     """library_ids without those that config does not list (config None: all of them)."""
     if config is None:

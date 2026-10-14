@@ -15,8 +15,10 @@ answer per line, in order, each answer carrying the request's "id".
         -> {"ok": true}     loads the two models (n: OpenCV's threads, 0 = its own
                             choice)
     {"op": "faces", "image": base64 JPEG or PNG, "max_edge": px, "min_edge": px,
-     "min_size": px, "min_score": s, "max_faces": n}
+     "min_size": px, "min_score": s, "max_faces": n, "tile": px, "overlap": px,
+     "crop_edge": px, "crop_margin": m}
         -> {"ok": true, "width", "height", "faces": [...], "seconds"}
+           (tile, overlap, crop_edge and crop_margin are optional: see below)
     {"op": "quit"}  -> {"ok": true}, then the program ends (so does it when its
                        input closes: the program that started it is gone)
 
@@ -36,6 +38,18 @@ max_faces faces are kept, the surest first, and only those at least
 min_size pixels on their short side (in the picture as sent) with a score
 of at least min_score.
 
+A picture looked at in full size (people.py sends wide panoramas and very
+large pictures as they are, with max_edge at least their long edge) is
+too large for the detector to look at in one go: with "tile", each size
+of the pyramid larger than tile pixels (wide or high) is cut into tiles
+of at most tile x tile pixels (tiles()), which overlap by "overlap"
+pixels, more than the largest face that size keeps (BAND_HIGH on its
+short side), so every such face lies whole in some tile. A face a tile
+only shows a part of (its box comes within EDGE_GAP pixels of a side of
+the tile that is not a side of the picture) is left to the tile next to
+it, which shows it whole. Without "tile" a size is looked at whole, as
+before (and max_edge is at most UNTILED_MAX_EDGE).
+
 Each face is then cut out of the picture as sent, turned upright and
 scaled by its five landmarks (eyes, nose tip, mouth corners) to the 112 x
 112 pixels the SFace recogniser wants (OpenCV's alignCrop), and SFace
@@ -52,6 +66,11 @@ little-endian float32. Per face the answer has:
     sharpness  the variance of the Laplacian of the grey 112 x 112 face (how
                sharp it is; blurred faces have low values)
     edge       the long edge of the size that found it
+    crop       only when the request has "crop_edge": a JPEG (base64) of a
+               square crop_edge pixels wide around the face, cut from the
+               picture as sent with crop_margin of the face's size around
+               its box (as people_groups.crop cuts it from a preview), so
+               a face found in full size shows sharp on the People page
 
 This file runs with any Python 3.9 or later; numpy and OpenCV are only
 imported when a request needs them, so the protocol can be tested
@@ -64,7 +83,7 @@ import os
 import sys
 import time
 
-WORKER_VERSION = 1
+WORKER_VERSION = 2
 # The face sizes (short side of the box, in pixels of one size of the
 # pyramid) each size keeps: YuNet was trained on faces of about 10 to 300
 # pixels and misses or splits larger ones.
@@ -74,7 +93,19 @@ BAND_HIGH = 288
 DEFAULT_MAX_EDGE = 2048
 DEFAULT_MIN_EDGE = 256
 SMALLEST_EDGE = 64
-LARGEST_EDGE = 8192
+# The largest picture looked at (pixels on its long edge: JPEG's own limit),
+# and the largest size looked at whole, without tiles.
+LARGEST_EDGE = 65535
+UNTILED_MAX_EDGE = 8192
+# Tiles (see the module notes): the smallest tile asked for, and how much of a
+# tile two tiles at most overlap. A face whose box comes within EDGE_GAP
+# pixels of a side of its tile inside the picture is left to the next tile.
+SMALLEST_TILE = 512
+EDGE_GAP = 2
+# A face's picture ("crop_edge"): the sizes asked for, and its JPEG quality.
+SMALLEST_CROP = 32
+LARGEST_CROP = 1024
+CROP_QUALITY = 85
 # Detections kept per size before merging, and the detector's own limits.
 DETECTOR_TOP_K = 200
 DETECTOR_SCORE = 0.5
@@ -133,6 +164,39 @@ def in_band(short_side, index, count, low=BAND_LOW, high=BAND_HIGH):
     return True
 
 
+def spans(length, tile, overlap):
+    """[(start, size)] of the pieces a line of length pixels is cut into: as few as
+    can be at most tile long and overlap each next one by at least overlap, all of
+    one size, spread evenly from one end to the other (one piece when it fits)."""
+    length, tile = int(length), int(tile)
+    overlap = max(0, min(int(overlap), tile // 2))
+    if length <= tile:
+        return [(0, max(0, length))]
+    count = -(-(length - overlap) // (tile - overlap))
+    size = min(tile, -(-(length + (count - 1) * overlap) // count))
+    step = (length - size) / float(count - 1)
+    return [(int(round(index * step)), size) for index in range(count)]
+
+
+def tiles(width, height, tile, overlap):
+    """[(x, y, width, height)] of the tiles a picture of this size is looked at in
+    (see spans), row by row; one (the whole picture) when it fits in a tile."""
+    return [(x, y, tile_width, tile_height)
+            for y, tile_height in spans(height, tile, overlap)
+            for x, tile_width in spans(width, tile, overlap)]
+
+
+def cut_by_tile(box, part, width, height, gap=EDGE_GAP):
+    """True when a box (x, y, w, h, in pixels of a tile) comes within gap pixels of a
+    side of its tile (part: x, y, width, height in the picture of width x height)
+    that is not a side of the picture: the tile may show only a part of that face."""
+    x, y, w, h = box
+    left, top, tile_width, tile_height = part
+    return ((left > 0 and x < gap) or (top > 0 and y < gap)
+            or (left + tile_width < width and x + w > tile_width - gap)
+            or (top + tile_height < height and y + h > tile_height - gap))
+
+
 def _area(box):
     return max(0.0, box[2]) * max(0.0, box[3])
 
@@ -177,8 +241,13 @@ def _float(value, default, low, high):
 
 
 def options_of(request):
-    """The numbers a "faces" request may give, checked and filled in."""
-    max_edge = int(_float(request.get("max_edge"), DEFAULT_MAX_EDGE, SMALLEST_EDGE, LARGEST_EDGE))
+    """The numbers a "faces" request may give, checked and filled in (tile, overlap and
+    crop_edge 0 when it gives none: no tiles, no faces' pictures)."""
+    tile = int(_float(request.get("tile"), 0, 0, LARGEST_EDGE))
+    tile = max(SMALLEST_TILE, tile) if tile else 0
+    max_edge = int(_float(request.get("max_edge"), DEFAULT_MAX_EDGE, SMALLEST_EDGE,
+                          LARGEST_EDGE if tile else UNTILED_MAX_EDGE))
+    crop_edge = int(_float(request.get("crop_edge"), 0, 0, LARGEST_CROP))
     return {
         "max_edge": max_edge,
         "min_edge": int(_float(request.get("min_edge"), DEFAULT_MIN_EDGE, SMALLEST_EDGE,
@@ -186,6 +255,10 @@ def options_of(request):
         "min_size": _float(request.get("min_size"), DEFAULT_MIN_SIZE, 1, LARGEST_EDGE),
         "min_score": _float(request.get("min_score"), DEFAULT_MIN_SCORE, 0.0, 1.0),
         "max_faces": int(_float(request.get("max_faces"), DEFAULT_MAX_FACES, 1, MAX_FACES)),
+        "tile": tile,
+        "overlap": int(_float(request.get("overlap"), 0, 0, tile // 2)) if tile else 0,
+        "crop_edge": max(SMALLEST_CROP, crop_edge) if crop_edge else 0,
+        "crop_margin": _float(request.get("crop_margin"), 0.0, 0.0, 2.0),
     }
 
 
@@ -197,9 +270,15 @@ def find_faces(backend, data, options):
     """
     image, width, height = backend.decode(data)
     sizes = pyramid(width, height, options["max_edge"], options["min_edge"])
+    tile = options.get("tile") or 0
     candidates = []
     for index, (scale, scaled_width, scaled_height) in enumerate(sizes):
-        for row in backend.detect(image, scaled_width, scaled_height):
+        if tile and (scaled_width > tile or scaled_height > tile):
+            found = _detect_in_tiles(backend, image, scaled_width, scaled_height, tile,
+                                     options.get("overlap") or 0)
+        else:
+            found = backend.detect(image, scaled_width, scaled_height)
+        for row in found:
             x, y, w, h = row[0], row[1], row[2], row[3]
             if not in_band(min(w, h), index, len(sizes)):
                 continue
@@ -219,7 +298,7 @@ def find_faces(backend, data, options):
     faces = []
     for item in kept:
         vector, norm, sharpness = backend.embed(image, item)
-        faces.append({
+        face = {
             "box": [round(value, 2) for value in item["box"]],
             "landmarks": [[round(x, 2), round(y, 2)] for x, y in item["landmarks"]],
             "score": round(item["score"], 4),
@@ -227,8 +306,34 @@ def find_faces(backend, data, options):
             "norm": round(norm, 4),
             "sharpness": round(sharpness, 2),
             "edge": item["edge"],
-        })
+        }
+        if options.get("crop_edge"):
+            face["crop"] = base64.b64encode(backend.crop(
+                image, item["box"], options["crop_edge"], options.get("crop_margin") or 0.0
+            )).decode("ascii")
+        faces.append(face)
     return {"width": width, "height": height, "faces": faces}
+
+
+def _detect_in_tiles(backend, image, width, height, tile, overlap):
+    """The detector's rows of one size of the pyramid (width x height) looked at in
+    tiles (see the module notes), in pixels of that size."""
+    level = backend.scaled(image, width, height)
+    rows = []
+    for part in tiles(width, height, tile, overlap):
+        left, top = part[0], part[1]
+        for row in backend.detect_part(level, *part):
+            if cut_by_tile(row[:4], part, width, height):
+                continue
+            # (The box's corner and the five landmarks, from the tile to the size.)
+            moved = list(row)
+            moved[0] += left
+            moved[1] += top
+            for k in range(5):
+                moved[4 + 2 * k] += left
+                moved[5 + 2 * k] += top
+            rows.append(moved)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -273,20 +378,63 @@ class OpenCVBackend:
         height, width = image.shape[:2]
         return image, width, height
 
+    def scaled(self, image, width, height):
+        """The picture at that size."""
+        if (width, height) == (image.shape[1], image.shape[0]):
+            return image
+        return self.cv2.resize(image, (width, height), interpolation=self.cv2.INTER_AREA)
+
     def detect(self, image, width, height):
         """The detector's rows (x, y, w, h, 5 landmarks, score) at that size."""
         if self.detector is None:
             raise WorkerError("The models are not loaded.")
-        cv2 = self.cv2
-        if (width, height) != (image.shape[1], image.shape[0]):
-            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
-        if self.detector_size != (width, height):
-            self.detector.setInputSize((width, height))
-            self.detector_size = (width, height)
+        return self._detect(self.scaled(image, width, height))
+
+    def detect_part(self, image, x, y, width, height):
+        """The detector's rows in a part (a tile) of a picture, in pixels of the part."""
+        if self.detector is None:
+            raise WorkerError("The models are not loaded.")
+        return self._detect(self.np.ascontiguousarray(image[y:y + height, x:x + width]))
+
+    def _detect(self, image):
+        size = (image.shape[1], image.shape[0])
+        if self.detector_size != size:
+            self.detector.setInputSize(size)
+            self.detector_size = size
         _count, found = self.detector.detect(image)
         if found is None:
             return []
         return [list(map(float, row)) for row in found]
+
+    def crop(self, image, box, edge, margin):
+        """JPEG bytes of a square edge pixels wide around a face (box: x, y, w, h in
+        pixels), with margin of its size around it (black beyond the picture)."""
+        cv2, np = self.cv2, self.np
+        x, y, w, h = box
+        side = max(1.0, max(w, h) * (1 + 2 * margin))
+        left = int(round(x + w / 2.0 - side / 2.0))
+        top = int(round(y + h / 2.0 - side / 2.0))
+        size = max(1, int(round(side)))
+        height, width = image.shape[:2]
+        # Only the part of the square inside the picture is scaled (never a copy of
+        # the square at full size: a large face of a picture of many million pixels),
+        # then laid on a black square of edge pixels where it belongs.
+        scale = float(edge) / size
+        square = np.zeros((edge, edge, 3), dtype=image.dtype)
+        x0, y0 = max(0, left), max(0, top)
+        x1, y1 = min(width, left + size), min(height, top + size)
+        if x1 > x0 and y1 > y0:
+            ox, oy = int(round((x0 - left) * scale)), int(round((y0 - top) * scale))
+            pw = max(1, min(edge - ox, int(round((x1 - x0) * scale))))
+            ph = max(1, min(edge - oy, int(round((y1 - y0) * scale))))
+            if ox < edge and oy < edge:
+                square[oy:oy + ph, ox:ox + pw] = cv2.resize(
+                    image[y0:y1, x0:x1], (pw, ph), interpolation=cv2.INTER_AREA
+                    if size > edge else cv2.INTER_CUBIC)
+        ok, encoded = cv2.imencode(".jpg", square, [cv2.IMWRITE_JPEG_QUALITY, CROP_QUALITY])
+        if not ok:
+            raise WorkerError("The face's picture cannot be made.")
+        return encoded.tobytes()
 
     def embed(self, image, face):
         """(vector bytes, norm, sharpness) of a face ({"box", "landmarks", "score"})."""

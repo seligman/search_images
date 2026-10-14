@@ -538,6 +538,31 @@ class SafetyTest(AlbumsFixture, unittest.TestCase):
 
 
 @unittest.skipIf(not support.pillow_available(), "Pillow is not installed")
+class AlternativesTest(unittest.TestCase):
+    """The person:/place: alternatives of plain-language search in a saved search
+    ('person:"Anna Lopez" OR anna', search-core.js interpret)."""
+
+    def test_the_words_stay_without_them(self):
+        query = 'person:"Anna Lopez" OR anna beach date:2019 OR 2019'
+        self.assertEqual(albums.alternative_spans(query, ("person",)), [(0, 23)])
+        self.assertEqual(albums.without_alternatives(query, ("person",)),
+                         "anna beach date:2019 OR 2019")
+        self.assertEqual(albums.without_alternatives("place:lisbon OR lisbon tram",
+                                                     ("person", "place")), "lisbon tram")
+        self.assertEqual(albums.without_alternatives("place:lisbon OR lisbon tram",
+                                                     ("person",)), "place:lisbon OR lisbon tram")
+        self.assertEqual(albums.without_alternatives('person:"Anna Lopez" | "anna lopez"',
+                                                     ("person",)), '"anna lopez"')
+        # A person: of its own, negated, or with another field term after the OR: none.
+        for query in ("person:Anna beach", "-person:Anna OR anna", "person:Anna OR place:x",
+                      "person:Anna OR", 'beach person:"Anna"'):
+            self.assertEqual(albums.alternative_spans(query, ("person",)), [], query)
+            self.assertEqual(albums.without_alternatives(query, ("person",)), query)
+        self.assertTrue(albums.searches_person("person:Anna beach"))
+        self.assertFalse(albums.searches_person(albums.without_alternatives(
+            "person:Anna OR anna beach", ("person",))))
+
+
 class ScanFollowTest(support.TempBaseMixin, unittest.TestCase):
     """Marks and album places follow moved, renamed and swapped files (scan.py)."""
 

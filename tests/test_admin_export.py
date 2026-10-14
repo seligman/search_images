@@ -501,7 +501,7 @@ class DialogTest(ExportFixture, unittest.TestCase):
         scripts = re.findall(r'<script[^>]*\ssrc="([^"]+)"', html)
         self.assertEqual(scripts, ["/static/site.js", "/static/shell.js",
                                    "/static/export-review.js", "/static/place-names.js",
-                                   "/static/manage.js"])
+                                   "/static/street-maps.js", "/static/manage.js"])
         self.assertEqual(self.client.get("/static/export-review.js").status_code, 200)
         # Links from other sites never open the dialog (the address is dropped).
         response = self.client.get("/manage?dialog=export&id=lib_family1&step=review",

@@ -395,6 +395,63 @@ test("a trip's export: its trip page first, its search page beside it", function
     assert.strictEqual(site.detailUrl("ab12"), "detail.html?id=ab12");
 });
 
+test("a story's paragraphs and their links to pictures", function () {
+    assert.deepStrictEqual(TRIPS.storyParts("The dock [#3], the boat [#4][#ab2c]."), [
+        {text: "The dock "}, {id: "3"}, {text: ", the boat "}, {id: "4"}, {id: "ab2c"},
+        {text: "."}]);
+    assert.deepStrictEqual(TRIPS.storyParts("No links [#] [#x y]."),
+                           [{text: "No links [#] [#x y]."}]);
+    assert.deepStrictEqual(TRIPS.storyParts(""), []);
+    var trip = {days: [{date: "2024-05-10", story: "From the export."}, {date: "2024-05-11"}]};
+    assert.deepStrictEqual(TRIPS.storyDays(trip, null), {"2024-05-10": "From the export."});
+    assert.deepStrictEqual(TRIPS.storyDays(trip, {days: [{date: "2024-05-11", text: "Server."},
+                                                         {date: "2024-05-12", text: ""}]}),
+                           {"2024-05-11": "Server."});
+});
+
+test("what writing stories takes, in words", function () {
+    var lines = TRIPS.planWords({
+        trips: [{id: "a", title: "Lakes"}, {id: "b", title: "Island"}],
+        endpoints: [{name: "big", model: "m", local: true, tokens_in: 3400, tokens_out: 700},
+                    {name: "cloud", model: "c", local: false, host: "api.example.com",
+                     tokens_in: 1200, tokens_out: 300, cost: 0.0042}],
+        problems: [{title: "Hills", problem: "No endpoint can write the story."}],
+        skipped: {current: 3, edited: 1, empty: 0}});
+    assert.deepStrictEqual(lines.slice(0, 4), [
+        "2 stories to write: Lakes, Island.",
+        "With big (model m), on this computer: about 3,400 tokens of text to read and 700 to " +
+            "write.",
+        "With cloud (model c): about 1,200 tokens of text (without the names of people) " +
+            "sent to api.example.com and 300 written back, about $0.0042.",
+        "Hills: No endpoint can write the story."]);
+    assert.strictEqual(lines[4], "Left as they are: 3 stories up to date, 1 story you edited.");
+    assert.ok(/never a picture/.test(lines[5]));
+    // (People's names go only to a model on this computer or the network.)
+    assert.ok(/the names of people only to a model on this computer or your network/
+              .test(lines[5]), lines[5]);
+    assert.deepStrictEqual(TRIPS.planWords({trips: [], endpoints: [], skipped: {current: 2}}),
+                           ["No story to write.", "Left as they are: 2 stories up to date."]);
+    var unknown = TRIPS.planWords({trips: [{title: "A"}], endpoints: [
+        {name: "x", local: false, tokens_in: 10, tokens_out: 5, cost: null}]});
+    assert.ok(/cost not known/.test(unknown[1]));
+});
+
+test("how a story came about, in words", function () {
+    assert.strictEqual(TRIPS.storyStateWords({state: "missing"}), "No story yet.");
+    var made = Date.UTC(2026, 9, 13, 12) / 1000;
+    assert.strictEqual(TRIPS.storyStateWords({state: "current", made: made, model: "m",
+                                              local: true}),
+                       "Written 13 October 2026 with m on this computer");
+    assert.strictEqual(TRIPS.storyStateWords({state: "stale", made: made, model: "m",
+                                              edited: true, hidden: true,
+                                              reasons: ["its days changed (1 day added)"]}),
+                       "Written 13 October 2026 with m \u00b7 edited by you \u00b7 hidden: only " +
+                       "you see it \u00b7 out of date: its days changed (1 day added)");
+    assert.strictEqual(TRIPS.storyStateWords({state: "current", made: 0, edited: true}),
+                       "Written by you");
+    assert.ok(/Nothing to write/.test(TRIPS.storyStateWords({state: "empty"})));
+});
+
 var failed = 0;
 tests.forEach(function (item) {
     try {

@@ -1060,10 +1060,15 @@ def poster(tools, path, info, edge, grab=None):
     not, else the brightest. grab(seconds, edge) takes the frames when
     given (a 360 video's are stitched, see Video360); else grab_frame.
     """
+    return poster_moment(tools, path, info, edge, grab)[1]
+
+
+def poster_moment(tools, path, info, edge, grab=None):
+    """(seconds, frame): poster()'s frame and where in the video it is."""
     if grab is None:
         def grab(seconds, size):
             return grab_frame(tools, path, seconds, info, size)
-    best, best_level = None, -1.0
+    best, best_level, best_at = None, -1.0, 0.0
     for seconds in poster_times(info.get("duration")):
         frame = grab(seconds, edge)
         if frame is None and seconds > 0:
@@ -1072,14 +1077,14 @@ def poster(tools, path, info, edge, grab=None):
             break
         level = _brightness(frame)
         if level >= BLACK_LEVEL:
-            return frame
+            return seconds, frame
         if level > best_level:
-            best, best_level = frame, level
+            best, best_level, best_at = frame, level, seconds
     if best is None and info.get("duration"):
-        best = grab(0.0, edge)
+        best, best_at = grab(0.0, edge), 0.0
     if best is None:
         raise VideoReadError("no frame could be read from the video")
-    return best
+    return best_at, best
 
 
 def sheet_times(duration, count):
@@ -1912,6 +1917,31 @@ def _frames_of(tools, path, level=None):
     if v360 is not None:
         return v360.info, v360.grab
     return info, None
+
+
+def frame_source(tools, path, level=None):
+    """(info, grab) of a video's frames, as its poster and contact sheet are made: info
+    its parse_probe() (a 360 video's: its panorama's size), grab(seconds, edge) an RGB
+    image at most edge pixels (a 360 video's stitched, level: see video_360), or None
+    past its end. For People (people.py), which looks for faces in several frames.
+    Raises VideoReadError (images.SourceReadError when the file cannot be read)."""
+    if tools is None:
+        raise ToolsMissing()
+    try:
+        info, grab = _frames_of(tools, path, level)
+    except VideoReadError as error:
+        raise _read_failure(error, path)
+    if grab is None:
+        def grab(seconds, edge):
+            return grab_frame(tools, path, seconds, info, edge)
+    return info, grab
+
+
+def read_failure(error, path):
+    """The error to raise for a failure (VideoReadError) while frame_source's frames of
+    path were read: images.SourceReadError when the file cannot be read now (or a
+    program took too long, VideoTimeout), else error."""
+    return _read_failure(error, path)
 
 
 def sheet_jpeg(tools, path, edge=common.DEFAULT_MAX_IMAGE_EDGE, frames=DEFAULT_FRAMES,

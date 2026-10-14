@@ -44,7 +44,9 @@ import people_groups
 import place_estimates
 import raw_photos
 import search_index
+import street_maps
 import tracks
+import trip_stories
 import trips
 import videos
 import world_map
@@ -73,12 +75,14 @@ MAX_IMAGE_ID = 2 ** 63 - 1
 # refused, so a web page cannot reach the server through DNS rebinding.
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 # Sent with every page: scripts and styles only from this server (the page
-# settings are a JSON block, not a script), never shown inside a frame, no
-# <base> that could move the scripts' relative addresses, forms only sent
-# here, and no plugins.
-CONTENT_SECURITY_POLICY = ("default-src 'self'; img-src 'self' data: blob:; "
-                           "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; "
-                           "base-uri 'none'; form-action 'self'; object-src 'none'")
+# settings are a JSON block, not a script), requests only to it (no other
+# host is ever asked for anything: the street maps are its own files too),
+# never shown inside a frame, no <base> that could move the scripts'
+# relative addresses, forms only sent here, and no plugins.
+CONTENT_SECURITY_POLICY = ("default-src 'self'; connect-src 'self'; "
+                           "img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+                           "frame-ancestors 'none'; base-uri 'none'; form-action 'self'; "
+                           "object-src 'none'")
 FACE_CROPS = 512            # face pictures (/face/<id>) kept in memory
 # The name each page template goes by in the page settings ("page").
 PAGE_NAMES = {"page.html": "search", "detail.html": "detail", "map.html": "map",
@@ -700,8 +704,14 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         capabilities = {"admin": is_admin()}
         if not trips.settings(state.config())["enabled"]:
             capabilities["trips"] = False   # (no Trips link: see SITE.tripsUrl)
+        if not search_index.plain_language(state.config()):
+            capabilities["plain"] = False   # (no plain-language search: app.js plainOn)
         if people_shown():
             capabilities["people"] = True
+        streets = street_maps.page_info()
+        if streets is not None:
+            # (The street maps, street_maps.py: /maps/index.js and the tiles.)
+            extra = dict(extra or {}, streets=streets)
         return render_template_file(name, "server", "/static/", None,
                                     tiles_max=tiles_max_zoom(),
                                     libraries=visible_libraries(state.config()),
@@ -769,6 +779,23 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             etag_matches=request.if_none_match.contains)
         return Response(body, status=status, headers=headers, mimetype="application/json")
 
+    @app.route("/api/trips/<trip_id>/story")
+    def api_trip_story(trip_id):
+        """A trip's story (trip_stories.story_view): visitors get none of a hidden trip or
+        a hidden story, and no sentence that names people unless People is shown to
+        them, nor one linking a hidden picture; the admin also its state."""
+        if not trips.ID_RE.match(trip_id):
+            return not_found()
+        try:
+            story = trip_stories.story_view(get_conn(), state.config(),
+                                            list(visible_libraries(state.config())), trip_id,
+                                            admin=is_admin())
+        except trips.TripError:
+            return not_found()
+        response = jsonify(story)
+        response.headers["Cache-Control"] = "private, no-cache"
+        return response
+
     @app.route("/people")
     def people_page():
         # The people the faces show (people_groups.py): the admin's, and with "visitors":
@@ -835,8 +862,9 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     @app.route("/face/<int:face_id>")
     def face_picture(face_id):
         """A square picture of one face (people_groups.crop), cut from its picture's
-        preview: for the admin, or (with "visitors": true) a named person's face in a
-        picture the requester may see. Never kept by the browser without asking."""
+        preview (or the one kept of a face found in full size, people.stored_crop):
+        for the admin, or (with "visitors": true) a named person's face in a picture
+        the requester may see. Never kept by the browser without asking."""
         config = state.config()
         admin = is_admin()
         # (Faces only show on this server's own pages, never in another site's.)
@@ -850,10 +878,19 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             face, row = people_groups.face_source(store, get_conn(), face_id,
                                                   list(visible_libraries(config)), admin)
             epoch = people_groups.state_key(store)[:1]
+            # (A face found in full size has a picture of its own: the preview is
+            # too small for it.)
+            kept = people.stored_crop(store, face_id) if face is not None else None
         finally:
             store.close()
         if face is None:
             return not_found()
+        if kept is not None:
+            etag = hashlib.sha1(json.dumps([epoch, face_id, "kept", kept[1], len(kept[0])])
+                                .encode("utf-8")).hexdigest()[:24]
+            response = Response(kept[0], mimetype="image/jpeg")
+            response.set_etag(etag)
+            return face_response(response).make_conditional(request)
         path = None
         if row["has_preview"] == 1:
             try:
@@ -940,6 +977,35 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         response = Response(data, mimetype="image/jpeg")
         response.cache_control.max_age = TILE_CACHE_SECONDS
         return response
+
+    @app.route("/maps/index.js")
+    def street_maps_index():
+        # The street map tiles there are (street_maps.py), as the script an export
+        # writes too; 404 without street maps.
+        text, version = street_maps.shared.index_script()
+        if text is None:
+            return not_found()
+        return send_bytes(text, "text/javascript", "streets-" + version)
+
+    @app.route("/maps/LICENSE.txt")
+    def street_maps_licence():
+        # The street maps' licence (OpenStreetMap, ODbL), which the maps' credit links
+        # to (an export carries the same file).
+        return send_bytes(street_maps.LICENSE_TEXT.encode("ascii"), "text/plain",
+                          "streets-licence-" + hashlib.sha1(
+                              street_maps.LICENSE_TEXT.encode("ascii")).hexdigest()[:10])
+
+    @app.route("/maps/<int:zoom>/<int:x>/<int:y>.js")
+    def street_maps_tile(zoom, x, y):
+        # One street map tile, as a script (street_maps.tile_script); 404 when
+        # there is none.
+        if zoom > street_maps.RANGES["max_zoom"][1] or x >= 2 ** zoom or y >= 2 ** zoom:
+            return not_found()
+        data, version = street_maps.shared.tile(zoom, x, y)
+        if data is None:
+            return not_found()
+        return send_bytes(street_maps.tile_script(zoom, x, y, data), "text/javascript",
+                          "streets-%s-%d-%d-%d" % (version, zoom, x, y))
 
     @app.route("/api/index")
     def api_index():
@@ -1041,13 +1107,17 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
 
     @app.route("/api/embed")
     def api_embed():
-        # ?q=<what was typed>: its meaning vector (see embeddings.QueryEmbedder).
+        # ?q=<what was typed>: its meaning vector (see embeddings.QueryEmbedder);
+        # several q= (a query and its words): their vectors in one answer.
         # Only for this server's own pages: it may wake a model.
         if not same_origin():
             response = jsonify({"error": "Requests from other sites are not allowed."})
             response.status_code = 403
         else:
-            status, payload = state.embedder.answer(state.config(), request.args.get("q", ""),
+            texts = request.args.getlist("q")
+            status, payload = state.embedder.answer(state.config(),
+                                                    texts if len(texts) > 1
+                                                    else request.args.get("q", ""),
                                                     client=request.remote_addr or "",
                                                     admin=is_admin())
             response = jsonify(payload)
@@ -1545,6 +1615,7 @@ def main(argv=None):
     serve_parser = sub.add_parser("serve", help="Run the interactive search server.")
     serve_parser.add_argument("--host", default="127.0.0.1", help="Set the IP to bind to (default: '127.0.0.1')")
     serve_parser.add_argument("--port", type=int, default=5000, help="Set the port to run on (default: 5000)")
+    jobs.add_settings_base_argument(serve_parser)
 
     package_parser = sub.add_parser(
         "package", help="Export one library as a static website (see export.py).")
@@ -1556,8 +1627,10 @@ def main(argv=None):
         "--library", default=None,
         help="The library to export (name or id); needed when more than one "
              "library is enabled.")
+    jobs.add_settings_base_argument(package_parser)
 
     args = parser.parse_args(_command_line(sys.argv[1:] if argv is None else argv))
+    jobs.use_settings_base(parser, args)
 
     try:
         db.init()
@@ -1566,9 +1639,10 @@ def main(argv=None):
 
     if args.command == "package":
         import export
+        ctx = jobs.ConsoleContext("export")
+        jobs.log_tool_command(ctx, "serve.py", sys.argv[1:] if argv is None else argv)
         try:
-            summary = package(args.output, library=args.library,
-                              ctx=jobs.ConsoleContext("export"))
+            summary = package(args.output, library=args.library, ctx=ctx)
         except KeyboardInterrupt:
             raise SystemExit("\nStopped (Ctrl+C). Run the same command again to finish the "
                              "export; what is done is kept.")

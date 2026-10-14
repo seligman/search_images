@@ -2501,12 +2501,13 @@ def _backfill(conn, library, ctx, helper, thumbs, previews, threads, video):
 def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
         newest_first=None, retry_failed=False, allow_mass_removal=False, helper=None,
         now=None, verbose=False, redescribe_stale=False, limit=None, endpoint_name=None,
-        conn=None, embed_vectors=True):
+        conn=None, embed_vectors=True, ids=None, force=False):
     """Scan (and back-fill) the selected libraries, then describe what needs it.
 
     library_ids limits the run to those library ids (default: every enabled
     library). db.init() must have run in this process. redescribe_stale,
-    limit and endpoint_name are passed on to describe.describe_pending.
+    limit, endpoint_name, ids and force are passed on to
+    describe.describe_pending.
     conn is an index.db connection to use (default: one opened and closed
     here). Unless the run stopped (or embed_vectors is False), the embed
     step (embeddings.after_run) follows when search by meaning is set up,
@@ -2585,7 +2586,7 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
                              if not jobs.library_removed(ctx, library["id"])],
                 newest_first=newest_first, retry_failed=retry_failed,
                 redescribe_stale=redescribe_stale, limit=limit, endpoint_name=endpoint_name,
-                previews=previews)
+                previews=previews, ids=ids, force=force)
             summary["stopped"] = summary["describe"]["stopped"]
         elif ctx.should_stop():
             summary["stopped"] = True
@@ -2783,6 +2784,65 @@ def test_endpoint(config, name, image_path=None, out=None):
     return 0 if result["ok"] else 1
 
 
+def _ids_argument(text):
+    """--ids: picture ids separated by commas."""
+    try:
+        ids = [int(part) for part in text.split(",") if part.strip()]
+    except ValueError:
+        ids = []
+    if not ids:
+        raise argparse.ArgumentTypeError("give picture ids (whole numbers) separated by commas")
+    return ids
+
+
+# The switches that run one job of the Manage page as it does (jobs.RUNNERS): switch
+# (argparse's name) -> the kind of job.
+JOB_MODES = {"previews": "previews", "proxies": "proxies", "drive_previews": "drive_previews",
+             "delete_library_data": "delete_library"}
+
+
+def job_mode(args):
+    """The kind of job (jobs.RUNNERS) a switch of JOB_MODES asks for, or None."""
+    for name, kind in JOB_MODES.items():
+        if getattr(args, name, None):
+            return kind
+    return None
+
+
+def run_job(kind, config, ctx, library_ids, helper, args):
+    """Run a job of the Manage page with the runner it uses (jobs.RUNNERS), on the
+    libraries of --library (or every enabled one); returns the exit code: 0 when it
+    finished or was stopped as asked, 1 when it failed."""
+    if kind == "delete_library":
+        params = {"library_id": args.delete_library_data, "confirm_name": args.confirm_name}
+    elif library_ids is None:
+        params = {"library_id": None}
+    elif len(library_ids) == 1:
+        params = {"library_id": library_ids[0]}
+    elif library_ids:
+        params = {"library_id": None, "library_ids": library_ids}
+    else:
+        ctx.log("No enabled library to work on.", "warn")
+        return 0
+    conn = db.connect()
+    try:
+        summary = jobs.RUNNERS[kind](ctx, conn, config, params, helper=helper)
+    except jobs.JobError as error:
+        ctx.log(str(error), "error")
+        return 1
+    finally:
+        conn.close()
+    summary = summary if isinstance(summary, dict) else {}
+    if summary.get("error"):
+        ctx.log(str(summary["error"]), "error")
+        return 1
+    if ctx.should_stop():
+        ctx.log("Stopped as asked. Progress saved; run scan.py again to continue.")
+    else:
+        ctx.log("Done.")
+    return 0
+
+
 def main(argv=None):
     """Command line entry point. Returns the process exit code."""
     _safe_output()
@@ -2841,10 +2901,33 @@ def main(argv=None):
     parser.add_argument("--allow-mass-removal", action="store_true",
                         help="Mark files missing even when most of a library seems to "
                              "have vanished.")
+    parser.add_argument("--ids", type=_ids_argument, metavar="ID,ID",
+                        help="With --no-scan: describe only these pictures (their ids, as "
+                             "the viewer's Describe now does).")
+    parser.add_argument("--force", action="store_true",
+                        help="With --ids: describe them again even when they have a "
+                             "description (the viewer's Describe again).")
+    parser.add_argument("--previews", action="store_true",
+                        help="Only build the missing previews (and other details older "
+                             "pictures lack), as Build previews on the Manage page does.")
+    parser.add_argument("--proxies", action="store_true",
+                        help="Only make the playable copies of videos browsers may not play "
+                             "(\"video_proxies\" in SETTINGS.md).")
+    parser.add_argument("--drive-previews", action="store_true",
+                        help="Only make the sped-up previews of drives (\"drive_previews\" "
+                             "in SETTINGS.md).")
+    parser.add_argument("--delete-library-data", metavar="LIBRARY_ID",
+                        help="Delete the indexed data of a library that is no longer in the "
+                             "settings (its id, as the Manage page lists it), with "
+                             "--confirm-name.")
+    parser.add_argument("--confirm-name", metavar="NAME",
+                        help="With --delete-library-data: the library's name, to confirm.")
     parser.add_argument("--verbose", action="store_true",
                         help="List every added or changed file (by default only the "
                              "first %d of each kind per library)." % FILE_LOG_LIMIT)
+    jobs.add_settings_base_argument(parser)
     args = parser.parse_args(argv)
+    jobs.use_settings_base(parser, args)
 
     if args.list_endpoints or args.test_endpoint:
         # These only read config.json (and talk to the endpoint).
@@ -2888,15 +2971,43 @@ def main(argv=None):
     if args.rebuild_looks and not args.embed_images:
         print("--rebuild-looks goes with --embed-images.")
         return 2
+    if args.ids is not None and not (args.no_scan and not args.refine and not args.embed
+                                     and not args.embed_images):
+        print("--ids goes with --no-scan (it describes those pictures only).")
+        return 2
+    if args.force and args.ids is None:
+        print("--force goes with --ids: the pictures to describe again.")
+        return 2
+    mode = job_mode(args)
+    if mode is not None and (args.no_scan or args.no_describe or args.refine or args.embed
+                             or args.embed_images or args.endpoint or args.redescribe_stale
+                             or args.retry_failed or args.limit is not None
+                             or args.newest_first is not None
+                             or len([name for name in JOB_MODES
+                                     if getattr(args, name)]) > 1):
+        print("%s only runs that job: no other switch goes with it but --library (and "
+              "--confirm-name with --delete-library-data)."
+              % ", ".join("--" + name.replace("_", "-") for name in JOB_MODES
+                          if getattr(args, name)))
+        return 2
+    if mode == "delete_library" and (args.library or args.confirm_name is None):
+        print("--delete-library-data needs --confirm-name (the library's name), and no "
+              "--library.")
+        return 2
+    if args.confirm_name is not None and mode != "delete_library":
+        print("--confirm-name goes with --delete-library-data.")
+        return 2
     if args.endpoint and not args.no_describe and not common.resolve_endpoints(
             config, args.endpoint):
         names = ", ".join(item["name"] for item in common.endpoint_list(config)) or "none"
         print("No enabled endpoint or group is named %s (configured: %s). See "
               "--list-endpoints." % (args.endpoint, names))
         return 2
-    if not config.get("libraries"):
-        print("No libraries configured. Run settings.py first.")
-        return 0
+    jobs.log_tool_command(ctx, "scan.py", argv)
+    if not config.get("libraries") and mode != "delete_library":
+        # (A scheduled run without its settings folder must not look like one that worked.)
+        print(jobs.missing_settings() or "No libraries configured. Run settings.py first.")
+        return 2
     lock = jobs.WorkerLock()
     if not lock.acquire("scan.py"):
         print("Another job is running: %s. Try again when it has finished."
@@ -2918,6 +3029,9 @@ def main(argv=None):
                     continue
                 library_ids.append(library["id"])
         helper = common.load_helper(config.get("helper", ""))
+        if mode is not None:
+            with ctx.stop_on_ctrl_c():
+                return run_job(mode, config, ctx, library_ids, helper, args)
         with ctx.stop_on_ctrl_c():
             if args.embed_images:
                 summary = run_looks(config, ctx, library_ids, args.limit, args.rebuild_looks,
@@ -2932,7 +3046,8 @@ def main(argv=None):
                               newest_first=args.newest_first, retry_failed=args.retry_failed,
                               allow_mass_removal=args.allow_mass_removal, helper=helper,
                               verbose=args.verbose, redescribe_stale=args.redescribe_stale,
-                              limit=args.limit, endpoint_name=args.endpoint)
+                              limit=args.limit, endpoint_name=args.endpoint, ids=args.ids,
+                              force=args.force)
     except (db.DatabaseError, common.ConfigError) as error:
         print("Error: %s" % error)
         return 2

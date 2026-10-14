@@ -238,6 +238,11 @@
     background: rgba(0, 0, 0, 0.85);
 }
 
+/* A video's face: its link says the moment it was seen at. */
+.face-open.is-video {
+    font-variant-numeric: tabular-nums;
+}
+
 .face-owner {
     position: absolute;
     top: 6px;

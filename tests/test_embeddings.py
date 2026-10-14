@@ -870,6 +870,57 @@ class ServerTest(EmbedFixture, unittest.TestCase):
                          (503, "unavailable"))
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
+    def test_a_query_and_its_words_in_one_request(self):
+        # (search-core.js meaningTexts: the query, then its words on their own.)
+        def expected(text):
+            return embeddings.quantize(fake_embed_server.word_vector(
+                embeddings.DEFAULT_QUERY_PREFIX + text), self.dims)
+        before = len(self.server.embed_requests())
+        response = self.client.get("/api/embed?q=dog+on+a+sofa&q=dog&q=sofa")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        payload = response.get_json()
+        self.assertEqual((payload["model"], payload["dims"]), ("vec", self.dims))
+        self.assertEqual([base64.b64decode(vec) for vec in payload["vecs"]],
+                         [expected(text) for text in ("dog on a sofa", "dog", "sofa")])
+        self.assertEqual(payload["vec"], payload["vecs"][0])
+        # One call to the model for all of them.
+        self.assertEqual(len(self.server.embed_requests()) - before, 1)
+        # Remembered one by one: a known text costs nothing, a new set only its new texts.
+        count = len(self.server.texts())
+        single = self.client.get("/api/embed?q=sofa").get_json()
+        self.assertEqual(single["vec"], payload["vecs"][2])
+        self.assertNotIn("vecs", single)
+        self.assertEqual(len(self.server.texts()), count)
+        again = self.client.get("/api/embed?q=dog+on+a+rug&q=dog&q=rug").get_json()
+        self.assertEqual([base64.b64decode(vec) for vec in again["vecs"]],
+                         [expected(text) for text in ("dog on a rug", "dog", "rug")])
+        self.assertEqual(self.server.texts()[count:],
+                         [embeddings.DEFAULT_QUERY_PREFIX + text for text in ("dog on a rug",
+                                                                              "rug")])
+        # An empty one, or none: nothing to look for; QUERY_TEXTS at most (the
+        # pages never ask for more: search-core.js MEANING_TEXTS).
+        self.assertEqual(self.client.get("/api/embed?q=dog&q=%20").status_code, 400)
+        texts = ["word%d" % n for n in range(embeddings.QUERY_TEXTS + 1)]
+        many = self.client.get("/api/embed?" + "&".join("q=" + text for text in texts))
+        self.assertEqual(many.status_code, 400)
+        enough = self.client.get("/api/embed?" + "&".join("q=" + text for text in texts[1:]))
+        self.assertEqual(len(enough.get_json()["vecs"]), embeddings.QUERY_TEXTS)
+        # Every QUERY_TEXTS_PER_TOKEN texts the model must embed count as one query
+        # against the client's bucket; texts it knows cost nothing.
+        self.assertEqual(embeddings.QUERY_TEXTS_PER_TOKEN, 3)
+        embedder = self.app.extensions["search_images"].embedder
+        with mock.patch.object(embedder, "_burst", 3.0), mock.patch.object(embedder, "_rate",
+                                                                               0.0001):
+            first = self.client.get("/api/embed?q=a+b+c&q=a&q=b&q=c", environ_base=REMOTE)
+            self.assertEqual((first.status_code, len(first.get_json()["vecs"])), (200, 4))
+            self.assertEqual(self.client.get("/api/embed?q=d+e&q=d&q=e",
+                                             environ_base=REMOTE).status_code, 200)
+            self.assertEqual(self.client.get("/api/embed?q=a+b+c&q=a",
+                                             environ_base=REMOTE).status_code, 200)
+            self.assertEqual(self.client.get("/api/embed?q=f",
+                                             environ_base=REMOTE).status_code, 429)
+
     def test_not_set_up_and_too_many_queries(self):
         self.configure(embedding={"endpoint": ""})
         response = self.client.get("/api/embed?q=dog")

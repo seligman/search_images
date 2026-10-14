@@ -8,7 +8,10 @@ would print for it, "black_until": seconds of black frames at the start,
 colours it cannot convert), "fail_frames": true to fail every frame,
 "frames_until": seconds after which there is no frame (the picture ends
 before the sound), "keyframe_every": seconds between key frames (default
-1)}. make_video() writes one, with any bytes after it (an Insta360
+1), "faces": [{"k": 1..7, "box": [x, y, w, h] as fractions of the frame,
+"from": seconds, "to": seconds}]: squares of colour (255, 0, 32 * k) on the
+frames of that time, which the face helper's stand-in finds as the face of
+person k (tests/fake_people_worker.py)}. make_video() writes one, with any bytes after it (an Insta360
 trailer: insta360_trailer()).
 
     python fake_ffmpeg.py ffprobe ARGS...   prints the probe JSON (exit 1 for
@@ -154,9 +157,25 @@ def _frame(spec, seconds, edge, size=None):
         image = Image.linear_gradient("L").resize(size).convert("RGB")
         tint = Image.new("RGB", size, (shade, 255 - shade, (shade * 3) % 256))
         image = Image.blend(image, tint, 0.5)
+        _draw_faces(image, spec.get("faces") or (), seconds)
     buffer = io.BytesIO()
     image.save(buffer, "BMP")
     return buffer.getvalue()
+
+
+def _draw_faces(image, faces, seconds):
+    """The squares of the faces seen at seconds (see the module notes)."""
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    for face in faces:
+        if not float(face.get("from", 0)) <= seconds <= float(face.get("to", 1e9)):
+            continue
+        x, y, w, h = face["box"]
+        side = max(1, int(round(min(w * width, h * height))))
+        left, top = int(round(x * width)), int(round(y * height))
+        draw.rectangle([left, top, left + side - 1, top + side - 1],
+                       fill=(255, 0, 32 * int(face["k"])))
 
 
 def _ffprobe(argv):

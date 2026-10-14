@@ -32,6 +32,8 @@
      EXPORT_REVIEW.looksText(counts, options, parts)  how many pictures
                                        "Looks like this" works for and what
                                        it adds, or ""
+     EXPORT_REVIEW.streetsText(counts, options)  what goes of the street maps
+                                       (counts.street_maps), or ""
      EXPORT_REVIEW.detailsText(options)  what is published with each picture
      EXPORT_REVIEW.serveCommand(folder)  the command that tries a site locally
      EXPORT_REVIEW.bytes(n)            "162 MB"
@@ -102,6 +104,20 @@ var EXPORT_REVIEW = (function () {
                        "routes_trim option) are left out, so where drives start and end " +
                        "(often your home) is not shown. Without it, clips keep their place " +
                        "names but not their positions."},
+        street_maps: {label: "Street maps",
+                      hint: "With Location: the street maps downloaded on the Manage page, " +
+                            "only around the published places and along the published " +
+                            "routes, so the site's maps show streets offline too " +
+                            "(OpenStreetMap data, credited at the foot of the pages). They " +
+                            "show where the pictures are, as Location does; the review says " +
+                            "how large they are."},
+        street_km: {label: "Around each place",
+                    hint: "Kilometres of street map around each published place (and 2 km " +
+                          "either side of the routes)."},
+        street_zoom: {label: "Street map detail",
+                      hint: "The most detailed street maps that go along: zoom 15 shows " +
+                            "every building, 14 the streets, 12 the main roads; each step " +
+                            "down makes them about three times smaller."},
         title: {label: "Site title",
                 hint: "Shown in the header and the browser tab."},
         credits: {label: "Footer line",
@@ -153,6 +169,12 @@ var EXPORT_REVIEW = (function () {
                 hint: "Choose what to publish: put the pictures in an album (a manual " +
                       "one) on the search page, then pick it here. The checks below still " +
                       "apply to them."},
+        story: {label: "The trip's story",
+                hint: "With Location (it names the trip's places): the story written for " +
+                      "the trip on its page, a paragraph a day. It names people only with " +
+                      "People's names on (and only those in the pictures published), and " +
+                      "leaves out the sentences about pictures that are not published or " +
+                      "near home, and those naming a town of home."},
         people_names: {label: "People's names (as tags)",
                        hint: "The names you gave people on the People page, as tags of the " +
                              "pictures they are in, so a search for a name finds them in the " +
@@ -524,7 +546,8 @@ var EXPORT_REVIEW = (function () {
                      ["large panoramas", parts.panos], ["videos", parts.videos],
                      ["RAW files", parts.raws],
                      ["pages and data", parts.data], ["meaning vectors", parts.vectors],
-                     ["look vectors", parts.looks], ["search by meaning", parts.meaning]];
+                     ["look vectors", parts.looks], ["search by meaning", parts.meaning],
+                     ["street maps", parts.maps]];
         var list = named.filter(function (item) {
             return item[1] > 0;
         }).map(function (item) {
@@ -740,6 +763,28 @@ var EXPORT_REVIEW = (function () {
             "vector yet (Update looks on the Manage page first)" : "") + ".";
     }
 
+    /* What goes of the street maps (counts.street_maps of the preview:
+       {available, on, tiles, bytes}), in a sentence; "" when they are not
+       asked for. */
+    function streetsText(counts, options) {
+        var found = counts && counts.street_maps;
+        if (!found || !options || !options.location || !options.street_maps) {
+            return "";
+        }
+        if (!found.available) {
+            return "There are no street maps to publish: download them on the Manage page " +
+                "first. The site's maps show the world image only.";
+        }
+        if (!found.tiles) {
+            return "No street map goes along: none was downloaded around the published " +
+                "places.";
+        }
+        return "Street maps: " + number(found.tiles) + (found.tiles === 1 ? " tile" : " tiles") +
+            " (" + bytes(found.bytes) + "), " + number(options.street_km) + " km around the " +
+            "published places, down to zoom " + number(options.street_zoom) +
+            (options.home_km ? ", none near home" : "") + ".";
+    }
+
     // What each picture carries into the export, in a sentence or two.
     function detailsText(options) {
         var shown = ["title", "description", "tags", "any text read in the picture",
@@ -774,6 +819,10 @@ var EXPORT_REVIEW = (function () {
         if (options.location && typeof options.home_km === "number" && options.home_km > 0) {
             text += " Nothing within about " + number(options.home_km) + " km of home: no " +
                 "position, route or town there.";
+        }
+        if (options.story && options.location) {
+            text += " The trip's story goes too, a paragraph a day" + (options.people_names
+                ? "." : ", without the sentences that name people.");
         }
         return text;
     }
@@ -812,6 +861,7 @@ var EXPORT_REVIEW = (function () {
         similarText: similarText,
         meaningText: meaningText,
         looksText: looksText,
+        streetsText: streetsText,
         detailsText: detailsText,
         serveCommand: serveCommand,
         bytes: bytes

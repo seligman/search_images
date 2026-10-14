@@ -755,8 +755,11 @@ def explain_error(error, endpoint=None):
 # Requests, one kind of endpoint at a time
 
 def _openai_request(settings, key, system, user_text, encoded, mime, schema, stream_options):
-    content = [{"type": "image_url",
-                "image_url": {"url": "data:%s;base64,%s" % (mime, encoded), "detail": "high"}}]
+    content = []
+    if encoded is not None:
+        content.append({"type": "image_url",
+                        "image_url": {"url": "data:%s;base64,%s" % (mime, encoded),
+                                      "detail": "high"}})
     if user_text:
         content.append({"type": "text", "text": user_text})
     messages = [{"role": "system", "content": system}] if system else []
@@ -964,8 +967,10 @@ def _read_openai_stream(response, timeout, secrets):
 
 
 def _claude_request(settings, key, system, user_text, encoded, mime, schema):
-    content = [{"type": "image",
-                "source": {"type": "base64", "media_type": mime, "data": encoded}}]
+    content = []
+    if encoded is not None:
+        content.append({"type": "image",
+                        "source": {"type": "base64", "media_type": mime, "data": encoded}})
     if user_text:
         content.append({"type": "text", "text": user_text})
     payload = {"model": settings["model"], "max_tokens": settings["max_output_tokens"],
@@ -1023,7 +1028,10 @@ def _describe_claude(settings, key, secrets, system, user_text, encoded, mime, s
 
 def _ollama_request(settings, key, system, user_text, encoded, schema):
     messages = [{"role": "system", "content": system}] if system else []
-    messages.append({"role": "user", "content": user_text or "", "images": [encoded]})
+    message = {"role": "user", "content": user_text or ""}
+    if encoded is not None:
+        message["images"] = [encoded]
+    messages.append(message)
     payload = {"model": settings["model"], "messages": messages, "stream": False,
                "think": False, "format": sanitize_schema(schema, settings) or "json",
                "options": {"num_predict": settings["max_output_tokens"]}}
@@ -1061,11 +1069,12 @@ def describe(endpoint, system, user_text, jpeg, schema, timeout=None, mime=None,
     endpoint is an endpoint dict (see common.endpoint_settings); system the
     system prompt ('' for none); user_text the text sent after the image;
     jpeg the image bytes, normally from images.prepare_for_llm (mime is
-    sniffed from them unless given); schema the JSON schema the reply must
-    follow (cut down to what the provider accepts by sanitize_schema), or
-    None for any JSON object. timeout overrides the endpoint's. request_extra
-    is merged into the request body after the endpoint's own "extra"
-    settings (see merge_body).
+    sniffed from them unless given), or None for a request of text only
+    (trip_stories.py: no picture is sent); schema the JSON schema the
+    reply must follow (cut down to what the provider accepts by
+    sanitize_schema), or None for any JSON object. timeout overrides the
+    endpoint's. request_extra is merged into the request body after the
+    endpoint's own "extra" settings (see merge_body).
 
     Returns {"text", "model" (as the server reports it; '' if it does
     not), "finish" ("ok", "length", "refusal" or "filtered"), "reason" (the
@@ -1079,9 +1088,12 @@ def describe(endpoint, system, user_text, jpeg, schema, timeout=None, mime=None,
     if not settings["base_url"]:
         raise ProviderError("endpoint", "no base URL is set (the %s preset needs one)"
                             % settings["preset"])
-    data = bytes(jpeg)
-    mime = mime or image_mime(data)
-    encoded = base64.b64encode(data).decode("ascii")
+    if jpeg is None:
+        encoded = mime = None
+    else:
+        data = bytes(jpeg)
+        mime = mime or image_mime(data)
+        encoded = base64.b64encode(data).decode("ascii")
     timeout = timeout or settings["timeout"]
     started = time.monotonic()
     reply = _DESCRIBERS[settings["kind"]](settings, key, secrets, system, user_text, encoded,

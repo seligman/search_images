@@ -4,7 +4,9 @@
    with the people (and lets them be copied only once the people have come); the
    People page's person picker chooses with Enter the person whose name was typed,
    else a new person of that name, else the only match; and a person whose last
-   faces went leaves the list in its place. All people and pictures are made up.
+   faces went leaves the list in its place; a face of a video says its moment and
+   opens the video's page there; and the viewer's information pane reaches every
+   moment of a person in a video. All people and pictures are made up.
 
    Run by tests/test_people.py, or directly:
        node tests/js/people_pages_test.js
@@ -142,6 +144,13 @@ function serverPage(template, scripts, searchText, answer) {
         console: {log: function () {}, warn: function () {}, error: function (text) {
             log.error = String(text);
         }},
+        // (Base64, as a browser has it: meaning vectors.)
+        atob: function (text) {
+            return Buffer.from(text, "base64").toString("binary");
+        },
+        btoa: function (text) {
+            return Buffer.from(text, "binary").toString("base64");
+        },
         URLSearchParams: URLSearchParams,
         URL: URL,
         fetch: fetch
@@ -258,13 +267,74 @@ test("the Albums page counts a smart album that names a person with the people",
          });
      });
 
+test("the Albums page asks for its smart albums' meaning vectors together", function () {
+    // Three smart albums by words and meaning: their searches and their words
+    // (SearchCore.meaningTexts, 10 texts) in as few requests as the server
+    // takes (SearchCore.MEANING_TEXTS each), not one each.
+    var albums = [
+        {id: 1, name: "Snow dogs", kind: "smart", cover: null, query: "dog playing in snow",
+         options: {}},
+        {id: 2, name: "Beach kids", kind: "smart", cover: null, query: "kids at the beach",
+         options: {}},
+        {id: 3, name: "Hikes", kind: "smart", cover: null, query: "waterfall hike", options: {}}
+    ];
+    var dims = 4;
+    var vector = Buffer.from(Int8Array.from([127, 0, 0, 0]).buffer).toString("base64");
+    var embeds = [];
+    var page = serverPage("albums.html", ["site.js", "shell.js", "search-core.js", "albums.js"], "",
+                          function (url) {
+                              var plain = url.split("?")[0];
+                              if (plain === "/api/index") {
+                                  return response(200, {version: 1, albums: albums,
+                                                        records: RECORDS,
+                                                        libraries: [{id: "lib",
+                                                                     name: "Example"}]});
+                              }
+                              if (plain === "/api/vectors") {
+                                  var data = [];
+                                  RECORDS.forEach(function (rec, k) {
+                                      data.push(k === 0 ? 127 : 0, k === 0 ? 0 : 127, 0, 0);
+                                  });
+                                  return response(200, {model: "m", dims: dims, query: true,
+                                                        count: RECORDS.length,
+                                                        ids: RECORDS.map(function (rec) {
+                                                            return rec.i;
+                                                        }),
+                                                        data: Buffer.from(Int8Array.from(data)
+                                                                          .buffer)
+                                                            .toString("base64")});
+                              }
+                              if (plain === "/api/embed") {
+                                  var texts = new URLSearchParams(url.split("?")[1]).getAll("q");
+                                  embeds.push(texts);
+                                  return response(200, {model: "m", dims: dims, vec: vector,
+                                                        vecs: texts.map(function () {
+                                                            return vector;
+                                                        })});
+                              }
+                              return null;
+                          });
+    return waitFor(function () {
+        return embeds.length >= 2 && cardOf(page, "Hikes");
+    }).then(function () {
+        return settle();
+    }).then(function () {
+        var asked = [].concat.apply([], embeds);
+        assert.strictEqual(asked.length, 10, JSON.stringify(embeds));
+        assert.strictEqual(embeds.length, 2, JSON.stringify(embeds));
+        assert.ok(embeds.every(function (texts) {
+            return texts.length <= 9;
+        }));
+    });
+});
+
 /* ---------- The People page ---------------------------------------------------------- */
 
 var LISTED = [{id: 3, name: "", label: "Person 3", cover: 31, faces: 4, ids: [1, 2, 3]},
               {id: 4, name: "Annabel", label: "Annabel", cover: 41, faces: 6,
                ids: [1, 2, 3, 4, 5, 6]},
               {id: 12, name: "", label: "Person 12", cover: 121, faces: 9,
-               ids: [7, 8, 9, 10]},
+               ids: [7, 8, 9, 10], videos: 1},
               {id: 1, name: "", label: "Person 1", cover: 11, faces: 3, ids: [11, 12]}];
 
 function peoplePage(searchText) {
@@ -290,15 +360,18 @@ function peoplePage(searchText) {
                               if (gone[one[1]]) {
                                   return response(404, {error: "There is no person."});
                               }
+                              var shown = [{id: 301, quality: 0.9, owner: false, image: 1},
+                                           {id: 302, quality: 0.8, owner: false, image: 2}];
+                              if (one[1] === "12") {
+                                  // (A face of a video, seen 72.4 s into it.)
+                                  shown.push({id: 303, quality: 0.7, owner: false, image: 9,
+                                              at: 72.4});
+                              }
                               return response(200, {person: {id: Number(one[1]), name: "",
                                                              label: "Person " + one[1],
                                                              hidden: false, cover: null,
-                                                             faces: 2},
-                                                    faces: [{id: 301, quality: 0.9,
-                                                             owner: false, image: 1},
-                                                            {id: 302, quality: 0.8,
-                                                             owner: false, image: 2}],
-                                                    similar: []});
+                                                             faces: shown.length},
+                                                    faces: shown, similar: []});
                           }
                           if (plain === "/api/admin/people/faces") {
                               if (body.faces === "all") {
@@ -441,6 +514,128 @@ test("a person whose last faces went gives its place to the list", function () {
         }), page.log.requests);
     });
 });
+
+test("a face of a video says its moment and opens the video there", function () {
+    var page = peoplePage("");
+    return waitFor(function () {
+        return page.document.querySelectorAll(".person-facts").length === LISTED.length;
+    }).then(function () {
+        var facts = page.document.querySelectorAll(".person-facts").map(function (node) {
+            return node.textContent;
+        });
+        assert.ok(facts.indexOf("4 pictures (1 video)") >= 0, facts);
+        assert.ok(facts.indexOf("6 pictures") >= 0, facts);
+        page = peoplePage("?person=12");
+        return waitFor(function () {
+            return page.document.querySelectorAll(".face-tile").length === 3;
+        });
+    }).then(function () {
+        var items = page.document.querySelectorAll(".face-item");
+        var links = items.map(function (item) {
+            var open = item.querySelector(".face-open");
+            return [open.textContent, open.href];
+        });
+        // (A picture's face: its page, with the face marked; a video's at its moment.)
+        assert.deepStrictEqual(links[0], ["Picture", "/detail?id=1&face=301"]);
+        assert.deepStrictEqual(links[2], ["\u25b6 1:12", "/detail?id=9&at=72.4"]);
+        assert.ok(/Open the video at 1:12/.test(items[2].querySelector(".face-open").title));
+        assert.ok(/in a video at 1:12/.test(items[2].querySelector(".face-tile")
+            .getAttribute("aria-label")));
+    });
+});
+
+test("every moment of a person in a video can be reached from the viewer", function () {
+    var page = serverPage("detail.html", ["site.js", "shell.js", "search-core.js", "viewer.js"],
+                          "", function () {
+                              return null;
+                          });
+    var box = page.document.createElement("div");
+    page.document.body.appendChild(box);
+    var moved = [];
+    var stage = {seekTo: function (seconds) {
+        moved.push(seconds);
+        return true;
+    }};
+    var at = [0.4, 4.2, 8.9, 13, 17.5, 22, 26.6, 31, 61.9];
+    page.context.VIEWER.renderInfo(box, {i: 9, l: "lib", t: "Party", mv: 1, dur: 70},
+                                   {id: 9, media: "video", people: {names: [
+                                       {id: 5, label: "Ada", named: true, at: at}]}},
+                                   {get: function () {
+                                       return null;
+                                   }, stage: stage});
+    function texts() {
+        return box.querySelectorAll(".info-moment").map(function (node) {
+            return node.textContent;
+        });
+    }
+    // (Whole seconds rounded down, as the player and the People page say them.)
+    assert.deepStrictEqual(texts(), ["0:00", "0:04", "0:08", "0:13", "0:17", "0:22", "+3"]);
+    var more = box.querySelector(".info-moment.is-more");
+    assert.strictEqual(more.tagName, "BUTTON");
+    more.click();
+    assert.deepStrictEqual(texts(), ["0:00", "0:04", "0:08", "0:13", "0:17", "0:22", "0:26",
+                                     "0:31", "1:01"]);
+    assert.strictEqual(page.document.activeElement.textContent, "0:26");
+    box.querySelectorAll(".info-moment")[8].click();
+    box.querySelectorAll(".info-moment")[0].click();
+    assert.deepStrictEqual(moved, [61.9, 0.4]);
+    // On a phone (a coarse pointer) they are as large as the pane's other buttons.
+    var css = read("style.css");
+    var found = false;
+    var re = /@media \(pointer: coarse\) \{([\s\S]*?)\n\}/g;
+    var block;
+    while ((block = re.exec(css)) !== null) {
+        var rule = /\.info-moment \{([^}]*)\}/.exec(block[1]);
+        if (rule) {
+            found = true;
+            assert.ok(Number((/min-height: (\d+)px/.exec(rule[1]) || [0, 0])[1]) >= 40, rule[1]);
+            assert.ok(Number((/min-width: (\d+)px/.exec(rule[1]) || [0, 0])[1]) >= 40, rule[1]);
+        }
+    }
+    assert.ok(found, "no coarse-pointer rule for .info-moment");
+});
+
+test("the face a link asks for is marked on its picture, and a pan view goes there",
+     function () {
+         var page = serverPage("detail.html", ["site.js", "shell.js", "search-core.js",
+                                               "viewer.js"], "", function () {
+             return null;
+         });
+         var rec = {i: 4, l: "lib", t: "Bay", w: 16000, h: 3800};
+         var panned = [];
+         var stage = {rec: rec, mode: "image", filling: true, base: {w: 3000, h: 712},
+                      img: page.document.createElement("img"),
+                      box: page.document.createElement("div"),
+                      panTo: function (at) {
+                          panned.push(at);
+                      }};
+         var detail = {id: 4, people: {names: [], faces: [
+             {id: 301, x: 0.8, y: 0.4, w: 0.004, h: 0.012, person: null, label: "",
+              quality: 0.1},
+             {id: 302, x: 0.1, y: 0.4, w: 0.01, h: 0.03, person: 5, label: "Ada",
+              quality: 0.9}]}};
+         function draw(face) {
+             var info = page.document.createElement("div");
+             page.context.VIEWER.renderInfo(info, rec, detail, {get: function () {
+                 return null;
+             }, stage: stage, face: face});
+             return stage.box.querySelectorAll(".face-box").map(function (box) {
+                 return box.classList.contains("is-chosen");
+             });
+         }
+         // "Show faces" off: the face asked for alone, marked; the pan view goes to it.
+         assert.deepStrictEqual(draw(301), [true]);
+         assert.strictEqual(panned.length, 1);
+         assert.ok(Math.abs(panned[0] - 0.802) < 1e-9, panned);
+         // (Not again while it stays.)
+         draw(301);
+         assert.strictEqual(panned.length, 1);
+         // Without one: none, as before; "Show faces" on: all, the one asked for marked.
+         assert.deepStrictEqual(draw(undefined), []);
+         page.context.localStorage.setItem("searchImages.faceBoxes", "1");
+         assert.deepStrictEqual(draw(301), [true, false]);
+         assert.deepStrictEqual(draw(undefined), [false, false]);
+     });
 
 /* ---------- Run ---------------------------------------------------------------------- */
 

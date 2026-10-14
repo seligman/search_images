@@ -481,7 +481,7 @@ function base64(numbers) {
 function exportPage(options) {
     options = options || {};
     var data = records();
-    var log = {scripts: [], progress: 0, loads: 0};
+    var log = {scripts: [], progress: 0, loads: 0, queries: []};
     var document = makeDocument();
     var config = {mode: "static", page: "search", data: "data/", libraries: ["Example"],
                   libraryList: [{id: "lib", name: "Example"}],
@@ -587,7 +587,9 @@ function exportPage(options) {
                                 return options.check === undefined ? 0.999 : options.check;
                             },
                             query: function (text) {
-                                log.query = text;
+                                // (The query first, then its words: meaningTexts.)
+                                log.queries.push(text);
+                                log.query = log.queries[0];
                                 // (options.far: a query like none of the pictures.)
                                 return Int8Array.from(options.far ? unit([-1].concat(
                                     new Array(DIMS - 1).fill(0))) : data.vectors[7]);
@@ -738,6 +740,9 @@ test("a search loads the vectors, then the model, with its progress; then it run
                      .test(text);
              }), seen.join(" | "));
              assert.strictEqual(page.log.query, "kids playing outside");
+             // (Its words on their own too, for Per-term coverage, at once.)
+             assert.deepStrictEqual(page.log.queries.slice(0, 4),
+                                    ["kids playing outside", "kids", "playing", "outside"]);
              assert.deepStrictEqual(shown(page).filter(function (text) {
                  return /Snow angel/.test(text);
              }).length, 1);
@@ -745,7 +750,10 @@ test("a search loads the vectors, then the model, with its progress; then it run
              // The query's vector is kept for the tab, by model.
              var kept = JSON.parse(page.context.sessionStorage.getItem(
                  "searchImages.queryVectors"));
-             assert.deepStrictEqual(Object.keys(kept), [MODEL_ID + "\nkids playing outside"]);
+             assert.deepStrictEqual(Object.keys(kept), [MODEL_ID + "\nkids playing outside",
+                                                        MODEL_ID + "\nkids",
+                                                        MODEL_ID + "\nplaying",
+                                                        MODEL_ID + "\noutside"]);
              assert.strictEqual(kept[MODEL_ID + "\nkids playing outside"].model, MODEL_ID);
          });
      });

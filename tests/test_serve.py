@@ -370,8 +370,8 @@ class ServerTest(ServerFixture, unittest.TestCase):
 
     def test_app_config_cannot_break_out_of_the_script(self):
         # The page settings block plus the page's scripts (site, shell, the
-        # search engine, the routes, the viewer, the page's own).
-        for url, scripts in (("/", 7), ("/detail", 7), ("/map", 7)):
+        # search engine, the maps' ground, the routes, the viewer, the page's own).
+        for url, scripts in (("/", 8), ("/detail", 8), ("/map", 8)):
             html = self.client.get(url).get_data(as_text=True)
             self.assertNotIn(XSS_NAME, html)
             self.assertNotIn("<script>alert", html)

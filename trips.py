@@ -84,6 +84,9 @@ lists its look units (look_units: pictures of the day that look alike,
 which its strip shows once). The page (static/trips.js) chooses the best
 pictures of each day from the search records.
 
+The command line, python trips.py, lists the trips (--list) and writes their
+stories (--stories, see trip_stories.py).
+
 This module uses only the standard library.
 """
 
@@ -95,6 +98,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 
@@ -153,6 +157,7 @@ HOME_MIN_DAYS = 3
 TITLE_LENGTH = 100
 # A trip id: a library id or "away-YYYYMMDD", and ".YYYYMMDD" for a part of a split trip.
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}(?:\.\d{8})?$")
+_AWAY_ID_RE = re.compile(r"^away-(\d{4})(\d{2})(\d{2})$")
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _CONTROL_RE = re.compile("[\x00-\x1f\x7f]")
 # What _exif_facts looks for in the text of the exif column.
@@ -1092,10 +1097,22 @@ class Trips:
         self.home = home
 
     def get(self, trip_id):
-        """The trip trip_id; TripError (404) when there is none."""
+        """The trip trip_id; TripError (404) when there is none. An id the trip had before
+        its first day moved (as a command line logged earlier names it) still finds it:
+        by the key the owner's changes know it by (key), else -- "away-YYYYMMDD" -- the
+        away trip (not a part of one) that holds that day."""
         for trip in self.trips:
             if trip.id == trip_id:
                 return trip
+        for trip in self.trips:
+            if self.key(trip) == trip_id:
+                return trip
+        match = _AWAY_ID_RE.match(trip_id) if isinstance(trip_id, str) else None
+        if match:
+            day = "%s-%s-%s" % match.groups()
+            for trip in self.trips:
+                if trip.kind == "away" and "." not in trip.id and trip.holds(day):
+                    return trip
         raise TripError("There is no trip %s." % trip_id, 404)
 
     def key(self, trip):
@@ -1284,6 +1301,28 @@ def gap_classes(times):
     return "".join(digits)
 
 
+def visible_by_base(built):
+    """{base trip id: its pictures that are not hidden} of built (a Trips): the pictures of
+    a trip's parts count together."""
+    visible = collections.defaultdict(list)
+    for trip in built.trips:
+        visible[trip.base].extend(picture for picture in trip.pictures if not picture.hidden)
+    return visible
+
+
+def visitors_see(trip, options, visible):
+    """True when visitors are shown a trip (view): Trips is on, the trip is not hidden, it
+    holds a picture they may see, and an away trip (not merged by the owner) is one by
+    the pictures they may see (big_enough: not by the owner's hidden pictures). options:
+    settings(); visible: visible_by_base."""
+    if not options["enabled"] or trip.hidden:
+        return False
+    if trip.kind == "away" and not trip.merged and not big_enough(visible[trip.base],
+                                                                  options["min_pictures"]):
+        return False
+    return any(not picture.hidden for picture in list(trip.pictures) + list(trip.other))
+
+
 def view(conn, config, library_ids, admin=False, edits=None):
     """What /api/trips sends: {"enabled", "best_per_day", "trips": [trip_view], newest
     first}. Visitors get no hidden trip, no trip with nothing they may see, and no away
@@ -1295,14 +1334,10 @@ def view(conn, config, library_ids, admin=False, edits=None):
     if not options["enabled"]:
         return result
     built = build(conn, config, library_ids, edits)
-    visible = collections.defaultdict(list)     # base trip id -> its pictures not hidden
-    for trip in built.trips:
-        visible[trip.base].extend(picture for picture in trip.pictures if not picture.hidden)
+    visible = visible_by_base(built)
     listed = []
     for trip in built.trips:
-        if not admin and (trip.hidden or (
-                trip.kind == "away" and not trip.merged
-                and not big_enough(visible[trip.base], options["min_pictures"]))):
+        if not admin and not visitors_see(trip, options, visible):
             continue
         listed.append(trip)
     # The look units of every day of the trips, worked out together.
@@ -1516,3 +1551,17 @@ def reset_trip(conn, config, library_ids, trip_id):
         edits["merges"] = [merge for merge in edits["merges"] if not set(merge["ids"]) & keys]
     _rewrite(change)
     return sorted(members)
+
+
+# ---------------------------------------------------------------------------
+# Command line
+
+def main(argv=None):
+    """python trips.py --list | --stories [--trip ID] [--redo] (trip_stories.main_cli).
+    Returns the exit code."""
+    import trip_stories
+    return trip_stories.main_cli(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

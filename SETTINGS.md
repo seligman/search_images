@@ -27,7 +27,11 @@ Or, on Windows:
     set SETTINGS_BASE=c:\path\to\data
     python scan.py
 
-The same variable is honored by every script.
+The same variable is honored by every script, and the tools that jobs
+have command lines for (scan.py, export.py, people.py, make_places.py,
+trips.py, serve.py) also take the folder as `--settings-base FOLDER`. When the folder
+is not the program folder, the command line a job logs (see "Automating"
+in the README) ends with `--settings-base FOLDER`, so it runs as it is.
 
 ## Top-level shape
 
@@ -51,12 +55,15 @@ The same variable is honored by every script.
     "drives": { "slack": 20, "min_clips": 3 },
     "drive_previews": { "enabled": false, "speed": 60, "height": 720 },
     "gps_check": { "enabled": true },
+    "plain_language": true,
     "place_estimates": { "enabled": true },
     "gps_tracks": { "enabled": true },
     "trips": { "enabled": true },
+    "trip_stories": { "endpoint": "" },
     "people": { "enabled": false },
     "local_times": { "enabled": true },
     "raw": { "enabled": true, "index_alone": true },
+    "street_maps": { "radius_km": 20 },
     "libraries": [ { ... }, { ... } ]
 }
 ```
@@ -933,6 +940,24 @@ pictures); drives get routes on the map and in the viewer. Optional:
 
 `"gps_tracks": false` means the same as `{"enabled": false}`.
 
+## plain_language
+
+Plain-language search (README, "Plain language"): the search box
+understands the names of people and places and dates in what is typed
+(`anna in lisbon last summer`) and shows how as chips over the results.
+On by default:
+
+```
+"plain_language": true
+```
+
+- `false` (or `{"enabled": false}`) turns it off: every page (search, map,
+  albums) searches what is typed as it is typed, with no chips and no
+  questions, and the search tips leave it out. A site published while it
+  is off is off too. Words that are names are still searched by their
+  words only when searching by words and meaning (README, "Search by
+  meaning"): that is not part of this switch.
+
 ## trips
 
 Trips: libraries whose folder is named like a trip and runs of days away
@@ -986,11 +1011,48 @@ library's `export` below (but `album`), and one more:
   nest, so exports made with different sizes tell no more together than
   the smallest; a size kept from before that is none of these is read as
   the default.
+- `story` - `true` publishes the trip's story (see "trip_stories" below),
+  unless it is hidden, and only with `location` (the story names the
+  trip's places) (default `false`).
 
 They are kept with the trip in `data/trips.json` (`"exports"`), not in
 config.json: the Export dialog writes them when a trip's export starts.
 
 `"trips": false` means the same as `{"enabled": false}`.
+
+## trip_stories
+
+The trips' stories (see README, "Trip stories"): a paragraph a day written
+by a language model from each trip's facts (text only). All keys are
+optional:
+
+```
+"trip_stories": {
+    "endpoint": "",
+    "pictures": 6,
+    "prompt_tokens": 6000,
+    "notes": ""
+}
+```
+
+- `endpoint` - the endpoint (or group) that writes them. Empty (the
+  default): the `refine` endpoint of the trip's libraries (its own first),
+  else their describe endpoint. An endpoint of a `local_server` is started
+  for the job and stopped afterwards, and the job stops before its
+  `stop_at` time. Only an endpoint on this computer or your local network
+  gets the names of the people (People); a cloud endpoint gets the facts
+  without them, and its stories name nobody.
+- `pictures` - how many of a day's best pictures the facts describe (1 to
+  24, default 6). More gives the model more to tell, and longer prompts.
+- `prompt_tokens` - about how many tokens one request's prompt may hold
+  (1000 to 200000, default 6000); a longer trip is written in several
+  requests of a few days each. For an endpoint of a `local_server`, also
+  no more than its `ctx_per_slot` allows besides the answer (the answer
+  gets up to 4000 tokens, a third of `ctx_per_slot` at most).
+- `notes` - your words added to the prompt (up to 1000 characters), for
+  instance who the people are, or the language or voice to write in: "We
+  are a family of four. Write in German." The model is still told to use
+  only the facts.
 
 ## people
 
@@ -1000,8 +1062,10 @@ picture and a face recogniser makes a vector of each, on this computer's
 processor, in a helper program that runs with a Python environment of its
 own; then the faces are grouped into people, which you name on the
 People page. The faces, the people and their names are kept in
-`data/faces.db`, never sent anywhere and never exported (but for the
-names, with an export's `people_names` option). Every key is optional
+`data/faces.db`, never sent anywhere (but for the names, to the model that
+writes trip stories when it runs on this computer or your local network:
+see "trip_stories") and never exported (but for the names, with an
+export's `people_names` option). Every key is optional
 except `enabled`, `python` and `models_dir` (or full paths in `detector`
 and `recognizer`); all of them are set in `config.json` only (no page
 changes them).
@@ -1020,6 +1084,11 @@ changes them).
     "min_score": 0.7,
     "min_size": 20,
     "max_faces": 64,
+    "full_size": true,
+    "full_megapixels": 60,
+    "frames": 12,
+    "frame_seconds": 4,
+    "drives": false,
     "match": 0.4,
     "group_quality": 0.25,
     "min_faces": 3,
@@ -1063,7 +1132,10 @@ changes them).
   64, default 1; 0 lets OpenCV choose, which is all the processor's
   cores). More helpers find faces faster and keep more of the processor
   busy; each one holds OpenCV and the models in memory (about 300 MB,
-  up to about 450 MB while it looks at a large picture).
+  up to about 450 MB while it looks at a large picture, and up to about
+  1 GB while it looks at one in full size, see `full_size`: at most two
+  helpers do so at a time). Videos are read with ffmpeg in this program
+  (see `frames`), at most four at a time.
 - `max_edge` - the largest size a picture is looked at (its long edge in
   pixels, 320 to 4096, default 2048; pictures are looked at in their
   stored preview, at most 2048 pixels, so larger values only matter for
@@ -1082,6 +1154,68 @@ changes them).
   pixels of the picture looked at, default 20).
 - `max_faces` - at most this many faces per picture, the surest first (1
   to 500, default 64).
+- `full_size` - `true` (the default): wide panoramas (at least 2.2 times
+  as wide as they are high, or as high as they are wide: the pictures the
+  viewer pans along) and very large pictures (at least `full_megapixels`
+  million pixels, default 60; 5 to 1000) are looked at in full size, read
+  from their original files (at most 100 million pixels), when they are
+  larger than `max_edge` on their long edge: in a 2048 pixel preview of a
+  panorama the people are a few pixels high, too small to be found.
+  The helper looks at such a picture in tiles of at most 2048 pixels
+  (which overlap, so a face on the boundary of two is seen whole), at
+  every size down to 256 pixels; that takes many times as long as a
+  picture looked at in its preview (it holds many times the pixels), and
+  a small picture of each face found is kept in `data/faces.db`, as the
+  preview is too small to show them on the People page. Their library's
+  folder must be reachable (they wait for a later run when it is not).
+  Changing `full_size` or `full_megapixels` only looks again at the
+  pictures it concerns; the faces found again where they were keep what
+  you said about them (names, moves), and a face you put in a person stays
+  even when the full size does not show it again. An original that takes
+  longer than 5 minutes to read waits for a later run when its folder went
+  away meanwhile (else it counts as a failed try). 360-degree photos are looked at in
+  their previews, as before (videos: see `frames`). `false` looks at
+  every picture in its preview.
+- `frames` - the most frames of a video looked at (0 to 60, default 12):
+  its poster frame and about one every `frame_seconds` seconds (0.5 to
+  600, default 4), spread evenly over it (a 20 second clip: 5 frames; a
+  minute or longer: 12). The frames are read from the video's file with
+  ffmpeg on the processor (never with hardware decoding; the `ffmpeg`
+  setting, see Videos), at most `max_edge` pixels, so its library's folder
+  must be reachable (videos wait for a later run when it is not, or when
+  ffmpeg is missing). A 360-degree video's frames are stitched panoramas,
+  as its poster is, of which only the faces near the horizon are kept.
+  The faces of one person in a video's frames are linked by how alike
+  they are (never two faces of one frame) and kept as one face: the best
+  of them, with a small picture of it, the second it was seen at (where
+  the video's page starts it when you open it from the People page),
+  and every moment that person was seen at (the viewer's moments). A face
+  stays with that best one only when it is at least 0.4 alike to it (the
+  default `match`), or a little less where a face that stays was in
+  another frame (one person turning away): two people who look a little
+  alike stay two. A face seen in a single frame and too blurred to tell
+  who it is (a quality below 0.1) is left out, and so are the faces past
+  the 32 best of a video (a crowd). The faces found before in a video's
+  poster keep what you said about them when they are found again as the
+  same person; a face you put in a person stays even when the frames do
+  not show it again. Each frame takes about as long as a picture looked
+  at in its preview, and ffmpeg's time to read it (longer for 4K videos).
+  A video whose frames take longer than 10 minutes to read, or whose
+  folder goes away while they are read, waits for a later run (or counts
+  as a failed try when its folder is still there); Stop is heard between
+  frames. Changing `frames` or `frame_seconds` only looks again at the
+  videos. `0` looks at a video's poster (its preview) alone, as before.
+- `drives` - `false` (the default): the clips of a dashcam's drives
+  (see Drives: a drive whose camera cut its clips at most 5 minutes long)
+  are not looked at for faces -- they mostly show other drivers -- and
+  the faces found in them before go, but for those in a person (yours or
+  the grouping's); the Manage page counts them as skipped. The chapters
+  of a longer recording (action cameras cut one into files by their size,
+  mostly longer than 5 minutes) are looked at as any video, and so are a
+  dashcam's clips that make no drive: a recording of fewer clips than the
+  drives' `min_clips`, or a clip copied into another folder. With
+  `frames` 0 (posters alone) no clip is skipped, as before. `true` looks
+  at every drive's clips as at any video.
 - `match` - how alike faces must be to be one person (0.2 to 0.9,
   default 0.4): the faces are grouped by average linkage, two groups
   becoming one while the cosine of their faces' vectors, on average over
@@ -1186,6 +1320,44 @@ is indexed by the largest preview the camera stored in it. Optional:
 RAW files only with its `raw_files` option (see `export` under
 `libraries`).
 
+## street_maps
+
+The street maps (README, "Street maps"): what `street_maps.py --download`
+and **Download** on the Manage page download. All keys are optional:
+
+```
+"street_maps": {
+    "radius_km": 20,
+    "route_km": 5,
+    "max_zoom": 15,
+    "whole_degrees": true,
+    "source": ""
+}
+```
+
+- `radius_km` - kilometres around each place of a picture (its GPS
+  position or estimated place; not of hidden pictures; 1 to 200, default
+  20): a square that wide either way. Street maps of 5 GB or more are
+  only downloaded when allowed a second time (`--allow-large`).
+- `route_km` - kilometres either side of the drive routes (0 to 50,
+  default 5; 0: none along them).
+- `max_zoom` - the most detailed zoom downloaded (8 to 15, default 15:
+  every building; 14, the streets, is two to three times smaller). The
+  maps zoom three steps past it.
+- `whole_degrees` - `true` (the default) asks the map's host for every
+  tile of the whole-degree squares (about 111 km from south to north) the
+  areas touch, and keeps only the areas: the host learns no more than
+  those squares, and the download is larger than what is kept. `false`
+  asks for the tiles kept only: a smaller download, but the host can see
+  which areas they are.
+- `source` - the address of a PMTiles file of the Protomaps basemap
+  (version 4) to download from, for instance a build you keep on your own
+  server; `""` (the default) is the newest build listed at
+  build-metadata.protomaps.dev.
+
+A size check or download made with other settings is not changed by
+them: check the size again.
+
 ## libraries
 
 A list of folders to scan. Each library is one object:
@@ -1267,8 +1439,11 @@ A list of folders to scan. Each library is one object:
 - `export` - optional saved options for publishing the library as a static
   website (see README, "Publishing a library"). The Export dialog on the
   Manage page writes them when an export starts (only the options that
-  differ from the defaults are stored). Every option may be left out; the
-  defaults publish as little as possible:
+  differ from the defaults are stored). `export.py` uses them too, and has
+  a switch for each that changes it for one run (`--file-names` for
+  `file_names`, `--no-file-names` to turn it off; see `python export.py
+  --help` and "Automating" in the README). Every option may be left out;
+  the defaults publish as little as possible:
   - `title` - the site's name; blank (the default) uses the library name.
   - `images` - `"web"` (the default: 2048 px pictures), `"original"` (the
     originals with their metadata removed; HEIC, HEIF, AVIF and TIFF become
@@ -1299,6 +1474,14 @@ A list of folders to scan. Each library is one object:
     library), with the positions of the clips and estimated places there:
     a drive often starts and ends at home. A line that passes that near is
     cut there too.
+  - `street_maps` - with `location`, `true` also publishes the street maps
+    (see `street_maps` above) around the published positions and routes,
+    from zoom 9 on; default `false`. In a trip's export, no tile that
+    touches the area around home goes.
+  - `street_km` - with `street_maps`: kilometres around each published
+    position (1 to 50, default 5; 2 km either side of the routes).
+  - `street_zoom` - with `street_maps`: the most detailed zoom that goes
+    (10 to 15, default 14).
   - `file_names`, `folders` - `true` publishes file names or folder names
     (searchable); default `false`.
   - `exclude_types` - picture types left out; default
@@ -1385,7 +1568,8 @@ A list of folders to scan. Each library is one object:
     pictures of that manual album (see "Favorites, ratings and albums" in
     the README) are published, those of this library; the rules above
     still leave out what they leave out. The Export dialog lists the
-    albums by name (`export.py --album NAME` takes a name or an id). A
+    albums by name (`export.py --album NAME` takes a name, or the id as
+    `#ID`; `--no-album` exports the whole library for one run). A
     smart album cannot be used: **Copy to a new album** on the Albums page
     makes a manual album of its pictures. An export whose album was
     deleted stops and says so (an album's id is never given to another

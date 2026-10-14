@@ -65,6 +65,7 @@ import search_index
 import settings
 import sheet_talk
 import trip_export
+import trip_stories
 import trips
 import videos
 
@@ -105,9 +106,10 @@ JOB_PARAMS = {
     "faces": ("limit", "retry_failed"),
     "group_faces": (),
     "delete_faces": ("confirm",),
+    "trip_stories": ("trip", "redo"),
 }
 BOOL_PARAMS = ("allow_mass_removal", "retry_failed", "redescribe_stale", "force", "save_options",
-               "rebuild")
+               "rebuild", "redo")
 EXPORT_FOLDER_TIMEOUT = 5.0  # seconds to look at an export's output folder
 MODEL_LIST_SECONDS = 30.0   # how long a listing of the models folder is reused
 MODEL_LIST_WAIT = 1.0       # seconds a request waits for a first listing
@@ -1065,7 +1067,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         return info
 
     def snapshot(config, since=0):
-        return manager.snapshot(since, library_names(config))
+        return manager.snapshot(since, library_names(config), config=config)
 
     def since_arg():
         try:
@@ -1269,6 +1271,14 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
             if library_id is not None or params.get("confirm") is not True:
                 raise AdminError(400, "Deleting the face data needs confirm: true (and no "
                                       "library: it is all deleted).", {"confirm": "Needed."})
+        if kind == "trip_stories":
+            # (A trip's pictures come from its own libraries: no library.)
+            if library_id is not None:
+                raise AdminError(400, "Trip stories are written for a trip or for every "
+                                      "trip (send no library).", {"library": "None."})
+            if params.get("trip") is not None:
+                _built, trip, _libraries = load_trip(config, params.get("trip"))
+                cleaned.update(trip=trip.id, trip_title=trip.title)
         if cleaned.get("force") and "ids" not in cleaned:
             # Describing a whole library again is "Re-describe stale" (or a
             # new prompt version), never a single click.
@@ -1919,6 +1929,75 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         job, added = manager.enqueue("places", None, params)
         return jsonify({"job": job, "added": added, "places": places_view()}), 202
 
+    # -- street maps (street_maps.py) -----------------------------------------
+
+    def maps_view(full=False):
+        """street_maps.status() (full: with how many places of pictures have no street
+        map) with the maps job that is waiting or running ("job") and the last one that
+        finished ("last")."""
+        import street_maps
+        jobs_now = manager.snapshot(manager.buffer.latest)
+        config = state.config()
+        result = street_maps.status(get_conn() if full else None, config)
+        waiting = [job for job in [jobs_now["current"]] + jobs_now["queue"]
+                   if job is not None and job["kind"] == "maps"]
+        finished = [job for job in jobs_now["recent"] if job["kind"] == "maps"]
+        result["job"] = waiting[0] if waiting else None
+        result["last"] = finished[0] if finished else None
+        return result
+
+    @bp.route("/maps", methods=["GET"])
+    def maps_state():
+        return jsonify(maps_view(request.args.get("full") == "1"))
+
+    @bp.route("/maps/<action>", methods=["POST"])
+    def maps_action(action):
+        """plan: check the size of a download of the street maps (a job; it reads the
+        map's directories); download {expect_bytes, source, allow_large}: download them
+        as the last size check said (a job; one of street_maps.LARGE_BYTES or more only
+        with allow_large: true); remove: delete them (not while a job, or a command
+        line tool, holds the job lock: a download may be running)."""
+        import street_maps
+        data = body()
+        if action == "plan":
+            params = {}
+        elif action == "download":
+            last = street_maps.status()["plan"]
+            expect = data.get("expect_bytes")
+            if not last or data.get("source") != last.get("source"):
+                raise AdminError(409, "Check the size of the download first.")
+            if isinstance(expect, bool) or not isinstance(expect, int) or expect <= 0:
+                raise AdminError(400, "expect_bytes must be the size agreed to, in bytes.")
+            if not isinstance(data.get("allow_large", False), bool):
+                raise AdminError(400, "allow_large must be true or false.")
+            params = {"download": True, "expect_bytes": expect, "source": last["source"]}
+            if last.get("large"):
+                if data.get("allow_large") is not True:
+                    raise AdminError(409, "The street maps would be %s or more: allow "
+                                          "that first." % street_maps.human_bytes(
+                                              street_maps.LARGE_BYTES))
+                params["allow_large"] = True
+        elif action == "remove":
+            if maps_view()["job"] is not None:
+                raise AdminError(409, "A street maps job is waiting or running; stop it "
+                                      "first.")
+            lock = jobs.WorkerLock()
+            if not lock.acquire("deleting the street maps"):
+                raise AdminError(409, "Wait until the running job has finished (%s)."
+                                 % (lock.holder() or "another process"))
+            try:
+                removed = street_maps.remove()
+            except OSError as error:
+                raise AdminError(409, "The street maps could not be deleted: %s"
+                                 % common.redact(str(error)))
+            finally:
+                lock.release()
+            return jsonify({"removed": removed, "maps": maps_view()})
+        else:
+            raise AdminError(404, "Unknown action: %s." % action)
+        job, added = manager.enqueue("maps", None, params)
+        return jsonify({"job": job, "added": added, "maps": maps_view()}), 202
+
     # -- pictures -------------------------------------------------------------
 
     @bp.route("/images/hide", methods=["POST"])
@@ -2435,6 +2514,36 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         if not trips.ID_RE.match(trip_id or ""):
             raise AdminError(404, "There is no trip %s." % trip_id)
         return trip_id
+
+    @bp.route("/trips/<trip_id>/story", methods=["POST"])
+    def edit_trip_story(trip_id):
+        """{days?: [{date, text}], hidden?: bool, forget?: true}: the owner's change of a
+        trip's story (trip_stories.change_story); answers its story_view."""
+        data = body()
+        trip_id = trip_id_arg(trip_id)
+        if not any(key in data for key in ("days", "hidden", "forget")):
+            raise AdminError(400, "Send days, hidden or forget.")
+
+        def change(conn, config, ids):
+            try:
+                return trip_stories.change_story(conn, config, ids, trip_id,
+                                                 days=data.get("days"),
+                                                 hidden=data.get("hidden"),
+                                                 forget_it=data.get("forget") is True)
+            except trip_stories.StoryError as error:
+                raise AdminError(error.status, str(error))
+        return jsonify({"story": trip_change(change)})
+
+    @bp.route("/trips/stories/plan", methods=["GET"])
+    def trip_stories_plan():
+        """?trip=ID&redo=1: what a trip_stories job would write, with which endpoints and
+        about what it costs (trip_stories.plan), for the pages to show before it starts."""
+        trip_id = request.args.get("trip") or None
+        if trip_id is not None:
+            trip_id = trip_id_arg(trip_id)
+        redo = request.args.get("redo") in ("1", "true")
+        return jsonify(trip_change(lambda conn, config, ids: trip_stories.plan(
+            conn, config, trip_id, redo)))
 
     @bp.route("/trips/<trip_id>", methods=["POST"])
     def edit_trip(trip_id):

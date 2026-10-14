@@ -16,7 +16,12 @@
    person or mark as not faces; "Not faces" (?view=not_face) those marked,
    to take the mark back. "Group faces again" (while People is on) queues
    the job that groups the faces anew (what the admin said is kept). The
-   faces are pictures the server cuts from the previews (/face/<id>).
+   faces are pictures the server cuts from the previews (/face/<id>), or
+   keeps (faces found in full size, and in the frames of videos). A face of
+   a video says the moment it was seen at: its link ("0:12" after a play
+   sign) opens the video's page there (detail?id=...&at=seconds); a face of
+   a picture's ("Picture") opens its page with the face marked
+   (detail?id=...&face=<id>).
 
    In the person picker (Move to..., Add to a person..., Merge into...)
    Enter chooses the person whose name is the one typed, else the new
@@ -104,7 +109,34 @@
 
     function picturesText(person) {
         var count = Array.isArray(person.ids) ? person.ids.length : 0;
-        return fmt.plural(count, "picture");
+        var videos = typeof person.videos === "number" ? person.videos : 0;
+        return fmt.plural(count, "picture") + (videos ? " (" + fmt.plural(videos, "video") +
+                                               ")" : "");
+    }
+
+    // 0:07, 1:02:03 (a moment of a video: whole seconds rounded down, as the
+    // viewer's moments, VIEWER.format.momentText, say it too).
+    function momentText(seconds) {
+        var total = Math.max(0, Math.floor(seconds));
+        var hours = Math.floor(total / 3600);
+        var minutes = Math.floor(total / 60) % 60;
+        var rest = total % 60;
+        var two = function (value) {
+            return (value < 10 ? "0" : "") + value;
+        };
+        return (hours ? hours + ":" + two(minutes) : String(minutes)) + ":" + two(rest);
+    }
+
+    // The page of the picture a face is in: a video's at the face's moment, a
+    // picture's with the face marked (face=: a face of a panorama is a few pixels
+    // across in it, see viewer.js faceBoxesFor).
+    function faceUrl(face) {
+        var url = SITE.detailUrl(face.image);
+        var join = url.indexOf("?") >= 0 ? "&" : "?";
+        if (typeof face.at === "number" && isFinite(face.at)) {
+            return url + join + "at=" + encodeURIComponent(String(Math.round(face.at * 10) / 10));
+        }
+        return url + join + "face=" + encodeURIComponent(String(face.id));
     }
 
     function sameText(text) {
@@ -582,10 +614,13 @@
 
     function faceTile(face, label) {
         var item = el("li", {className: "face-item"});
+        var video = typeof face.at === "number" && isFinite(face.at);
         var tile = el("button", {type: "button", className: "face-tile",
                                  attrs: {"aria-pressed": selected[face.id] ? "true" : "false",
                                          "aria-label": "Face " + face.id +
                                              (label ? " of " + label : "") +
+                                             (video ? ", in a video at " + momentText(face.at)
+                                                 : "") +
                                              (face.owner ? ", placed by you" : "")},
                                  title: face.owner ? "You put this face here" : ""});
         tile.appendChild(faceImage(face.id, ""));
@@ -599,9 +634,15 @@
             item.appendChild(el("span", {className: "face-owner", attrs: {"aria-hidden": "true"}}));
         }
         if (face.image !== null && face.image !== undefined) {
-            item.appendChild(el("a", {className: "face-open", href: SITE.detailUrl(face.image),
-                                      text: "Picture", title: "Open the picture this face is in",
-                                      attrs: {"aria-label": "Open the picture of face " +
+            // (A video's: its moment, which it opens at.)
+            item.appendChild(el("a", {className: "face-open" + (video ? " is-video" : ""),
+                                      href: faceUrl(face),
+                                      text: video ? "\u25b6 " + momentText(face.at) : "Picture",
+                                      title: video ? "Open the video at " + momentText(face.at) +
+                                          ", where this face is"
+                                          : "Open the picture this face is in",
+                                      attrs: {"aria-label": (video ? "Open the video of face "
+                                                             : "Open the picture of face ") +
                                                             face.id}}));
         }
         return item;

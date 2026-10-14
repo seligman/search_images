@@ -334,7 +334,9 @@ var SHELL = (function () {
         drive_previews: "Make sped-up drives",
         faces: "Find faces",
         group_faces: "Group faces into people",
-        delete_faces: "Delete face data"
+        delete_faces: "Delete face data",
+        maps: "Street maps",
+        trip_stories: "Write trip stories"
     };
     var STATE_LABELS = {
         queued: "Waiting",
@@ -365,7 +367,11 @@ var SHELL = (function () {
         drive_previews: "Making sped-up previews of drives",
         faces: "Finding faces",
         people: "Grouping faces into people",
-        "delete faces": "Deleting face data"
+        "delete faces": "Deleting face data",
+        "street maps size": "Checking the size of the street maps",
+        "street maps download": "Downloading the street maps",
+        "street maps file": "Writing the street maps file",
+        stories: "Writing trip stories"
     };
     var STAGE_VERBS = {
         scan: "Scanning",
@@ -385,6 +391,9 @@ var SHELL = (function () {
         var params = job.params || {};
         if (job.kind === "places" && params.download) {
             return "Download place names";
+        }
+        if (job.kind === "maps") {
+            return params.download ? "Download street maps" : "Check the size of street maps";
         }
         if (job.kind === "describe" && params.retry_failed) {
             return "Retry failed";
@@ -420,7 +429,8 @@ var SHELL = (function () {
     function jobTitle(job) {
         var kind = jobKind(job);
         if ((job.kind === "process" || job.kind === "places" || job.kind === "delete_faces" ||
-                job.kind === "group_faces") && !job.library_id) {
+                job.kind === "group_faces" || job.kind === "maps" ||
+                (job.kind === "trip_stories" && !(job.params || {}).trip)) && !job.library_id) {
             return kind;
         }
         return kind + ": " + jobLibrary(job);
@@ -464,6 +474,59 @@ var SHELL = (function () {
             return "Another server that uses the same data folder is running a job";
         }
         return "A run started from the command line (scan.py) is running";
+    }
+
+    /* What the Manage page says of a library's faces after "Faces: <count>"
+       (info: people.counts() of the library; enabled: People is on):
+       " in 4 pictures (4 of 7 pictures looked at; 1 in full size). 3 to look
+       at, a job for the processor: 1 wide or very large picture in full size
+       and 2 videos in several frames each. ..." The parts of what is to be
+       looked at are told apart, never counted twice. */
+    function facesNote(info, enabled) {
+        var count = function (key) {
+            return typeof info[key] === "number" && isFinite(info[key]) ? info[key] : 0;
+        };
+        var how = [];
+        if (count("full")) {
+            how.push(number(count("full")) + " in full size");
+        }
+        if (count("videos")) {
+            how.push(plural(count("videos"), "video") + " in several frames");
+        }
+        var text = " in " + plural(count("with_faces"), "picture") + " (" +
+            number(count("done")) + " of " + plural(count("pictures"), "picture") +
+            " looked at" + (how.length ? "; " + how.join(", ") : "") + ").";
+        if (enabled && count("pending")) {
+            var kinds = [];
+            if (count("full_pending")) {
+                kinds.push(plural(count("full_pending"), "wide or very large picture") +
+                           " in full size");
+            }
+            if (count("video_pending")) {
+                kinds.push(plural(count("video_pending"), "video") + " in several frames" +
+                           (count("video_pending") > 1 ? " each" : ""));
+            }
+            var others = count("pending") - count("full_pending") - count("video_pending");
+            if (kinds.length && others > 0) {
+                kinds.push(plural(others, "other picture"));
+            }
+            text += " " + number(count("pending")) + " to look at, a job for the processor" +
+                (kinds.length ? ": " + (kinds.length > 1 ? kinds.slice(0, -1).join(", ") +
+                                        " and " + kinds[kinds.length - 1] : kinds[0]) : "") +
+                ".";
+            if (count("changed")) {
+                text += " " + number(count("changed")) + " looked at before with other " +
+                    "settings " + (count("changed") === 1 ? "keeps its" : "keep their") +
+                    " faces until then.";
+            }
+        }
+        if (count("failed")) {
+            text += " " + number(count("failed")) + " could not be looked at.";
+        }
+        if (count("skipped")) {
+            text += " " + plural(count("skipped"), "clip") + " of dashcam drives skipped.";
+        }
+        return text;
     }
 
     function add(totals, key, value) {
@@ -570,11 +633,19 @@ var SHELL = (function () {
                 (faced.looked || faced.failed || job.kind === "faces")) {
             parts.push(plural(faced.faces || 0, "face") + " found in " +
                        plural(faced.looked, "picture") + " looked at");
+            if (faced.videos) {
+                // (Videos, looked at in several frames each.)
+                parts.push(plural(faced.videos, "video") + " in " +
+                           plural(faced.frames || 0, "frame"));
+            }
             if (faced.failed) {
                 parts.push(number(faced.failed) + " could not be looked at");
             }
             if (faced.offline) {
                 parts.push(number(faced.offline) + " wait for their folder");
+            }
+            if (faced.no_tools) {
+                parts.push(plural(faced.no_tools, "video") + " wait for ffmpeg");
             }
         }
         // (people_groups.group: faces, grouped, people, new; the faces job's own as its
@@ -643,12 +714,42 @@ var SHELL = (function () {
                        (summary.drives.failed ? " (" + number(summary.drives.failed) +
                         " failed)" : ""));
         }
+        if (job.kind === "maps") {
+            // (street_maps.py: a size check's plan, or a download's tiles.)
+            if (summary.plan && typeof summary.plan.download_bytes === "number") {
+                parts.push(bytes(summary.plan.download_bytes) + " to download, " +
+                           bytes(summary.plan.keep_bytes) + " to keep");
+            }
+            if (typeof summary.tiles === "number" && summary.tiles) {
+                parts.push(plural(summary.tiles, "map tile") + " (" + bytes(summary.bytes) +
+                           ")");
+            }
+            if (summary.stopped) {
+                parts.push("stopped: start it again to go on");
+            }
+        }
         if (job.kind === "places") {
             if (summary.index && typeof summary.index.cities === "number") {
                 parts.push(plural(summary.index.cities, "town") + " known");
             }
             if (summary.places && typeof summary.places.checked === "number") {
                 parts.push(plural(summary.places.checked, "picture") + " given a place");
+            }
+        }
+        if (job.kind === "trip_stories" && typeof summary.written === "number") {
+            // (trip_stories.write_stories: written, current, edited, failed, cost.)
+            parts.push(plural(summary.written, "story", "stories") + " written");
+            if (summary.current) {
+                parts.push(number(summary.current) + " up to date");
+            }
+            if (summary.edited) {
+                parts.push(number(summary.edited) + " kept (edited)");
+            }
+            if (summary.failed) {
+                parts.push(number(summary.failed) + " failed");
+            }
+            if (typeof summary.cost === "number" && summary.cost > 0) {
+                parts.push("about " + money(summary.cost));
             }
         }
         if (summary.offline && summary.offline.length) {
@@ -1228,6 +1329,7 @@ var SHELL = (function () {
         field: field,
         notice: notice,
         warningList: warningList,
+        facesNote: facesNote,
         TEST_COST_KEY: TEST_COST_KEY,
         format: {
             number: number,
