@@ -7,7 +7,8 @@ rating of 0 (none) to 5 stars. A picture without either has no row.
 Albums (albums, album_items): a "manual" album holds the pictures put in
 it, in an order of the owner's (position); a "smart" album is a saved
 search -- what was typed in the search box (query) with the filters, the
-sort and the words/meaning mode (options, JSON: see clean_options) --
+sort, the words/meaning mode and an area of the map (options, JSON: see
+clean_options) --
 that the search page (static/search-core.js) works out whenever it is
 used, so it always holds the pictures that match now. Album names are
 unique, compared without regard to case. Deleting an album never touches
@@ -33,6 +34,7 @@ import time
 import unicodedata
 
 import image_edits
+import map_areas
 
 # Most pictures one request may mark (or put in, or take out of, an album).
 MARK_LIMIT = 10000
@@ -55,7 +57,7 @@ SORTS = ("", "relevance", "newest", "oldest", "name", "quality", "shuffle", "alb
 BY = ("", "words", "meaning")
 FILTER_VALUES = 50          # values per filter group (site.js MAX_VALUES)
 FILTER_VALUE_LENGTH = 200
-OPTION_KEYS = ("filters", "sort", "by", "lib", "from", "to")
+OPTION_KEYS = ("filters", "sort", "by", "lib", "from", "to", "area", "aname")
 _DATE_KEY_RE = re.compile(r"^\d{4}(?:-(?:0[1-9]|1[0-2])(?:-(?:0[1-9]|[12]\d|3[01]))?)?$")
 _CONTROL_RE = re.compile("[\x00-\x1f\x7f]")
 # album:#<id> names an album by its id only (as search-core's findAlbum reads it).
@@ -316,13 +318,16 @@ def clean_query(value):
 
 
 def clean_options(value):
-    """A smart album's options as sent: {filters: {group: [values]}, sort, by, lib, from, to}.
+    """A smart album's options as sent: {filters: {group: [values]}, sort, by, lib, from, to,
+    area, aname}.
 
     Every key may be left out; the result has only those with a value.
     filters uses the groups of the search page's facets (FILTER_GROUPS);
     sort one of SORTS; by "words", "meaning" or "" (both); lib a library
     id ("" all); from and to the timeline's dates ("YYYY", "YYYY-MM" or
-    "YYYY-MM-DD"). Raises AlbumError for anything else.
+    "YYYY-MM-DD"); area an area of the map (map_areas: the pictures taken
+    in it), aname its name (kept only with area). Raises AlbumError for
+    anything else.
     """
     if value is None:
         return {}
@@ -378,6 +383,20 @@ def clean_options(value):
             raise AlbumError("%s is a date: YYYY, YYYY-MM or YYYY-MM-DD." % key,
                              {"options": "Bad %s." % key})
         result[key] = item
+    area = value.get("area")
+    if area not in (None, ""):
+        if map_areas.parse(area) is None:
+            raise AlbumError("area is an area of the map, as the map page draws it.",
+                             {"options": "Bad area."})
+        result["area"] = area
+        aname = value.get("aname")
+        if aname not in (None, ""):
+            if not isinstance(aname, str) or len(aname) > map_areas.NAME_LENGTH:
+                raise AlbumError("aname is the area's name, at most %d characters."
+                                 % map_areas.NAME_LENGTH, {"options": "Bad aname."})
+            name = map_areas.clean_name(_storable(aname, "options", "The area's name"))
+            if name:
+                result["aname"] = name
     return result
 
 
@@ -642,7 +661,8 @@ def create_album(conn, name, kind="manual", query="", options=None, ids=(), now=
     query = clean_query(query) if kind == "smart" else ""
     options = clean_options(options) if kind == "smart" else {}
     if kind == "smart" and not query and not options.get("filters") and not (
-            options.get("from") or options.get("to") or options.get("lib")):
+            options.get("from") or options.get("to") or options.get("lib") or
+            options.get("area")):
         raise AlbumError("A smart album needs a search: type words or choose filters first.",
                          {"query": "Required."})
     if kind == "smart" and ids:
@@ -714,7 +734,8 @@ def update_album(conn, album_id, changes, now=None):
         options = (clean_options(changes["options"]) if "options" in changes
                    else album["options"])
         if not query and not options.get("filters") and not (
-                options.get("from") or options.get("to") or options.get("lib")):
+                options.get("from") or options.get("to") or options.get("lib") or
+                options.get("area")):
             raise AlbumError("A smart album needs a search: words or filters.",
                              {"query": "Required."})
         sets += ["query = ?", "options = ?"]

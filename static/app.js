@@ -94,6 +94,15 @@
    or not, opens the viewer on the whole drive (VIEWER's driveOf), at
    that clip.
 
+   An area of the map ("Search an area" on the map page: state.area and
+   state.aname, see search-core.js "Areas on the map") limits the search to
+   the pictures taken in it, with an "Area: ..." chip that takes it away;
+   where the pictures were taken (SITE.loadPlaces) is loaded when a search
+   has one (or names a smart album that has one), and until it is in the
+   page says so instead of finding nothing. A published site without
+   locations has no areas: an area in its address is left out, with a note.
+   "Save as album" keeps the area.
+
    The grid is laid out in rows by this script (columns from the width and
    the size slider; a header row per month when sorted by date) and cut
    into blocks of about 60 pictures. Only the blocks near the screen hold
@@ -270,7 +279,7 @@
         return SITE.searchState.params({q: state.q, lib: SHELL.library(), filters: state.filters,
                                         hidden: state.hidden, junk: state.junk,
                                         sensitive: state.sensitive, from: state.from,
-                                        to: state.to, typed: state.typed});
+                                        to: state.to, typed: state.typed, area: state.area});
     }
 
     var viewSearch = "";        // mapSearch() of the search state.view belongs to
@@ -292,7 +301,8 @@
                 size: state.size === "m" ? "" : state.size,
                 hidden: state.hidden, junk: state.junk, sensitive: state.sensitive,
                 ids: state.ids, pick: state.pick, view: state.view, from: state.from,
-                to: state.to, by: state.by, typed: state.typed};
+                to: state.to, by: state.by, typed: state.typed, area: state.area,
+                aname: state.aname};
     }
 
     // The search state for links to other pages (without the view settings).
@@ -369,7 +379,7 @@
             count += state.filters[key].length;
         });
         return count + (state.junk ? 1 : 0) + (state.sensitive ? 1 : 0) + (state.hidden ? 1 : 0) +
-            (state.ids ? 1 : 0) + (state.from || state.to ? 1 : 0);
+            (state.ids ? 1 : 0) + (state.from || state.to ? 1 : 0) + (state.area ? 1 : 0);
     }
 
     /* The pictures picked on the map (state.ids): {ids, stale} once the
@@ -389,6 +399,64 @@
     }
 
     var droppedPicks = false;
+
+    /* Where the pictures were taken, for an area of the map: loaded once a
+       search has an area (or names a smart album with one), then set on the
+       index (setPlaces) every time it is made. */
+    var places = null;          // SITE.loadPlaces' answer, once in
+    var placesAsked = false;
+    var placesFailed = false;   // (asked again with the next search: changed)
+    var placesStale = false;    // the index changed since: loaded afresh when wanted
+    var droppedArea = false;    // an area that cannot be searched here was left out
+
+    function wantsPlaces() {
+        if (state.area) {
+            return true;
+        }
+        return /(^|\s)-?albums?:/i.test(state.q) && data.albums.some(function (album) {
+            return album && album.kind === "smart" && album.options &&
+                typeof album.options.area === "string" && album.options.area;
+        });
+    }
+
+    function wantPlaces() {
+        if (state.area && (!SITE.hasAreas() || !SearchCore.areas.read(state.area))) {
+            // (A published site without locations, or an area that cannot be read.)
+            state.area = "";
+            state.aname = "";
+            droppedArea = true;
+        }
+        if (placesAsked || !data || !wantsPlaces()) {
+            return;
+        }
+        placesAsked = true;
+        var fresh = placesStale;
+        placesStale = false;
+        SITE.loadPlaces(function (answer) {
+            if (!answer) {
+                placesFailed = true;
+            } else {
+                places = answer;
+                placesFailed = false;
+                setPlaces();
+            }
+            run({keepScroll: true});
+        }, fresh);
+    }
+
+    // The pictures changed (an edit, new ones): where they were taken may have too.
+    function placesChanged() {
+        if (places) {
+            placesStale = true;
+            placesAsked = false;
+        }
+    }
+
+    function setPlaces() {
+        if (data && places) {
+            data.index.setPlaces(places.points, places.routes);
+        }
+    }
 
     // Drops a list of picked pictures that cannot be read (before a search).
     function checkPicked() {
@@ -431,6 +499,8 @@
         if (looks) {
             data.index.setLooks(looks);
         }
+        setPlaces();
+        placesChanged();
         loadedAt = Date.now();
     }
 
@@ -448,6 +518,8 @@
             if (looks) {
                 data.index.setLooks(looks);
             }
+            setPlaces();
+            placesChanged();
             run({keepScroll: true});
         }
     }
@@ -479,6 +551,9 @@
         var chosen = picked();
         if (chosen && !chosen.stale) {
             options.ids = chosen.ids;
+        }
+        if (state.area) {
+            options.area = state.area;
         }
         options.meaning = state.by || "hybrid";
         options.vector = meaningVector();
@@ -1605,6 +1680,7 @@
             typedAllFor = null;
         }
         wantPeople();
+        wantPlaces();
         if (state.typed && state.typed !== "*") {
             // (Only the parts whose words are still in the query stay as typed:
             // by the words, as a name may only be known once the people come.)
@@ -1664,6 +1740,10 @@
         expandedDrives = {};
         anchor = null;
         droppedPicks = false;
+        droppedArea = false;
+        if (placesFailed) {
+            placesAsked = false;
+        }
         run({top: options.top !== false});
         writeUrl({push: options.push === true});
     }
@@ -1750,6 +1830,8 @@
         state.sensitive = "";
         state.hidden = false;
         state.ids = "";
+        state.area = "";
+        state.aname = "";
         changed();
     }
 
@@ -1766,6 +1848,8 @@
         state.ids = "";
         state.from = "";
         state.to = "";
+        state.area = "";
+        state.aname = "";
         state.q = "";
         if (group === "q") {
             state.q = value;
@@ -1785,6 +1869,8 @@
         target.view = "";
         target.from = "";
         target.to = "";
+        target.area = "";
+        target.aname = "";
         if (group !== "q") {
             target.filters[group] = [value];
         }
@@ -2614,6 +2700,15 @@
             warnings.push("The pictures picked on the map could not be found any more (the " +
                           "pictures have changed since): showing the whole search.");
         }
+        if (droppedArea) {
+            warnings.push(SITE.hasAreas() ? "The area of the map could not be read: " +
+                          "showing the whole search." : "This site does not publish where " +
+                          "the pictures were taken, so the area of the map was left out.");
+        }
+        if (placesFailed && state.area) {
+            warnings.push("Where the pictures were taken could not be loaded, so the area " +
+                          "finds nothing for now.");
+        }
         if (looksSettled && !looks && result.meaning && result.meaning.mode === "look") {
             // (look: with no look vectors here: only the picture itself is found.)
             warnings.push("Looks like this needs the pictures' look vectors, and " +
@@ -2663,7 +2758,7 @@
         // (Not for a visibility switch alone, such as "Hide blurry ...":
         // a smart album does not keep those.)
         var searching = Boolean(state.q.replace(/\s+/g, "") || savedFilterCount() ||
-                                state.from || state.to || SHELL.library());
+                                state.from || state.to || SHELL.library() || state.area);
         save.hidden = !adminOn || !serverMode || !searching || Boolean(example) ||
             Boolean(state.ids);
         var changing = albumBeingChanged();
@@ -2740,6 +2835,12 @@
         if (state.to) {
             options.to = state.to;
         }
+        if (state.area) {
+            options.area = state.area;
+            if (state.aname) {
+                options.aname = state.aname;
+            }
+        }
         return options;
     }
 
@@ -2751,10 +2852,12 @@
         var changing = albumBeingChanged();
         var box = SHELL.modal({title: changing ? "Save the search of " + changing.name
             : "Save this search as a smart album"});
+        // (Its words, or the name of its area of the map when it has no words.)
+        var words = state.q.replace(/^\s+|\s+$/g, "");
         var name = el("input", {type: "text", className: "input", maxLength: 100,
                                 autocomplete: "off", spellcheck: false,
                                 value: changing ? changing.name
-                                    : state.q.replace(/^\s+|\s+$/g, "").slice(0, 100)});
+                                    : (words || (state.area && state.aname) || "").slice(0, 100)});
         var field = SHELL.field("Album name", name);
         box.body.appendChild(field.node);
         var parts = [];
@@ -2779,6 +2882,10 @@
         }
         if (state.from || state.to) {
             parts.push(SearchCore.rangeLabel(state.from || "", state.to || ""));
+        }
+        if (state.area) {
+            parts.push("the area of the map (" + SearchCore.areas.label(state.area, state.aname) +
+                       ")");
         }
         if (SHELL.library()) {
             parts.push("the library " + (SHELL.libraryName() || SHELL.library()));
@@ -3228,6 +3335,14 @@
                 state.hidden = false;
                 changed();
             }));
+        }
+        if (state.area) {
+            chips.push(chipButton("Area: " + SearchCore.areas.label(state.area, state.aname),
+                                  function () {
+                                      state.area = "";
+                                      state.aname = "";
+                                      changed();
+                                  }, "Show every place again"));
         }
         var chosen = picked();
         if (chosen && !chosen.stale) {
@@ -3808,6 +3923,11 @@
         if (result.total) {
             return;
         }
+        if (result.areaPending && !placesFailed) {
+            // (The places are on their way: the area finds its pictures in a moment.)
+            emptyBox("Loading where the pictures were taken\u2026", [], []);
+            return;
+        }
         var lines = [];
         var actions = [];
         var looking = false;
@@ -4069,6 +4189,38 @@
                               label: "Show all of them",
                               run: function () {
                                   state.ids = "";
+                                  changed();
+                              }});
+            }
+        }
+        if (state.area) {
+            var anywhere = found(function (options) {
+                delete options.area;
+            });
+            var everywhereIds = anywhere ? SearchCore.search(data.index, searched(), (function () {
+                var options = {};
+                Object.keys(base).forEach(function (key) {
+                    options[key] = base[key];
+                });
+                delete options.area;
+                return options;
+            })()).items : [];
+            // (None of them with a position: a place named without one is in no area.)
+            var unplaced = anywhere && data.index.placedCount(everywhereIds) === 0;
+            var areaLabel = " (" + SearchCore.areas.label(state.area, state.aname) + ").";
+            var what = state.q ? " \u201c" + state.q + "\u201d" : " the search";
+            if (anywhere) {
+                reasons.push({text: !unplaced ? matching(anywhere) + " but none was taken in " +
+                                  "the area of the map" + areaLabel
+                                  : anywhere === 1 ? "The picture that matches" + what + " has " +
+                                    "no position, so it is in no area of the map" + areaLabel
+                                      : "None of the " + fmt.plural(anywhere, "picture") +
+                                        " that match" + what + " has a position, so none is " +
+                                        "in an area of the map" + areaLabel,
+                              label: "Search everywhere",
+                              run: function () {
+                                  state.area = "";
+                                  state.aname = "";
                                   changed();
                               }});
             }

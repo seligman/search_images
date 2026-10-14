@@ -64,6 +64,7 @@ in the README) ends with `--settings-base FOLDER`, so it runs as it is.
     "local_times": { "enabled": true },
     "raw": { "enabled": true, "index_alone": true },
     "street_maps": { "radius_km": 20 },
+    "named_places": { "enabled": true },
     "libraries": [ { ... }, { ... } ]
 }
 ```
@@ -891,7 +892,8 @@ locations, or a choice in the viewer). All keys are optional:
 ```
 
 - `enabled` - `false` turns the estimates off (the places you set or
-  accepted in the viewer stay).
+  accepted in the viewer stay, and so do the places the pictures' files
+  name).
 - `window_minutes` - how far in time (1 to 240, default 30) a located
   picture may be from the picture to count; on one side only, the nearest
   must be within half of it. (Also how far apart a picture without a
@@ -1358,6 +1360,37 @@ and **Download** on the Manage page download. All keys are optional:
 A size check or download made with other settings is not changed by
 them: check the size again.
 
+The map page's **Search an area**, **Street or place** reads the streets,
+parks and places from the same tiles (README, "Searching an area of the
+map"); there are no settings of its own. Street maps of `"max_zoom": 14`
+name fewer small places (cafes, minor sights) there.
+
+## named_places
+
+The named places of the pictures on the street maps (README, "Named
+places"): the park, beach, museum or cafe where each picture with a
+position was taken, read from the downloaded street maps. All keys are
+optional:
+
+```
+"named_places": {
+    "enabled": true,
+    "max_estimate_km": 0.3
+}
+```
+
+- `enabled` - `false` turns them off: the pages, searches and exports
+  leave the pictures' named places out at once, none are looked up, and
+  the next scan (or `python named_places.py --update`) deletes what was
+  kept of them.
+- `max_estimate_km` - an estimated place (see `place_estimates`) gets a
+  named place only when it may be off by at most this much (0 to 2,
+  default 0.3 km); estimates of more than 0.15 km get an area only (a
+  park, a zoo) they lie deep enough inside of.
+
+Changing them takes effect at the next scan, or at once with **Find named
+places** (or **Look up all again**) under Street maps on the Manage page.
+
 ## libraries
 
 A list of folders to scan. Each library is one object:
@@ -1482,6 +1515,9 @@ A list of folders to scan. Each library is one object:
     position (1 to 50, default 5; 2 km either side of the routes).
   - `street_zoom` - with `street_maps`: the most detailed zoom that goes
     (10 to 15, default 14).
+  - `world_zoom` - with `location`: the most detailed zoom of the world
+    map's tiles that go (2 to 12, default 5; zoom 6 alone has three times
+    the tiles of zoom 0 to 5 together).
   - `file_names`, `folders` - `true` publishes file names or folder names
     (searchable); default `false`.
   - `exclude_types` - picture types left out; default
@@ -1582,9 +1618,11 @@ A list of folders to scan. Each library is one object:
     `false`: none of it is published, not even the name of the album the
     export is limited to. A smart album whose search cannot be published
     is left out: one limited to another library, one with `folder:`,
-    `file:`, `place:` or `has:gps` (or the Place filter) while
-    `folders`, `file_names` or `location` is off, one with `lib:`, and one
-    that looks for pictures like one that is not published.
+    `file:`, `place:` or `has:gps` (or the Place filter, or an area of
+    the map) while `folders`, `file_names` or `location` is off, one with
+    `lib:`, and one that looks for pictures like one that is not
+    published. A trip's export also leaves out a smart album whose area
+    of the map comes into the area around home (`home_km`).
   - `people_names` - `true` also publishes the names of the people in the
     pictures (People: named people who are not hidden), as tags of the
     pictures they are in; default `false`. Faces, their boxes and

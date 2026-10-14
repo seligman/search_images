@@ -111,6 +111,7 @@ import jobs
 import llm
 import local_times
 import looks
+import named_places
 import not_duplicates
 import opening_views
 import people
@@ -2165,6 +2166,121 @@ def _redate_kept(conn, library_id):
             if isinstance(item, int) and not isinstance(item, bool)}
 
 
+# What read_place_names reads of a picture's file for its XMP packet: a JPEG's
+# segments before its image data (in its first PLACE_HEAD_BYTES), another file's
+# packet among its first PLACE_READ_BYTES.
+PLACE_HEAD_BYTES = 1024 * 1024
+PLACE_READ_BYTES = 16 * 1024 * 1024
+_XMP_START, _XMP_END = b"<x:xmpmeta", b"</x:xmpmeta>"
+
+
+def file_xmp_place(path):
+    """The place a picture's file names in its XMP (imageinfo.xmp_place: {"city",
+    "region", "country", "cc"} as given, {} for none), read from the start of the file
+    only (PLACE_HEAD_BYTES, PLACE_READ_BYTES). Raises OSError."""
+    with open(path, "rb") as handle:
+        data = handle.read(PLACE_HEAD_BYTES)
+        if data[:3] == b"\xff\xd8\xff":
+            xmp = imageinfo.jpeg_xmp(data)
+        else:
+            data += handle.read(max(0, PLACE_READ_BYTES - len(data)))
+            start = data.find(_XMP_START)
+            end = data.find(_XMP_END, start) if start >= 0 else -1
+            xmp = data[start:end + len(_XMP_END)] if end >= 0 else b""
+    return imageinfo.xmp_place(xmp)
+
+
+def read_place_names(conn, library, ctx, threads=6):
+    """Read the place names of the XMP of a library's present pictures again (the files
+    of pictures indexed before they were read; see place_estimates.file_place): only the
+    start of each file (file_xmp_place), and only the exif's "XMPPlace" changes, with
+    images.updated when it does. Files that cannot be read are counted and left as
+    they are. Returns {"checked", "named" (whose files name a place), "changed",
+    "failed", "aborted", "ids" (of those changed)}."""
+    summary = {"checked": 0, "named": 0, "changed": 0, "failed": 0, "aborted": False,
+               "ids": []}
+    rows = conn.execute("SELECT id, path, exif FROM images WHERE library_id = ? AND "
+                        "missing_since IS NULL AND media <> ? ORDER BY id",
+                        (library["id"], videos.MEDIA_VIDEO)).fetchall()
+    if not rows:
+        return summary
+    label = common.library_label(library)
+    ctx.stage("place names", total=len(rows))
+    root = common.library_root(library)
+    timer = _CommitTimer(conn, None)
+
+    def read(row):
+        try:
+            return file_xmp_place(os.path.join(root, *row["path"].split("/"))), None
+        except OSError as error:
+            return None, error
+
+    def handle(row, outcome):
+        place, error = outcome
+        if error is not None:
+            summary["failed"] += 1
+        else:
+            summary["checked"] += 1
+            summary["named"] += 1 if place else 0
+            exif = _json_dict(row["exif"])
+            if (exif.get("XMPPlace") or {}) != place:
+                if place:
+                    exif["XMPPlace"] = place
+                else:
+                    exif.pop("XMPPlace", None)
+                _update_row(conn, row["id"], {"exif": _exif_json(exif),
+                                              "updated": time.time()})
+                summary["changed"] += 1
+                summary["ids"].append(row["id"])
+                timer.wrote()
+        ctx.step(item=row["path"])
+
+    try:
+        summary["aborted"] = _parallel_reads(threads, rows, read, handle, ctx.should_stop, ctx,
+                                             timer.flush)
+    finally:
+        timer.commit()
+    ctx.log("Place names in the files of %s: %d read, %d name a place, %d changed%s%s."
+            % (label, summary["checked"], summary["named"], summary["changed"],
+               "; %d could not be read" % summary["failed"] if summary["failed"] else "",
+               "; stopped" if summary["aborted"] else ""))
+    return summary
+
+
+def run_place_names(config, ctx, library_ids=None):
+    """read_place_names of the selected libraries (default: every enabled one), then the
+    GPS check (the estimates give pictures without a position the place their file
+    names) and the named places of the located pictures whose names changed (a file that
+    names another country than its position's gets none). Returns {"libraries":
+    [summaries], "changed", "stopped"}."""
+    libraries = describe.selected_libraries(config, library_ids)
+    summary = {"libraries": [], "changed": 0, "stopped": False}
+    conn = db.connect()
+    try:
+        changed = []
+        for library in libraries:
+            if ctx.should_stop():
+                summary["stopped"] = True
+                break
+            result = read_place_names(conn, library, ctx, reader_threads(config))
+            summary["libraries"].append(result)
+            changed.extend(result["ids"])
+            if result["aborted"]:
+                summary["stopped"] = True
+                break
+        summary["changed"] = len(changed)
+        if changed:
+            gps_check.run_safely(conn, config, ctx)
+            try:
+                named_places.update(conn, config, ctx, redo=True, ids=set(changed))
+            except (sqlite3.OperationalError, OSError) as error:
+                ctx.log("Named places could not be looked up (%s); the next scan does it."
+                        % common.redact(str(error)), "warn")
+    finally:
+        conn.close()
+    return summary
+
+
 def redate_videos(conn, library, ctx, video):
     """Read the dates of a library's videos again where the current rules may date them
     otherwise: those dated by a creation time read as UTC whose name holds the same
@@ -2579,6 +2695,11 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
             localised = local_times.run_safely(conn, config, ctx)
             if localised is not None:
                 summary["local_times"] = localised
+            # The named places on the street maps of the pictures whose position
+            # changed (named_places.py; nothing without street maps).
+            named = named_places.run_safely(conn, config, ctx)
+            if named is not None:
+                summary["named_places"] = named
         if describe_images and not summary["stopped"] and not ctx.should_stop():
             summary["describe"] = describe.describe_pending(
                 conn, config, ctx, helper=helper,
@@ -2588,6 +2709,11 @@ def run(config, ctx, library_ids=None, scan_images=True, describe_images=True,
                 redescribe_stale=redescribe_stale, limit=limit, endpoint_name=endpoint_name,
                 previews=previews, ids=ids, force=force)
             summary["stopped"] = summary["describe"]["stopped"]
+            if summary["describe"].get("described"):
+                # (A picture's description says which named places fit it.)
+                named = named_places.run_safely(conn, config, ctx)
+                if named is not None:
+                    summary["named_places"] = named
         elif ctx.should_stop():
             summary["stopped"] = True
         if embed_vectors and not summary["stopped"]:
@@ -2916,6 +3042,11 @@ def main(argv=None):
     parser.add_argument("--drive-previews", action="store_true",
                         help="Only make the sped-up previews of drives (\"drive_previews\" "
                              "in SETTINGS.md).")
+    parser.add_argument("--read-place-names", action="store_true",
+                        help="Read the place names in the XMP of every picture's file again "
+                             "(City, State, Country: pictures indexed by an older version "
+                             "were read without them); only the start of each file is read "
+                             "and nothing else changes. With --library: that library only.")
     parser.add_argument("--delete-library-data", metavar="LIBRARY_ID",
                         help="Delete the indexed data of a library that is no longer in the "
                              "settings (its id, as the Manage page lists it), with "
@@ -2990,6 +3121,14 @@ def main(argv=None):
               % ", ".join("--" + name.replace("_", "-") for name in JOB_MODES
                           if getattr(args, name)))
         return 2
+    if args.read_place_names and (mode is not None or args.no_scan or args.no_describe
+                                  or args.refine or args.embed or args.embed_images
+                                  or args.endpoint or args.redescribe_stale
+                                  or args.retry_failed or args.limit is not None
+                                  or args.ids is not None or args.newest_first is not None):
+        print("--read-place-names only reads the place names in the files: no other switch "
+              "goes with it but --library.")
+        return 2
     if mode == "delete_library" and (args.library or args.confirm_name is None):
         print("--delete-library-data needs --confirm-name (the library's name), and no "
               "--library.")
@@ -3032,6 +3171,11 @@ def main(argv=None):
         if mode is not None:
             with ctx.stop_on_ctrl_c():
                 return run_job(mode, config, ctx, library_ids, helper, args)
+        if args.read_place_names:
+            with ctx.stop_on_ctrl_c():
+                summary = run_place_names(config, ctx, library_ids)
+            ctx.log("Stopped as asked." if summary["stopped"] else "Done.")
+            return 0
         with ctx.stop_on_ctrl_c():
             if args.embed_images:
                 summary = run_looks(config, ctx, library_ids, args.limit, args.rebuild_looks,

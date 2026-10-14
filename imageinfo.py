@@ -2,10 +2,11 @@
 """Facts about image files that need no image library.
 
 Format sniffing from a file's first bytes, EXIF cleaning, the capture date,
-GPS position and camera name worked out from an EXIF dict, and the metadata
-clues for 360-degree photos (XMP GPano tags, 360 camera makers). images.py
-uses these on freshly read files; db.py uses the same functions on EXIF JSON
-stored by older versions, so both give the same answers.
+GPS position and camera name worked out from an EXIF dict, the metadata
+clues for 360-degree photos (XMP GPano tags, 360 camera makers) and the
+place names an XMP packet gives (xmp_place). images.py uses these on
+freshly read files; db.py uses the same functions on EXIF JSON stored by
+older versions, so both give the same answers.
 
 This module uses only the standard library.
 """
@@ -620,6 +621,59 @@ def xmp_covers_sphere(xmp):
         if part and whole and part < whole * (1.0 - PANORAMA_ASPECT_TOLERANCE):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# The place an XMP packet names
+
+# The XMP location fields (Adobe's photoshop namespace and IPTC Core) as
+# Lightroom, Photoshop, digiKam and exiftool write where a picture was taken:
+# names only, no position. (key in the result, property)
+XMP_PLACE_FIELDS = (("city", "photoshop:City"), ("region", "photoshop:State"),
+                    ("country", "photoshop:Country"), ("cc", "Iptc4xmpCore:CountryCode"))
+XMP_PLACE_MAX = 100       # longest name kept
+_XMP_PLACE_RES = tuple(
+    (key, re.compile(rb"%s\s*(?:=\s*\"([^\"]*)\"|=\s*'([^']*)'|>([^<]*)<)"
+                     % re.escape(name.encode("ascii"))))
+    for key, name in XMP_PLACE_FIELDS)
+_XML_ENTITY_RE = re.compile(r"&(?:#(\d{1,7})|#x([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos));")
+_XML_ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'"}
+_COUNTRY_CODE_RE = re.compile(r"^[A-Za-z]{2}$")
+
+
+def _xml_unescape(text):
+    def replace(match):
+        if match.group(3):
+            return _XML_ENTITIES[match.group(3)]
+        number = int(match.group(1)) if match.group(1) else int(match.group(2), 16)
+        return chr(number) if 0 < number <= 0x10FFFF else ""
+    return _XML_ENTITY_RE.sub(replace, text)
+
+
+def xmp_place(xmp):
+    """The place an XMP packet names: {"city", "region", "country", "cc"} (those given:
+    XMP_PLACE_FIELDS), or {} when it names none.
+
+    Both the attribute form (photoshop:City="Lucca") and the element form
+    (<photoshop:City>Lucca</photoshop:City>) are found. Names are single
+    spaced, without control characters, at most XMP_PLACE_MAX characters;
+    the country code is kept only as two letters (upper case).
+    """
+    text = _xmp_text(xmp)
+    place = {}
+    for key, pattern in _XMP_PLACE_RES:
+        match = pattern.search(text)
+        if not match:
+            continue
+        raw = next(group for group in match.groups() if group is not None)
+        value = _xml_unescape(raw.decode("utf-8", "replace"))
+        value = " ".join("".join(char if char.isprintable() else " "
+                                 for char in value).split())[:XMP_PLACE_MAX].strip()
+        if key == "cc":
+            value = value.upper() if _COUNTRY_CODE_RE.match(value) else ""
+        if value:
+            place[key] = value
+    return place
 
 
 def _exif_text(exif, key):

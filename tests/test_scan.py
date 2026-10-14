@@ -745,6 +745,53 @@ class CommandLineTest(ScanTestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(len(self.rows()), 1)
 
+    def test_the_place_names_of_the_files_read_again(self):
+        # A picture whose file names its place, indexed by a version that did not read
+        # the names (no "XMPPlace" in its exif): --read-place-names reads them, and
+        # nothing else of it changes.
+        packet = ("<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description "
+                  "rdf:about='' photoshop:State=\"North Coast\" photoshop:Country=\"Examplia\" "
+                  "Iptc4xmpCore:CountryCode=\"XA\"/></rdf:RDF></x:xmpmeta>").encode("utf-8")
+        names = {"region": "North Coast", "country": "Examplia", "cc": "XA"}
+        imagegen.write_bytes(self.folder, "named.jpg", imagegen.jpeg_with_xmp(
+            Image.new("RGB", (64, 48), (90, 140, 200)), packet))
+        write_jpeg(os.path.join(self.folder, "plain.jpg"), seed=5)
+        self.configure()
+        self.scan()
+        named = self.rows()["named.jpg"]
+        exif = json.loads(named["exif"])
+        self.assertEqual(exif.pop("XMPPlace"), names)
+        self.execute("UPDATE images SET exif = ? WHERE id = ?", (json.dumps(exif), named["id"]))
+        self.execute("DELETE FROM place_estimates WHERE image_id = ?", (named["id"],))
+        before = self.rows()
+        del self.reads[:]
+        code, output = self.run_main("--read-place-names")
+        self.assertEqual(code, 0, output)
+        self.assertIn("2 read, 1 name a place, 1 changed.", output)
+        after = self.rows()
+        self.assertEqual(json.loads(after["named.jpg"]["exif"])["XMPPlace"], names)
+        self.assertEqual(after["plain.jpg"], before["plain.jpg"])
+        self.assertEqual({key: value for key, value in after["named.jpg"].items()
+                          if key not in ("exif", "updated")},
+                         {key: value for key, value in before["named.jpg"].items()
+                          if key not in ("exif", "updated")})
+        self.assertGreater(after["named.jpg"]["updated"], before["named.jpg"]["updated"])
+        self.assertEqual(self.reads, [])        # (only the start of each file)
+        # It has the place its file names now (no position: see place_estimates).
+        conn = db.connect()
+        try:
+            import place_estimates
+            self.assertEqual(place_estimates.for_picture(conn, named["id"])["source"], "file")
+        finally:
+            conn.close()
+        # Again: nothing to change.
+        code, output = self.run_main("--read-place-names", "--library", "Family")
+        self.assertIn("2 read, 1 name a place, 0 changed.", output)
+        # Nothing else goes with it.
+        code, output = self.run_main("--read-place-names", "--no-describe")
+        self.assertEqual(code, 2)
+        self.assertIn("--read-place-names only", output)
+
     def test_piped_output_with_names_the_console_cannot_encode(self):
         name = "写真-été.jpg"
         write_jpeg(os.path.join(self.folder, name), seed=4)

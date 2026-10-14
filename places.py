@@ -972,7 +972,8 @@ def status(conn=None):
     also "gps_ignored", the present pictures whose position the GPS check
     set aside (gps_check.py: they count nowhere else), "estimates"
     (place_estimates.status: the pictures without a position that have an
-    estimated place, or one the owner set) and "local_times"
+    estimated place, one the owner set or one their file names) and
+    "local_times"
     (local_times.status: the pictures that have the local time of their
     place).
     """

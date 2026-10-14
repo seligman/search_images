@@ -44,7 +44,10 @@
    (rows: {zoom: [[row, first column, last column, ...]]}), so no tile
    that is not there is ever asked for. Scripts (not fetch) so that a site
    opened from disk works too; nothing is ever asked of another host. Maps
-   that show street tiles credit OpenStreetMap (STREETS.ATTRIBUTION).
+   that show street tiles credit OpenStreetMap (STREETS.ATTRIBUTION), and
+   while the world image shows, NASA's Blue Marble (STREETS.WORLD_CREDIT:
+   make_tiles.py's world image, and the small bundled one, are made from
+   it; public domain).
 
      STREETS.Basemap(options)      {tileUrl(z, x, y), tileSize, tileZoom
                                    (the world image's most detailed zoom),
@@ -72,6 +75,9 @@
                                    (the credit's link: a file of the server
                                    or of the export, never another host)
      STREETS.creditNode(tag, className, streets)   a map's credit (hidden)
+     STREETS.showCredit(node, drawn)   shows the parts of a map's credit
+                                   for what Basemap.draw drew; true when
+                                   the credit was hidden and shows now
      STREETS.clearOf(node, canvas)  a node's rectangle on a canvas (for
                                    draw's avoid), or null when hidden
      STREETS.WorldLayer(options)   the world image alone (the same options)
@@ -79,7 +85,14 @@
      STREETS.inflate(bytes)        gzip (or raw deflate) undone: a Uint8Array
      STREETS.decodeTile(bytes)     an MVT tile: {layer name: {extent,
                                    features: [{type, props, geom: [Int16Array
-                                   of x, y pairs, one per ring or line]}]}}
+                                   of x, y pairs, one per ring or line], id
+                                   (when it has one)}]}}; the named points
+                                   of interest too (pois: not drawn, see
+                                   Picker)
+     STREETS.Picker(streets)       the named streets, areas and places of
+                                   the street maps at a place or in a view,
+                                   and all of one of them (the map page's
+                                   search of an area; see Picker)
      STREETS.mercatorY(lat), STREETS.latitudeAt(t)   0 (north) to 1 (south)
 
    Loads under Node for the tests (tests/js/streets_test.js): no document
@@ -93,6 +106,7 @@ var STREETS = (function () {
     var hasDocument = typeof document !== "undefined" && document !== null;
 
     var ATTRIBUTION = "\u00a9 OpenStreetMap contributors";
+    var WORLD_CREDIT = "Imagery: NASA Blue Marble";
     var MAX_LAT = 85.0511287798;
     // A street tile is this many pixels wide at its own zoom.
     var STREET_TILE = 512;
@@ -127,9 +141,10 @@ var STREETS = (function () {
     var DECODED_KEPT = 96;
     var RETRY_MS = 30000;
     var FONT = "system-ui, -apple-system, \"Segoe UI\", Roboto, sans-serif";
-    // The layers drawn (the others are not even decoded).
+    // The layers decoded (the others are not even read): those drawn, and the named
+    // points of interest (Picker).
     var LAYERS = ["earth", "landcover", "landuse", "water", "roads", "buildings", "boundaries",
-                  "places"];
+                  "places", "pois"];
 
     /* ---------- Projection ------------------------------------------------ */
 
@@ -547,10 +562,13 @@ var STREETS = (function () {
         var tags = [];
         var type = 0;
         var commands = null;
+        var id = null;
         while (reader.pos < bytes.length) {
             var key = reader.varint();
             var field = Math.floor(key / 8);
-            if (field === 2) {
+            if (field === 1 && (key & 7) === 0) {
+                id = reader.varint();
+            } else if (field === 2) {
                 tags = packed(reader.bytesField());
             } else if (field === 3) {
                 type = reader.varint();
@@ -578,14 +596,24 @@ var STREETS = (function () {
                 box[3] = Math.max(box[3], part[n + 1]);
             }
         });
-        return {type: type, props: props, geom: geom, box: box};
+        var feature = {type: type, props: props, geom: geom, box: box};
+        if (id !== null) {
+            feature.id = id;
+        }
+        return feature;
     }
 
-    // Features left out: address points and nameless points of buildings.
+    // Features left out: address points and nameless points of buildings, and the
+    // points of interest without a name.
     function skipFeature(layer) {
         if (layer === "buildings") {
             return function (props, type) {
                 return type === 1;
+            };
+        }
+        if (layer === "pois") {
+            return function (props, type) {
+                return type !== 1 || typeof props.name !== "string" || !props.name;
             };
         }
         return null;
@@ -1187,6 +1215,7 @@ var STREETS = (function () {
         this.queue = [];
         this.loading = 0;
         this.listeners = [];
+        this.pinned = {};       // "z/x/y" -> how many Picker reads want it kept
     }
 
     Source.prototype.address = function (name) {
@@ -1287,7 +1316,7 @@ var STREETS = (function () {
     Source.prototype.keepOnly = function (wanted) {
         var self = this;
         this.queue = this.queue.filter(function (key) {
-            if (wanted[key]) {
+            if (wanted[key] || self.pinned[key]) {
                 return true;
             }
             delete self.tiles[key];
@@ -1325,10 +1354,15 @@ var STREETS = (function () {
         entry.at = Date.now();
         if (data) {
             this.order.push(key);
-            while (this.order.length > DECODED_KEPT) {
-                var old = this.order.shift();
-                if (this.tiles[old] && this.tiles[old].state === "ready") {
-                    delete this.tiles[old];
+            // (The oldest go first, but not those a Picker waits for.)
+            for (var k = 0; this.order.length > DECODED_KEPT && k < this.order.length; k++) {
+                var old = this.order[k];
+                if (!this.pinned[old]) {
+                    this.order.splice(k, 1);
+                    k -= 1;
+                    if (this.tiles[old] && this.tiles[old].state === "ready") {
+                        delete this.tiles[old];
+                    }
                 }
             }
         }
@@ -1409,6 +1443,28 @@ var STREETS = (function () {
         canvas.width = w;
         canvas.height = h;
         return canvas;
+    }
+
+    /* The view's coordinates (CSS pixels, as drawn on ctx) moved to the
+       nearest edge of a device pixel: {x(v), y(v)}. The maps draw scaled by
+       the screen's pixel ratio (1.25 at 125 %), and a tile whose side falls
+       inside a device pixel covers it only in part: two tiles side by side
+       there let what is under them show through, a hairline seam. Tiles
+       placed with these meet on whole device pixels (at a ratio of 1: whole
+       pixels, as Math.round). */
+    function pixelEdges(ctx) {
+        var m = typeof ctx.getTransform === "function" ? ctx.getTransform() : null;
+        if (!m || m.b || m.c || !(m.a > 0) || !(m.d > 0)) {
+            return {x: Math.round, y: Math.round};
+        }
+        return {
+            x: function (v) {
+                return (Math.round(v * m.a + m.e) - m.e) / m.a;
+            },
+            y: function (v) {
+                return (Math.round(v * m.d + m.f) - m.f) / m.d;
+            }
+        };
     }
 
     function WorldLayer(options) {
@@ -1513,6 +1569,7 @@ var STREETS = (function () {
         var rows = Math.pow(2, tz);
         var colW = world / cols;
         var stretch = zoom - tz;
+        var snap = pixelEdges(ctx);
         ctx.globalAlpha = stretch <= 1 ? 1 : Math.max(0.35, 1 - 0.2 * (stretch - 1));
         var x0 = Math.floor(left / colW);
         var x1 = Math.ceil((left + w) / colW) - 1;
@@ -1522,16 +1579,16 @@ var STREETS = (function () {
         var y1 = Math.min(rows - 1, Math.floor((90 - latBottom) / (180 / rows)));
         for (var ty = y0; ty <= y1; ty++) {
             var lat = rowLatitudes(tz, ty);
-            var dy = Math.round(mercatorY(lat.north) * world - top);
-            var dh = Math.round(mercatorY(lat.south) * world - top) - dy;
+            var dy = snap.y(mercatorY(lat.north) * world - top);
+            var dh = snap.y(mercatorY(lat.south) * world - top) - dy;
             if (dh <= 0) {
                 continue;
             }
             for (var tx = x0; tx <= x1; tx++) {
                 // The world repeats sideways: column tx is column tx mod cols.
                 var x = mod(tx, cols);
-                var dx = Math.round(tx * colW - left);
-                var dw = Math.round((tx + 1) * colW - left) - dx;
+                var dx = snap.x(tx * colW - left);
+                var dw = snap.x((tx + 1) * colW - left) - dx;
                 var entry = this.get(tz, x, ty);
                 if (entry && entry.loaded) {
                     ctx.drawImage(entry.merc, dx, dy, dw, dh);
@@ -1661,13 +1718,14 @@ var STREETS = (function () {
         var wanted = {};
         var shown = [];
         var visible = (x1 - x0 + 1) * (y1 - y0 + 1);
+        var snap = pixelEdges(ctx);
         for (var ty = y0; ty <= y1; ty++) {
             for (var tx = x0; tx <= x1; tx++) {
                 var x = mod(tx, n);
-                var dx = Math.round(tx * size - left);
-                var dy = Math.round(ty * size - top);
-                var dw = Math.round((tx + 1) * size - left) - dx;
-                var dh = Math.round((ty + 1) * size - top) - dy;
+                var dx = snap.x(tx * size - left);
+                var dy = snap.y(ty * size - top);
+                var dw = snap.x((tx + 1) * size - left) - dx;
+                var dh = snap.y((ty + 1) * size - top) - dy;
                 result.tiles += 1;
                 // The most detailed tile there is for this place: at most
                 // FILL_LEVELS zooms coarser, and not below FROM_ZOOM (else the
@@ -1745,6 +1803,7 @@ var STREETS = (function () {
                 break;
             }
         }
+        var snap = pixelEdges(ctx);
         for (var down = 1; down <= 2; down++) {
             var m = Math.pow(2, down);
             var found = false;
@@ -1753,11 +1812,11 @@ var STREETS = (function () {
                     var child = this.rendered[(d + down) + "/" + (x * m + i) + "/" +
                                               (y * m + j) + tail];
                     if (child) {
-                        var cx = Math.round(dx + i * dw / m);
-                        var cy = Math.round(dy + j * dh / m);
+                        var cx = snap.x(dx + i * dw / m);
+                        var cy = snap.y(dy + j * dh / m);
                         ctx.drawImage(child.canvas, cx, cy,
-                                      Math.round(dx + (i + 1) * dw / m) - cx,
-                                      Math.round(dy + (j + 1) * dh / m) - cy);
+                                      snap.x(dx + (i + 1) * dw / m) - cx,
+                                      snap.y(dy + (j + 1) * dh / m) - cy);
                         found = true;
                     }
                 }
@@ -1896,6 +1955,1059 @@ var STREETS = (function () {
         ctx.restore();
     }
 
+    /* ---------- Streets and places by name (an area of the map) ------------- */
+
+    /* A Picker finds the named streets and places of the street maps for
+       the map page's "Street or place" (map.js: a search limited to an area,
+       see search-core.js "Areas on the map"), from the tiles of the street
+       maps alone (nothing is asked of another host), at the most detailed
+       zoom there is at the place:
+
+         streets  named roads and paths (the roads layer)
+         areas    outlined areas (the landuse layer: a park, a zoo, a
+                  campus) named by the point of interest with the same id
+                  (as named_places.py names them), looked for in the tiles
+                  around and the coarser tiles at the place down to
+                  LABEL_ZOOM
+         places   named points of interest (the pois layer)
+
+       at(lat, lon, metres, callback) lists those at a place: callback([{kind
+       ("street", "area" or "place"), name, what (its kind in words: "park",
+       "museum", "street"), metres (how far; 0 inside an area), key}]),
+       nearest first, areas smallest first. inView(box, zoom, callback) lists
+       those of the tiles of a view (box {south, west, north, east}; for
+       the keyboard's list), each once (a street by its name, an area by its
+       id, a place by its name and point), by name (of one name, the street
+       first; numbers in names by their value; two of one name and kind told
+       apart by where they are in the view: near "north-west"), or
+       callback(null, why): "wait" before the street maps' index is in
+       (whenReady), "large" for a view of more than GATHER_TILES tiles.
+       whenReady(callback) calls callback(true) once the index is in (at
+       once when it is), callback(false) when it cannot be read. gather(item,
+       callback) then reads all of it: a street's parts (the roads of that
+       name joined to the one picked, within JOIN_METRES of one another), an
+       area's outline (its parts in each tile, cut at the tile's edges, then
+       joined again into one outline: dissolve), a place's point -- from the
+       tile it was found in and on through the tiles it goes on into, at most
+       GATHER_TILES of them: callback({kind, name, what, parts: [[lat, lon,
+       lat, lon, ...]], cut (true when it went on further)}) or null. Tiles
+       not loaded yet are asked for (and kept until the Picker is done with
+       them). */
+    var GATHER_TILES = 36;
+    var JOIN_METRES = 30;
+    var LABEL_ZOOM = 10;
+    var PICK_WAIT_MS = 20000;
+    // The road kinds that are streets (railways and ferries are not offered).
+    var STREET_KINDS = ["highway", "major_road", "medium_road", "minor_road", "other", "path"];
+    // How far a named place of the street maps names the pictures taken around
+    // it, by its kind (metres: named_places.py KINDS, which a test keeps the same),
+    // and the accuracy named_places.py gives a position taken indoors (see
+    // placeWithin).
+    var PLACE_REACH = {
+        aerodrome: 300, airport: 300, alpine_hut: 60, amusement_arcade: 40, antiques: 15,
+        aquarium: 150, archaeological_site: 150, art: 15, arts_centre: 60, attraction: 150,
+        bakery: 25, bar: 30, bare_rock: 100, beach: 200, biergarten: 40, books: 15, brewery: 80,
+        bridge: 100, bus_station: 60, cafe: 30, camp_site: 150, cape: 150, caravan_site: 100,
+        casino: 120, castle: 150, cave_entrance: 100, cemetery: 100, cheese: 15, chocolate: 15,
+        cinema: 50, college: 150, commercial: 60, confectionery: 15, conference_centre: 100,
+        deli: 15, department_store: 40, dog_park: 60, events_venue: 80, exhibition_centre: 120,
+        fast_food: 25, ferry_terminal: 100, food_court: 50, forest: 200, fort: 150, fountain: 60,
+        gallery: 50, garden: 100, geyser: 100, gift: 15, glacier: 1000, golf_course: 200,
+        grass: 40, heath: 150, hospital: 80, hostel: 40, hot_spring: 100, hotel: 60,
+        ice_cream: 25, ice_rink: 60, library: 50, lighthouse: 150, mall: 120, marina: 100,
+        marketplace: 40, meadow: 100, memorial: 60, monument: 100, motel: 50, museum: 100,
+        national_park: 1000, nature_reserve: 200, nightclub: 30, observatory: 100, park: 150,
+        peak: 300, pedestrian: 60, picnic_site: 60, pier: 100, pitch: 60, place_of_worship: 80,
+        planetarium: 80, playground: 40, protected_area: 200, pub: 30, railway: 100,
+        recreation_ground: 100, resort: 150, restaurant: 30, ruins: 100, sand: 150, school: 60,
+        scrub: 100, ski: 300, sports_centre: 80, stadium: 200, station: 150, theatre: 50,
+        theme_park: 250, tower: 80, townhall: 80, university: 200, viewpoint: 150,
+        village_green: 80, volcano: 1000, water_park: 100, waterfall: 150, wetland: 150,
+        wine: 15, wine_bar: 30, winery: 150, winter_sports: 300, wood: 150, zoo: 200
+    };
+    var PLACE_INDOOR_M = 65;
+    // How a road's kind and kind_detail read (else "street").
+    var ROAD_WORDS = {highway: "road", major_road: "road", path: "path", rail: "railway",
+                      ferry: "ferry"};
+
+    function Picker(streets) {
+        this.source = sourceFor(streets);
+    }
+
+    Picker.prototype.ready = function () {
+        return Boolean(this.source) && this.source.state === "ready";
+    };
+
+    // callback(true) once the street maps' index is in, callback(false) if it cannot be.
+    Picker.prototype.whenReady = function (callback) {
+        var source = this.source;
+        if (!source || source.state === "failed") {
+            callback(false);
+            return;
+        }
+        if (source.state === "ready") {
+            callback(true);
+            return;
+        }
+        function check() {
+            if (source.state === "ready" || source.state === "failed") {
+                var at = source.listeners.indexOf(check);
+                if (at >= 0) {
+                    source.listeners.splice(at, 1);
+                }
+                callback(source.state === "ready");
+            }
+        }
+        source.listeners.push(check);
+        source.start();
+    };
+
+    // The most detailed zoom of a street tile at a place (FROM_ZOOM or more), or -1.
+    Picker.prototype.zoomAt = function (lat, lon) {
+        var source = this.source;
+        if (!this.ready() || !isFinite(lat) || !isFinite(lon)) {
+            return -1;
+        }
+        var t = mercatorY(lat);
+        for (var z = source.index.maxzoom; z >= Math.max(FROM_ZOOM, source.index.minzoom); z--) {
+            var n = Math.pow(2, z);
+            if (source.has(z, mod(Math.floor((lon + 180) / 360 * n), n),
+                           Math.max(0, Math.min(n - 1, Math.floor(t * n))))) {
+                return z;
+            }
+        }
+        return -1;
+    };
+
+    // The decoded tile of a key ("z/x/y") when it is in, else null.
+    Picker.prototype.data = function (key) {
+        var entry = this.source ? this.source.tiles[key] : null;
+        return entry && entry.state === "ready" ? entry.data : null;
+    };
+
+    /* Asks for the tiles keys ("z/x/y", only those the index has) and calls
+       callback() once each is in or could not be loaded (or after
+       PICK_WAIT_MS). They are kept while waiting (Source.pinned). */
+    Picker.prototype.read = function (keys, callback) {
+        var source = this.source;
+        var wanted = keys.filter(function (key) {
+            var p = key.split("/").map(Number);
+            return source.has(p[0], p[1], p[2]);
+        });
+        var waiting = true;
+        var timer = 0;
+        function busy(key) {
+            var entry = source.tiles[key];
+            return Boolean(entry && (entry.state === "queued" || entry.state === "loading"));
+        }
+        function check() {
+            if (waiting && !wanted.some(busy)) {
+                finish();
+            }
+        }
+        function finish() {
+            waiting = false;
+            var at = source.listeners.indexOf(check);
+            if (at >= 0) {
+                source.listeners.splice(at, 1);
+            }
+            wanted.forEach(function (key) {
+                source.pinned[key] = Math.max(0, (source.pinned[key] || 1) - 1);
+                if (!source.pinned[key]) {
+                    delete source.pinned[key];
+                }
+            });
+            if (timer) {
+                clearTimeout(timer);
+            }
+            callback();
+        }
+        wanted.forEach(function (key) {
+            var p = key.split("/").map(Number);
+            source.pinned[key] = (source.pinned[key] || 0) + 1;
+            source.tile(p[0], p[1], p[2]);
+        });
+        if (!wanted.some(busy)) {
+            finish();
+            return;
+        }
+        source.listeners.push(check);
+        timer = setTimeout(finish, PICK_WAIT_MS);
+    };
+
+    // World units (0 to 1 round the world, Web Mercator) of a point of a tile.
+    function tileWorld(z, x, y, extent, px, py) {
+        var n = Math.pow(2, z);
+        return [(x + px / extent) / n, (y + py / extent) / n];
+    }
+
+    function worldLatLon(wx, wy) {
+        return [latitudeAt(wy), wx * 360 - 180];
+    }
+
+    // Metres per world unit at world y.
+    function worldMetres(wy) {
+        return 40075016.686 * Math.cos(latitudeAt(wy) * Math.PI / 180);
+    }
+
+    function keyOf(z, x, y) {
+        return z + "/" + x + "/" + y;
+    }
+
+    function displayName(props) {
+        var name = typeof props.name === "string" ? props.name.replace(/^\s+|\s+$/g, "") : "";
+        return name;
+    }
+
+    function words(kind) {
+        return String(kind || "").replace(/_/g, " ");
+    }
+
+    /* The circle (metres around it) that holds the pictures a point of interest
+       of this kind (its props.kind) names on the viewer's Place line: its reach
+       and half the accuracy of a position taken indoors, as named_places.py
+       allows (rounded up to 5 m); null for a kind it does not name. */
+    function placeWithin(kind) {
+        if (!Object.prototype.hasOwnProperty.call(PLACE_REACH, kind)) {
+            return null;
+        }
+        var reach = PLACE_REACH[kind];
+        return Math.ceil((reach + Math.min(PLACE_INDOOR_M, reach) / 2) / 5) * 5;
+    }
+
+    function roadWhat(props) {
+        return ROAD_WORDS[props.kind] || (props.kind_detail === "pedestrian" ? "path" : "street");
+    }
+
+    function streetFamily(kind) {
+        return STREET_KINDS.indexOf(kind) >= 0 ? "street" : String(kind || "");
+    }
+
+    // Distance (squared, tile units) from (px, py) to a line's segments.
+    function lineDistance2(geom, px, py) {
+        var best = Infinity;
+        geom.forEach(function (part) {
+            if (part.length === 2) {
+                best = Math.min(best, (part[0] - px) * (part[0] - px) +
+                                (part[1] - py) * (part[1] - py));
+            }
+            for (var k = 2; k < part.length; k += 2) {
+                var ax = part[k - 2];
+                var ay = part[k - 1];
+                var dx = part[k] - ax;
+                var dy = part[k + 1] - ay;
+                var length = dx * dx + dy * dy;
+                var t = length > 0 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) /
+                                                       length)) : 0;
+                var ex = ax + t * dx - px;
+                var ey = ay + t * dy - py;
+                best = Math.min(best, ex * ex + ey * ey);
+            }
+        });
+        return best;
+    }
+
+    // Twice the signed area of a ring (tile units; > 0: an outer ring, as MVT has it).
+    function ringArea(ring) {
+        var sum = 0;
+        for (var k = 0, j = ring.length - 2; k < ring.length; j = k, k += 2) {
+            sum += ring[j] * ring[k + 1] - ring[k] * ring[j + 1];
+        }
+        return sum;
+    }
+
+    function inside(ring, px, py) {
+        var found = false;
+        for (var k = 0, j = ring.length - 2; k < ring.length; j = k, k += 2) {
+            if ((ring[k + 1] > py) !== (ring[j + 1] > py) &&
+                    px < (ring[j] - ring[k]) * (py - ring[k + 1]) / (ring[j + 1] - ring[k + 1]) +
+                    ring[k]) {
+                found = !found;
+            }
+        }
+        return found;
+    }
+
+    // The outer rings of a polygon feature that hold (px, py): their area (tile units), or 0.
+    function areaAround(feature, px, py) {
+        var best = 0;
+        feature.geom.forEach(function (ring) {
+            var size = ringArea(ring);
+            if (size > 0 && inside(ring, px, py)) {
+                best = best ? Math.min(best, size) : size;
+            }
+        });
+        return best / 2;
+    }
+
+    /* The names of areas: {id: the name of the point of interest with that id}
+       of the decoded tiles (those of keys first, then every other one in: the
+       ones at the place down to LABEL_ZOOM among them). */
+    Picker.prototype.areaNames = function (keys) {
+        var source = this.source;
+        var names = Object.create(null);
+        var all = (keys || []).slice();
+        Object.keys(source.tiles).forEach(function (key) {
+            if (source.tiles[key].state === "ready" && all.indexOf(key) < 0) {
+                all.push(key);
+            }
+        });
+        for (var k = 0; k < all.length; k++) {
+            var data = this.data(all[k]);
+            var pois = data && data.pois ? data.pois.features : [];
+            for (var f = 0; f < pois.length; f++) {
+                var id = pois[f].id;
+                if (id !== undefined && names[id] === undefined && displayName(pois[f].props)) {
+                    names[id] = displayName(pois[f].props);
+                }
+            }
+        }
+        return names;
+    };
+
+    /* The streets, areas and places at a place (see Picker): within metres
+       of it (a street or a place; an area holds it). */
+    Picker.prototype.at = function (lat, lon, metres, callback) {
+        var self = this;
+        var z = this.zoomAt(lat, lon);
+        if (z < 0) {
+            callback([]);
+            return;
+        }
+        var n = Math.pow(2, z);
+        var fx = mod((lon + 180) / 360 * n, n);
+        var fy = mercatorY(lat) * n;
+        var x = Math.floor(fx);
+        var y = Math.max(0, Math.min(n - 1, Math.floor(fy)));
+        var key = keyOf(z, x, y);
+        // (The tile, and the coarser ones at the place: the names of areas.)
+        var keys = [key];
+        for (var up = z - 1; up >= Math.max(LABEL_ZOOM, this.source.index.minzoom); up--) {
+            keys.push(keyOf(up, x >> (z - up), y >> (z - up)));
+        }
+        this.read(keys, function () {
+            var data = self.data(key);
+            if (!data) {
+                callback([]);
+                return;
+            }
+            var found = [];
+            var seen = {};
+            var extent = (data.roads || data.landuse || data.pois || {extent: 4096}).extent ||
+                4096;
+            var px = (fx - x) * extent;
+            var py = (fy - y) * extent;
+            var perUnit = worldMetres(fy / n) / n / extent;     // metres per tile unit
+            var reach = metres / perUnit;
+            var names = null;           // (the names of areas, once one holds the place)
+            (data.roads ? data.roads.features : []).forEach(function (feature) {
+                var name = displayName(feature.props);
+                if (!name || feature.type !== 2 || STREET_KINDS.indexOf(feature.props.kind) < 0) {
+                    return;
+                }
+                var d = Math.sqrt(lineDistance2(feature.geom, px, py));
+                var id = "street:" + streetFamily(feature.props.kind) + ":" + name;
+                if (d <= reach && (!seen[id] || seen[id].metres > d * perUnit)) {
+                    if (seen[id]) {
+                        found.splice(found.indexOf(seen[id]), 1);
+                    }
+                    seen[id] = {kind: "street", name: name, what: roadWhat(feature.props),
+                                metres: Math.round(d * perUnit), key: key,
+                                family: streetFamily(feature.props.kind), at: [px, py]};
+                    found.push(seen[id]);
+                }
+            });
+            (data.landuse ? data.landuse.features : []).forEach(function (feature) {
+                if (feature.type !== 3) {
+                    return;
+                }
+                var size = areaAround(feature, px, py);
+                if (size && !names) {
+                    names = self.areaNames(keys);
+                }
+                var name = size && feature.id !== undefined ? names[feature.id] || "" : "";
+                var id = "area:" + feature.id;
+                if (name && !seen[id]) {
+                    seen[id] = {kind: "area", name: name, what: words(feature.props.kind),
+                                metres: 0, key: key, id: feature.id, size: size};
+                    found.push(seen[id]);
+                }
+            });
+            (data.pois ? data.pois.features : []).forEach(function (feature) {
+                var name = displayName(feature.props);
+                var point = feature.geom[0];
+                if (!name || feature.type !== 1 || !point || seen["area:" + feature.id]) {
+                    return;
+                }
+                var d = Math.sqrt((point[0] - px) * (point[0] - px) +
+                                  (point[1] - py) * (point[1] - py));
+                var id = "place:" + name + ":" + point[0] + ":" + point[1];
+                if (d <= reach && !seen[id]) {
+                    seen[id] = {kind: "place", name: name, what: words(feature.props.kind),
+                                metres: Math.round(d * perUnit), key: key,
+                                point: worldLatLon.apply(null, tileWorld(z, x, y, extent,
+                                                                         point[0], point[1]))};
+                    found.push(seen[id]);
+                }
+            });
+            var order = {place: 0, street: 1, area: 2};
+            found.sort(function (a, b) {
+                return a.kind === "area" && b.kind === "area" ? a.size - b.size
+                    : a.kind === "area" || b.kind === "area" ? order[a.kind] - order[b.kind]
+                        : a.metres - b.metres || order[a.kind] - order[b.kind];
+            });
+            callback(found);
+        });
+    };
+
+    /* The streets, areas and places named in the tiles of a view (box
+       {south, west, north, east} in degrees; the tiles of zoom, or the most
+       detailed there are below it; at most GATHER_TILES of them, else []
+       and the view is too large): [{kind, name, what, key, ...}], each name
+       of a kind once, by name. */
+    Picker.prototype.inView = function (box, zoom, callback) {
+        var self = this;
+        if (!this.ready()) {
+            callback(null, "wait");
+            return;
+        }
+        var index = this.source.index;
+        var z = Math.max(FROM_ZOOM, Math.min(index.maxzoom, Math.round(zoom)));
+        var n = Math.pow(2, z);
+        var x0 = Math.floor((box.west + 180) / 360 * n);
+        var x1 = Math.floor((box.east + 180) / 360 * n);
+        var y0 = Math.max(0, Math.floor(mercatorY(box.north) * n));
+        var y1 = Math.min(n - 1, Math.floor(mercatorY(box.south) * n));
+        if ((x1 - x0 + 1) * (y1 - y0 + 1) > GATHER_TILES) {
+            callback(null, "large");
+            return;
+        }
+        var keys = [];
+        for (var ty = y0; ty <= y1; ty++) {
+            for (var tx = x0; tx <= x1; tx++) {
+                keys.push(keyOf(z, mod(tx, n), ty));
+            }
+        }
+        this.read(keys, function () {
+            var found = [];
+            var seen = {};
+            var names = self.areaNames(keys);
+            keys.forEach(function (key) {
+                var data = self.data(key);
+                if (!data) {
+                    return;
+                }
+                (data.roads ? data.roads.features : []).forEach(function (feature) {
+                    var name = displayName(feature.props);
+                    var family = streetFamily(feature.props.kind);
+                    var id = "street:" + family + ":" + name;
+                    var part = feature.geom[0];
+                    if (name && feature.type === 2 && part && !seen[id] && family === "street") {
+                        seen[id] = true;
+                        var p = key.split("/").map(Number);
+                        found.push({kind: "street", name: name, what: roadWhat(feature.props),
+                                    key: key, family: family, at: [part[0], part[1]],
+                                    where: tileWorld(p[0], p[1], p[2],
+                                                     data.roads.extent || 4096, part[0],
+                                                     part[1])});
+                    }
+                });
+                (data.landuse ? data.landuse.features : []).forEach(function (feature) {
+                    var id = "area:" + feature.id;
+                    if (feature.type !== 3 || seen[id]) {
+                        return;
+                    }
+                    var name = feature.id !== undefined ? names[feature.id] || "" : "";
+                    if (name) {
+                        seen[id] = true;
+                        var p = key.split("/").map(Number);
+                        // (Where it is: the middle of its first ring's box.)
+                        var ring = feature.geom[0] || [0, 0];
+                        var xs = ring.filter(function (value, index) {
+                            return index % 2 === 0;
+                        });
+                        var ys = ring.filter(function (value, index) {
+                            return index % 2 === 1;
+                        });
+                        var extent = data.landuse.extent || 4096;
+                        found.push({kind: "area", name: name, what: words(feature.props.kind),
+                                    key: key, id: feature.id,
+                                    where: tileWorld(p[0], p[1], p[2], extent,
+                                                     (Math.min.apply(null, xs) +
+                                                      Math.max.apply(null, xs)) / 2,
+                                                     (Math.min.apply(null, ys) +
+                                                      Math.max.apply(null, ys)) / 2)});
+                    }
+                });
+                (data.pois ? data.pois.features : []).forEach(function (feature) {
+                    var name = displayName(feature.props);
+                    var point = feature.geom[0];
+                    var p = key.split("/").map(Number);
+                    var extent = data.pois.extent || 4096;
+                    if (!name || feature.type !== 1 || !point || seen["area:" + feature.id] ||
+                            point[0] < 0 || point[1] < 0 || point[0] >= extent ||
+                            point[1] >= extent) {
+                        return;
+                    }
+                    // (Once each: two places of one name elsewhere are two, one point
+                    // in two tiles is one.)
+                    var where = tileWorld(p[0], p[1], p[2], extent, point[0], point[1]);
+                    var id = "place:" + name + ":" + Math.round(where[0] * 4e6) + ":" +
+                        Math.round(where[1] * 4e6);
+                    if (seen[id]) {
+                        return;
+                    }
+                    seen[id] = true;
+                    found.push({kind: "place", name: name, what: words(feature.props.kind),
+                                type: String(feature.props.kind || ""), key: key,
+                                point: worldLatLon.apply(null, where), where: where});
+                });
+            });
+            // (By name, numbers by their value -- "Pier 7" before "Pier 40" --; of one
+            // name, a street, then an area, then a place.)
+            var order = {street: 0, area: 1, place: 2};
+            found.sort(function (a, b) {
+                return compareNames(a.name, b.name) || order[a.kind] - order[b.kind];
+            });
+            placeTwins(found, box);
+            callback(found);
+        });
+    };
+
+    // Names compared as a reader sorts them: case and accents aside, numbers by value.
+    function compareNames(a, b) {
+        var x = a.toLowerCase();
+        var y = b.toLowerCase();
+        if (typeof x.localeCompare === "function") {
+            try {
+                return x.localeCompare(y, undefined, {numeric: true, sensitivity: "base"});
+            } catch (error) {
+                // (An old browser without the options: plainly, below.)
+            }
+        }
+        return x < y ? -1 : x > y ? 1 : 0;
+    }
+
+    // Of a list's entries with one name and kind, each told apart by where it is in
+    // the view (box): its "near" ("north-west", "middle"), from its world point.
+    function placeTwins(found, box) {
+        var counts = {};
+        found.forEach(function (item) {
+            var id = item.kind + ":" + item.what + ":" + item.name.toLowerCase();
+            counts[id] = (counts[id] || 0) + 1;
+        });
+        var west = (box.west + 180) / 360;
+        var east = (box.east + 180) / 360;
+        var top = mercatorY(box.north);
+        var bottom = mercatorY(box.south);
+        found.forEach(function (item) {
+            var id = item.kind + ":" + item.what + ":" + item.name.toLowerCase();
+            if (counts[id] < 2 || !item.where) {
+                return;
+            }
+            var fx = (item.where[0] - west - Math.round(item.where[0] - (west + east) / 2)) /
+                ((east - west) || 1);
+            var fy = (item.where[1] - top) / ((bottom - top) || 1);
+            var row = fy < 1 / 3 ? "north" : fy > 2 / 3 ? "south" : "";
+            var column = fx < 1 / 3 ? "west" : fx > 2 / 3 ? "east" : "";
+            item.near = row && column ? row + "-" + column : row || column || "middle";
+        });
+    }
+
+    /* A line cut to the square [0, extent] of its tile: [[x, y, x, y, ...]] (the
+       pieces inside, Liang and Barsky). */
+    function clipLine(part, extent) {
+        var out = [];
+        var current = null;
+        if (part.length === 2) {
+            return part[0] >= 0 && part[0] <= extent && part[1] >= 0 && part[1] <= extent
+                ? [[part[0], part[1]]] : [];
+        }
+        for (var k = 2; k < part.length; k += 2) {
+            var x0 = part[k - 2];
+            var y0 = part[k - 1];
+            var dx = part[k] - x0;
+            var dy = part[k + 1] - y0;
+            var low = 0;
+            var high = 1;
+            var edges = [[-dx, x0], [dx, extent - x0], [-dy, y0], [dy, extent - y0]];
+            var empty = false;
+            for (var e = 0; e < 4 && !empty; e++) {
+                var p = edges[e][0];
+                var q = edges[e][1];
+                if (p === 0) {
+                    empty = q < 0;
+                } else if (p < 0) {
+                    low = Math.max(low, q / p);
+                } else {
+                    high = Math.min(high, q / p);
+                }
+                empty = empty || low > high;
+            }
+            if (empty) {
+                current = null;
+                continue;
+            }
+            var ax = x0 + low * dx;
+            var ay = y0 + low * dy;
+            if (!current || low > 0) {
+                current = [ax, ay];
+                out.push(current);
+            }
+            current.push(x0 + high * dx, y0 + high * dy);
+            if (high < 1) {
+                current = null;
+            }
+        }
+        return out;
+    }
+
+    // A ring cut to the square [0, extent] (Sutherland and Hodgman), or null.
+    function clipRing(ring, extent) {
+        var points = [];
+        for (var k = 0; k < ring.length; k += 2) {
+            points.push([ring[k], ring[k + 1]]);
+        }
+        [[0, 1, 0], [0, -1, extent], [1, 1, 0], [1, -1, extent]].forEach(function (edge) {
+            var axis = edge[0];
+            var sign = edge[1];
+            var at = edge[2];
+            var kept = [];
+            function keep(point) {
+                return sign * (point[axis] - at) >= 0;
+            }
+            for (var i = 0; i < points.length; i++) {
+                var a = points[i];
+                var b = points[(i + 1) % points.length];
+                if (keep(a)) {
+                    kept.push(a);
+                }
+                if (keep(a) !== keep(b)) {
+                    var t = (at - a[axis]) / (b[axis] - a[axis]);
+                    var cut = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+                    cut[axis] = at;     // (exactly on the edge: see dissolve)
+                    kept.push(cut);
+                }
+            }
+            points = kept;
+        });
+        if (points.length < 3) {
+            return null;
+        }
+        var out = [];
+        points.forEach(function (point) {
+            out.push(point[0], point[1]);
+        });
+        return out;
+    }
+
+    // The tiles next to (z, x, y) whose side a piece of [x, y, ...] (tile units) touches.
+    function sidesTouched(piece, extent, z, x, y) {
+        var n = Math.pow(2, z);
+        var out = [];
+        var slack = extent / 1024;
+        var west = false;
+        var east = false;
+        var north = false;
+        var south = false;
+        for (var k = 0; k < piece.length; k += 2) {
+            west = west || piece[k] <= slack;
+            east = east || piece[k] >= extent - slack;
+            north = north || piece[k + 1] <= slack;
+            south = south || piece[k + 1] >= extent - slack;
+        }
+        if (west) {
+            out.push(keyOf(z, mod(x - 1, n), y));
+        }
+        if (east) {
+            out.push(keyOf(z, mod(x + 1, n), y));
+        }
+        if (north && y > 0) {
+            out.push(keyOf(z, x, y - 1));
+        }
+        if (south && y < n - 1) {
+            out.push(keyOf(z, x, y + 1));
+        }
+        return out;
+    }
+
+    // [x, y, ...] of tile units as world units (the copy of the world nearest ref x).
+    function toWorld(piece, z, x, y, extent, refX) {
+        var out = [];
+        for (var k = 0; k < piece.length; k += 2) {
+            var at = tileWorld(z, x, y, extent, piece[k], piece[k + 1]);
+            out.push(refX === undefined ? at[0] : at[0] + Math.round(refX - at[0]), at[1]);
+        }
+        return out;
+    }
+
+    // Distance (world units) from a point to a piece's segments.
+    function pieceDistance(piece, px, py) {
+        var best = Infinity;
+        if (piece.length === 2) {
+            return Math.sqrt((piece[0] - px) * (piece[0] - px) + (piece[1] - py) * (piece[1] - py));
+        }
+        for (var k = 2; k < piece.length; k += 2) {
+            var ax = piece[k - 2];
+            var ay = piece[k - 1];
+            var dx = piece[k] - ax;
+            var dy = piece[k + 1] - ay;
+            var length = dx * dx + dy * dy;
+            var t = length > 0 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) /
+                                                   length)) : 0;
+            var ex = ax + t * dx - px;
+            var ey = ay + t * dy - py;
+            best = Math.min(best, ex * ex + ey * ey);
+        }
+        return Math.sqrt(best);
+    }
+
+    // True when two pieces (world units) come within gap of each other (at an end of one).
+    function joined(a, b, gap) {
+        var ends = [[a, b], [b, a]];
+        for (var k = 0; k < 2; k++) {
+            var one = ends[k][0];
+            var other = ends[k][1];
+            var last = one.length - 2;
+            if (pieceDistance(other, one[0], one[1]) <= gap ||
+                    pieceDistance(other, one[last], one[last + 1]) <= gap) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* Pieces (world units) joined end to end where one ends where another
+       starts (within gap): fewer, longer lines. */
+    function chain(pieces, gap) {
+        var list = pieces.map(function (piece) {
+            return piece.slice();
+        });
+        var merged = true;
+        function close(ax, ay, bx, by) {
+            return Math.abs(ax - bx) <= gap && Math.abs(ay - by) <= gap;
+        }
+        while (merged) {
+            merged = false;
+            for (var i = 0; i < list.length && !merged; i++) {
+                for (var j = 0; j < list.length && !merged; j++) {
+                    if (i === j || list[i].length < 4 || list[j].length < 4) {
+                        continue;
+                    }
+                    var a = list[i];
+                    var b = list[j];
+                    var aEnd = a.length - 2;
+                    var bEnd = b.length - 2;
+                    var joinedPiece = null;
+                    if (close(a[aEnd], a[aEnd + 1], b[0], b[1])) {
+                        joinedPiece = a.concat(b.slice(2));
+                    } else if (close(a[aEnd], a[aEnd + 1], b[bEnd], b[bEnd + 1])) {
+                        joinedPiece = a.concat(reversed(b).slice(2));
+                    } else if (close(a[0], a[1], b[0], b[1])) {
+                        // (Two ways that start at the same corner.)
+                        joinedPiece = reversed(a).concat(b.slice(2));
+                    }
+                    if (joinedPiece) {
+                        list[i] = joinedPiece;
+                        list.splice(j, 1);
+                        merged = true;
+                    }
+                }
+            }
+        }
+        return list;
+    }
+
+    function reversed(piece) {
+        var out = [];
+        for (var k = piece.length - 2; k >= 0; k -= 2) {
+            out.push(piece[k], piece[k + 1]);
+        }
+        return out;
+    }
+
+    /* The rings of an area's pieces cut at the edges of the tiles of zoom
+       n = 2^z ([x, y, ...] world units, outer rings as MVT has them) joined
+       again: an edge along a tile's edge that the piece on its other side
+       has too (the other way round) is no edge of the area, so it goes;
+       what is left is chained into rings -- the area's outline, and the
+       edges where it was cut short (GATHER_TILES). Rings of no area (or the
+       other way round: slivers where two tiles' cuts differ a little) are
+       left out. */
+    function dissolve(rings, n) {
+        var edges = [];
+        var seams = {};             // "x" or "y" + the line -> [[from, to], ...] along it
+        function onLine(value) {
+            return value * n === Math.round(value * n);
+        }
+        rings.forEach(function (ring) {
+            var count = ring.length / 2;
+            for (var k = 0; k < count; k++) {
+                var ax = ring[2 * k];
+                var ay = ring[2 * k + 1];
+                var b = (k + 1) % count;
+                var bx = ring[2 * b];
+                var by = ring[2 * b + 1];
+                if (ax === bx && ay === by) {
+                    continue;
+                }
+                if (ax === bx && onLine(ax)) {
+                    (seams["x" + ax] = seams["x" + ax] || {line: ax, axis: 0, runs: []})
+                        .runs.push([ay, by]);
+                } else if (ay === by && onLine(ay)) {
+                    (seams["y" + ay] = seams["y" + ay] || {line: ay, axis: 1, runs: []})
+                        .runs.push([ax, bx]);
+                } else {
+                    edges.push([ax, ay, bx, by]);
+                }
+            }
+        });
+        Object.keys(seams).forEach(function (id) {
+            var seam = seams[id];
+            var cuts = [];
+            seam.runs.forEach(function (run) {
+                cuts.push(run[0], run[1]);
+            });
+            cuts.sort(function (a, b) {
+                return a - b;
+            });
+            cuts = cuts.filter(function (value, index) {
+                return !index || value !== cuts[index - 1];
+            });
+            function point(along) {
+                return seam.axis === 0 ? [seam.line, along] : [along, seam.line];
+            }
+            var open = null;            // [from, direction] of the run being kept
+            function close(at) {
+                if (open) {
+                    var from = point(open[1] > 0 ? open[0] : at);
+                    var to = point(open[1] > 0 ? at : open[0]);
+                    edges.push([from[0], from[1], to[0], to[1]]);
+                    open = null;
+                }
+            }
+            for (var k = 0; k + 1 < cuts.length; k++) {
+                var low = cuts[k];
+                var high = cuts[k + 1];
+                var net = 0;
+                seam.runs.forEach(function (run) {
+                    if (Math.min(run[0], run[1]) <= low && Math.max(run[0], run[1]) >= high) {
+                        net += run[1] > run[0] ? 1 : -1;
+                    }
+                });
+                var direction = net > 0 ? 1 : net < 0 ? -1 : 0;
+                if (open && open[1] !== direction) {
+                    close(low);
+                }
+                if (direction && !open) {
+                    open = [low, direction];
+                }
+            }
+            close(cuts[cuts.length - 1]);
+        });
+        // The edges chained into rings, each from where the one before it ends.
+        var starts = {};
+        edges.forEach(function (edge, index) {
+            var key = edge[0] + "," + edge[1];
+            (starts[key] = starts[key] || []).push(index);
+        });
+        var used = [];
+        var out = [];
+        edges.forEach(function (edge, index) {
+            if (used[index]) {
+                return;
+            }
+            var ring = [];
+            var at = index;
+            while (at !== undefined && !used[at]) {
+                used[at] = true;
+                ring.push(edges[at][0], edges[at][1]);
+                var next = starts[edges[at][2] + "," + edges[at][3]] || [];
+                at = next.filter(function (candidate) {
+                    return !used[candidate];
+                })[0];
+            }
+            if (ring.length >= 6 && ringArea(ring) > 0) {
+                out.push(ring);
+            }
+        });
+        return out;
+    }
+
+    /* All of a street, area or place of at() or inView() (see Picker). */
+    Picker.prototype.gather = function (item, callback) {
+        var self = this;
+        if (!item || !this.ready()) {
+            callback(null);
+            return;
+        }
+        if (item.kind === "place") {
+            callback({kind: "place", name: item.name, what: item.what, type: item.type,
+                      parts: [item.point.slice()], cut: false});
+            return;
+        }
+        var first = item.key.split("/").map(Number);
+        var z = first[0];
+        var visited = {};
+        var pieces = [];            // {world: [x, y, ...], sides: [keys]}
+        var refX = null;
+        var cut = false;
+        var seed = null;            // (a street: the piece nearest where it was picked)
+        function take(key) {
+            var p = key.split("/").map(Number);
+            var data = self.data(key);
+            var layer = data ? data[item.kind === "street" ? "roads" : "landuse"] : null;
+            if (!layer) {
+                return;
+            }
+            var extent = layer.extent || 4096;
+            layer.features.forEach(function (feature) {
+                if (item.kind === "street" ? feature.type !== 2 ||
+                        displayName(feature.props) !== item.name ||
+                        streetFamily(feature.props.kind) !== item.family
+                    : feature.type !== 3 || feature.id !== item.id) {
+                    return;
+                }
+                feature.geom.forEach(function (part) {
+                    var cutParts = item.kind === "street" ? clipLine(part, extent)
+                        : ringArea(part) > 0 ? [clipRing(part, extent)] : [];
+                    cutParts.forEach(function (piece) {
+                        if (!piece || piece.length < 2) {
+                            return;
+                        }
+                        if (refX === null) {
+                            refX = tileWorld(p[0], p[1], p[2], extent, piece[0], piece[1])[0];
+                        }
+                        var entry = {world: toWorld(piece, p[0], p[1], p[2], extent, refX),
+                                     sides: sidesTouched(piece, extent, p[0], p[1], p[2]),
+                                     key: key};
+                        pieces.push(entry);
+                        if (item.kind === "street" && item.at) {
+                            // (The piece nearest where it was picked: in its tile, or
+                            // one next to it when it was picked near the edge.)
+                            var at = tileWorld(first[0], first[1], first[2], extent, item.at[0],
+                                               item.at[1]);
+                            var d = pieceDistance(entry.world, at[0] + Math.round(refX - at[0]),
+                                                  at[1]);
+                            if (!seed || d < seed.distance) {
+                                seed = {entry: entry, distance: d};
+                            }
+                        }
+                    });
+                });
+            });
+        }
+        // The pieces of the street joined to the seed (all of an area's).
+        function kept() {
+            if (item.kind !== "street") {
+                return pieces;
+            }
+            var start = seed ? seed.entry : pieces[0];
+            if (!start) {
+                return [];
+            }
+            var gap = JOIN_METRES / worldMetres(start.world[1]);
+            var inSet = [start];
+            var left = pieces.filter(function (piece) {
+                return piece !== start;
+            });
+            var grew = true;
+            while (grew) {
+                grew = false;
+                for (var k = left.length - 1; k >= 0; k--) {
+                    var piece = left[k];
+                    if (inSet.some(function (one) {
+                        return joined(one.world, piece.world, gap);
+                    })) {
+                        inSet.push(piece);
+                        left.splice(k, 1);
+                        grew = true;
+                    }
+                }
+            }
+            return inSet;
+        }
+        function next(keys) {
+            var fresh = keys.filter(function (key) {
+                var p = key.split("/").map(Number);
+                return !visited[key] && self.source.has(p[0], p[1], p[2]);
+            });
+            if (!fresh.length) {
+                finish();
+                return;
+            }
+            var room = GATHER_TILES - Object.keys(visited).length;
+            if (fresh.length > room) {
+                cut = true;
+                fresh = fresh.slice(0, Math.max(0, room));
+            }
+            if (!fresh.length) {
+                finish();
+                return;
+            }
+            fresh.forEach(function (key) {
+                visited[key] = true;
+            });
+            self.read(fresh, function () {
+                fresh.forEach(take);
+                var wanted = [];
+                kept().forEach(function (piece) {
+                    piece.sides.forEach(function (key) {
+                        if (!visited[key] && wanted.indexOf(key) < 0) {
+                            wanted.push(key);
+                        }
+                    });
+                });
+                next(wanted);
+            });
+        }
+        function finish() {
+            var chosen = kept();
+            if (!chosen.length) {
+                callback(null);
+                return;
+            }
+            var world = chosen.map(function (piece) {
+                return piece.world;
+            });
+            if (item.kind === "street") {
+                world = chain(world, 2 / worldMetres(world[0][1]));
+            } else if (item.kind === "area") {
+                // (One outline again, not a piece in each tile: drawn without the
+                // tiles' edges, and as deep inside as it is.)
+                var joinedRings = dissolve(world, Math.pow(2, z));
+                world = joinedRings.length ? joinedRings : world;
+            }
+            var parts = world.map(function (piece) {
+                var out = [];
+                for (var k = 0; k < piece.length; k += 2) {
+                    var at = worldLatLon(piece[k], piece[k + 1]);
+                    out.push(at[0], at[1]);
+                }
+                return out;
+            });
+            callback({kind: item.kind, name: item.name, what: item.what, parts: parts, cut: cut});
+        }
+        if (z < 0 || !isFinite(z)) {
+            callback(null);
+            return;
+        }
+        // (A street is read from its tile and the eight around it first: picked near
+        // a tile's edge, it may be in the next one only.)
+        var around = [item.key];
+        if (item.kind === "street") {
+            var n = Math.pow(2, z);
+            for (var dy = -1; dy <= 1; dy++) {
+                for (var dx = -1; dx <= 1; dx++) {
+                    if ((dx || dy) && first[2] + dy >= 0 && first[2] + dy < n) {
+                        around.push(keyOf(z, mod(first[1] + dx, n), first[2] + dy));
+                    }
+                }
+            }
+        }
+        next(around);
+    };
+
     /* ---------- Both ------------------------------------------------------- */
 
     function Basemap(options) {
@@ -1973,13 +3085,29 @@ var STREETS = (function () {
             ? streets.url + "LICENSE.txt" : null;
     }
 
-    /* The credit of a map that shows street tiles (hidden at first): "(c)
-       OpenStreetMap contributors (ODbL)", the licence's name a link to
-       licenceUrl (opened in another tab). tag: "p" or "span". */
+    /* The credit of a map (hidden at first; showCredit shows its parts):
+       WORLD_CREDIT (.map-credit-world) while the world image shows, and "(c)
+       OpenStreetMap contributors (ODbL)" (.map-credit-osm) while street
+       tiles do, the licence's name a link to licenceUrl (opened in another
+       tab), with a dot between them (.map-credit-sep) when both show. The
+       map page's credit (templates/map.html) has the same parts. tag: "p"
+       or "span". */
     function creditNode(tag, className, streets) {
         var node = document.createElement(tag);
         node.className = className;
-        node.appendChild(document.createTextNode(ATTRIBUTION + " ("));
+        function part(name, text) {
+            var span = document.createElement("span");
+            span.className = name;
+            if (text) {
+                span.textContent = text;
+            }
+            node.appendChild(span);
+            return span;
+        }
+        part("map-credit-world", WORLD_CREDIT);
+        part("map-credit-sep", " \u00b7 ").setAttribute("aria-hidden", "true");
+        var osm = part("map-credit-osm", "");
+        osm.appendChild(document.createTextNode(ATTRIBUTION + " ("));
         var link = document.createElement("a");
         link.textContent = "ODbL";
         link.rel = "license";
@@ -1988,10 +3116,33 @@ var STREETS = (function () {
         if (url) {
             link.href = url;
         }
-        node.appendChild(link);
-        node.appendChild(document.createTextNode(")"));
+        osm.appendChild(link);
+        osm.appendChild(document.createTextNode(")"));
         node.hidden = true;
         return node;
+    }
+
+    /* Shows the parts of a map's credit (creditNode) for what Basemap.draw
+       drew (drawn): the world image's unless street tiles covered the whole
+       view, the street maps' while any showed. Returns true when the credit
+       was hidden and shows now (the names are placed clear of it at the
+       next drawing). */
+    function showCredit(node, drawn) {
+        if (!node) {
+            return false;
+        }
+        var streets = Boolean(drawn && drawn.streets > 0);
+        var world = !streets || drawn.missing > 0 || drawn.streets < drawn.tiles;
+        [["map-credit-world", world], ["map-credit-osm", streets],
+         ["map-credit-sep", world && streets]].forEach(function (pair) {
+            var part = node.querySelector ? node.querySelector("." + pair[0]) : null;
+            if (part) {
+                part.hidden = !pair[1];
+            }
+        });
+        var was = node.hidden;
+        node.hidden = !world && !streets;
+        return was && !node.hidden;
     }
 
     /* A node's rectangle in the view of a canvas ([x0, y0, x1, y1], a little
@@ -2014,8 +3165,12 @@ var STREETS = (function () {
         FROM_ZOOM: FROM_ZOOM,
         FILL_LEVELS: FILL_LEVELS,
         FIT_ZOOM: FIT_ZOOM,
+        WORLD_CREDIT: WORLD_CREDIT,
+        PLACE_REACH: PLACE_REACH,
+        placeWithin: placeWithin,
         licenceUrl: licenceUrl,
         creditNode: creditNode,
+        showCredit: showCredit,
         clearOf: clearOf,
         placeLabel: placeLabel,
         mercatorY: mercatorY,
@@ -2032,7 +3187,12 @@ var STREETS = (function () {
         sourceFor: sourceFor,
         WorldLayer: WorldLayer,
         StreetLayer: StreetLayer,
-        Basemap: Basemap
+        Basemap: Basemap,
+        Picker: Picker,
+        dissolve: dissolve,
+        GATHER_TILES: GATHER_TILES,
+        clipLine: clipLine,
+        clipRing: clipRing
     };
 })();
 

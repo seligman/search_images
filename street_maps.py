@@ -1837,6 +1837,7 @@ def main(argv=None):
             return 1
         try:
             removed = remove()
+            _forget_named_places(config, ctx)
         except OSError as error:
             print("Error: the street maps could not be deleted: %s" % common.redact(error))
             return 1
@@ -1891,6 +1892,10 @@ def main(argv=None):
                 result = download(conn, config, ctx, found=found,
                                   expect_bytes=args.expect_bytes,
                                   allow_large=args.allow_large)
+                if not result["stopped"]:
+                    # (As the maps job: the named places of every picture, again.)
+                    import named_places
+                    named_places.run_safely(conn, config, ctx)
         finally:
             if args.download:
                 lock.release()
@@ -1905,6 +1910,29 @@ def main(argv=None):
         print("Error: a street maps file could not be written or read: %s"
               % common.redact(error))
         return 1
+    finally:
+        conn.close()
+
+
+def _forget_named_places(config, ctx):
+    """After the street maps were removed: the named places found on them go too
+    (named_places.clear); a database that cannot be opened is only a warning."""
+    import db
+    import named_places
+    try:
+        db.init(config, log=ctx.log)
+        conn = db.connect()
+    except (db.DatabaseError, common.ConfigError) as error:
+        ctx.log("The named places could not be forgotten (%s); the next scan does it."
+                % error, "warn")
+        return
+    try:
+        forgotten = named_places.clear(conn)
+        if forgotten:
+            ctx.log("Forgot the named places of %d picture(s)." % forgotten)
+    except Exception as error:      # (the maps are gone either way)
+        ctx.log("The named places could not be forgotten (%s); the next scan does it."
+                % common.redact(str(error)), "warn")
     finally:
         conn.close()
 

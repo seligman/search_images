@@ -426,7 +426,12 @@ class _Picture:
         self.look_kind = looks.kind_of(row)
         self.estimated = None
         place = None
-        if row["place_country"]:
+        # (The names its file gives, when it has a position: see place_estimates.)
+        named = place_estimates.gps_file_columns(row) if self.position is not None else None
+        if named is not None:
+            place = (named["place_city"], named["place_region"], named["place_country"],
+                     named["place_cc"])
+        elif row["place_country"]:
             place = (row["place_city"] or "", row["place_region"] or "",
                      row["place_country"] or "", row["place_cc"] or "")
         elif estimate is not None and place_estimates.usable(row, estimate):

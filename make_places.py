@@ -38,6 +38,7 @@ import db
 import gps_check
 import jobs
 import local_times
+import named_places
 import places
 
 
@@ -126,6 +127,7 @@ def main(argv=None):
                 # times follow the time zones of the places.)
                 gps_check.run_safely(conn, config, ctx)
                 local_times.run_safely(conn, config, ctx)
+                named_places.run_safely(conn, config, ctx)
         finally:
             conn.close()
     except (db.DatabaseError, common.ConfigError) as error:

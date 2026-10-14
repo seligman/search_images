@@ -412,6 +412,42 @@ class ServerTest(ServerFixture, unittest.TestCase):
         response.close()
         self.assertEqual(self.client.get("/tile/6/0/0.jpg").status_code, 404)
 
+    def test_tiles_version_changes_with_the_tile_pyramid(self):
+        # Browsers keep a tile a day under its address (TILE_CACHE_SECONDS), and the
+        # same address answers with the bundled map's cut before make_tiles.py and
+        # with the pyramid's tile after: the pages put the tiles' version in the
+        # address (SITE.tileUrl), so that no tile kept from before shows among the
+        # new ones (a darker block with a dotted grid).
+        def version():
+            config = app_config_of(self.client.get("/map").get_data(as_text=True))
+            for url in ("/", "/detail", "/albums"):
+                other = app_config_of(self.client.get(url).get_data(as_text=True))
+                self.assertEqual(other["tilesVersion"], config["tilesVersion"], url)
+            return config["tilesVersion"]
+
+        bundled = version()
+        self.assertEqual(bundled, str(serve.FALLBACK_TILE_VERSION))
+        self.assertEqual(version(), bundled)
+        # make_tiles.py has made the pyramid (it writes the manifest last).
+        self.base.write_file("data/tiles/0/0/0.jpg", b"\xff\xd8tile")
+        manifest = self.base.write_file("data/tiles/manifest.json",
+                                        json.dumps({"max_zoom": 0, "tile_size": 256}))
+        os.utime(manifest, ns=(int(NOW * 1e9), int(NOW * 1e9)))
+        made = version()
+        self.assertNotEqual(made, bundled)
+        self.assertEqual(version(), made)
+        # Made again (with --force, or from another picture of the world).
+        os.utime(manifest, ns=(int(NOW * 1e9), int((NOW + 60) * 1e9)))
+        again = version()
+        self.assertNotIn(again, (bundled, made))
+        # A new cut of the bundled map is a new version too.
+        with mock.patch.object(serve, "FALLBACK_TILE_VERSION", serve.FALLBACK_TILE_VERSION + 1):
+            self.assertNotEqual(version(), again)
+        # The tile route answers addresses with the version as those without.
+        response = self.client.get("/tile/0/0/0.jpg?v=" + again)
+        self.assertEqual(response.data, b"\xff\xd8tile")
+        response.close()
+
     def test_database_is_prepared_once(self):
         with mock.patch.object(db, "init", wraps=db.init) as init:
             app = serve.build_app()

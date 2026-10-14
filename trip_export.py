@@ -43,8 +43,14 @@ dashcam's clip whose GPS track enters the home area, or that has no fix (its
 overlay prints the last one it had, often where the drive started), is left
 out with the flag "home" (the review step shows them; one can be published by
 choice), and so are the words of its drive (written from its frames too). A
-home_km of 0 turns all of this off. Titles and descriptions are published as
-written (the review step lists the pictures).
+home_km of 0 turns all of this off. With the "marks" option, a smart album
+whose area of the map (map_areas.py) comes within the home area -- its box,
+with a street's metres around it -- is left out, and so is one whose
+place: terms (plain-language alternatives too) name a place only the home
+area has: the town or named place (named_places.py) withheld from a
+picture there, or a named place found in the home area (_TripExport.
+smart_search; a word some published picture's place also has is no secret). Titles and descriptions
+are published as written (the review step lists the pictures).
 
 The trip's story (trip_stories.py) goes only with the "story" option (off
 by default; never a hidden story) and the location option (it names the
@@ -68,6 +74,7 @@ import collections
 import math
 import os
 
+import albums
 import common
 import db
 import export
@@ -75,6 +82,8 @@ import gps_check
 import image_edits
 import jobs
 import local_times
+import map_areas
+import named_places
 import place_estimates
 import search_index
 import tracks
@@ -132,6 +141,18 @@ class HomeArea:
         if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
             return False
         return self.south <= lat < self.north and 0.0 <= self._x(lon) < self.width
+
+    def meets(self, south, west, north, east):
+        """True when a box (degrees; east after west, maybe past 180) and the area
+        overlap."""
+        if north < self.south or south >= self.north:
+            return False
+        if east - west >= 360.0:
+            return True
+        start = self._x(west)
+        span = east - west
+        # (The box's longitudes from its west edge, east of the area's west edge.)
+        return (start < self.width and start + span >= 0.0) or start + span >= 360.0
 
     def crosses(self, first, second):
         """True when the straight line between two positions ((lat, lon)) passes through
@@ -488,6 +509,10 @@ class _TripExport(export._Export):
         # (Positions, routes and town names: only with the location.)
         self.home = self.area if options["location"] else None
         self.at_home_ids = set()        # pictures whose town is not named (see records)
+        # (The town and named place names withheld near home, and those published: see
+        # smart_search; plain_words each.)
+        self.home_names = set()
+        self.published_names = set()
         self.withheld = set()           # clips of drives that lose their words
         self.trip_data = None
         self.story_days = 0             # days of the trip's story published
@@ -571,6 +596,8 @@ class _TripExport(export._Export):
                 if self.at_home(picture, estimates.get(picture.row["id"]), self.towns):
                     picture.record.pop("ci", None)
                     picture.record.pop("km", None)
+                    for key in named_places.RECORD_KEYS:
+                        picture.record.pop(key, None)
                     self.at_home_ids.add(picture.row["id"])
             plain = plain_words(self.conn, self.library_ids, self.at_home_ids)
             for picture in pictures:
@@ -582,6 +609,73 @@ class _TripExport(export._Export):
                         picture.record.pop("ex", None)
         self.trip_data = self.trip_view(pictures)
         return records
+
+    def album_numbers(self, pictures):
+        """As a library's export, once the names withheld near home are known (smart_search
+        leaves out an album whose search names one)."""
+        if self.home is not None:
+            self.home_names, self.published_names = self.names_at_home(pictures)
+        return export._Export.album_numbers(self, pictures)
+
+    def names_at_home(self, pictures):
+        """(the town and named place names withheld near home -- of the published pictures
+        at home (at_home), and every named place found in the home area -- and the place
+        names published), plain_words each."""
+        estimates = place_estimates.for_libraries(self.conn, self.library_ids)
+        home, published = set(), set()
+        for picture in pictures:
+            at_home = self.at_home(picture, estimates.get(picture.row["id"]), self.towns)
+            for key in ("ci", "rg", "co", "np"):
+                value = picture.record.get(key)
+                if isinstance(value, str) and value:
+                    (home if at_home and key in ("ci", "np") else published).add(
+                        named_places.plain_words(value))
+        home.update(self.named_at_home())
+        return home, published
+
+    def named_at_home(self):
+        """The named places (plain_words) found for positions in the home area, of any
+        picture of the libraries (named_places.py)."""
+        if not named_places.have_table(self.conn):
+            return set()
+        return {named_places.plain_words(name) for name, lat, lon in self.conn.execute(
+            "SELECT name, lat, lon FROM named_places WHERE name <> ''")
+            if self.home.contains(lat, lon)}
+
+    def place_at_home(self, value):
+        """True when a place: value (its words, or the starts of them, one after the
+        other) finds a name only the home area has (home_names; none that
+        published_names has)."""
+        wanted = named_places.plain_words(value).split()
+        if not wanted:
+            return False
+
+        def finds(name):
+            words = name.split()
+            return any(all(words[start + k].startswith(wanted[k]) for k in range(len(wanted)))
+                       for start in range(len(words) - len(wanted) + 1))
+        return (any(finds(name) for name in self.home_names)
+                and not any(finds(name) for name in self.published_names))
+
+    def smart_search(self, album, xids):
+        """As a library's export, but a smart album whose place: terms (plain-language
+        alternatives too) find a place only the home area has (place_at_home) is left
+        out: its search would name it."""
+        found = export._Export.smart_search(self, album, xids)
+        if found is None or self.home is None or not self.home_names:
+            return found
+        for term in albums.query_terms(album.get("query") or ""):
+            if term["field"] == "place" and self.place_at_home(term["value"]):
+                return None
+        return found
+
+    def area_published(self, text):
+        """As a library's export, but never an area that comes within the home area (its
+        box, with a street's metres around it)."""
+        if not export._Export.area_published(self, text):
+            return False
+        area = map_areas.parse(text)
+        return self.home is None or not self.home.meets(*area.bounds())
 
     def at_home(self, picture, estimate, towns):
         """True when a published picture's town must not go (see the module notes)."""
@@ -725,6 +819,8 @@ def export_trip(ctx, conn, config, trip_id, out_dir=None, options=None, helper=N
             if gps_check.run_safely(conn, config, ctx) is not None:
                 local_times.after_check_safely(conn, config, ctx)
                 built, trip, libraries = load(conn, config, trip_id)
+            # (And the named places of the positions that changed.)
+            named_places.run_safely(conn, config, ctx)
         if not libraries:
             raise export.ExportError("The trip %s has no pictures to publish." % trip.title)
         out_dir = os.path.abspath(out_dir) if out_dir else default_output_dir(config, built,

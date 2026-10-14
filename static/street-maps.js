@@ -8,7 +8,9 @@
    "maps" job, listed in the job panel like the others; this panel asks the
    server again every few seconds while one waits or runs. A download that
    stopped half way is named (its build, how far it got) while no job
-   runs.
+   runs. Under them, the named places found on the street maps
+   (named_places.py: how many pictures have one) with the buttons that
+   look them up (a "named_places" job; scans do it too).
 
    Pages are built with DOM calls and textContent only (never innerHTML).
 */
@@ -182,6 +184,46 @@
         return text;
     }
 
+    // The named places found on the street maps (named_places.py).
+    function namedSection(named, busy) {
+        box.appendChild(el("h3", {className: "street-maps-named-title", text: "Named places"}));
+        var text;
+        if (named.enabled === false) {
+            text = "Named places are turned off (config.json \"named_places\").";
+        } else if (named.pictures) {
+            text = fmt.number(named.named) + " of the " +
+                fmt.plural(named.pictures, "picture") + " with a position " +
+                (named.named === 1 ? "has" : "have") + " a named place on the street maps " +
+                "(a park, a beach, a museum, a cafe): the viewer shows it before the town, " +
+                "and searches find it (place:\"name\"). Scans look up new pictures.";
+        } else {
+            text = "Not looked up yet: the next scan looks them up, or Find named places now.";
+        }
+        box.appendChild(el("p", {className: "street-maps-named", text: text}));
+        if (named.job) {
+            box.appendChild(el("p", {className: "street-maps-job", text: jobText(named.job)}));
+        } else if (named.last && named.last.state === "failed" && named.last.error) {
+            box.appendChild(SHELL.notice("error", "The last try failed: " + named.last.error));
+        }
+        if (named.enabled === false) {
+            return;
+        }
+        var actions = el("div", {className: "place-names-actions street-maps-actions"});
+        var find = button("Find named places", named.pictures ? "" : "primary", function (node) {
+            start("named", {}, node, "Finding named places; see the job list.");
+        }, "Look up the pictures whose place changed since");
+        var again = button("Look up all again", "subtle", function (node) {
+            start("named", {redo: true}, node, "Finding the named places of every picture " +
+                  "again; see the job list.");
+        }, "Look up the named place of every picture again");
+        find.disabled = again.disabled = busy || Boolean(named.job);
+        actions.appendChild(find);
+        actions.appendChild(again);
+        box.appendChild(actions);
+        box.appendChild(el("p", {className: "field-hint", text: "From the command line: " +
+            (named.command || "python named_places.py --update") + "."}));
+    }
+
     function render(data) {
         window.clearTimeout(timer);
         last = data;
@@ -260,6 +302,11 @@
             actions.appendChild(drop);
         }
         box.appendChild(actions);
+        var named = data.available ? data.named : null;
+        if (named) {
+            namedSection(named, busy);
+        }
+        busy = busy || Boolean(named && named.job);
         var settings = data.settings || {};
         box.appendChild(el("p", {className: "field-hint", text: "What is downloaded: " +
             (settings.radius_km || 20) + " km around each place of a picture, " +

@@ -2765,6 +2765,7 @@
             function estimatedAvailability() {
                 details.estimated_places.input.disabled = !details.location.input.checked;
                 details.routes.input.disabled = !details.location.input.checked;
+                worldRow.hidden = !details.location.input.checked;
                 streetsAvailability(null);
                 // (So does a trip's story, which names its places.)
                 if (details.story && ((lib.export_info || {}).story || {}).available) {
@@ -2812,6 +2813,22 @@
                     .node,
                 field(R.OPTIONS.street_zoom.label, streetZoom,
                       {hint: R.OPTIONS.street_zoom.hint}).node
+            ]);
+            // The world map's tiles: how detailed (with the location).
+            var worldZoom = el("select", {className: "input export-world-zoom"});
+            [3, 4, 5, 6, 7, 8].forEach(function (zoom) {
+                worldZoom.appendChild(el("option", {value: String(zoom),
+                                                    text: "Zoom " + zoom}));
+            });
+            if (!worldZoom.querySelector('option[value="' + Number(opts.world_zoom) + '"]')) {
+                worldZoom.appendChild(el("option", {value: String(opts.world_zoom),
+                                                    text: "Zoom " + opts.world_zoom}));
+            }
+            worldZoom.value = String(opts.world_zoom);
+            worldZoom.addEventListener("change", changed);
+            var worldRow = el("div", {className: "field-grid export-world"}, [
+                field(R.OPTIONS.world_zoom.label, worldZoom, {hint: R.OPTIONS.world_zoom.hint})
+                    .node
             ]);
             var streetsReason = el("span", {className: "field-hint field-reason", hidden: true});
             details.street_maps.node.lastChild.appendChild(streetsReason);
@@ -2889,6 +2906,7 @@
             body.appendChild(el("fieldset", {className: "group"}, [
                 el("legend", {text: "Also publish"}),
                 detailList,
+                worldRow,
                 streetsRow,
                 fields.home_km ? fields.home_km.node : null,
                 detailsLine,
@@ -2980,6 +2998,7 @@
                 result.raw_files = withRaws.input.checked;
                 result.street_km = Number(streetKm.value) || opts.street_km;
                 result.street_zoom = Number(streetZoom.value) || opts.street_zoom;
+                result.world_zoom = Number(worldZoom.value) || opts.world_zoom;
                 return result;
             }
 
@@ -3137,6 +3156,10 @@
             var routesNote = R.routesText(counts);
             if (routesNote) {
                 holder.appendChild(el("p", {className: "muted", text: routesNote}));
+            }
+            var worldNote = R.worldText(counts, opts);
+            if (worldNote) {
+                holder.appendChild(el("p", {className: "muted", text: worldNote}));
             }
             var streetsNote = R.streetsText(counts, opts);
             if (streetsNote) {

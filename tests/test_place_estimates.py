@@ -2,9 +2,10 @@
 
 The rules on made-up pictures (estimate: copies, the pictures taken around
 the same time on both sides or one, the file-time rule, a library's area,
-the owner's choices), the database pass after the GPS check (update: the
-place_estimates rows, images.updated, the log line), the search records
-of the admin, visitors and an export, the owner's choices, the server's
+the owner's choices, the place a file names in its XMP), the database pass
+after the GPS check (update: the place_estimates rows, images.updated,
+the log line), the search records of the admin, visitors and an export,
+the owner's choices, the server's
 /api/image, /api/locations and the admin's routes, the town search of the
 place names, and the pages under Node (tests/js/place_estimates_test.js).
 Every position, town and camera here is made up.
@@ -16,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -24,6 +26,7 @@ import support
 import common
 import export
 import gps_check
+import imageinfo
 import jobs
 import place_estimates
 import places
@@ -518,6 +521,116 @@ class TargetsAndChoicesTest(unittest.TestCase):
         self.assertEqual(placed(found, camera)[0], "owner")
 
 
+def xmp_place_packet(**names):
+    """An XMP packet with location fields in attribute form (city=..., region=...,
+    country=..., cc=...)."""
+    properties = dict((key, name) for key, name in imageinfo.XMP_PLACE_FIELDS)
+    return ("<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF><rdf:Description rdf:about='' %s/>"
+            "</rdf:RDF></x:xmpmeta>" % " ".join(
+                '%s="%s"' % (properties[key], value) for key, value in names.items())
+            ).encode("utf-8")
+
+
+class FilePlaceTest(unittest.TestCase):
+    """The place a file names (XMP location fields): read, named, and the rule."""
+
+    def test_the_xmp_fields(self):
+        attribute = xmp_place_packet(city="Coralport", region="North Coast",
+                                     country="Examplia", cc="xa")
+        self.assertEqual(imageinfo.xmp_place(attribute),
+                         {"city": "Coralport", "region": "North Coast", "country": "Examplia",
+                          "cc": "XA"})
+        element = ("<rdf:Description><photoshop:City>Port\tSaint-Élise &amp; Bay"
+                   "</photoshop:City><photoshop:State>\n North  Coast </photoshop:State>"
+                   "<photoshop:Country></photoshop:Country><Iptc4xmpCore:CountryCode>XAX"
+                   "</Iptc4xmpCore:CountryCode></rdf:Description>").encode("utf-8")
+        # Entities, control characters and spaces; an empty name and a code that is
+        # not two letters are left out.
+        self.assertEqual(imageinfo.xmp_place(element),
+                         {"city": "Port Saint-Élise & Bay", "region": "North Coast"})
+        self.assertEqual(imageinfo.xmp_place(element.decode("utf-8")),
+                         imageinfo.xmp_place(element))
+        long_name = imageinfo.xmp_place(xmp_place_packet(country="E" * 500))["country"]
+        self.assertEqual(len(long_name), imageinfo.XMP_PLACE_MAX)
+        self.assertEqual(imageinfo.xmp_place(b"<x:xmpmeta/>"), {})
+        self.assertEqual(imageinfo.xmp_place(b""), {})
+        self.assertEqual(imageinfo.xmp_place(None), {})
+
+    def test_read_with_the_picture(self):
+        from PIL import Image
+        import imagegen
+        import images
+        folder = tempfile.mkdtemp(prefix="search-images-test-")
+        self.addCleanup(support.remove_tree, folder)
+        image = Image.new("RGB", (64, 48), (90, 140, 200))
+        named = imagegen.write_bytes(folder, "named.jpg", imagegen.jpeg_with_xmp(
+            image, xmp_place_packet(region="North Coast", country="Examplia", cc="XA")))
+        plain = imagegen.write_bytes(folder, "plain.jpg", imagegen.jpeg_bytes(image))
+        result = images.read_image(named, want_preview=False)
+        self.assertEqual(result["exif"]["XMPPlace"], {"region": "North Coast",
+                                                      "country": "Examplia", "cc": "XA"})
+        self.assertIsNone(result["lat"])
+        self.assertNotIn("XMPPlace", images.read_image(plain, want_preview=False)["exif"])
+
+    def test_the_names(self):
+        countries = {"XA": "Examplia", "XB": "Testland"}
+
+        def place(**names):
+            return place_estimates.file_place({"XMPPlace": names}, countries)
+
+        self.assertEqual(place(city="Coralport", region="North Coast", country="Examplia",
+                               cc="XA"), ("North Coast", "Examplia", "XA", "Coralport"))
+        # The code names the country as the place names do; a name alone gets its code.
+        self.assertEqual(place(country="Republic of Examplia", cc="XA"),
+                         ("", "Examplia", "XA", ""))
+        self.assertEqual(place(country="testland"), ("", "Testland", "XB", ""))
+        self.assertEqual(place(cc="XB"), ("", "Testland", "XB", ""))
+        # Not known to the place names: as the file says.
+        self.assertEqual(place(region="Far Isles", country="Nowhereland", cc="XZ"),
+                         ("Far Isles", "Nowhereland", "XZ", ""))
+        self.assertEqual(place_estimates.file_place({"XMPPlace": {"country": "Examplia"}}),
+                         ("", "Examplia", "", ""))
+        # No country: no place.
+        self.assertIsNone(place(city="Coralport", region="North Coast"))
+        self.assertIsNone(place(cc="XZ"))
+        self.assertIsNone(place_estimates.file_place({}))
+        self.assertIsNone(place_estimates.file_place({"XMPPlace": "Examplia"}))
+        self.assertIsNone(place_estimates.file_place(None))
+
+    def test_the_rule(self):
+        rows = [row(COAST, "14:00"), row(near(COAST, 1), "14:20")]
+        named = row(None, "14:05", camera=CAMERA, offset="")
+        # A position the GPS check sets aside (6,800 km off): estimated, not named.
+        aside = row(FAR, "14:05", camera=CAMERA, offset="")
+        names = ("Midlands", "Testland", "XB", "")
+        files = {named["id"]: names, aside["id"]: names}
+        check = gps_check.evaluate(rows + [named, aside], gps_check.settings({}))
+        found = place_estimates.estimate(rows + [named, aside], check,
+                                         place_estimates.settings({}), file_places=files)
+        # The file's place, though the pictures around it would place it.
+        self.assertEqual(placed(found, named), ("file", None, None))
+        self.assertEqual(found[named["id"]].area, names)
+        self.assertIsNone(found[named["id"]].radius_km)
+        self.assertEqual(placed(found, aside)[0], "time")
+        # Also with the estimates turned off; the owner's choice comes first.
+        off = place_estimates.settings({"place_estimates": {"enabled": False}})
+        self.assertEqual(placed(place_estimates.estimate(
+            rows + [named], check, off, file_places=files), named), ("file", None, None))
+        key = gps_check.content_key(named["content_hash"], named["id"])
+        for choice, wanted in (({"choice": "reject"}, None),
+                               ({"choice": "set", "lat": FAR[0], "lon": FAR[1]},
+                                ("owner", FAR[0], FAR[1]))):
+            found = place_estimates.estimate(rows + [named], check,
+                                             place_estimates.settings({}),
+                                             choices={key: choice}, file_places=files)
+            self.assertEqual(placed(found, named), wanted)
+        # Its record: the picture's own place (ps "f", not pe).
+        self.assertEqual(place_estimates.place_record({
+            "source": "file", "place_city": "", "place_region": "Midlands",
+            "place_country": "Testland", "place_cc": "XB"}),
+            {"rg": "Midlands", "co": "Testland", "cc": "XB", "ps": "f"})
+
+
 class WordsTest(unittest.TestCase):
 
     def test_reasons(self):
@@ -567,6 +680,9 @@ class WordsTest(unittest.TestCase):
             "Estimated places: 3 pictures without a position (2 from pictures taken around "
             "the same time, 1 from the library's area); 1 with a place you set; 4 changed. "
             "The admin finds them with is:place-estimated.")
+        self.assertEqual(place_estimates.summary_text(
+            {"estimated": 0, "by_source": {"file": 2}, "changed": 2}),
+            "Estimated places: none; 2 with the place their file names; 2 changed.")
 
     def test_positions_typed(self):
         self.assertEqual(place_estimates.parse_position("5.05, -150.2"), (5.05, -150.2))
@@ -704,26 +820,42 @@ class UpdateTest(PassFixture, unittest.TestCase):
         camera = self.insert(None, "14:10", camera=CAMERA, offset="")
         located = self.insert(near(COAST, 8), "15:00")
         self.check_all()
-        # Accept: the estimate becomes the owner's place.
+        estimated = place_estimates.for_picture(self.conn, camera)
+        self.assertGreater(estimated["radius_km"], 0)
+        # Accept: the estimate becomes the owner's place, as approximate as it was.
         place_estimates.set_choice(self.conn, camera, "accept")
         self.conn.commit()
         self.check_all()
         found = place_estimates.for_picture(self.conn, camera)
         self.assertEqual((found["source"], found["place_city"]), ("owner", "Coralport"))
+        self.assertEqual((found["lat"], found["lon"]), (estimated["lat"], estimated["lon"]))
+        self.assertAlmostEqual(found["radius_km"], estimated["radius_km"], places=3)
+        self.assertEqual(place_estimates.located(self.conn, ["lib_trips001"]),
+                         [(camera, found["lat"], found["lon"], found["radius_km"], True)])
         record = search_index.picture_record(self.conn, camera)
         self.assertEqual((record.get("pe"), record["ps"], record["co"]), (None, "o", "Examplia"))
         export_record = [record for record in search_index.build_records(
             self.conn, self.config, ["lib_trips001"], for_export=True,
             export_options={"location": True}) if record["i"] == camera][0]
         self.assertEqual(export_record["ps"], "o")
-        # Set: another position (a town picked from the place names).
+        # Set: another position (a town picked from the place names: its middle,
+        # TOWN_PICK_KM off).
         place_estimates.set_choice(self.conn, camera, "set", FAR[0], FAR[1])
         self.conn.commit()
         self.check_all()
         found = place_estimates.for_picture(self.conn, camera)
         self.assertEqual((found["lat"], found["place_city"]), (FAR[0], "Farhaven"))
         self.assertEqual(place_estimates.located(self.conn, ["lib_trips001"]),
-                         [(camera, FAR[0], FAR[1], None, True)])
+                         [(camera, FAR[0], FAR[1], place_estimates.TOWN_PICK_KM, True)])
+        # A position typed (not a town's own): exact.
+        place_estimates.set_choice(self.conn, camera, "set", FAR[0] + 0.01, FAR[1])
+        self.conn.commit()
+        self.check_all()
+        self.assertEqual(place_estimates.located(self.conn, ["lib_trips001"]),
+                         [(camera, FAR[0] + 0.01, FAR[1], None, True)])
+        place_estimates.set_choice(self.conn, camera, "set", FAR[0], FAR[1])
+        self.conn.commit()
+        self.check_all()
         view = place_estimates.view(self.conn, self.picture(camera), admin=True)
         self.assertEqual((view["source"], view["reason"], view["choice"]),
                          ("owner", "set by you", "set"))
@@ -755,6 +887,66 @@ class UpdateTest(PassFixture, unittest.TestCase):
             with self.assertRaises(place_estimates.ChoiceError) as caught:
                 place_estimates.set_choice(self.conn, *args)
             self.assertEqual(caught.exception.status, status, args)
+
+    def test_a_place_its_file_names(self):
+        self.day()
+        named = self.insert(None, "14:10", camera=CAMERA, offset="", exif=json.dumps(
+            {"XMPPlace": {"city": "Coralport", "region": "North Coast",
+                          "country": "Republic of Examplia", "cc": "XA"}}))
+        undated = self.insert(None, "03:00", camera=CAMERA, offset="",
+                              taken_at="2019-01-01T03:00:00", exif=json.dumps(
+                                  {"XMPPlace": {"region": "Midlands", "country": "Testland"}}))
+        # A position the GPS check sets aside (6,800 km off) is not replaced by the names.
+        aside = self.insert(FAR, "14:03", camera=CAMERA, offset="", exif=json.dumps(
+            {"GPS": {}, "XMPPlace": {"region": "Midlands", "country": "Testland"}}))
+        ctx = jobs.JobContext("t")
+        summary = self.check_all(ctx)
+        self.assertEqual(summary["estimates"]["by_source"], {"file": 2, "time": 1})
+        self.assertEqual(summary["estimates"]["estimated"], 1)
+        lines = [line for line in test_gps_check.log_lines(ctx) if "Estimated places" in line]
+        self.assertIn("1 picture without a position (1 from pictures taken around the same "
+                      "time); 2 with the place their file names", lines[0])
+        rows = {row_["image_id"]: row_ for row_ in self.conn.execute(
+            "SELECT * FROM place_estimates")}
+        self.assertEqual({key: rows[named][key] for key in (
+            "source", "lat", "lon", "radius_km", "place_city", "place_region",
+            "place_country", "place_cc", "place_km")},
+            {"source": "file", "lat": None, "lon": None, "radius_km": None,
+             "place_city": "Coralport", "place_region": "North Coast",
+             "place_country": "Examplia", "place_cc": "XA", "place_km": None})
+        self.assertEqual((rows[undated]["source"], rows[undated]["place_region"],
+                          rows[undated]["place_country"], rows[undated]["place_cc"]),
+                         ("file", "Midlands", "Testland", "XB"))
+        self.assertEqual(rows[aside]["source"], "time")
+        # The picture's own place (not estimated), without a pin.
+        record = search_index.picture_record(self.conn, named)
+        self.assertEqual({key: record.get(key) for key in ("ci", "rg", "co", "cc", "pe", "ps",
+                                                          "gp", "km")},
+                         {"ci": "Coralport", "rg": "North Coast", "co": "Examplia",
+                          "cc": "XA", "pe": None, "ps": "f", "gp": None, "km": None})
+        self.assertEqual([item[0] for item in place_estimates.located(
+            self.conn, ["lib_trips001"])], [aside])
+        view = place_estimates.view(self.conn, self.picture(named))
+        self.assertEqual((view["source"], view["reason"], view["radius_km"], view["place"]),
+                         ("file", "named in its file", None,
+                          "Coralport, North Coast, Examplia"))
+        status = places.status(self.conn)["estimates"]
+        self.assertEqual((status["estimated"], status["time"], status["file"],
+                          status["owner"]), (1, 1, 2, 0))
+        # An export: with location (as the owner's own places), not without.
+        for options, wanted in (({"location": True}, True), ({"location": False}, False)):
+            record = [record for record in search_index.build_records(
+                self.conn, self.config, ["lib_trips001"], for_export=True,
+                export_options=options) if record["i"] == named][0]
+            self.assertEqual(record.get("ps") == "f" and record.get("co") == "Examplia",
+                             wanted, options)
+            if not wanted:
+                self.assertFalse({"ci", "rg", "co", "cc", "pe", "ps"} & set(record))
+        # Nothing to accept; again: nothing changes.
+        with self.assertRaises(place_estimates.ChoiceError) as caught:
+            place_estimates.set_choice(self.conn, named, "accept")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(self.check_all()["estimates"]["changed"], 0)
 
     def test_hidden_pictures_are_not_on_the_map(self):
         self.day()
@@ -911,6 +1103,8 @@ class RouteTest(PassFixture, unittest.TestCase):
         self.day()
         camera = self.insert(None, "14:10", camera=CAMERA, offset="")
         self.check_all()
+        radius = [point for point in self.client.get("/api/locations").get_json()
+                  if point["id"] == camera][0]["r"]
         answer = self.post(camera, {"choice": "accept"})
         self.assertEqual(answer.status_code, 200, answer.get_data(as_text=True))
         answer = answer.get_json()
@@ -919,10 +1113,16 @@ class RouteTest(PassFixture, unittest.TestCase):
         self.assertEqual(answer["place"]["source"], "owner")
         self.assertNotIn("estimated", answer["place"])
         self.assertEqual(answer["place_estimate"]["choice"], "set")
+        # (Accepted, as approximate as it was: its radius goes with it.)
+        point = [point for point in self.client.get("/api/locations").get_json()
+                 if point["id"] == camera][0]
+        self.assertEqual((point.get("o"), point.get("e"), point["r"]), (1, None, radius))
         answer = self.post(camera, {"choice": "set", "lat": FAR[0], "lon": FAR[1]}).get_json()
         self.assertEqual(answer["record"]["ci"], "Farhaven")
         points = self.client.get("/api/locations").get_json()
-        self.assertIn({"id": camera, "lat": FAR[0], "lon": FAR[1], "o": 1}, points)
+        # (A town chosen: its middle, as far off as TOWN_PICK_KM.)
+        self.assertIn({"id": camera, "lat": FAR[0], "lon": FAR[1], "o": 1,
+                       "r": place_estimates.TOWN_PICK_KM}, points)
         answer = self.post(camera, {"choice": "reject"}).get_json()
         self.assertEqual(answer["record"], {})
         self.assertIsNone(answer["place"])
@@ -958,6 +1158,86 @@ class RouteTest(PassFixture, unittest.TestCase):
                                             "co": "Examplia", "cc": "XA", "ps": "o"})
         points = self.client.get("/api/locations").get_json()
         self.assertNotIn(camera, [point["id"] for point in points])
+
+    def test_a_position_whose_file_names_its_place(self):
+        # Taken at Coralport (Examplia), its file naming a village of Testland: the
+        # names are the file's (the pin its position), without a distance; the nearest
+        # town's are not even searched.
+        import serve
+        import trips
+        names = {"city": "Little Ford", "region": "Midlands", "country": "Testland",
+                 "cc": "XB"}
+        picture = self.insert(COAST, "14:00", exif=json.dumps(
+            {"GPS": {}, "XMPPlace": names}))
+        plain = self.insert(near(COAST, 1), "14:05")
+        self.check_all()
+        record = search_index.picture_record(self.conn, picture)
+        self.assertEqual({key: record.get(key) for key in ("ci", "rg", "co", "cc", "km", "ps",
+                                                          "gp", "pe")},
+                         {"ci": "Little Ford", "rg": "Midlands", "co": "Testland", "cc": "XB",
+                          "km": None, "ps": "f", "gp": 1, "pe": None})
+        other = search_index.picture_record(self.conn, plain)
+        self.assertEqual((other["ci"], other.get("ps")), ("Coralport", None))
+        # In the records of the pages and of an export with location; not without.
+        records = {record["i"]: record for record in search_index.build_records(
+            self.conn, self.config, ["lib_trips001"])}
+        self.assertEqual(records[picture]["co"], "Testland")
+        exported = {record["i"]: record for record in search_index.build_records(
+            self.conn, self.config, ["lib_trips001"], for_export=True,
+            export_options={"location": True})}
+        self.assertEqual((exported[picture]["ci"], exported[picture]["ps"]),
+                         ("Little Ford", "f"))
+        hidden = {record["i"]: record for record in search_index.build_records(
+            self.conn, self.config, ["lib_trips001"], for_export=True)}
+        self.assertFalse({"ci", "rg", "co", "cc", "ps", "km"} & set(hidden[picture]))
+        # The viewer's details, and a trip's places.
+        row = self.picture(picture)
+        self.assertEqual(serve.place_of(row), {"city": "Little Ford", "region": "Midlands",
+                                               "country": "Testland", "cc": "XB",
+                                               "source": "file"})
+        self.assertEqual(trips._Picture(row, None).place,
+                         ("Little Ford", "Midlands", "Testland", "XB"))
+        # No estimate is made for it (it has a position), and a country code alone
+        # names the country as the place names do.
+        self.assertIsNone(place_estimates.for_picture(self.conn, picture))
+        self.conn.execute("UPDATE images SET exif = ? WHERE id = ?",
+                          (json.dumps({"XMPPlace": {"cc": "XB"}}), picture))
+        self.conn.commit()
+        record = search_index.picture_record(self.conn, picture)
+        self.assertEqual((record.get("ci"), record["co"], record["cc"]), (None, "Testland", "XB"))
+        # A position the GPS check sets aside does not make way for the names.
+        self.conn.execute("UPDATE images SET lat = NULL, lon = NULL WHERE id = ?", (picture,))
+        self.conn.commit()
+        self.assertIsNone(place_estimates.gps_file_columns(self.picture(picture)))
+
+    def test_a_place_its_file_names(self):
+        names = {"region": "North Coast", "country": "Examplia", "cc": "XA"}
+        self.day()
+        named = self.insert(None, "14:10", camera=CAMERA, offset="",
+                            exif=json.dumps({"XMPPlace": names}))
+        aside = self.insert(FAR, "14:03", camera=CAMERA, offset="",
+                            exif=json.dumps({"GPS": {"GPSLatitudeRef": "N"},
+                                             "XMPPlace": names}))
+        self.check_all()
+        detail = self.client.get("/api/image/%d" % named).get_json()
+        self.assertEqual(detail["place"], {"city": "", "region": "North Coast",
+                                           "country": "Examplia", "cc": "XA",
+                                           "source": "file"})
+        self.assertEqual(detail["place_estimate"]["reason"], "named in its file")
+        self.assertNotIn(named, [point["id"] for point in
+                                 self.client.get("/api/locations").get_json()])
+        # The owner's place comes first; cleared, the file's again.
+        answer = self.post(named, {"choice": "set", "lat": FAR[0], "lon": FAR[1]}).get_json()
+        self.assertEqual((answer["record"]["ci"], answer["record"]["ps"]), ("Farhaven", "o"))
+        answer = self.post(named, {"choice": "clear"}).get_json()
+        self.assertEqual(answer["record"], {"rg": "North Coast", "co": "Examplia", "cc": "XA",
+                                            "ps": "f"})
+        self.assertEqual(self.post(named, {"choice": "accept"}).status_code, 409)
+        # Visitors never see the names a set-aside position's file gives (nor its GPS).
+        theirs = self.client.get("/api/image/%d" % aside, environ_base=REMOTE).get_json()
+        self.assertEqual(theirs["exif"], {})
+        mine = self.client.get("/api/image/%d" % aside).get_json()
+        self.assertEqual(mine["exif"]["XMPPlace"], names)
 
     def test_towns(self):
         answer = self.towns("coral").get_json()

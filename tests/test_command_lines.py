@@ -38,6 +38,7 @@ import make_places
 import people
 import places
 import scan
+import named_places
 import street_maps
 import trip_export
 import trip_stories
@@ -339,7 +340,7 @@ CASES = [
         "credits": "-- with thanks, (c) us", "zip": True, "allow_indexing": True,
         "videos": "include", "max_video_mb": 50, "raw_files": True, "similar": False,
         "meaning": False, "looks": False, "album": None, "marks": True,
-        "people_names": True}}),
+        "people_names": True, "world_zoom": 6}}),
     ("export", "Family", {"options": {"album": "ALBUM", "exclude_types": [],
                                       "include_ids": [], "exclude_ids": [],
                                       "title": "Summer, at last"}}),
@@ -366,6 +367,8 @@ CASES = [
                     "source": "https://build.example/20990101.pmtiles"}),
     ("maps", None, {"download": True, "expect_bytes": 99, "allow_large": True,
                     "source": "http://127.0.0.1:9/p.pmtiles"}),
+    ("named_places", None, {}),
+    ("named_places", None, {"redo": True}),
 ]
 
 # What each kind of job hands its work on to: kind -> [(module, function name, value it
@@ -391,7 +394,8 @@ PROBES = {
     "places": [(places, "update", {}), (places, "build", {}),
                (places, "rebuild_if_needed", None),
                (places, "label_pictures", {"aborted": False, "checked": 0}),
-               (gps_check, "run_safely", None), (local_times, "run_safely", None)],
+               (gps_check, "run_safely", None), (local_times, "run_safely", None),
+               (named_places, "run_safely", None)],
     "faces": [(people, "update", _UPDATE_RESULT)],
     "group_faces": [RUNNER],
     "delete_faces": [(people, "delete_all", {"error": "", "faces": 0, "pictures": 0,
@@ -405,7 +409,9 @@ PROBES = {
         "large": False, "at": 0}),
         (street_maps, "save_plan", None),
         (street_maps, "download", {"stopped": False, "tiles": 10, "bytes": 1000,
-                                   "downloaded": 5000, "build": "20990101.pmtiles"})],
+                                   "downloaded": 5000, "build": "20990101.pmtiles"}),
+        (named_places, "run_safely", None)],
+    "named_places": [(named_places, "update", dict(named_places._empty_summary(), maps=True))],
 }
 # What a call is compared without: what only says how the work is done.
 IGNORED = {"conn", "config", "ctx", "helper", "previews", "sleep", "servers", "now",
@@ -413,7 +419,7 @@ IGNORED = {"conn", "config", "ctx", "helper", "previews", "sleep", "servers", "n
 # How each tool is run: tool -> main(argv) giving the exit code.
 TOOLS = {"scan.py": scan.main, "export.py": export.main, "people.py": people.main,
          "make_places.py": make_places.main, "trips.py": trips.main,
-         "street_maps.py": street_maps.main}
+         "street_maps.py": street_maps.main, "named_places.py": named_places.main}
 
 
 class RoundTripTest(support.TempBaseMixin, unittest.TestCase):
@@ -612,7 +618,8 @@ class RoundTripTest(support.TempBaseMixin, unittest.TestCase):
                                                     library_id="lib_aaaa0002"), self.config)
         self.assertEqual(line, 'python export.py --library "My Pictures 2019" --out "'
                          + self.web_site + '" --title= --images original --location '
-                         '--estimated-places --no-routes --routes-trim 300 --file-names '
+                         '--estimated-places --no-routes --routes-trim 300 --world-zoom 6 '
+                         '--file-names '
                          '--no-folders --exclude-types "document,video" --include-private '
                          '--no-include-sensitive --include-undescribed --include-ids '
                          '"3:private+writing,5" --exclude-ids "9,11" '

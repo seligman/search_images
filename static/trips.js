@@ -1093,9 +1093,7 @@ var TRIPS = (function () {
         var clear = [STREETS.clearOf(this.tools, this.canvas),
                      STREETS.clearOf(this.credit, this.canvas)];
         var drawn = this.tiles.draw(ctx, view.zoom, at.left, at.top, view.w, view.h, clear);
-        var creditWas = this.credit.hidden;
-        this.credit.hidden = !drawn.streets;
-        if (creditWas && !this.credit.hidden) {
+        if (STREETS.showCredit(this.credit, drawn)) {
             this.schedule();            // (names placed clear of it next time)
         }
         // The routes: each line on the copy of the world nearest the middle.

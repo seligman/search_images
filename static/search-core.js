@@ -82,11 +82,19 @@
                          blurry
               ids        a list of picture ids: only these can match (the
                          pictures picked on the map)
+              area       an area drawn or picked on the map (its text, see
+                         "Areas on the map" below, or SearchCore.areas.read's
+                         answer): only the pictures taken in it can match --
+                         their positions, an estimated place deep enough
+                         inside, a drive's clip whose route passes through
+                         it (index.setPlaces gives them; until then nothing
+                         matches, and the result says areaPending). One that
+                         cannot be read is left out, with a warning
               albums     the albums album: can name: [{id, name, kind
                          ("manual" or "smart"), items (manual: picture ids
                          in the album's order), query and options (smart:
                          the saved search, {filters, sort, by, lib, from,
-                         to})}] (the "albums" of /api/index, or of an
+                         to, area, aname})}] (the "albums" of /api/index, or of an
                          export's manifest). A manual album holds the
                          pictures of its items and those whose al names it
                          (the page changes al in place); a smart album the
@@ -160,6 +168,8 @@
                undated
      album     {id, name, kind} of the one album the query names (album
                order is then possible), else null
+     areaPending  true when the area option (or a smart album's area)
+               found nothing because the index has no places yet
      sort      the order used; query: the parse() result as searched (pass
                it to highlights() so the marks agree with the matches);
                warnings: notes about parts of the query that could not be
@@ -186,7 +196,8 @@
      YYYY-MM or YYYY-MM-DD, or from..to with both included and either left
      out; only dates taken, as the range option), on: (today: this day in
      earlier years; MM-DD: that day in any year; or YYYY-MM-DD), place:
-     (words of the town, region or country), lib: (library name or id),
+     (words of the town, region or country, or of the named place on the
+     street maps: a park, a museum; record key np), lib: (library name or id),
      has: (text, gps, people, animals, food, vehicles, description) and
      is: (360, duplicate, hidden, undescribed, described, edited, private,
      sensitive, blurry, dark, overexposed, accidental, junk, v4, favorite,
@@ -302,13 +313,14 @@
      word are (MEANING_TERM_FULL, MEANING_TERM_MARGIN_Z). Words of position
      ("over", "near": RELATION_WORDS) and words no picture has (a
      misspelling) need no covering. A term without a vector does as
-     before (the meaning of the whole query decides). The ranking of what
-     is shown stays as it was. A single free word, phrases, field words and
-     filters are as before.
+     before (the meaning of the whole query decides), and so does every
+     term in a small set (fewer than MEANING_SMALL pictures with a vector,
+     where no z gets far). The ranking of what is shown stays as it was. A
+     single free word, phrases, field words and filters are as before.
 
    SearchCore.interpret(records, query, options), index.interpret(query,
        options) -> {text, query, parts, choices, rest, others, kept,
-       changed}
+       changed, dropped}
      Plain language: what a typed query asks for. In its plain words (not
      quoted, no field, not negated, not joined by OR) it finds: dates --
      a year that pictures were taken in ("2019"), "2015-2019" (or "2015 -
@@ -345,6 +357,11 @@
      (a date's)}]; rest the plain words left (as typed, "" when only small
      words are left); others what is not plain words (field words,
      phrases, -words, OR), as typed; changed: some part was replaced.
+     Words about taking the picture or that say nothing of it
+     (TAKEN_WORDS: "taken", "shot", "photographed", ...; "something") are
+     left out of query when it has such a part, or when "in", "at", "from",
+     ... and more words follow them ("taken in Port Ellis", "something at the
+     zoo"): dropped lists them. ("something warm to drink" keeps its words.)
      options.typed: keys of parts to leave as typed (kept lists those
      found), or "*" for all; options.plain false: nothing is interpreted.
      The page shows parts as chips and searches query; search() itself
@@ -377,6 +394,18 @@
      the words of the tags first (edit distance up to 2; 1 for short words).
      Skipped words are never corrected, and a correction that would find
      nothing either (with options, as for search) is not offered.
+
+   Areas on the map
+     index.setPlaces(points, routes) gives the index where its pictures
+     were taken (SITE.loadLocations' points and SITE.loadRoutes' routes),
+     for the area option. SearchCore.areas: read(text) (the area, or null),
+     encode(kind, parts, metres) (its text), has(area, lat, lon, depth),
+     label(area, name) ("Main Street, 50 m either side"), name(text) (an
+     area's name as an address may give it), bounds(area) ({south, west,
+     north, east}), metres(m) ("50 m", "1.2 km"), simplify(points,
+     tolerance), worldY(lat), latitudeOf(y), worldScale(lat) and the
+     limits MAX_TEXT, MAX_POINTS, MAX_METRES, NAME_LENGTH: see the notes
+     at readArea.
 
    Also: prepare(records) -> index with the same search / similar /
    suggest / interpret methods and get(id); normalize(text);
@@ -901,7 +930,7 @@ var SearchCore = (function () {
         sc: F_SCENE, st: F_SETTING, ev: F_EVENT, ty: F_KIND, dt: F_KIND, td: F_KIND,
         o: F_TEXT, text: F_TEXT, d: F_DESCRIPTION, description: F_DESCRIPTION,
         ex: F_EXTENDED, c: F_COLORS, qf: F_FLAGS, f: F_FOLDER, n: F_FILE, cm: F_CAMERA,
-        ci: F_PLACE, rg: F_PLACE, co: F_PLACE, place: F_PLACE,
+        ci: F_PLACE, rg: F_PLACE, co: F_PLACE, np: F_PLACE, place: F_PLACE,
         dvt: F_DRIVE, dvd: F_DRIVE, dvg: F_DRIVE
     });
 
@@ -986,10 +1015,11 @@ var SearchCore = (function () {
         add(F_FILE, textList(rec.n));
         add(F_CAMERA, textList(rec.cm));
         add(F_DRIVE, textList(rec.dvt).concat(textList(rec.dvd), textList(rec.dvg)));
-        if (isText(rec.co)) {
-            add(F_PLACE, textList(rec.ci).concat(textList(rec.rg), [rec.co],
-                                                 COUNTRY_WORDS[rec.cc] || []));
-        }
+        // (The named place on the street maps, np, is a place too: place:"harbour
+        // aquarium" finds the pictures taken there.)
+        add(F_PLACE, (isText(rec.co) ? textList(rec.ci).concat(textList(rec.rg), [rec.co],
+                                                               COUNTRY_WORDS[rec.cc] || [])
+            : []).concat(textList(rec.np)));
         var date = isText(rec.dk) ? /^(\d{4})-(\d{2})/.exec(rec.dk) : null;
         if (date) {
             var month = parseInt(date[2], 10);
@@ -2436,6 +2466,462 @@ var SearchCore = (function () {
         return rec.dk;
     }
 
+    /* ---------- Areas on the map ------------------------------------------- */
+
+    /* An area drawn or picked on the map (map.js) limits a search to the
+       pictures taken in it: the area option (the address's area=, a smart
+       album's options.area). Its text (readArea, encodeArea):
+
+           kind [metres] "." part ["." part ...]
+
+       kind "b": a rectangle, one part of two points (its south-west and
+       north-east corners); "p": polygons, each part a ring of three points
+       or more (a place is in the area when it is inside any of them); "l":
+       lines with metres (1 to AREA_MAX_METRES) either side, each part a
+       line of one point or more (a street; a point of interest is a line of
+       one point): a place is in the area when it is at most that far from
+       one of them. A part is the latitude and longitude of its points in
+       1/100000 degree, the first as it is and each next one as the change
+       from the one before (so a longitude may run past 180: a shape across
+       the date line), each number zig-zag coded (0, -1, 1, -2, ... are 0,
+       1, 2, 3, ...) and written five bits a character, lowest first, in
+       AREA_DIGITS, the character's 32 bit saying that more of the number
+       follows. Only letters, digits, "-", "_" and ".": nothing of it is
+       escaped in an address. At most AREA_MAX_TEXT characters,
+       AREA_MAX_PARTS parts and AREA_MAX_POINTS points (map_areas.py reads
+       the same text).
+
+       The edges of a shape are straight on the map (Web Mercator, as they
+       were drawn), and distances are measured on the map at the place's
+       latitude (where it is true to scale). A place counts when it is that
+       deep inside: 0 m for the pictures' own positions and the places the
+       owner set, half the radius of an estimated place (as named_places.py
+       asks of an area), so that a vague estimate is not "on" a street.
+       Where the pictures were taken comes from index.setPlaces. */
+    var AREA_DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_";
+    var AREA_SCALE = 100000;
+    var AREA_MAX_TEXT = 6000;
+    var AREA_MAX_PARTS = 200;
+    var AREA_MAX_POINTS = 2000;
+    var AREA_MAX_METRES = 5000;
+    var AREA_NAME_LENGTH = 100;
+    var AREA_RE = /^([bpl])([1-9]\d{0,3})?((?:\.[0-9A-Za-z_-]+)+)$/;
+    // The map's north and south edges (Web Mercator leaves the poles out), and
+    // the length of the equator: the map's world is that many metres wide there.
+    var AREA_MAX_LAT = 85.0511287798;
+    var EARTH_METRES = 40075016.686;
+    // Areas read lately (readArea), by their text.
+    var AREA_KEPT = 16;
+    var areasRead = Object.create(null);
+    var areasOrder = [];
+
+    var AREA_VALUES = (function () {
+        var out = Object.create(null);
+        for (var k = 0; k < AREA_DIGITS.length; k++) {
+            out[AREA_DIGITS.charAt(k)] = k;
+        }
+        return out;
+    })();
+
+    function areaNumber(value) {
+        var left = value < 0 ? -2 * value - 1 : 2 * value;
+        var out = "";
+        while (left >= 32) {
+            out += AREA_DIGITS.charAt(32 + left % 32);
+            left = Math.floor(left / 32);
+        }
+        return out + AREA_DIGITS.charAt(left);
+    }
+
+    // The numbers of a part's text, or null when it is none.
+    function areaNumbers(text) {
+        var out = [];
+        var value = 0;
+        var scale = 1;
+        for (var k = 0; k < text.length; k++) {
+            var digit = AREA_VALUES[text.charAt(k)];
+            if (digit === undefined || scale > 1e12) {
+                return null;
+            }
+            value += (digit % 32) * scale;
+            if (digit < 32) {
+                out.push(value % 2 ? -(value + 1) / 2 : value / 2);
+                value = 0;
+                scale = 1;
+            } else {
+                scale *= 32;
+            }
+        }
+        return scale === 1 ? out : null;
+    }
+
+    // 0 at the map's north edge to 1 at its south edge (Web Mercator).
+    function worldY(lat) {
+        var clamped = Math.max(-AREA_MAX_LAT, Math.min(AREA_MAX_LAT, lat));
+        var r = clamped * Math.PI / 180;
+        return (1 - Math.log(Math.tan(Math.PI / 4 + r / 2)) / Math.PI) / 2;
+    }
+
+    function latitudeOf(y) {
+        var v = Math.PI * (1 - 2 * y);
+        return Math.atan((Math.exp(v) - Math.exp(-v)) / 2) * 180 / Math.PI;
+    }
+
+    // Metres per world unit (the world's width) at a latitude.
+    function worldScale(lat) {
+        return EARTH_METRES * Math.cos(Math.max(-AREA_MAX_LAT, Math.min(AREA_MAX_LAT, lat)) *
+                                       Math.PI / 180);
+    }
+
+    /* The text of an area (see above): kind "b", "p" or "l"; parts: a list
+       of [lat, lon, lat, lon, ...] (degrees; a rectangle's one part [south,
+       west, north, east], east > west, east past 180 across the date line);
+       metres for "l". "" when that makes no area (readArea reads it). */
+    function encodeArea(kind, parts, metres) {
+        if (["b", "p", "l"].indexOf(kind) < 0 || !Array.isArray(parts) || !parts.length) {
+            return "";
+        }
+        var text = kind + (kind === "l" ? String(Math.round(Number(metres) || 0)) : "");
+        for (var p = 0; p < parts.length; p++) {
+            var part = parts[p];
+            if (!part || !(part.length >= 2) || part.length % 2) {
+                return "";
+            }
+            var shift = 0;
+            var lastLat = 0;
+            var lastLon = 0;
+            var piece = "";
+            for (var k = 0; k < part.length; k += 2) {
+                var lat = Math.round(Number(part[k]) * AREA_SCALE);
+                var lon = Math.round(Number(part[k + 1]) * AREA_SCALE);
+                if (!isFinite(lat) || !isFinite(lon)) {
+                    return "";
+                }
+                if (k === 0) {
+                    // (The first longitude within [-180, 180]; the others follow it.)
+                    shift = Math.round(lon / (360 * AREA_SCALE)) * 360 * AREA_SCALE;
+                }
+                lon -= shift;
+                piece += areaNumber(lat - lastLat) + areaNumber(lon - lastLon);
+                lastLat = lat;
+                lastLon = lon;
+            }
+            text += "." + piece;
+        }
+        return readArea(text) ? text : "";
+    }
+
+    /* The area of a text (see above): {text, kind, metres, parts (as
+       encodeArea's, a rectangle as its four corners), shapes (the parts in
+       world units -- x 0 at the date line to 1 once round the world east, y
+       as worldY -- [x, y, x, y, ...] each), box {x0, y0, x1, y1} (of the
+       shapes), cx (its middle x)}, or null when the text is none. An area
+       read already is given back as it is. */
+    function readArea(text) {
+        if (text && typeof text === "object" && isText(text.text) && text.shapes) {
+            return text;
+        }
+        if (!isText(text) || !text || text.length > AREA_MAX_TEXT) {
+            return null;
+        }
+        if (areasRead[text] !== undefined) {
+            return areasRead[text];
+        }
+        var area = parseArea(text);
+        areasRead[text] = area;
+        areasOrder.push(text);
+        if (areasOrder.length > AREA_KEPT) {
+            delete areasRead[areasOrder.shift()];
+        }
+        return area;
+    }
+
+    function parseArea(text) {
+        var match = AREA_RE.exec(text);
+        if (!match) {
+            return null;
+        }
+        var kind = match[1];
+        var metres = match[2] ? Number(match[2]) : 0;
+        if ((kind === "l") !== Boolean(match[2]) || metres > AREA_MAX_METRES) {
+            return null;
+        }
+        var texts = match[3].slice(1).split(".");
+        if (texts.length > AREA_MAX_PARTS || (kind === "b" && texts.length !== 1)) {
+            return null;
+        }
+        var parts = [];
+        var count = 0;
+        var half = 180 * AREA_SCALE;
+        for (var p = 0; p < texts.length; p++) {
+            var numbers = areaNumbers(texts[p]);
+            if (!numbers || !numbers.length || numbers.length % 2) {
+                return null;
+            }
+            count += numbers.length / 2;
+            if (count > AREA_MAX_POINTS) {
+                return null;
+            }
+            var lat = 0;
+            var lon = 0;
+            var points = [];
+            for (var k = 0; k < numbers.length; k += 2) {
+                lat += numbers[k];
+                lon += numbers[k + 1];
+                if (lat < -half / 2 || lat > half / 2 || lon < -3 * half || lon > 3 * half ||
+                        (k === 0 && (lon < -half || lon > half))) {
+                    return null;
+                }
+                points.push(lat / AREA_SCALE, lon / AREA_SCALE);
+            }
+            if (kind === "p" && points.length < 6) {
+                return null;
+            }
+            if (kind === "b") {
+                if (points.length !== 4 || !(points[2] > points[0]) || !(points[3] > points[1]) ||
+                        points[3] - points[1] >= 360) {
+                    return null;
+                }
+                // (Its four corners, as a ring.)
+                points = [points[0], points[1], points[2], points[1], points[2], points[3],
+                          points[0], points[3]];
+            }
+            parts.push(points);
+        }
+        var shapes = [];
+        var box = {x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity};
+        parts.forEach(function (points) {
+            var shape = new Float64Array(points.length);
+            for (var k = 0; k < points.length; k += 2) {
+                var x = (points[k + 1] + 180) / 360;
+                var y = worldY(points[k]);
+                shape[k] = x;
+                shape[k + 1] = y;
+                box.x0 = Math.min(box.x0, x);
+                box.x1 = Math.max(box.x1, x);
+                box.y0 = Math.min(box.y0, y);
+                box.y1 = Math.max(box.y1, y);
+            }
+            shapes.push(shape);
+        });
+        if (box.x1 - box.x0 >= 1) {
+            return null;            // (once round the world or more)
+        }
+        return {text: text, kind: kind, metres: metres, parts: parts, shapes: shapes, box: box,
+                cx: (box.x0 + box.x1) / 2};
+    }
+
+    // True when (x, y) is inside a ring of world units (even-odd).
+    function inRing(ring, x, y) {
+        var inside = false;
+        var count = ring.length;
+        for (var k = 0, j = count - 2; k < count; j = k, k += 2) {
+            var yk = ring[k + 1];
+            var yj = ring[j + 1];
+            if ((yk > y) !== (yj > y) &&
+                    x < (ring[j] - ring[k]) * (y - yk) / (yj - yk) + ring[k]) {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    /* The distance (world units) from (x, y) to the nearest edge of a shape:
+       of a ring (closed) or of a line (a line of one point: to that point). */
+    function shapeDistance(shape, x, y, closed) {
+        var count = shape.length;
+        if (count === 2) {
+            return Math.sqrt((shape[0] - x) * (shape[0] - x) + (shape[1] - y) * (shape[1] - y));
+        }
+        var best = Infinity;
+        for (var k = closed ? 0 : 2; k < count; k += 2) {
+            var j = k === 0 ? count - 2 : k - 2;
+            var ax = shape[j];
+            var ay = shape[j + 1];
+            var dx = shape[k] - ax;
+            var dy = shape[k + 1] - ay;
+            var length = dx * dx + dy * dy;
+            var t = length > 0 ? ((x - ax) * dx + (y - ay) * dy) / length : 0;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            var ex = ax + t * dx - x;
+            var ey = ay + t * dy - y;
+            var distance = ex * ex + ey * ey;
+            if (distance < best) {
+                best = distance;
+            }
+        }
+        return Math.sqrt(best);
+    }
+
+    /* True when the place at world units (x, y), where a world unit is
+       scale metres (worldScale), is in the area at least depth metres deep. */
+    function areaHasAt(area, x, y, scale, depth) {
+        if (!(scale > 0)) {
+            return false;
+        }
+        x += Math.round(area.cx - x);       // (the copy of the world nearest the area)
+        depth = depth > 0 ? depth : 0;
+        var reach = area.kind === "l" ? (area.metres - depth) / scale : 0;
+        var box = area.box;
+        if (reach < 0 || x < box.x0 - reach || x > box.x1 + reach || y < box.y0 - reach ||
+                y > box.y1 + reach) {
+            return false;
+        }
+        var shapes = area.shapes;
+        for (var s = 0; s < shapes.length; s++) {
+            if (area.kind === "l") {
+                if (shapeDistance(shapes[s], x, y, false) <= reach) {
+                    return true;
+                }
+            } else if (inRing(shapes[s], x, y) &&
+                       (!depth || shapeDistance(shapes[s], x, y, true) * scale >= depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // True when a place (degrees) is in an area (or its text) at least depth metres deep.
+    function areaHas(value, lat, lon, depth) {
+        var area = readArea(value);
+        if (!area || typeof lat !== "number" || typeof lon !== "number" || !isFinite(lat) ||
+                !isFinite(lon) || lat < -90 || lat > 90) {
+            return false;
+        }
+        return areaHasAt(area, (lon + 180) / 360, worldY(lat), worldScale(lat), depth);
+    }
+
+    function metresLabel(metres) {
+        return metres >= 1000 ? String(Number((metres / 1000).toFixed(1))) + " km"
+            : Math.round(metres) + " m";
+    }
+
+    // The name of an area as given (an address's aname): one line, at most
+    // AREA_NAME_LENGTH characters ("" for none).
+    function areaName(value) {
+        return isText(value) ? value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/^\s+|\s+$/g, "")
+            .slice(0, AREA_NAME_LENGTH) : "";
+    }
+
+    /* An area in words, after "Area: ": "drawn on the map" ("a rectangle on
+       the map"), its name ("City Park"), "Main Street, 50 m either side",
+       "within 100 m of City Museum" ("" when the text is no area). */
+    function areaLabel(value, name) {
+        var area = readArea(value);
+        if (!area) {
+            return "";
+        }
+        name = areaName(name);
+        if (area.kind === "l") {
+            var point = area.parts.length === 1 && area.parts[0].length === 2;
+            return point ? "within " + metresLabel(area.metres) + " of " + (name || "a point")
+                : (name || "along a line") + ", " + metresLabel(area.metres) + " either side";
+        }
+        return name || (area.kind === "b" ? "a rectangle on the map" : "drawn on the map");
+    }
+
+    /* The area's bounds in degrees, {south, west, north, east} (with a
+       line's metres around it; east may be past 180, or west before -180,
+       for an area across the date line), or null. */
+    function areaBounds(value) {
+        var area = readArea(value);
+        if (!area) {
+            return null;
+        }
+        var box = area.box;
+        var north = latitudeOf(box.y0);
+        var south = latitudeOf(box.y1);
+        var west = box.x0 * 360 - 180;
+        var east = box.x1 * 360 - 180;
+        if (area.kind === "l") {
+            var latStep = area.metres / (EARTH_METRES / 360);
+            var lonStep = latStep / Math.max(0.01, Math.cos(Math.min(AREA_MAX_LAT, Math.max(
+                Math.abs(north), Math.abs(south))) * Math.PI / 180));
+            north = Math.min(90, north + latStep);
+            south = Math.max(-90, south - latStep);
+            west -= lonStep;
+            east += lonStep;
+        }
+        return {south: south, west: west, north: north, east: east};
+    }
+
+    /* A line or ring ([x, y, x, y, ...]) with fewer points: those within
+       tolerance of the line the others make are left out (Douglas and
+       Peucker). The first and last points stay. */
+    function simplifyLine(points, tolerance) {
+        var count = Math.floor((points || []).length / 2);
+        if (count <= 2 || !(tolerance > 0)) {
+            return Array.prototype.slice.call(points || [], 0, count * 2);
+        }
+        var keep = new Uint8Array(count);
+        keep[0] = 1;
+        keep[count - 1] = 1;
+        var stack = [[0, count - 1]];
+        var limit = tolerance * tolerance;
+        while (stack.length) {
+            var span = stack.pop();
+            var a = span[0];
+            var b = span[1];
+            var ax = points[2 * a];
+            var ay = points[2 * a + 1];
+            var dx = points[2 * b] - ax;
+            var dy = points[2 * b + 1] - ay;
+            var length = dx * dx + dy * dy;
+            var far = -1;
+            var farthest = limit;
+            for (var k = a + 1; k < b; k++) {
+                var px = points[2 * k] - ax;
+                var py = points[2 * k + 1] - ay;
+                var t = length > 0 ? Math.max(0, Math.min(1, (px * dx + py * dy) / length)) : 0;
+                var ex = px - t * dx;
+                var ey = py - t * dy;
+                var distance = ex * ex + ey * ey;
+                if (distance > farthest) {
+                    farthest = distance;
+                    far = k;
+                }
+            }
+            if (far >= 0) {
+                keep[far] = 1;
+                stack.push([a, far], [far, b]);
+            }
+        }
+        var out = [];
+        for (var n = 0; n < count; n++) {
+            if (keep[n]) {
+                out.push(points[2 * n], points[2 * n + 1]);
+            }
+        }
+        return out;
+    }
+
+    /* The positions ([lat, lon, lat, lon, ...]) of a clip's GPS track as the
+       routes have it (tracks.encode: [[tenths of seconds, lat, lon (1/100000
+       degree), speed]], each row but the first the change from the one
+       before; see routes.js), [] when the text is none. */
+    function trackPositions(text) {
+        var rows;
+        try {
+            rows = JSON.parse(text || "[]");
+        } catch (error) {
+            return [];
+        }
+        var out = [];
+        var lat = 0;
+        var lon = 0;
+        for (var k = 0; Array.isArray(rows) && k < rows.length; k++) {
+            var row = rows[k];
+            if (!Array.isArray(row) || row.length !== 4 || typeof row[1] !== "number" ||
+                    typeof row[2] !== "number") {
+                return [];
+            }
+            lat += row[1];
+            lon += row[2];
+            out.push(lat / 1e5, lon / 1e5);
+        }
+        return out;
+    }
+
     // A growing list of 32-bit integers.
     function IntBuffer(size) {
         this.data = new Int32Array(size > 1024 ? size : 1024);
@@ -2490,6 +2976,7 @@ var SearchCore = (function () {
         this.cosCache = [];
         this.tagWords = null;
         this.marks = null;
+        this.located = null;                // where the pictures were taken (setPlaces)
         this.things = Object.create(null);  // word -> the THING_FIELDS it is a thing of
         this.wordStart = new Int32Array(n + 1);
         // Only while building: per record its (form id, fields) pairs; per
@@ -3800,6 +4287,14 @@ var SearchCore = (function () {
     // to a place ("in Lisbon", "near Coimbra") or to a person ("with Anna").
     var PLACE_LEADS = wordSet("in at near around from to");
     var PERSON_LEADS = wordSet("with");
+    // Words about taking the picture, and words that say nothing of what it
+    // shows: no description has them ("taken in Italy", "pictures shot at
+    // the zoo", "something in Lisbon"). Left out of a query that names a
+    // place, a date or a person, or before one of FILLER_LEADS and more words
+    // ("taken in Port Ellis": a place known only by its pictures' words).
+    var TAKEN_WORDS = wordSet("taken shot photographed filmed snapped captured something " +
+                              "anything");
+    var FILLER_LEADS = wordSet("in at near around from during on");
     // Words before a name that make it a mountain, a lake, ... rather than
     // the town of that name ("mount Fuji", "lake Como"): asked about.
     var FEATURE_WORDS = wordSet("mount mt mountain lake river cape fort bay island isle " +
@@ -4123,7 +4618,14 @@ var SearchCore = (function () {
             entry.labels[label] = (entry.labels[label] || 0) + 1;
         }
         this.records.forEach(function (rec) {
-            if (!rec || typeof rec !== "object" || !isText(rec.co)) {
+            if (!rec || typeof rec !== "object") {
+                return;
+            }
+            // (A named place on the street maps too: "at the harbour aquarium".)
+            textList(rec.np).forEach(function (name) {
+                add(name, name);
+            });
+            if (!isText(rec.co)) {
                 return;
             }
             textList(rec.ci).concat(textList(rec.rg), [rec.co]).forEach(function (name) {
@@ -4276,7 +4778,7 @@ var SearchCore = (function () {
             text = text.slice(0, MAX_QUERY_LENGTH);
         }
         var out = {text: text, query: text, parts: [], choices: [], rest: "", others: "",
-                   kept: [], changed: false};
+                   kept: [], changed: false, dropped: []};
         var typed = opts.typed === "*" ? "*" : Array.isArray(opts.typed) ? opts.typed : [];
         if (opts.plain === false || typed === "*" || !/\S/.test(text)) {
             return out;
@@ -4490,8 +4992,30 @@ var SearchCore = (function () {
             span.part.query = span.replace;
             out.parts.push(span.part);
         });
+        // Words about taking the picture (TAKEN_WORDS): left out.
+        var edits = spans.slice();
+        units.forEach(function (unit, u) {
+            if (!unit || used[u] || TAKEN_WORDS[unitWord(unit)] !== true) {
+                return;
+            }
+            var next = unitWord(units[u + 1]);
+            if (spans.length || (FILLER_LEADS[next] === true && units[u + 2])) {
+                used[u] = true;
+                out.dropped.push(unit.raw);
+                // (With the space after it; at the end, the space before it.)
+                var from = unit.start;
+                var to = unit.end;
+                while (to < text.length && SPACE.test(text.charAt(to))) {
+                    to += 1;
+                }
+                while (to === text.length && from > 0 && SPACE.test(text.charAt(from - 1))) {
+                    from -= 1;
+                }
+                edits.push({start: from, end: to, replace: ""});
+            }
+        });
         var rewritten = text;
-        spans.slice().sort(function (a, b) {
+        edits.sort(function (a, b) {
             return b.start - a.start;
         }).forEach(function (span) {
             rewritten = rewritten.slice(0, span.start) + span.replace + rewritten.slice(span.end);
@@ -5030,6 +5554,9 @@ var SearchCore = (function () {
         if (isText(saved.from) || isText(saved.to)) {
             out.range = {from: saved.from || "", to: saved.to || ""};
         }
+        if (isText(saved.area) && saved.area) {
+            out.area = saved.area;
+        }
         if (out.meaning !== "words" && typeof opts.vectorFor === "function") {
             // (With the vectors of its words too, or by its words alone until
             // they have all come: Per-term coverage.)
@@ -5073,6 +5600,7 @@ var SearchCore = (function () {
             var found = this.search(album.query || "", smartOptions(album, opts, stack));
             // (What its search could not understand is said here too.)
             found.warnings.forEach(context.warn);
+            context.areaPending = context.areaPending || found.areaPending;
             for (var k = 0; k < found.items.length; k++) {
                 r = this.position[String(found.items[k])];
                 if (r !== undefined && rank[r] < 0) {
@@ -5212,6 +5740,20 @@ var SearchCore = (function () {
                 }
             }
         }
+        // (Only the pictures taken in the area: none until the places are in.)
+        var area = opts.area ? readArea(opts.area) : null;
+        var areaPending = false;
+        if (opts.area && !area) {
+            context.warn("The area on the map could not be read, so it was left out.");
+        } else if (area) {
+            var inside = this.inArea(area);
+            areaPending = !inside;
+            for (r = 0; r < n; r++) {
+                if (alive[r] && !(inside && inside[r])) {
+                    alive[r] = 0;
+                }
+            }
+        }
         // (Within the one album the query names, its drives are made of
         // its clips only.)
         var soleSet = soleAlbum(parsed);
@@ -5334,6 +5876,7 @@ var SearchCore = (function () {
             sort: sort,
             query: parsed,
             warnings: warnings,
+            areaPending: areaPending || Boolean(context.areaPending),
             byMeaning: meaning ? meaning.only : [],
             meaning: meaning ? {mode: meaning.mode, best: meaning.best,
                                 terms: meaning.terms || []} : null
@@ -5551,6 +6094,14 @@ var SearchCore = (function () {
     var MEANING_FEW_Z = 2.2;
     var MEANING_FEW_MARGIN_Z = 0.5;
     var MEANING_FEW = 4;
+    /* Nor does per-term coverage (see MEANING_TERM_Z) apply in such a small
+       set: the meaning of the whole query decides, with the closest few as
+       above. A word's own z is held down as the query's is (in a set of 19
+       described pictures, the motel sign that "a place to stay along an old
+       highway" means had z 1.97 for "highway"; the coffee cups of "something
+       warm to drink" z 2.49 for "drink" but -1.25 for "warm"), and the cuts
+       measured on a library of thousands of pictures left such a set's
+       searches of several words with nothing. */
     // similar: and the "More like this" strip: pictures at least this z
     // (over the cosines of the other pictures to the picture), and at least
     // SIMILAR_MIN_SD standard deviations above the cosine of two pictures
@@ -5821,6 +6372,128 @@ var SearchCore = (function () {
         var count = Index.prototype.setVectors.call(view, vectors);
         view.norms = vectorNorms(view.vectors);
         return count;
+    };
+
+    /* Where the pictures were taken, for the area option: points, the
+       located pictures of SITE.loadLocations ([{id, lat, lon}], with "e": 1
+       for an estimated place or "o": 1 for the owner's, and "r": its radius
+       in km when known: such a place is in an area only at least half its
+       radius deep), and routes, the
+       drives' routes of SITE.loadRoutes ([{c: [{i: clip id, p: its GPS
+       track}]}]: a clip is in an area its route passes through). Returns
+       how many records have a place; null takes them away (an area then
+       finds nothing: result.areaPending). */
+    Index.prototype.setPlaces = function (points, routes) {
+        this.located = null;
+        if (!Array.isArray(points) && !Array.isArray(routes)) {
+            return 0;
+        }
+        var n = this.n;
+        var lists = new Array(n);
+        var position = this.position;
+        var total = 0;
+        function add(id, lat, lon, depth) {
+            var r = position[String(id)];
+            if (r === undefined || typeof lat !== "number" || typeof lon !== "number" ||
+                    !isFinite(lat) || !isFinite(lon) || lat < -90 || lat > 90) {
+                return;
+            }
+            (lists[r] = lists[r] || []).push(lat, lon, depth);
+            total += 1;
+        }
+        (Array.isArray(points) ? points : []).forEach(function (point) {
+            if (point && typeof point === "object") {
+                var radius = (point.e || point.o) && typeof point.r === "number" &&
+                    point.r > 0 ? point.r : 0;
+                add(point.id, point.lat, point.lon, radius * 1000 / 2);
+            }
+        });
+        (Array.isArray(routes) ? routes : []).forEach(function (route) {
+            (route && Array.isArray(route.c) ? route.c : []).forEach(function (clip) {
+                var track = clip && typeof clip.p === "string" ? trackPositions(clip.p) : [];
+                for (var k = 0; k < track.length; k += 2) {
+                    add(clip.i, track[k], track[k + 1], 0);
+                }
+            });
+        });
+        var start = new Int32Array(n + 1);
+        var xs = new Float64Array(total);
+        var ys = new Float64Array(total);
+        var scales = new Float64Array(total);
+        var depths = new Float64Array(total);
+        var at = 0;
+        var placed = 0;
+        for (var r = 0; r < n; r++) {
+            start[r] = at;
+            var list = lists[r];
+            if (!list) {
+                continue;
+            }
+            placed += 1;
+            for (var k = 0; k < list.length; k += 3) {
+                var x = (list[k + 1] + 180) / 360;
+                xs[at] = x - Math.floor(x);
+                ys[at] = worldY(list[k]);
+                scales[at] = worldScale(list[k]);
+                depths[at] = list[k + 2];
+                at += 1;
+            }
+        }
+        start[n] = at;
+        // (found: the areas worked out with these places, by their text.)
+        this.located = {start: start, x: xs, y: ys, scale: scales, depth: depths, count: placed,
+                        found: Object.create(null), kept: []};
+        return placed;
+    };
+
+    /* How many of these picture ids have a place to be in an area by
+       (setPlaces: a position, an estimated or the owner's place with one, a
+       route); null while the index has no places. (A place named without a
+       position -- the one a file names, an estimate of a region -- is in no
+       area.) */
+    Index.prototype.placedCount = function (ids) {
+        var places = this.located;
+        if (!places) {
+            return null;
+        }
+        var count = 0;
+        var position = this.position;
+        (ids || []).forEach(function (id) {
+            var r = position[String(id)];
+            if (r !== undefined && places.start[r + 1] > places.start[r]) {
+                count += 1;
+            }
+        });
+        return count;
+    };
+
+    /* Per record 1 when it was taken in the area (readArea's), else 0; null
+       while the index has no places (setPlaces). */
+    Index.prototype.inArea = function (area) {
+        var places = this.located;
+        if (!places || !area) {
+            return null;
+        }
+        var found = places.found[area.text];
+        if (found) {
+            return found;
+        }
+        found = new Uint8Array(this.n);
+        var start = places.start;
+        for (var r = 0; r < this.n; r++) {
+            for (var k = start[r]; k < start[r + 1]; k++) {
+                if (areaHasAt(area, places.x[k], places.y[k], places.scale[k], places.depth[k])) {
+                    found[r] = 1;
+                    break;
+                }
+            }
+        }
+        places.found[area.text] = found;
+        places.kept.push(area.text);
+        if (places.kept.length > AREA_KEPT) {
+            delete places.found[places.kept.shift()];
+        }
+        return found;
     };
 
     // 1 / the length of a vector (0 for one of length 0).
@@ -6098,8 +6771,9 @@ var SearchCore = (function () {
         }
         var plan = {mode: mode, vector: vector, free: free, similar: null, lacking: null,
                     clauses: parsed.clauses, termVector: null};
-        if (mode === "hybrid" && count >= 2) {
-            // (Per-term coverage: see MEANING_TERM_Z.)
+        // (Per-term coverage: see MEANING_TERM_Z; not in a small set, see
+        // MEANING_SMALL.)
+        if (mode === "hybrid" && count >= 2 && this.vecCount >= MEANING_SMALL) {
             plan.lacking = [];
             var dims = this.vectors.dims;
             var given = opts.termVectors;
@@ -7106,8 +7780,9 @@ var SearchCore = (function () {
             "YYYY, YYYY-MM or YYYY-MM-DD)"},
         {example: "on:today", meaning: "taken on this day in earlier years (on:05-14: " +
             "that day in any year)"},
-        {example: "place:portugal", meaning: "taken in a town, region or country (pictures " +
-            "with a GPS position, or an estimated place: is:place-estimated)"},
+        {example: "place:portugal", meaning: "taken in a town, region or country, or at a " +
+            "named place of the street maps (place:\"city zoo\"; pictures with a GPS " +
+            "position, or an estimated place: is:place-estimated)"},
         {example: "has:text", meaning: "with text, a location (has:gps), people, animals, ..."},
         {example: "is:360", meaning: "360\u00b0 photos and videos; also is:video, is:drive, " +
             "is:duplicate, is:undescribed, is:edited, is:hidden, is:gps-ignored"},
@@ -7154,6 +7829,12 @@ var SearchCore = (function () {
             var values = rec && typeof rec === "object" ? placeValues(rec) : [];
             return values.length ? values[values.length - 1] : "";
         },
+        // The search for the pictures taken at a named place (a record's np):
+        // place:"its words".
+        namedPlaceQuery: function (name) {
+            var words = tokens(name);
+            return words.length ? "place:\"" + words.join(" ") + "\"" : "";
+        },
         dateLabel: dateLabel,
         rangeLabel: rangeLabel,
         findAlbum: findAlbum,
@@ -7167,7 +7848,25 @@ var SearchCore = (function () {
         MEANING_TEXTS: MEANING_TEXTS,
         decodeVectors: decodeVectors,
         joinVectors: joinVectors,
-        queryVector: queryVector
+        queryVector: queryVector,
+        areas: {
+            read: readArea,
+            encode: encodeArea,
+            has: areaHas,
+            label: areaLabel,
+            name: areaName,
+            bounds: areaBounds,
+            metres: metresLabel,
+            simplify: simplifyLine,
+            trackPositions: trackPositions,
+            worldY: worldY,
+            latitudeOf: latitudeOf,
+            worldScale: worldScale,
+            MAX_TEXT: AREA_MAX_TEXT,
+            MAX_POINTS: AREA_MAX_POINTS,
+            MAX_METRES: AREA_MAX_METRES,
+            NAME_LENGTH: AREA_NAME_LENGTH
+        }
     };
 })();
 

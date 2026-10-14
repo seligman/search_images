@@ -35,6 +35,10 @@
    come after it (unless the map was moved since). Names on the street
    maps keep clear of the buttons, the credits and the note.
 
+   The list of a pin names each picture's named place on the street maps
+   (a park, a museum: the record's np, see named_places.py), and its title
+   the named place most of them were taken at.
+
    Estimated places (place_estimates.py: pictures without a GPS position
    of their own, points with "e": 1) are drawn as hollow pins (a pin whose
    pictures are all estimated), and only while "Show estimated places" is
@@ -50,7 +54,13 @@
    playing the whole drive. A clip of a drive opened from a pin plays the
    whole drive too, as on the search page.
 
-   The address holds the search (as on the search page) and the map's
+   An area of the map limits the search ("Search an area": a rectangle, a
+   shape drawn around it, the view, or a street, park or place picked from
+   the street maps; see "An area of the map" in the page's code and
+   search-core.js "Areas on the map"): only its pictures keep their pins,
+   the rest of the map is veiled, and a chip in the bar names it.
+
+   The address holds the search (as on the search page, with its area) and the map's
    view ("view=lat,lon,zoom"), so a reload, a link or "Back to the map"
    shows the same place (a view that shows none of the search's pictures
    is not kept: the map fits them), and the open list ("pin=lat,lon").
@@ -467,8 +477,8 @@ var MAP = (function () {
 
     /* The search a chip of the viewer opens (a search state, see
        SITE.searchState): just that value -- group "q" for words, else a
-       facet group -- without the query, filters, map view or dates
-       (state.from/to, the timeline's) of the search the map shows. */
+       facet group -- without the query, filters, map view, dates
+       (state.from/to, the timeline's) or area of the search the map shows. */
     function chipState(state, group, value) {
         var target = {};
         Object.keys(state || {}).forEach(function (key) {
@@ -479,6 +489,8 @@ var MAP = (function () {
         target.view = "";
         target.from = "";
         target.to = "";
+        target.area = "";
+        target.aname = "";
         if (group !== "q") {
             target.filters[group] = [value];
         }
@@ -677,6 +689,7 @@ var MAP = (function () {
             // (No storage: the default.)
         }
         var allRoutes = null;           // ROUTES.prepare's routes, once loaded
+        var routeList = null;           // and as they came (for the index's places)
         var routeLines = [];            // the lines of the search's clips
         var routeCount = 0;             // the routes they are of
         var onRoutes = {};              // ids of the clips drawn as lines: no pins
@@ -726,6 +739,9 @@ var MAP = (function () {
         var vectorsWanted = false;
         var allLocations = null;
         var locations = [];
+        // With an area that holds none of the pictures that match: {total, placed} of
+        // those that match anywhere (placed: how many have a place to be in an area by).
+        var areaElsewhere = null;
         var matchCount = 0;
         var rank = {};
         var loadState = "loading";      // loading | failed | ready
@@ -825,6 +841,11 @@ var MAP = (function () {
                     SHELL.setState({view: formatView(view), ids: null});
                 }
                 updateLinks();
+                if (areaMode === "pick") {
+                    // (The names of the new view, for the list.)
+                    listNames();
+                }
+                hideMenu();
             }, 250);
         }
 
@@ -885,11 +906,8 @@ var MAP = (function () {
             var noteWas = detailNote.hidden;
             detailNote.hidden = drawn.stretch < 2 ||
                 (drawn.streets > 0 && drawn.missing < NOTE_SHARE * drawn.tiles);
-            var creditWas = streetsCredit ? streetsCredit.hidden : true;
-            if (streetsCredit) {
-                streetsCredit.hidden = !drawn.streets;
-            }
-            if ((creditWas && streetsCredit && !streetsCredit.hidden) ||
+            // (The credit: the world image's, the street maps', or both.)
+            if (STREETS.showCredit(streetsCredit, drawn) ||
                     (noteWas && !detailNote.hidden && drawn.streets)) {
                 // (Shown just now: the names are placed clear of it again.)
                 scheduleDraw();
@@ -1132,6 +1150,7 @@ var MAP = (function () {
             var at = corner();
             drawTiles(at);
             drawRoutes(at);
+            drawArea(at);
             drawPinsNow(at);
             drawTarget();
         }
@@ -1245,7 +1264,8 @@ var MAP = (function () {
         }
 
         function filtered() {
-            return Boolean(search.q || Object.keys(search.filters).length || SHELL.library());
+            return Boolean(search.q || Object.keys(search.filters).length || SHELL.library() ||
+                           search.area);
         }
 
         function renderStatus() {
@@ -1267,13 +1287,35 @@ var MAP = (function () {
                 return point.e;
             }).length;
             if (count) {
-                statusBar.textContent = (filtered() && matchCount > count
-                    ? fmt.number(count) + " of " + fmt.plural(matchCount, "matching picture") +
-                      " have a location"
-                    : fmt.plural(count, "picture") + " with a location") +
+                // (With words or filters too: the matching ones.)
+                var narrowed = Boolean(search.q || Object.keys(search.filters).length ||
+                                       SHELL.library() || search.from || search.to);
+                statusBar.textContent = (search.area ? fmt.plural(
+                    count, narrowed ? "matching picture" : "picture") + " in this area"
+                    : filtered() && matchCount > count
+                        ? fmt.number(count) + " of " + fmt.plural(matchCount, "matching picture") +
+                          " have a location"
+                        : fmt.plural(count, "picture") + " with a location") +
                     (estimated ? " (" + fmt.number(estimated) + " estimated)" : "") +
                     (routeCount && showRoutes ? " \u00b7 " + fmt.plural(routeCount, "drive route")
                         : "");
+                showMessage(null);
+                return;
+            }
+            if (search.area) {
+                // (No card over the map: the area is in sight, to draw again. A
+                // place named without a position is in no area: said so.)
+                var elsewhere = areaElsewhere && areaElsewhere.total && areaElsewhere.placed === 0
+                    ? areaElsewhere.total : 0;
+                statusBar.textContent = matchCount
+                    ? fmt.plural(matchCount, "picture") + " of this area " +
+                      (matchCount === 1 ? "has" : "have") + " only an estimated place: " +
+                      "Show estimated places shows " + (matchCount === 1 ? "it" : "them")
+                    : elsewhere === 1 ? "The picture that matches has no position, so it is " +
+                      "in no area of the map"
+                        : elsewhere ? "None of the " + fmt.plural(elsewhere, "picture") +
+                          " that match has a position, so none is in an area of the map"
+                            : "No pictures in this area";
                 showMessage(null);
                 return;
             }
@@ -1281,10 +1323,13 @@ var MAP = (function () {
             var back = el("a", {className: "button", href: SITE.searchUrl(searchLinkState()),
                                 text: "Back to search"});
             if (filtered() && matchCount) {
-                showMessage(matchCount === 1 ? "The picture that matches has no location"
+                // ("position": a picture may have a place without one, see
+                // place_estimates.file_place.)
+                showMessage(matchCount === 1 ? "The picture that matches has no position"
                     : "None of the " + fmt.plural(matchCount, "picture") + " that match " +
-                      "have a location",
-                            ["Only pictures with a GPS position in their file are on the map."],
+                      "have a position",
+                            ["Only pictures with a GPS position in their file are on the map " +
+                             "(a place named without a position has no pin)."],
                             [back]);
             } else if (filtered()) {
                 showMessage("No pictures match this search", [], [back]);
@@ -1366,6 +1411,11 @@ var MAP = (function () {
             if (date) {
                 text.appendChild(el("span", {className: "map-panel-date", text: date}));
             }
+            var named = VIEWER.format.namedPlace(rec);
+            if (named) {
+                text.appendChild(el("span", {className: "map-panel-place", text: named,
+                                             title: VIEWER.format.namedPlaceNote(rec)}));
+            }
             if (estimatedIds[id]) {
                 link.classList.add("is-estimated");
                 text.appendChild(el("span", {className: "map-panel-date",
@@ -1423,6 +1473,23 @@ var MAP = (function () {
             panBy(x - sx, y - sy);
         }
 
+        // " \u00b7 Harbour Aquarium": the named place more than half of a pin's
+        // pictures were taken at, for the list's title, or "".
+        function panelPlace(ids) {
+            var counts = Object.create(null);
+            var best = "";
+            ids.forEach(function (id) {
+                var name = VIEWER.format.namedPlace(indexById[id]);
+                if (name) {
+                    counts[name] = (counts[name] || 0) + 1;
+                    if (!best || counts[name] > counts[best]) {
+                        best = name;
+                    }
+                }
+            });
+            return best && counts[best] * 2 > ids.length ? " \u00b7 " + best : "";
+        }
+
         function openPanel(group, byKeyboard) {
             var ids = group.ids.slice().sort(byRank);
             var picked = {};
@@ -1434,7 +1501,7 @@ var MAP = (function () {
                          point: unproject(group.x, group.y, width())};
             markPicked();
             clear(panelList);
-            panelTitle.textContent = fmt.plural(ids.length, "picture");
+            panelTitle.textContent = fmt.plural(ids.length, "picture") + panelPlace(ids);
             panelList.scrollTop = 0;
             showMore();
             updateGridLink();
@@ -1621,6 +1688,7 @@ var MAP = (function () {
                         if (loaded) {
                             allLocations = loaded;
                         }
+                        placeIndex();
                         if (selection && selection.point) {
                             startPin = selection.point;
                         }
@@ -1652,6 +1720,14 @@ var MAP = (function () {
         }
 
         function clickAt(x, y, slack) {
+            if (areaMode === "pick") {
+                pickAt(x, y, slack > MOUSE_SLACK ? PICK_TOUCH_SLACK : PICK_SLACK);
+                return;
+            }
+            if (areaMode) {
+                return;
+            }
+            hideMenu();
             var hit = hitPin(pins, x, y, slack);
             if (hit) {
                 openPanel(hit.group, false);
@@ -1683,6 +1759,11 @@ var MAP = (function () {
             event.preventDefault();
             takeFocus();
             var p = rectPoint(event);
+            if (areaMode === "box" || areaMode === "draw") {
+                sketchStart(p);
+                sketch.mouse = true;
+                return;
+            }
             drag = {downX: p.x, downY: p.y, lastX: p.x, lastY: p.y, moved: false};
         });
 
@@ -1712,7 +1793,19 @@ var MAP = (function () {
             drag.lastY = p.y;
         });
 
+        // (Drawing an area: the mouse draws instead of moving the map.)
+        window.addEventListener("mousemove", function (event) {
+            if (sketch && sketch.mouse) {
+                sketchMove(rectPoint(event));
+            }
+        });
+
         window.addEventListener("mouseup", function (event) {
+            if (sketch && sketch.mouse) {
+                sketchMove(rectPoint(event));
+                sketchDone();
+                return;
+            }
             if (!drag) {
                 return;
             }
@@ -1771,10 +1864,15 @@ var MAP = (function () {
             event.preventDefault();
             takeFocus();
             var touches = touchList(event);
-            if (touches.length === 1) {
+            if (touches.length === 1 && (areaMode === "box" || areaMode === "draw")) {
+                // (One finger draws the area; two still move the map.)
+                sketchStart(touches[0]);
+                touchState = {kind: "sketch"};
+            } else if (touches.length === 1) {
                 touchState = {kind: "pan", lastX: touches[0].x, lastY: touches[0].y,
                               downX: touches[0].x, downY: touches[0].y, moved: false};
             } else if (touches.length >= 2) {
+                sketch = null;
                 touchState = {kind: "pinch", startSpread: spread(touches[0], touches[1]),
                               startZoom: view.zoom, lastMid: middle(touches[0], touches[1]),
                               moved: true};
@@ -1787,7 +1885,9 @@ var MAP = (function () {
                 return;
             }
             var touches = touchList(event);
-            if (touchState.kind === "pan" && touches.length === 1) {
+            if (touchState.kind === "sketch" && sketch && touches.length === 1) {
+                sketchMove(touches[0]);
+            } else if (touchState.kind === "pan" && touches.length === 1) {
                 var p = touches[0];
                 if (Math.abs(p.x - touchState.downX) + Math.abs(p.y - touchState.downY) > 6) {
                     touchState.moved = true;
@@ -1808,6 +1908,11 @@ var MAP = (function () {
 
         canvas.addEventListener("touchend", function (event) {
             event.preventDefault();
+            if (touchState && touchState.kind === "sketch") {
+                sketchDone();
+                touchState = event.touches.length ? {kind: "done"} : null;
+                return;
+            }
             if (touchState && touchState.kind === "pan" && !touchState.moved) {
                 var now = Date.now();
                 // A second tap within 300 ms near the first zooms in.
@@ -1865,12 +1970,26 @@ var MAP = (function () {
             var stepX = Math.max(40, Math.round(view.w / (event.shiftKey ? 2 : 6)));
             var stepY = Math.max(40, Math.round(view.h / (event.shiftKey ? 2 : 6)));
             var key = event.key;
-            if (key === "Escape") {
+            if (key === "Escape" && (sketch || (areaMenu && !areaMenu.hidden) ||
+                                     (areaTools && !areaTools.hidden))) {
+                // (The area being drawn, the menu, the tool chosen, then the tools.)
+                if (sketch) {
+                    sketch = null;
+                    scheduleDraw();
+                } else if (areaMenu && !areaMenu.hidden) {
+                    hideMenu();
+                } else if (areaMode) {
+                    setMode("");
+                } else {
+                    closeTools(true);
+                }
+            } else if (key === "Escape") {
                 if (panel.hidden) {
                     return;
                 }
                 closePanel(true);
-            } else if (inPanel) {
+            } else if (inPanel || (areaTools && areaTools.contains(target)) ||
+                       (areaMenu && areaMenu.contains(target))) {
                 return;
             } else if (key === "+" || key === "=") {
                 zoomAt(view.w / 2, view.h / 2, view.zoom + 1);
@@ -1912,6 +2031,885 @@ var MAP = (function () {
         document.getElementById("zoom-out").addEventListener("click", function () {
             zoomAt(view.w / 2, view.h / 2, view.zoom - 1);
         });
+
+        /* An area of the map: the search by drawing on the map
+
+           "Search an area" opens a strip of tools over the map: Rectangle
+           (drag across the map), Draw (draw around it; letting go closes
+           it), Street or place (click or tap one on the street maps, or find
+           one by name among those of the view -- a street with some metres
+           either side, an outlined area such as a park, a point of interest
+           with a circle around it: STREETS.Picker) and This view (the
+           rectangle the map shows; the keyboard's way too). The area becomes
+           part of the search (the address's area= and aname=, SearchCore's
+           area option): only the pictures taken in it keep their pins, the
+           rest of the map is veiled, and a chip in the bar names it, with an
+           x that takes it away. The search page, smart albums and an export
+           that publishes locations keep it. Two fingers still move the map
+           while drawing; Esc stops. */
+
+        var areaButton = document.getElementById("map-area-button");
+        var areaTools = document.getElementById("map-area-tools");
+        var areaHint = document.getElementById("map-area-hint");
+        var areaFind = document.getElementById("map-area-find");
+        var areaInput = document.getElementById("map-area-input");
+        var areaList = document.getElementById("map-area-list");
+        var areaMetres = document.getElementById("map-area-metres");
+        var areaMenu = document.getElementById("map-area-menu");
+        var areaChip = document.getElementById("map-area-chip");
+        var areaModes = areaTools ? Array.prototype.slice.call(
+            areaTools.querySelectorAll("[data-mode]")) : [];
+        var picker = streets && STREETS.Picker ? new STREETS.Picker(streets) : null;
+        var AREAS = SearchCore.areas;
+        // Street or place works from this zoom on (closer, a click is precise).
+        var PICK_ZOOM = 13;
+        var PICK_SLACK = 10;
+        var PICK_TOUCH_SLACK = 22;
+        var NAMES_SHOWN = 40;
+        // A free shape: a point every SKETCH_STEP pixels at most, its outline
+        // simplified to within SKETCH_TOLERANCE pixels, at most SKETCH_POINTS
+        // points while drawing; anything smaller than MIN_SKETCH pixels is no area.
+        var SKETCH_STEP = 3;
+        var SKETCH_TOLERANCE = 1.5;
+        var SKETCH_POINTS = 4000;
+        var MIN_SKETCH = 8;
+        // A street or an area from the street maps is simplified to within this
+        // many metres (a street's at most a quarter of its width either side).
+        var PICK_TOLERANCE = 3;
+        // The veil over the rest of the map: darker over the dark street maps.
+        var VEIL = "rgba(12, 17, 24, 0.4)";
+        var DARK_VEIL = "rgba(0, 0, 0, 0.55)";
+        var EDGE = "rgba(255, 210, 63, 0.98)";
+        var EDGE_CASING = "rgba(12, 17, 24, 0.85)";
+        var HINTS = {
+            "": "Drag a rectangle, draw around a place, or pick a street or a place of the " +
+                "street maps; This view searches what the map shows now.",
+            // (Without street maps: no picking; the admin is told where they come from.)
+            plain: "Drag a rectangle or draw around a place; This view searches what the map " +
+                "shows now." + (adminOn ? " Street maps (Manage, Street maps) let you pick a " +
+                "street or a place too." : ""),
+            box: "Drag across the map to draw a rectangle. Two fingers still move the map; " +
+                "Esc stops.",
+            draw: "Draw around the area with the mouse or a finger; letting go closes it. " +
+                "Esc stops.",
+            pick: "Click or tap a street, a park or a place of the street maps, or find one " +
+                "by name in this view."
+        };
+        var areaMode = "";          // "", "box", "draw" or "pick"
+        var sketch = null;          // being drawn: {kind, points: [{x, y}] (screen)}
+        var named = null;           // the names of the view (Street or place)
+        var namedFor = "";          // the view they are of
+        var namedWhy = "";          // why there are none: "wait", "large" or "failed"
+        var chosenWithFocus = false;    // a name chosen with the focus in the tools
+        var namedShown = [];        // those in the list now
+        var namedActive = -1;
+        var namesTimer = 0;
+        var picking = 0;            // the pick being read (its number)
+        var veilCanvas = null;
+
+        function currentArea() {
+            return search.area ? AREAS.read(search.area) : null;
+        }
+
+        // True when the focus is in the tools or the Which one? menu.
+        function focusInTools() {
+            var focused = document.activeElement;
+            return Boolean(focused && ((areaTools && areaTools.contains(focused)) ||
+                                       (areaMenu && areaMenu.contains(focused))));
+        }
+
+        function renderAreaChip() {
+            if (!areaChip) {
+                return;
+            }
+            clear(areaChip);
+            var label = search.area ? AREAS.label(search.area, search.aname) : "";
+            areaChip.hidden = !label;
+            // (A phone's bar keeps its rows: style.css, "map-has-area".)
+            document.body.classList.toggle("map-has-area", Boolean(label));
+            if (label) {
+                var chip = el("button", {type: "button", className: "filter-chip",
+                                         title: "Show every place again"},
+                              [el("span", {text: "Area: " + label}),
+                               el("span", {className: "filter-chip-x", text: "\u00d7",
+                                           attrs: {"aria-hidden": "true"}})]);
+                chip.setAttribute("aria-label", "Area: " + label + ": remove");
+                chip.addEventListener("click", function () {
+                    setArea("", "");
+                    canvas.focus({preventScroll: true});
+                });
+                areaChip.appendChild(chip);
+            }
+            if (areaButton) {
+                areaButton.textContent = label ? "Change the area" : "Search an area";
+                areaButton.setAttribute("aria-label", label ? "Change the area of the map"
+                    : "Search an area of the map");
+            }
+        }
+
+        // The search limited to an area (its text; "" for none) named name
+        // (keepTools: the tools stay as they are).
+        function setArea(text, name, keepTools) {
+            var area = text ? AREAS.read(text) : null;
+            search.area = area ? area.text : "";
+            search.aname = area ? AREAS.name(name) : "";
+            SHELL.setState({area: search.area || null, aname: search.aname || null});
+            // (Set from the tools with the keyboard -- This view, the list of names,
+            // Which one? --: the focus goes to the new chip, not lost with the tools.)
+            var fromTools = focusInTools() || chosenWithFocus;
+            chosenWithFocus = false;
+            if (!keepTools) {
+                closeTools(false);
+            }
+            renderAreaChip();
+            if (fromTools && !keepTools) {
+                var chipButton = areaChip ? areaChip.querySelector("button") : null;
+                (chipButton && !areaChip.hidden ? chipButton : areaButton || canvas)
+                    .focus({preventScroll: true});
+            }
+            if (loadState === "ready") {
+                applySearch(false);
+            } else {
+                updateLinks();
+            }
+            scheduleDraw();
+        }
+
+        /* The tools */
+
+        function openTools() {
+            if (!areaTools) {
+                return;
+            }
+            areaTools.hidden = false;
+            areaButton.setAttribute("aria-expanded", "true");
+            document.body.classList.add("map-area-open");
+            setMode("");
+            var pick = areaTools.querySelector("[data-mode='pick']");
+            if (pick) {
+                // (No street maps here: the button goes, and the hint says nothing of it.)
+                pick.hidden = !picker;
+                pick.title = "Pick a street, a park or a place of the street maps";
+            }
+            showMetres();
+            if (areaModes[0]) {
+                areaModes[0].focus();
+            }
+        }
+
+        function closeTools(returnFocus) {
+            if (!areaTools || areaTools.hidden) {
+                return;
+            }
+            setMode("");
+            areaTools.hidden = true;
+            areaButton.setAttribute("aria-expanded", "false");
+            document.body.classList.remove("map-area-open");
+            if (returnFocus) {
+                areaButton.focus();
+            }
+        }
+
+        function setHint(text) {
+            if (areaHint) {
+                areaHint.textContent = text;
+            }
+        }
+
+        // The Within list as wide as the street searched now (an address's
+        // width not among its choices becomes one).
+        function showMetres() {
+            var area = currentArea();
+            if (!areaMetres || !area || area.kind !== "l" || !(area.metres > 0)) {
+                return;
+            }
+            var value = String(Math.round(area.metres));
+            var options = Array.prototype.slice.call(areaMetres.querySelectorAll("option"));
+            var known = options.some(function (option) {
+                return option.getAttribute("value") === value;
+            });
+            if (!known) {
+                var added = el("option", {text: fmt.number(Number(value)) + " m",
+                                          attrs: {value: value}});
+                var before = options.filter(function (option) {
+                    return Number(option.getAttribute("value")) > Number(value);
+                })[0] || null;
+                areaMetres.insertBefore(added, before);
+            }
+            areaMetres.value = value;
+        }
+
+        function setMode(mode) {
+            areaMode = mode;
+            sketch = null;
+            picking += 1;
+            hideMenu();
+            areaModes.forEach(function (button) {
+                button.setAttribute("aria-pressed",
+                                    button.getAttribute("data-mode") === mode ? "true" : "false");
+            });
+            canvas.classList.toggle("drawing", mode === "box" || mode === "draw");
+            canvas.classList.toggle("picking", mode === "pick");
+            if (areaTools) {
+                areaTools.classList.toggle("is-drawing", mode === "box" || mode === "draw");
+            }
+            if (areaFind) {
+                areaFind.hidden = mode !== "pick";
+            }
+            setHint(mode ? HINTS[mode] || "" : picker ? HINTS[""] : HINTS.plain);
+            if (mode === "pick") {
+                listNames();
+            }
+            scheduleDraw();
+        }
+
+        // A screen point as a place; the longitude goes on past 180 (or -180)
+        // so the points of one shape stay together across the date line.
+        function screenPlace(sx, sy) {
+            var at = corner();
+            var place = unproject(at.left + sx, at.top + sy, at.w);
+            return {lat: place.lat, lon: (at.left + sx) / at.w * 360 - 180};
+        }
+
+        // Screen pixels per metre at a latitude.
+        function pixelsPerMetre(lat) {
+            return width() / AREAS.worldScale(lat);
+        }
+
+        /* An area's text from parts in degrees, simplified (in world units,
+           tolerance in metres at the first point) until it is short enough;
+           "" when it cannot be made. */
+        function fitText(kind, parts, metres, tolerance) {
+            var lat = parts[0][0];
+            var step = tolerance / AREAS.worldScale(lat);
+            for (var tries = 0; tries < 12; tries++) {
+                var simple = parts.map(function (part) {
+                    var world = [];
+                    for (var k = 0; k < part.length; k += 2) {
+                        world.push((part[k + 1] + 180) / 360, AREAS.worldY(part[k]));
+                    }
+                    world = step > 0 ? AREAS.simplify(world, step) : world;
+                    var out = [];
+                    for (var j = 0; j < world.length; j += 2) {
+                        out.push(AREAS.latitudeOf(world[j + 1]), world[j] * 360 - 180);
+                    }
+                    return out;
+                }).filter(function (part) {
+                    return kind !== "p" || part.length >= 6;
+                });
+                var text = simple.length ? AREAS.encode(kind, simple, metres) : "";
+                if (text && text.length <= AREAS.MAX_TEXT) {
+                    return text;
+                }
+                step = Math.max(step * 2, 1e-9);
+            }
+            return "";
+        }
+
+        /* A drawn line as a lasso: cut where it first crosses itself (the loop
+           it closed there; a line that overshoots its start, or goes round
+           twice, searches what the first loop holds), else as drawn. [{x, y}] */
+        function lassoLoop(points) {
+            for (var j = 2; j < points.length; j++) {
+                var c = points[j - 1];
+                var d = points[j];
+                for (var i = 0; i < j - 2; i++) {
+                    var a = points[i];
+                    var b = points[i + 1];
+                    var den = (b.x - a.x) * (d.y - c.y) - (b.y - a.y) * (d.x - c.x);
+                    if (!den) {
+                        continue;
+                    }
+                    var t = ((c.x - a.x) * (d.y - c.y) - (c.y - a.y) * (d.x - c.x)) / den;
+                    var u = ((c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x)) / den;
+                    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+                        var loop = [{x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y)}]
+                            .concat(points.slice(i + 1, j));
+                        if (loop.length >= 3) {
+                            return loop;
+                        }
+                    }
+                }
+            }
+            return points;
+        }
+
+        function sketchDone() {
+            var drawn = sketch;
+            sketch = null;
+            scheduleDraw();
+            if (!drawn || drawn.points.length < 2) {
+                return;
+            }
+            if (drawn.kind !== "box") {
+                drawn = {kind: drawn.kind, points: lassoLoop(drawn.points)};
+            }
+            var xs = drawn.points.map(function (point) {
+                return point.x;
+            });
+            var ys = drawn.points.map(function (point) {
+                return point.y;
+            });
+            var x0 = Math.min.apply(null, xs);
+            var x1 = Math.max.apply(null, xs);
+            var y0 = Math.min.apply(null, ys);
+            var y1 = Math.max.apply(null, ys);
+            if (x1 - x0 < MIN_SKETCH || y1 - y0 < MIN_SKETCH) {
+                setHint("That is too small for an area: drag further.");
+                return;
+            }
+            var text = "";
+            if (drawn.kind === "box") {
+                var sw = screenPlace(x0, y1);
+                var ne = screenPlace(x1, y0);
+                text = AREAS.encode("b", [[sw.lat, sw.lon, ne.lat, ne.lon]]);
+            } else {
+                var flat = [];
+                drawn.points.forEach(function (point) {
+                    flat.push(point.x, point.y);
+                });
+                var tolerance = SKETCH_TOLERANCE;
+                for (var tries = 0; tries < 12 && !text; tries++) {
+                    var simple = AREAS.simplify(flat, tolerance);
+                    var ring = [];
+                    for (var k = 0; k < simple.length; k += 2) {
+                        var place = screenPlace(simple[k], simple[k + 1]);
+                        ring.push(place.lat, place.lon);
+                    }
+                    if (ring.length < 6) {
+                        break;
+                    }
+                    text = AREAS.encode("p", [ring]);
+                    text = text.length <= AREAS.MAX_TEXT ? text : "";
+                    tolerance *= 2;
+                }
+            }
+            if (!text) {
+                setHint("That shape could not be made into an area: try again.");
+                return;
+            }
+            setArea(text, "");
+        }
+
+        function searchThisView() {
+            var sw = screenPlace(0, view.h);
+            var ne = screenPlace(view.w, 0);
+            if (ne.lon - sw.lon >= 360) {
+                sw.lon = -180;
+                ne.lon = 179.99999;
+            }
+            var text = AREAS.encode("b", [[Math.max(-85, sw.lat), sw.lon, Math.min(85, ne.lat),
+                                           ne.lon]]);
+            if (text) {
+                setArea(text, "");
+            }
+        }
+
+        /* Street or place */
+
+        function metresChosen() {
+            var value = areaMetres ? Number(areaMetres.value) : 50;
+            return value >= 1 && value <= AREAS.MAX_METRES ? value : 50;
+        }
+
+        function hideMenu() {
+            if (areaMenu && !areaMenu.hidden) {
+                areaMenu.hidden = true;
+                clear(areaMenu);
+            }
+        }
+
+        // "Pine Park \u00b7 park", with where it is when the view has two ("(north-west)").
+        function itemText(item) {
+            return item.name + " \u00b7 " + whatText(item);
+        }
+
+        function whatText(item) {
+            return item.what + (item.near ? " (" + item.near + ")" : "");
+        }
+
+        // The pick of a list or the menu: read all of it, then search it.
+        function choose(item) {
+            // (The menu goes, and the focus with it: setArea puts it on the chip.)
+            chosenWithFocus = focusInTools();
+            hideMenu();
+            if (!picker || !item) {
+                return;
+            }
+            var number = picking += 1;
+            setHint("Reading " + item.name + " from the street maps\u2026");
+            picker.gather(item, function (found) {
+                if (number !== picking) {
+                    return;
+                }
+                if (!found || !found.parts.length) {
+                    setHint("That could not be read from the street maps.");
+                    return;
+                }
+                // (A place: the circle that holds the pictures it names, see
+                // STREETS.placeWithin; Within shows it and changes it.)
+                var metres = (found.kind === "place" && STREETS.placeWithin(found.type)) ||
+                    metresChosen();
+                var text = found.kind === "area" ? fitText("p", found.parts, 0, PICK_TOLERANCE)
+                    : fitText("l", found.parts, metres, Math.min(PICK_TOLERANCE, metres / 4));
+                if (!text) {
+                    setHint("That is too large to search as one area.");
+                    return;
+                }
+                setArea(text, found.name);
+                if (found.cut) {
+                    SHELL.toast("Only the part of " + found.name + " near where it was picked " +
+                                "is searched (it goes on further).", "info");
+                }
+            });
+        }
+
+        function showMenu(x, y, list) {
+            if (!areaMenu) {
+                choose(list[0]);
+                return;
+            }
+            clear(areaMenu);
+            areaMenu.appendChild(el("p", {className: "map-area-menu-title", text: "Which one?"}));
+            list.forEach(function (item) {
+                areaMenu.appendChild(el("button", {type: "button", className: "map-area-option",
+                                                   text: itemText(item), attrs: {role: "menuitem"},
+                                                   on: {click: function () {
+                                                       choose(item);
+                                                   }}}));
+            });
+            areaMenu.hidden = false;
+            var w = areaMenu.offsetWidth || 220;
+            var h = areaMenu.offsetHeight || 40 * list.length;
+            areaMenu.style.left = Math.round(Math.max(8, Math.min(x + 10, view.w - w - 8))) + "px";
+            areaMenu.style.top = Math.round(Math.max(8, Math.min(y + 10, view.h - h - 8))) + "px";
+            var first = areaMenu.querySelector("button");
+            if (first) {
+                first.focus({preventScroll: true});
+            }
+        }
+
+        // A click or tap in Street or place: what is named there.
+        function pickAt(x, y, slack) {
+            hideMenu();
+            if (!picker) {
+                return;
+            }
+            if (view.zoom < PICK_ZOOM) {
+                setHint("Zoom in further to pick a street or a place.");
+                return;
+            }
+            var place = screenPlace(x, y);
+            var lat = place.lat;
+            var lon = normalizeLon(place.lon);
+            var number = picking += 1;
+            if (!picker.ready() && picker.whenReady) {
+                // (Their index is not in yet: the pick waits for it.)
+                setHint("Reading the street maps\u2026");
+                picker.whenReady(function (ready) {
+                    if (number !== picking) {
+                        return;
+                    }
+                    if (ready) {
+                        pickAt(x, y, slack);
+                    } else {
+                        setHint("The street maps could not be read.");
+                    }
+                });
+                return;
+            }
+            setHint("Looking at the street maps there\u2026");
+            picker.at(lat, lon, slack / pixelsPerMetre(lat), function (list) {
+                if (number !== picking) {
+                    return;
+                }
+                if (!list.length) {
+                    setHint("Nothing with a name right there: try closer to a street or a name " +
+                            "of the map.");
+                } else if (list.length === 1) {
+                    choose(list[0]);
+                } else {
+                    setHint(HINTS.pick);
+                    showMenu(x, y, list.slice(0, 8));
+                }
+            });
+        }
+
+        // The names of the view, for the list (read again when the view changed).
+        function listNames() {
+            if (!picker || !areaFind) {
+                return;
+            }
+            var key = formatView(view) + "/" + view.w + "x" + view.h;
+            if (key === namedFor && named) {
+                filterNames();
+                return;
+            }
+            namedFor = key;
+            named = null;
+            namedWhy = "";
+            filterNames();
+            if (view.zoom < PICK_ZOOM) {
+                return;
+            }
+            var sw = screenPlace(0, view.h);
+            var ne = screenPlace(view.w, 0);
+            picker.inView({south: sw.lat, west: sw.lon, north: ne.lat, east: ne.lon}, view.zoom,
+                          function (list, why) {
+                              if (namedFor !== key) {
+                                  return;
+                              }
+                              if (list) {
+                                  named = list;
+                                  namedWhy = "";
+                                  filterNames();
+                                  return;
+                              }
+                              // (Not read: asked again on the next key or focus, and once
+                              // the street maps' index is in.)
+                              named = null;
+                              namedFor = "";
+                              namedWhy = why || "wait";
+                              filterNames();
+                              if (namedWhy === "wait" && picker.whenReady) {
+                                  picker.whenReady(function (ready) {
+                                      if (areaMode !== "pick") {
+                                          return;
+                                      }
+                                      if (ready) {
+                                          listNames();
+                                      } else {
+                                          namedWhy = "failed";
+                                          filterNames();
+                                      }
+                                  });
+                              }
+                          });
+        }
+
+        function filterNames() {
+            if (!areaList) {
+                return;
+            }
+            clear(areaList);
+            namedActive = -1;
+            var typed = SearchCore.normalize(areaInput ? areaInput.value : "");
+            var note = null;
+            if (view.zoom < PICK_ZOOM || (!named && namedWhy === "large")) {
+                note = "Zoom in further to list the streets and places of the view.";
+            } else if (!named) {
+                note = namedWhy === "failed" ? "The street maps could not be read."
+                    : namedWhy === "wait" ? "Reading the street maps\u2026"
+                        : "Reading the names of the view\u2026";
+            }
+            namedShown = [];
+            if (!note && typed) {
+                var starts = [];
+                var within = [];
+                named.forEach(function (item) {
+                    var name = SearchCore.normalize(item.name);
+                    var at = name.indexOf(typed);
+                    if (at === 0) {
+                        starts.push(item);
+                    } else if (at > 0) {
+                        within.push(item);
+                    }
+                });
+                namedShown = starts.concat(within).slice(0, NAMES_SHOWN);
+                if (!namedShown.length) {
+                    note = "No street or place of the view is called that.";
+                }
+            } else if (!note) {
+                note = fmt.plural(named.length, "name") + " in this view: type to find one.";
+            }
+            namedShown.forEach(function (item, index) {
+                var option = el("li", {className: "map-area-name", id: "map-area-name-" + index,
+                                       attrs: {role: "option", "aria-selected": "false"}},
+                                [el("span", {text: item.name}),
+                                 el("span", {className: "map-area-what",
+                                             text: " \u00b7 " + whatText(item)})]);
+                option.addEventListener("mousedown", function (event) {
+                    event.preventDefault();
+                });
+                option.addEventListener("click", function () {
+                    choose(item);
+                });
+                areaList.appendChild(option);
+            });
+            if (note) {
+                areaList.appendChild(el("li", {className: "map-area-note", text: note,
+                                               attrs: {role: "presentation"}}));
+            }
+            if (areaInput) {
+                areaInput.setAttribute("aria-expanded", namedShown.length ? "true" : "false");
+                areaInput.removeAttribute("aria-activedescendant");
+            }
+        }
+
+        function markName(index) {
+            var options = areaList ? areaList.querySelectorAll("[role='option']") : [];
+            namedActive = Math.max(-1, Math.min(namedShown.length - 1, index));
+            for (var k = 0; k < options.length; k++) {
+                options[k].setAttribute("aria-selected", k === namedActive ? "true" : "false");
+                options[k].classList.toggle("is-active", k === namedActive);
+            }
+            if (namedActive >= 0) {
+                areaInput.setAttribute("aria-activedescendant", "map-area-name-" + namedActive);
+                if (options[namedActive].scrollIntoView) {
+                    options[namedActive].scrollIntoView({block: "nearest"});
+                }
+            } else {
+                areaInput.removeAttribute("aria-activedescendant");
+            }
+        }
+
+        /* Drawing the area: the rest of the map veiled, its outline, and the
+           shape being drawn. */
+
+        // The page's theme is dark (chosen, or the system's): the street maps are.
+        function darkTheme() {
+            var chosen = document.documentElement.getAttribute("data-theme");
+            if (chosen === "dark" || chosen === "light") {
+                return chosen === "dark";
+            }
+            return Boolean(window.matchMedia &&
+                           window.matchMedia("(prefers-color-scheme: dark)").matches);
+        }
+
+        function veilFor() {
+            if (!veilCanvas) {
+                veilCanvas = document.createElement("canvas");
+            }
+            if (typeof veilCanvas.getContext !== "function") {
+                return null;
+            }
+            if (veilCanvas.width !== canvas.width || veilCanvas.height !== canvas.height) {
+                veilCanvas.width = canvas.width;
+                veilCanvas.height = canvas.height;
+            }
+            return veilCanvas;
+        }
+
+        // The area's shapes in screen pixels: [[x, y, x, y, ...]].
+        function screenShapes(area, at) {
+            var w = at.w;
+            var shift = nearestCopy(area.cx * w, at.left + view.w / 2, w) - area.cx * w - at.left;
+            return area.shapes.map(function (shape) {
+                var out = [];
+                for (var k = 0; k < shape.length; k += 2) {
+                    out.push(shape[k] * w + shift, shape[k + 1] * w - at.top);
+                }
+                return out;
+            });
+        }
+
+        function trace(target, shape, close) {
+            target.moveTo(shape[0], shape[1]);
+            for (var k = 2; k < shape.length; k += 2) {
+                target.lineTo(shape[k], shape[k + 1]);
+            }
+            if (close) {
+                target.closePath();
+            }
+        }
+
+        function drawArea(at) {
+            var area = currentArea();
+            if (area) {
+                var shapes = screenShapes(area, at);
+                var radius = area.kind === "l" ? Math.max(3, area.metres * pixelsPerMetre(
+                    AREAS.latitudeOf((area.box.y0 + area.box.y1) / 2))) : 0;
+                var off = veilFor();
+                var v = off ? off.getContext("2d") : null;
+                if (v) {
+                    v.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    v.globalCompositeOperation = "source-over";
+                    v.clearRect(0, 0, view.w, view.h);
+                    v.fillStyle = darkTheme() ? DARK_VEIL : VEIL;
+                    v.fillRect(0, 0, view.w, view.h);
+                    v.globalCompositeOperation = "destination-out";
+                    v.fillStyle = "#000000";
+                    v.strokeStyle = "#000000";
+                    v.lineCap = "round";
+                    v.lineJoin = "round";
+                    shapes.forEach(function (shape) {
+                        v.beginPath();
+                        if (area.kind !== "l") {
+                            // (Even-odd, as it is searched: SearchCore inRing.)
+                            trace(v, shape, true);
+                            v.fill("evenodd");
+                        } else if (shape.length === 2) {
+                            v.arc(shape[0], shape[1], radius, 0, Math.PI * 2);
+                            v.fill();
+                        } else {
+                            trace(v, shape, false);
+                            v.lineWidth = 2 * radius;
+                            v.stroke();
+                        }
+                    });
+                    v.globalCompositeOperation = "source-over";
+                    ctx.drawImage(off, 0, 0, view.w, view.h);
+                }
+                ctx.save();
+                ctx.lineCap = "round";
+                ctx.lineJoin = "round";
+                [[4.5, EDGE_CASING], [2, EDGE]].forEach(function (pass) {
+                    ctx.beginPath();
+                    shapes.forEach(function (shape) {
+                        if (area.kind !== "l") {
+                            trace(ctx, shape, true);
+                        } else if (shape.length === 2) {
+                            ctx.moveTo(shape[0] + radius, shape[1]);
+                            ctx.arc(shape[0], shape[1], radius, 0, Math.PI * 2);
+                        } else {
+                            trace(ctx, shape, false);
+                        }
+                    });
+                    ctx.lineWidth = area.kind === "l" ? pass[0] - 1 : pass[0];
+                    ctx.strokeStyle = pass[1];
+                    if (area.kind === "l") {
+                        ctx.setLineDash([6, 5]);
+                    }
+                    ctx.stroke();
+                });
+                ctx.restore();
+            }
+            if (sketch && sketch.points.length > 1) {
+                ctx.save();
+                ctx.beginPath();
+                var first = sketch.points[0];
+                var last = sketch.points[sketch.points.length - 1];
+                if (sketch.kind === "box") {
+                    ctx.rect(Math.min(first.x, last.x), Math.min(first.y, last.y),
+                             Math.abs(last.x - first.x), Math.abs(last.y - first.y));
+                } else {
+                    ctx.moveTo(first.x, first.y);
+                    sketch.points.forEach(function (point) {
+                        ctx.lineTo(point.x, point.y);
+                    });
+                }
+                ctx.fillStyle = "rgba(255, 210, 63, 0.16)";
+                ctx.fill("evenodd");
+                ctx.lineWidth = 4.5;
+                ctx.strokeStyle = EDGE_CASING;
+                ctx.stroke();
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = EDGE;
+                ctx.stroke();
+                ctx.restore();
+            }
+        }
+
+        function sketchStart(p) {
+            sketch = {kind: areaMode, points: [{x: p.x, y: p.y}]};
+            scheduleDraw();
+        }
+
+        function sketchMove(p) {
+            var points = sketch.points;
+            var last = points[points.length - 1];
+            if (sketch.kind === "box") {
+                points[1] = {x: p.x, y: p.y};
+            } else if (Math.abs(p.x - last.x) + Math.abs(p.y - last.y) >= SKETCH_STEP &&
+                       points.length < SKETCH_POINTS) {
+                points.push({x: p.x, y: p.y});
+            }
+            scheduleDraw();
+        }
+
+        if (areaButton && areaTools) {
+            areaButton.addEventListener("click", function () {
+                if (areaTools.hidden) {
+                    openTools();
+                } else {
+                    closeTools(true);
+                }
+            });
+            areaModes.forEach(function (button) {
+                button.addEventListener("click", function (event) {
+                    var mode = button.getAttribute("data-mode");
+                    setMode(areaMode === mode ? "" : mode);
+                    // (Not with a finger: a phone's keyboard would cover the map to tap
+                    // on; the box is there to tap.)
+                    var touch = Boolean(window.matchMedia &&
+                                        window.matchMedia("(pointer: coarse)").matches);
+                    if (areaMode === "pick" && areaInput && (event.detail === 0 || !touch)) {
+                        areaInput.focus();
+                    }
+                });
+            });
+            var thisView = document.getElementById("map-area-view");
+            if (thisView) {
+                thisView.addEventListener("click", searchThisView);
+            }
+            var closeButton = document.getElementById("map-area-close");
+            if (closeButton) {
+                closeButton.addEventListener("click", function () {
+                    closeTools(true);
+                });
+            }
+        }
+        if (areaInput) {
+            areaInput.addEventListener("input", function () {
+                listNames();
+            });
+            areaInput.addEventListener("focus", listNames);
+            areaInput.addEventListener("keydown", function (event) {
+                if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    markName(namedActive + 1);
+                } else if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    markName(namedActive - 1);
+                } else if (event.key === "Enter") {
+                    event.preventDefault();
+                    choose(namedShown[namedActive >= 0 ? namedActive : 0]);
+                } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (areaInput.value) {
+                        areaInput.value = "";
+                        filterNames();
+                    } else {
+                        closeTools(true);
+                    }
+                }
+            });
+        }
+        if (areaMetres) {
+            areaMetres.addEventListener("change", function () {
+                // (A street or a place searched now gets the new width.)
+                var area = currentArea();
+                if (area && area.kind === "l") {
+                    var text = area.text.replace(/^l\d+/, "l" + metresChosen());
+                    if (AREAS.read(text)) {
+                        setArea(text, search.aname, true);
+                    }
+                }
+            });
+        }
+        if (areaMenu) {
+            areaMenu.addEventListener("keydown", function (event) {
+                if (event.key === "Escape") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    hideMenu();
+                    canvas.focus({preventScroll: true});
+                    return;
+                }
+                // (A menu's keys: up and down, round at the ends; Home, End.)
+                var items = Array.prototype.slice.call(
+                    areaMenu.querySelectorAll("[role='menuitem']"));
+                var at = items.indexOf(document.activeElement);
+                var next = event.key === "ArrowDown" ? (at + 1) % items.length
+                    : event.key === "ArrowUp" ? (at <= 0 ? items.length - 1 : at - 1)
+                        : event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : -1;
+                if (next >= 0 && items.length) {
+                    event.preventDefault();
+                    items[next].focus({preventScroll: true});
+                }
+            });
+        }
 
         /* Following the search */
 
@@ -1956,7 +2954,11 @@ var MAP = (function () {
         }
 
         function fit() {
-            var spot = fitView(locations, view.w, view.h, TILE, MIN_ZOOM, fitLimit(), 48);
+            // (A search of an area shows the area.)
+            var bounds = search.area ? AREAS.bounds(search.area) : null;
+            var spot = fitView(bounds ? [{lat: bounds.south, lon: normalizeLon(bounds.west)},
+                                         {lat: bounds.north, lon: normalizeLon(bounds.east)}]
+                : locations, view.w, view.h, TILE, MIN_ZOOM, fitLimit(), 48);
             if (spot) {
                 setView(spot.lat, spot.lon, spot.zoom);
             } else {
@@ -2008,13 +3010,25 @@ var MAP = (function () {
                 hidden: adminOn && search.hidden, sensitive: search.sensitive || undefined,
                 junk: search.junk, group: false, sort: search.sort || undefined,
                 range: {from: search.from, to: search.to}, seed: SITE.shuffleSeed(),
-                albums: indexAlbums
+                albums: indexAlbums, area: search.area || undefined
             }));
             rank = {};
             found.items.forEach(function (id, index) {
                 rank[id] = index;
             });
             matchCount = found.total;
+            // (Nothing in the area: are the pictures that match anywhere placed at all?)
+            areaElsewhere = null;
+            if (search.area && !found.total) {
+                var everywhere = SearchCore.search(searchIndex, interpreted.query,
+                                                   peopleSearch.options({
+                    library: library || "", libraries: indexLibraries, filters: search.filters,
+                    hidden: adminOn && search.hidden, sensitive: search.sensitive || undefined,
+                    junk: search.junk, group: false, range: {from: search.from, to: search.to},
+                    albums: indexAlbums}));
+                areaElsewhere = {total: everywhere.total,
+                                 placed: searchIndex.placedCount(everywhere.items)};
+            }
             estimatedIds = {};
             var anyEstimated = false;
             locations = (allLocations || []).filter(function (point) {
@@ -2059,6 +3073,13 @@ var MAP = (function () {
             scheduleDraw();
         }
 
+        // Where the pictures were taken, for an area (SearchCore's setPlaces).
+        function placeIndex() {
+            if (searchIndex && allLocations) {
+                searchIndex.setPlaces(allLocations, routeList || []);
+            }
+        }
+
         function load() {
             loadState = "loading";
             renderStatus();
@@ -2087,11 +3108,18 @@ var MAP = (function () {
                     }
                     allLocations = loaded;
                     loadState = "ready";
+                    placeIndex();
                     applySearch(false);
                     if (allRoutes === null && SITE.loadRoutes && typeof ROUTES !== "undefined") {
                         SITE.loadRoutes(function (list) {
                             if (list) {
                                 allRoutes = ROUTES.prepare(list);
+                                routeList = list;
+                                placeIndex();
+                                // (The list open from the address stays open.)
+                                if (selection && selection.point) {
+                                    startPin = selection.point;
+                                }
                                 applySearch(false);
                             }
                         });
@@ -2164,6 +3192,7 @@ var MAP = (function () {
                     applySearch(true);
                 }
             });
+            renderAreaChip();
             updateLinks();
             load();
         }

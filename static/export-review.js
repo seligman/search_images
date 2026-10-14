@@ -34,6 +34,8 @@
                                        it adds, or ""
      EXPORT_REVIEW.streetsText(counts, options)  what goes of the street maps
                                        (counts.street_maps), or ""
+     EXPORT_REVIEW.worldText(counts, options)  what goes of the world map's
+                                       tiles (counts.world_map), or ""
      EXPORT_REVIEW.detailsText(options)  what is published with each picture
      EXPORT_REVIEW.serveCommand(folder)  the command that tries a site locally
      EXPORT_REVIEW.bytes(n)            "162 MB"
@@ -83,11 +85,13 @@ var EXPORT_REVIEW = (function () {
         location: {label: "Location",
                    hint: "GPS positions (rounded to about 10 m), the town, region and " +
                          "country of each (when place names were downloaded, with a " +
-                         "GeoNames credit at the foot of the pages), the map, and the AI " +
-                         "model's separate landmark and place-guess fields. Shows where " +
-                         "pictures were taken, which may include your home. Titles and " +
-                         "descriptions can still name a place a picture shows; read them " +
-                         "in the review."},
+                         "GeoNames credit at the foot of the pages), the named place on " +
+                         "the street maps where each was taken (a park, a museum, a cafe, " +
+                         "a hotel, with an OpenStreetMap credit), the map, the areas of " +
+                         "the map of smart albums, and the AI model's separate landmark " +
+                         "and place-guess fields. Shows where pictures were taken, which " +
+                         "may include your home. Titles and descriptions can still name a " +
+                         "place a picture shows; read them in the review."},
         estimated_places: {label: "Estimated places",
                            hint: "With Location: the places estimated for pictures without " +
                                  "a GPS position of their own (from a copy, the pictures " +
@@ -118,6 +122,13 @@ var EXPORT_REVIEW = (function () {
                       hint: "The most detailed street maps that go along: zoom 15 shows " +
                             "every building, 14 the streets, 12 the main roads; each step " +
                             "down makes them about three times smaller."},
+        world_zoom: {label: "World map detail",
+                     hint: "With Location: the most detailed zoom of the world map's " +
+                           "tiles that go along; the maps draw closer views from them, " +
+                           "a little blurred, until the street maps take over. Each zoom " +
+                           "has four times the tiles of the one before (zoom 6 alone is " +
+                           "about twice as large as zoom 0 to 5): the review says how large " +
+                           "they are."},
         title: {label: "Site title",
                 hint: "Shown in the header and the browser tab."},
         credits: {label: "Footer line",
@@ -547,7 +558,7 @@ var EXPORT_REVIEW = (function () {
                      ["RAW files", parts.raws],
                      ["pages and data", parts.data], ["meaning vectors", parts.vectors],
                      ["look vectors", parts.looks], ["search by meaning", parts.meaning],
-                     ["street maps", parts.maps]];
+                     ["street maps", parts.maps], ["world map", parts.tiles]];
         var list = named.filter(function (item) {
             return item[1] > 0;
         }).map(function (item) {
@@ -785,6 +796,25 @@ var EXPORT_REVIEW = (function () {
             (options.home_km ? ", none near home" : "") + ".";
     }
 
+    /* What goes of the world map's tiles (counts.world_map of the preview:
+       {available (the highest zoom there is; null: the bundled small map),
+       zoom, tiles, bytes, more: {zoom, tiles, bytes} of the next zoom}), in a
+       sentence; "" without location or a tile pyramid. */
+    function worldText(counts, options) {
+        var found = counts && counts.world_map;
+        if (!found || !options || !options.location || typeof found.available !== "number") {
+            return "";
+        }
+        var text = "World map: " + number(found.tiles) + (found.tiles === 1 ? " tile" :
+            " tiles") + " (" + bytes(found.bytes) + "), down to zoom " + number(found.zoom);
+        if (found.more) {
+            text += "; zoom " + number(found.more.zoom) + " would add " +
+                number(found.more.tiles) + (found.more.tiles === 1 ? " tile" : " tiles") +
+                " (" + bytes(found.more.bytes) + ")";
+        }
+        return text + ".";
+    }
+
     // What each picture carries into the export, in a sentence or two.
     function detailsText(options) {
         var shown = ["title", "description", "tags", "any text read in the picture",
@@ -793,7 +823,8 @@ var EXPORT_REVIEW = (function () {
         var hidden = [];
         (options.file_names ? shown : hidden).push("file name");
         (options.folders ? shown : hidden).push("folder");
-        (options.location ? shown : hidden).push("location (GPS position and place names)");
+        (options.location ? shown : hidden).push("location (GPS position, place names and " +
+                                                 "named place)");
         if (options.location && options.estimated_places) {
             shown.push("estimated place");
         }
@@ -818,7 +849,7 @@ var EXPORT_REVIEW = (function () {
         }
         if (options.location && typeof options.home_km === "number" && options.home_km > 0) {
             text += " Nothing within about " + number(options.home_km) + " km of home: no " +
-                "position, route or town there.";
+                "position, route, town or named place there.";
         }
         if (options.story && options.location) {
             text += " The trip's story goes too, a paragraph a day" + (options.people_names
@@ -862,6 +893,7 @@ var EXPORT_REVIEW = (function () {
         meaningText: meaningText,
         looksText: looksText,
         streetsText: streetsText,
+        worldText: worldText,
         detailsText: detailsText,
         serveCommand: serveCommand,
         bytes: bytes

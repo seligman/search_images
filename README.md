@@ -913,6 +913,9 @@ the page header or the filters.
   [Estimated places](#estimated-places)). The routes of drives are lines,
   while **Show drive routes** is on: point at one to see the clip there,
   click it to play the drive from there (see [Routes](#routes-a-dashcams-gps)).
+  **Search an area** limits the search to a rectangle, a shape you draw,
+  the view, or a street or a park of the street maps (see [Searching an
+  area of the map](#searching-an-area-of-the-map)).
   The map uses
   a small bundled world image; run `python make_tiles.py` once for a
   detailed one (see [Other tools](#other-tools)), and download the [street
@@ -1057,6 +1060,13 @@ fields, `-words` or next to `OR`):
   also finds the pictures with it in their words (`date:2005 OR 2005`: a
   scan in the folder "2005 Taxes" has only the file's date).
 
+Words about taking the picture, which no description has (`taken`,
+`shot`, `photographed`, `filmed`, ...; and `something`, `anything`), are
+left out when the search names a person, a place or a date, or when
+`in`, `at`, `from`, ... and more words follow them: `pictures taken in
+Calgary` is `in Calgary`, `something at the zoo` is `at the zoo`
+(`something warm to drink` keeps its words).
+
 Everything else is searched as words (and by meaning, see below). Each
 chip's **×** searches that part as typed words instead, and **Search the
 words as typed** does it for all of them, for that search (the address
@@ -1157,9 +1167,12 @@ A switch next to the sort order chooses how a search goes:
   above the results says how many pictures have the words.
 
 Close in meaning means much closer than the other pictures are; in a
-small set of pictures (a small published library, say), where none can
-stand out much, the closest few still show when they are a little closer
-than the rest.
+small set of pictures (fewer than 50 with meaning vectors: a small
+published library, say), where none can stand out much, the closest few
+still show when they are a little closer than the rest -- and there the
+meaning of the whole search decides, not each word on its own (no word
+stands out among so few pictures either: `something warm to drink` finds
+the coffee cups of the sample pictures).
 - **Words**: the words alone, as without an embedding model. The page
   remembers this choice; the other two last until you leave the page.
 
@@ -1190,8 +1203,8 @@ words. Unlike the rest of a search, what you type then goes to the
 server (`/api/embed`), and from there to the embedding endpoint: one on
 this computer or network unless `allow_cloud` is set (see SETTINGS.md).
 The server's request log leaves the words out (of every address it
-logs it keeps only ids and switches: no words searched for, place, tag,
-person's name or trip title), the browser does not cache the answers, and each computer only ever gets back its own
+logs it keeps only ids and switches: no words searched for, place, area
+of the map, tag, person's name or trip title), the browser does not cache the answers, and each computer only ever gets back its own
 searches. Vectors are kept in `data/vectors.db`; deleting it is harmless
 (**Update meaning search** makes it again). Deleting a library's indexed
 data deletes its vectors too.
@@ -1331,11 +1344,11 @@ put them together:
 - The **Favorites** and **Rating** filters count them, and `is:favorite`,
   `rating:` and `album:` find them (see [Search syntax](#search-syntax)).
 - **Save as album** above the results keeps the search shown -- the words,
-  the filters, the library, the timeline's dates, the sort and Words /
-  Meaning -- as a **smart album**: it always holds the pictures that search
-  finds now, so new pictures join it by themselves. Saving under the name
-  of a smart album that exists changes its search. (Hiding blurry or
-  sensitive pictures alone is not a search to keep.)
+  the filters, the library, the timeline's dates, the area of the map, the
+  sort and Words / Meaning -- as a **smart album**: it always holds the
+  pictures that search finds now, so new pictures join it by themselves.
+  Saving under the name of a smart album that exists changes its search.
+  (Hiding blurry or sensitive pictures alone is not a search to keep.)
 - **Albums** (in the page header) lists the albums with a cover, how many
   pictures each shows and **Open** (a search of the album). A manual album
   shows in its own order; **Arrange** changes it: drag the pictures (or use
@@ -1408,6 +1421,35 @@ on Manage does it at once, for every library (also those turned off).
 **Download again** fetches newer files and looks up every place again; a
 download that arrives incomplete is not used, and the place names stay as
 they were.
+
+A picture without a GPS position whose file names where it was taken --
+the XMP location fields City, State/Province, Country and Country Code
+(`photoshop:City`, `photoshop:State`, `photoshop:Country`,
+`Iptc4xmpCore:CountryCode`), as Lightroom, digiKam or exiftool write them
+-- has that place: "Lucca, Tuscany, Italy", found and shown like any
+other place, but without a pin on the map (there is no position). With
+place names downloaded, the country code gives the country its name
+there. A place you set comes first (see [Estimated places](#estimated-places)):
+on this computer the viewer offers **Change place...** and **No place**
+for it (**Use its file's place** brings it back), and the Manage page's
+place names count these pictures.
+
+A file with a GPS position that names its place too is shown and found
+by those names, not by the nearest town of the place names (someone, or
+a program they chose, wrote them; the nearest town of a list may be
+across a border: a picture taken in a Swiss village a few kilometres
+from Italy would otherwise read as Italian), without a distance; its pin
+and its areas of the map are its position's. Its [named
+place](#named-places), if any, comes first, unless the names are of
+another country than the position's (then it gets none). A position the
+GPS check sets aside does not make way for the names (programs often
+fill them in from that very position).
+
+The names are read when a scan reads the file (a new or changed one).
+Pictures indexed by an older version were read without them: `python
+scan.py --read-place-names` (with `--library NAME` for one library)
+reads the XMP of every picture's file once more -- only the start of a
+JPEG, at most 16 MB of another file -- and changes nothing else.
 
 Place names are words about where a picture was taken: other computers
 see them like the GPS positions (see [Searching from other
@@ -1494,6 +1536,182 @@ pictures it publishes (see [Publishing a library](#publishing-a-library)).
 The map is in the Web Mercator projection, as the street maps are (and
 most web maps): a place far from the equator is drawn larger than one near
 it, and the poles (beyond 85 degrees) are not on it.
+
+### Named places
+
+The street maps also know what is where: parks, beaches, nature reserves,
+zoos, airports and campuses (as outlined areas), and museums, aquariums,
+viewpoints, stadiums, stations, theatres, hotels, restaurants and cafes
+(as points of interest), with their OpenStreetMap names. Once the street
+maps are downloaded, each picture with a position gets its **named
+place**: the park, beach, museum or cafe where it was taken. The viewer
+shows it before the town -- "Harbour Aquarium · Seaport, North Coast,
+Exampleland (2 km)", with what it is and how far ("aquarium, 60 m away";
+"zoo, taken inside it"; "nearby" when the position may be off by more
+than that, and "probably taken inside it" for an estimated place) -- as a
+chip that finds every picture taken
+there; the search finds its words (`place:"harbour aquarium"` too), plain
+language offers it as a place ("fish at harbour aquarium"), and the map's
+list of a pin names it, in its title when most of the pin's pictures were
+taken there. Looking a place up reads the downloaded street maps only:
+nothing goes over the network.
+
+How the place is chosen, from the most detailed tiles around the position:
+
+- an area the position is inside of (a zoo, a park, a beach), at least as
+  deep inside as the position may be off (half of that); an airport is
+  the place of everything inside it (gates, shops and its stations are
+  not);
+- or a point of interest within its reach: a viewpoint, a museum or a
+  stadium is seen from 100 to 200 m away, a minor sight (a small chapel, a
+  ride, a plaque) from less, a cafe or a restaurant only from 25 to 30 m
+  -- plus how far off the position may be, up to half the reach again;
+- the most specific of those wins: a sight right by the position before
+  the park it is in, a small area before a large one, a zoo or an
+  aquarium before the cafe or the stage in it; places to eat, shop and
+  stay by how near they are;
+- when the position cannot tell the best one from another of its kind
+  (two cafes 9 and 12 m away, the position maybe 30 m off), neither is
+  named -- the area it is in, or none: the cafe next door is no guess
+  worth showing (a place the description names, a destination such as a
+  museum or a zoo, and two names of one tower are never in doubt);
+- never a home: residential areas, houses, flats and guest houses are
+  left out, and so are bus stops, parking, cash machines, offices, most
+  shops (a gift shop or a market counts, from right there) and a
+  boat-tour operator's stand.
+
+How far off a position may be: what the file says (`GPSHPositioningError`,
+which phones write; 30 m when it says nothing, 65 m for a picture taken
+indoors, where a phone's position is often worse); for an [estimated
+place](#estimated-places), its radius (only estimates of at most 0.3 km
+get a named place, never a place to eat, shop or stay, and only one that
+reaches as far as the radius); for a dashcam clip's position from its GPS
+track, how far the drive goes (so only an area it stays inside names it:
+a drive passes many places); a position you set gets one too (an
+estimate you accepted as an estimate, by its radius; a town you chose
+none: its position is the town's middle). A position that may
+be more than 150 m off gets an area only. The picture counts too:
+
+- a place its description names wins ("the Harbour Museum and the Old
+  Tower at dusk", "a Gull Cafe cup on a table"), and a place of the kind
+  its scene or title says counts more (the theatre, not the church next
+  door, for a theatre's inside);
+- taken from a vehicle, or moving (its GPS speed 30 km/h or more), it
+  gets an area only; taken from a plane (high up or fast by its GPS, or
+  "above the clouds", an aerial view from a plane by its description), none;
+- a restaurant, a cafe or a bar only for a picture of food or a meal, or
+  one whose scene, title or tags say it was taken in one (a shop, a
+  theatre or a hotel room is not the cafe beside it); a meal indoors names
+  the restaurant before the casino down the street (but the aquarium,
+  not its restaurant);
+- in a street or a square, only landmarks (and areas) count from further
+  than 20 m: the museum across the street is not where a street scene was
+  taken; indoors, the point of an area (a college's) only from close by.
+
+Tried on a library of about 2,500 pictures with a position (60 more were
+taken from a plane: none), 46 % of the photos with their own GPS position
+got a named place (a third of the phone videos, 40 % of the estimates of
+0.3 km or less). Of 60 pictures picked at random with theirs, 51 were
+right and 9 near enough (the hotel a view was taken from, the gallery
+next to the one it was taken in), none wrong; of 109 pictures picked
+because they looked wrong under earlier rules (45 were), 7 are wrong now
+and 28 have no named place. Some right ones go too: two cafes, or two
+restaurants, a phone's position cannot tell apart are both left out.
+
+Scans look up the pictures whose position changed (and those described
+since), and so do the places job and a download of the street maps (then
+every picture again: about half a minute for 2,500 positions, the first
+time); **Find named places** (Manage, under Street maps)
+does it at once, **Look up all again** for every picture, and the
+viewer's location choices for the pictures they change. Deleting the
+street maps forgets them (street maps downloaded down to zoom 14 only,
+`"max_zoom": 14`, hold fewer of the small places: cafes, minor sights). From
+the command line:
+
+    python named_places.py [--status]        how many pictures have one
+    python named_places.py --update          look up the pictures that changed
+    python named_places.py --redo            look up every picture again
+    python named_places.py --lookup LAT LON  the named places of a position,
+                                             best first (--accuracy M)
+
+They are kept in `data/index.db` (a table of their own, worked out again
+whenever needed) and set in `config.json` (`named_places`: `enabled`,
+`max_estimate_km`; see [SETTINGS.md](SETTINGS.md)). A named place is
+location data: other computers see it as they see positions, and an
+export publishes it only with **Location** -- and only when it publishes
+the position it was found for (an estimated place's only with **Estimated
+places**, a dashcam clip's only with its route, none in the area around
+home of a trip's export, nor a smart album that searches for one there),
+its distance rounded to 10 m, with the OpenStreetMap credit at the foot of
+the pages (and `maps/LICENSE.txt`) also without the street maps. Turned
+off (`"enabled": false`), or with the street maps deleted, none show at
+once, before the next scan forgets them; an export looks up the pictures
+whose position changed since the last scan first.
+
+### Searching an area of the map
+
+**Search an area** on the map limits a search to the pictures taken in an
+area you mark on it:
+
+- **Rectangle**: drag across the map;
+- **Draw**: draw around the area with the mouse or a finger (letting go
+  closes the shape; a line that crosses itself is a lasso: the loop it
+  closed is the area, not what it drew past it);
+- **Street or place** (with the [street maps](#street-maps)): click or tap
+  a street, a park or a place of the street maps (when several are there,
+  a small menu asks which), or type a name to find it among the streets
+  and places of the view (the arrow keys and `Enter` choose; two of one
+  name say where they are in the view, "north-west"; on a phone the
+  keyboard opens when you tap the box). A street becomes the street with
+  25 to 500 m either side (**Within**, 50 m by default; it shows the width
+  of the street searched now), a park or another outlined area its
+  outline (one outline, though the street maps keep it in pieces, a piece
+  a tile), a place (a museum, a cafe) a circle around it as wide as the
+  [named places](#named-places) reach for its kind (185 m for an
+  aquarium, 45 m for a cafe: the pictures the viewer names after it are
+  in it; **Within** shows it and changes it). Without street
+  maps it is not offered. All of a street is read from the
+  street maps -- the parts of it joined to the one you picked, not another
+  street of the same name across town -- from up to 36 tiles of the street
+  maps (at street level a tile is about a kilometre across); a longer one
+  is searched near where you picked it, and the page says so;
+- **This view**: the rectangle the map shows (also the way to do it with
+  the keyboard: move and zoom the map with the arrow keys, `+` and `-`).
+
+Two fingers still move and zoom the map while you draw; `Esc` stops. The
+area becomes part of the search: only its pictures keep their pins, the
+rest of the map is veiled, the status says how many pictures it holds (or
+how many of the matching ones, with words or filters too), and a chip in
+the map's bar ("Area: Main Street, 50 m either side") takes it away again
+(set from the keyboard, the focus goes to it). It goes with the search to
+the search page (an **Area** chip there too, and the empty page says when
+the search finds pictures elsewhere), into the address (a short code:
+`area=`, with its name in `aname=`), and into a smart album (**Save as
+album**, which offers the area's name for the album's when there are no
+words; an area alone is a search too). It works with words, people,
+dates, plain language and the filters as any other part of a search.
+
+What counts as taken in the area: a picture's own GPS position and a
+position you set; a dashcam clip whose route passes through it (also when
+its own position, the middle of its track, is outside); an [estimated
+place](#estimated-places) only when it is inside by at least half its
+radius (an estimate of 300 m is never "on" a street 50 m wide) -- an
+estimate you accepted too, and a town you chose as if it had a radius of
+5 km (its position is the town's middle, not where the picture was
+taken). Hidden
+pictures are not on the map, and so not in an area. The edges of a shape
+are straight on the map as you drew them.
+
+The search page loads where the pictures were taken (the map's own data:
+about 50 bytes a located picture, and the drives' routes) only when a
+search has an area, or names a smart album that has one. Everything runs
+in the browser, from the map's own tiles: nothing is asked of another
+computer, and a published site that publishes locations does all of this
+too (picking a street or a place needs its street maps). A site without locations has no areas: an address
+with one shows the whole search, with a note. An area is location data:
+the server's request log never shows it, and an export publishes a smart
+album's area only with **Location** (a trip's export never one that comes
+near home).
 
 ### Positions that cannot be right (the GPS check)
 
@@ -1648,17 +1866,18 @@ picture's own place: no longer marked as estimated, a pin like any
 other), **Change place...** (type the start of a town's name -- "Lucca",
 "Paris, Texas" -- and pick it, or type a position as `lat, lon`) and
 **Reject** (the picture has no place); **Set place...** among the
-picture's actions gives a place to a picture that has none. Your choice
-follows the picture (by its content, also when it is moved or renamed)
-and survives every scan; **Clear** or **Estimate again** lets the
-estimates decide again. A place you set is never a GPS position
-(`has:gps` stays false) and is not used to estimate other pictures. The
-settings are `place_estimates` in config.json (see SETTINGS.md); an
-export publishes estimated places only when it publishes locations and
-**Estimated places** is ticked, places you set with locations -- one you
-accepted from an estimate that came from a dashcam's GPS track only as
-the track's positions go (with **Drive routes**, and not near where a
-drive starts or ends).
+picture's actions gives a place to a picture that has none, and **Change
+place...** or **No place** to one whose file names its place (see [Place
+names](#place-names)). Your choice follows the picture (by its content,
+also when it is moved or renamed) and survives every scan; **Clear** or
+**Estimate again** lets the estimates decide again. A place you set is
+never a GPS position (`has:gps` stays false) and is not used to estimate
+other pictures. The settings are `place_estimates` in config.json (see
+SETTINGS.md); an export publishes estimated places only when it publishes
+locations and **Estimated places** is ticked, places you set and those
+the files name with locations -- one you accepted from an estimate that
+came from a dashcam's GPS track only as the track's positions go (with
+**Drive routes**, and not near where a drive starts or ends).
 
 ### Trips
 
@@ -2431,8 +2650,10 @@ them all. `serve.py package` always uses the saved options.
   sensitive (`--include-private`, `--include-sensitive`), file names
   (`--file-names`), folder names (`--folders`), and GPS positions with the
   map (`--location`, which also adds the AI model's separate landmark and
-  place-guess fields, and the place names: then the pages credit GeoNames
-  at their foot, the map in a corner; `--estimated-places` adds the
+  place-guess fields, the place names and the [named
+  places](#named-places) of the published positions: then the pages credit
+  GeoNames, and for the named places OpenStreetMap, at their foot, the map
+  in a corner; `--estimated-places` adds the
   estimated places, see [Estimated places](#estimated-places); `--routes`
   the routes of drives and the positions their clips have from their GPS
   tracks, see below). Without it,
@@ -2483,6 +2704,15 @@ them all. `serve.py package` always uses the saved options.
   pages and in a corner of the maps. The review says how many tiles go and
   how large they are (and the free space the export checks for counts
   them). They show where the pictures are, as the positions do.
+- With `--location` the site's map carries the world map's tiles too (the
+  detailed world image of `make_tiles.py`, see [Other tools](#other-tools),
+  or tiles cut from the small bundled one), down to zoom `--world-zoom` (2
+  to 12, default 5; **World map detail** in the dialog, `world_zoom` in
+  the saved options): the maps draw closer views from them, a little
+  blurred, until the street maps take over. Each zoom has four times the
+  tiles of the one before: of `make_tiles.py`'s tiles, zoom 0 to 5 are
+  about 16 MB and zoom 6 alone about 36 MB. The review and the log say how
+  many go, how large they are and what the next zoom would add.
 - Your favorites, ratings and album names are published only with
   `--marks` (**Favorites, ratings and albums** in the dialog, `marks` in
   the saved options): then the site's `is:favorite`, `rating:` and
@@ -2490,8 +2720,9 @@ them all. `serve.py package` always uses the saved options.
   (in their order) and your smart albums with their searches as you saved
   them. A smart album is left out when its search cannot be published: one
   limited to another library, one that searches by folder, file name or
-  place (`folder:`, `file:`, `place:`, `has:gps`, the Place filter) while
-  those are not published, by library (`lib:`), for pictures like one
+  place (`folder:`, `file:`, `place:`, `has:gps`, the Place filter, an
+  area of the map) while those are not published, by library (`lib:`), for
+  pictures like one
   that is not published, or for a person (`person:`: the site has no
   people, and the search would publish a name). Without `--marks`, not
   even the name of the album the export is limited to goes out.
@@ -2675,8 +2906,9 @@ it off (the dialog asks for it by name, so an empty field never does):
   smaller -- so sites made with different sizes tell together no more
   than the one of the smallest size. Still, keep to one size.
 - With **Location**, no position in the area is published: its pictures
-  keep their region and country but not their town, nor the AI model's
-  landmark and place-guess words, and neither does any picture whose town
+  keep their region and country but not their town, their named place,
+  nor the AI model's landmark and place-guess words, and neither does any
+  picture whose town
   has pictures in the area; estimated places in it are not shown, and
   drive routes are cut at its edge (besides the 500 m left out at both
   ends of every drive), and a RAW file holding a position in it, or whose
@@ -2684,7 +2916,8 @@ it off (the dialog asks for it by name, so an empty field never does):
   tile that touches the area goes (the maps show the world image there, and
   no name of a place in it). Home is no place the trip went to: those pictures
   are left out of the places of the trip and of its days, and of the
-  site's title.
+  site's title. With **Favorites, ratings and albums**, a smart album whose
+  area of the map comes into the area around home is left out.
 - Whatever the options, a dashcam's clip whose GPS track enters the area,
   or that has no fix (its overlay then prints the last position it had,
   often where the drive started), is left out as **Near home**: the review
@@ -2745,7 +2978,7 @@ search by meaning or of the looks (with the opening views of 360 photos),
 previews, playable copies and sped-up drives, place names, finding,
 grouping or deleting faces, an export of a library or a trip, deleting a
 library's data, the trips' stories, a size check or download of the street
-maps, and the viewer's **Describe now** --
+maps, finding named places, and the viewer's **Describe now** --
 writes as the first line of its log the command line that does the same
 thing:
 
@@ -2813,6 +3046,7 @@ either way). Typed or pasted into a console, it works as it is.
 | **Write stories...** (Trips), **Write the story**, **Write again** (a trip) | `python trips.py --stories [--trip ID] [--redo]` |
 | **Check the size** (Manage: Street maps) | `python street_maps.py --plan` |
 | **Download** (Manage: Street maps) | `python street_maps.py --download --yes --expect-bytes N [--allow-large]` (`N`: the size you agreed to) |
+| **Find named places**, **Look up all again** (Manage: Street maps) | `python named_places.py --update`, `python named_places.py --redo` |
 
 The Export dialog saves its options before it exports, so an export's
 command line needs none: `export.py` uses the saved options as the job
@@ -2829,8 +3063,9 @@ characters: an export sent thousands of chosen pictures), or one with a
 setting no switch gives. Saving those options in the Export dialog (or
 renaming the folder) gives it one again.
 
-`scan.py`, `people.py`, `make_places.py`, `trips.py --stories` and
-`street_maps.py --download` (and `--remove`) take the same lock as the
+`scan.py`, `people.py`, `make_places.py`, `trips.py --stories`,
+`named_places.py --update` (and `--redo`) and `street_maps.py --download`
+(and `--remove`) take the same lock as the
 server's jobs: one started while a job runs says so and exits with status
 1 at once (a job started on a page waits for the tool to finish instead),
 and one export runs at a time. They exit with 0 when the work is done or
@@ -2961,9 +3196,10 @@ stories; `--stories` writes them (see [Trip stories](#trip-stories)).
 
 downloads a detailed world image (about 27 MB, to `data/blue_marble.jpg`)
 and cuts it into map tiles in `data/tiles/`, for the Map page and for
-exports with locations. Without it the map shows a small bundled image. Run
-it again after an interruption: it keeps the tiles that are whole and
-writes the missing or damaged ones.
+exports with locations. Without it the map shows a small bundled image (a
+page opened or reloaded after a run shows only the new tiles: the browser
+keeps none from before). Run it again after an interruption: it keeps the
+tiles that are whole and writes the missing or damaged ones.
 
 ### Program files
 
@@ -3017,6 +3253,13 @@ writes the missing or damaged ones.
 - `trip_stories.py` - the trips' stories: their facts, the prompt, what
   comes back, where they are kept, who sees what, and the job that writes
   them (see [Trip stories](#trip-stories))
+- `map_areas.py` - areas of the map (the search by drawing on the map):
+  their short text in an address and a smart album, read as the pages read
+  it (see [Searching an area of the map](#searching-an-area-of-the-map))
+- `named_places.py` - named places from the street maps: the park, museum
+  or cafe where each picture was taken, the rules that choose it, their
+  table in `index.db` and the `named_places` job; `python named_places.py
+  --update`, `--lookup LAT LON` (see [Named places](#named-places))
 - `places.py` - place names: the GeoNames download, the place index and
   the nearest town of a GPS position (`static/place-names.js` is their
   part of the Manage page)
@@ -3295,6 +3538,9 @@ sample images are covered by their own licenses, listed in
 `static/worldmap.jpg` is an equirectangular projection derived from NASA's
 Blue Marble imagery and is in the public domain. Source:
 https://commons.wikimedia.org/wiki/File:Equirectangular-projection.jpg
+The detailed world image `make_tiles.py` downloads is NASA's Blue Marble
+too (public domain). The maps say so in a corner ("Imagery: NASA Blue
+Marble") while the world image shows, on this computer and in exports.
 
 The street maps (downloaded by you, see [Street maps](#street-maps)) are
 OpenStreetMap data, (c) OpenStreetMap contributors, available under the

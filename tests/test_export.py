@@ -279,14 +279,16 @@ class ExportFixture(unittest.TestCase):
         def sample(name, target):
             shutil.copyfile(os.path.join(SAMPLES, name), target)
 
-        sample("13-lighthouse.jpg", os.path.join(trip, FILE_PREFIX + "_0001.jpg"))
+        # ("The lighthouse": a sample picture without a location, so that gps.jpg is
+        # the only picture with a position.)
+        sample("15-vegetables.jpg", os.path.join(trip, FILE_PREFIX + "_0001.jpg"))
         sample("01-cat.jpg", os.path.join(trip, FILE_PREFIX + "_0002.jpg"))
         sample("01-cat.jpg", os.path.join(trip, FILE_PREFIX + "_0002 copy.jpg"))
         sample("05-coffee.jpg", os.path.join(cls.family, "private.jpg"))
         sample("04-beach.jpg", os.path.join(cls.family, "sensitive.jpg"))
         # An exact copy of the lighthouse, not described: it is left out,
         # and so the lighthouse is no stack in the export.
-        sample("13-lighthouse.jpg", os.path.join(cls.family, "undescribed.jpg"))
+        sample("15-vegetables.jpg", os.path.join(cls.family, "undescribed.jpg"))
         sample("16-penguin.jpg", os.path.join(cls.family, "hidden.jpg"))
         sample("18-chalkboard-menu.jpg", os.path.join(cls.family, "document.jpg"))
         sample("14-train.jpg", os.path.join(cls.other, "train.jpg"))
@@ -1062,6 +1064,10 @@ class ExportTest(ExportFixture):
             html = handle.read()
         self.assertIn('<footer class="export-credits">Photos &lt;by&gt; me &amp; co</footer>',
                       html)
+        # The map credits the world image (NASA's Blue Marble) in a corner.
+        with open(os.path.join(out, "map.html"), encoding="utf-8") as handle:
+            self.assertIn('<span class="map-credit-world">Imagery: NASA Blue Marble</span>',
+                          handle.read())
         # Still no GPS in the pictures themselves.
         with open(os.path.join(out, "images", picnic["i"] + ".jpg"), "rb") as handle:
             self.assert_clean_jpeg(handle.read(), "picnic")
@@ -1159,6 +1165,67 @@ class ExportTest(ExportFixture):
         for rel in copied:
             if rel not in ("tiles/1/0/0.jpg", "tiles/1/3/1.jpg", "tiles/1/2/1.jpg"):
                 self.assertEqual(after[rel], files[rel], rel)
+
+    def test_the_world_map_goes_down_to_world_zoom(self):
+        # A pyramid of zoom 0 to 3 (2 + 8 + 32 + 128 tiles) in the data folder.
+        tiles = common.tiles_dir()
+        self.addCleanup(support.remove_tree, tiles)
+        buffer = io.BytesIO()
+        Image.new("RGB", (16, 16), (10, 60, 120)).save(buffer, format="JPEG")
+        tile = buffer.getvalue()
+        for zoom in range(4):
+            for x in range(2 ** (zoom + 1)):
+                for y in range(2 ** zoom):
+                    path = os.path.join(tiles, str(zoom), str(x), "%d.jpg" % y)
+                    common.ensure_dir(os.path.dirname(path))
+                    with open(path, "wb") as handle:
+                        handle.write(tile)
+        with open(os.path.join(tiles, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump({"max_zoom": 3, "tile_size": 256}, handle)
+        out = self.out("world-zoom")
+        config = common.load_config()
+
+        def exported(options):
+            lines = []
+            export.export_library(export.LogContext(lines.append), self.conn, config,
+                                  self.library_id, out, options)
+            html = open(os.path.join(out, "map.html"), encoding="utf-8").read()
+            page = json.loads(re.search(r'id="app-config">(.*?)</script>', html).group(1))
+            return (sorted(rel for rel in files_of(out) if rel.startswith("tiles/")),
+                    page["tilesMax"], [line for line in lines if "World map" in line])
+
+        # The default (zoom 5) holds the whole pyramid.
+        copied, top, said = exported({"location": True})
+        self.assertEqual((len(copied), top), (170, 3))
+        self.assertEqual(len(said), 1)
+        self.assertIn("World map: 170 tile(s), %s (zoom 3 and less)."
+                      % export.human_bytes(170 * len(tile)), said[0])
+        # Zoom 2: the tiles of zoom 3 go (and the pages know it); the log says
+        # what zoom 3 would add.
+        copied, top, said = exported({"location": True, "world_zoom": 2})
+        self.assertEqual((len(copied), top), (42, 2))
+        self.assertFalse([rel for rel in copied if rel.startswith("tiles/3/")])
+        self.assertIn("World map: 42 tile(s), %s (zoom 2 and less; --world-zoom 3 adds 128 "
+                      "tile(s), %s)." % (export.human_bytes(42 * len(tile)),
+                                         export.human_bytes(128 * len(tile))), said[0])
+        # The review counts them, with what the next zoom adds.
+        preview = export.preview_export(self.conn, config, self.library_id,
+                                        {"location": True, "world_zoom": 2})
+        self.assertEqual(preview["counts"]["world_map"], {
+            "available": 3, "zoom": 2, "tiles": 42, "bytes": 42 * len(tile),
+            "more": {"zoom": 3, "tiles": 128, "bytes": 128 * len(tile)}})
+        self.assertEqual(preview["size_parts"]["tiles"], 42 * len(tile))
+        self.assertNotIn("world_map", export.preview_export(self.conn, config,
+                                                            self.library_id)["counts"])
+        # Out of range: refused.
+        for wrong in (1, 13, True, "5"):
+            with self.assertRaises(export.OptionsError):
+                export.validate_options({"world_zoom": wrong})
+        # Without a pyramid: the bundled small map's zoom 0 to 2 only.
+        support.remove_tree(tiles)
+        copied, top, said = exported({"location": True, "world_zoom": 2})
+        self.assertEqual((len(copied), top), (42, 2))
+        self.assertEqual(said, [])
 
     def test_the_small_map_is_cut_into_tiles_once(self):
         import serve

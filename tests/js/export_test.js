@@ -16,8 +16,10 @@
    with it) or {query, state: "off"} (the page's self-check fails), "albums":
    the names of the albums the manifest lists (the marks option), in
    order, "trip": {title} (a trip's export, trip_export.py: its trip, whose
-   days list every picture)}. A query with "with_albums" searches with those
-   albums.
+   days list every picture), "area": {text, query, titles} (an area of the
+   map, see search-core.js: with the site's own locations the search of
+   query in it finds titles; without titles, the site has no areas)}. A
+   query with "with_albums" searches with those albums.
    Prints one line per test and exits with status 1 when any test fails.
 */
 "use strict";
@@ -229,6 +231,27 @@ test("every address of a record is a file of the export", function () {
         assert.ok(exists(map));
     }
 });
+
+if (expected.area) {
+    test("an area of the map finds the pictures taken in it, from the site's own files",
+         function () {
+             assert.strictEqual(SITE.hasAreas(), expected.area.titles !== undefined);
+             return promised(SITE.loadPlaces).then(function (places) {
+                 assert.ok(places, "the places load");
+                 assert.deepStrictEqual(fetched, []);
+                 var index = SearchCore.prepare(data.records);
+                 index.setPlaces(places.points, places.routes);
+                 var found = SearchCore.search(index, expected.area.query || "",
+                                               {area: expected.area.text, albums: data.albums});
+                 var titles = found.items.map(function (id) {
+                     return data.records.filter(function (other) {
+                         return other.i === id;
+                     })[0].t || "";
+                 }).sort();
+                 assert.deepStrictEqual(titles, (expected.area.titles || []).slice().sort());
+             });
+         });
+}
 
 test("searches find the expected pictures", function () {
     (expected.queries || []).forEach(function (entry) {

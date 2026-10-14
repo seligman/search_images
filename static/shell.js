@@ -336,6 +336,7 @@ var SHELL = (function () {
         group_faces: "Group faces into people",
         delete_faces: "Delete face data",
         maps: "Street maps",
+        named_places: "Find named places",
         trip_stories: "Write trip stories"
     };
     var STATE_LABELS = {
@@ -371,6 +372,7 @@ var SHELL = (function () {
         "street maps size": "Checking the size of the street maps",
         "street maps download": "Downloading the street maps",
         "street maps file": "Writing the street maps file",
+        "named places": "Finding named places on the street maps",
         stories: "Writing trip stories"
     };
     var STAGE_VERBS = {
@@ -394,6 +396,9 @@ var SHELL = (function () {
         }
         if (job.kind === "maps") {
             return params.download ? "Download street maps" : "Check the size of street maps";
+        }
+        if (job.kind === "named_places") {
+            return params.redo ? "Look up all named places again" : "Find named places";
         }
         if (job.kind === "describe" && params.retry_failed) {
             return "Retry failed";
@@ -430,6 +435,7 @@ var SHELL = (function () {
         var kind = jobKind(job);
         if ((job.kind === "process" || job.kind === "places" || job.kind === "delete_faces" ||
                 job.kind === "group_faces" || job.kind === "maps" ||
+                job.kind === "named_places" ||
                 (job.kind === "trip_stories" && !(job.params || {}).trip)) && !job.library_id) {
             return kind;
         }
@@ -734,6 +740,17 @@ var SHELL = (function () {
             }
             if (summary.places && typeof summary.places.checked === "number") {
                 parts.push(plural(summary.places.checked, "picture") + " given a place");
+            }
+        }
+        if (job.kind === "named_places" && typeof summary.named === "number") {
+            // (named_places.update: how many have one, and how many were looked up.)
+            parts.push(number(summary.named) + " of " + plural(summary.pictures || 0, "picture") +
+                       " with a position have a named place");
+            if (summary.looked_up) {
+                parts.push(number(summary.looked_up) + " looked up");
+            }
+            if (summary.stopped) {
+                parts.push("stopped: start it again to go on");
             }
         }
         if (job.kind === "trip_stories" && typeof summary.written === "number") {

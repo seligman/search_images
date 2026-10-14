@@ -84,6 +84,15 @@ folders), and in their drives', never go out: a dashcam prints its
 position over its video -- one without a fix the last it had, often where
 the drive started -- and the model reads it. Their pictures show it all
 the same: the review counts them (counts.routes "overlay" and "near").
+A picture's named place on the street maps (named_places.py: np, nk, nd,
+ni, na in its record; nd rounded to named_places.EXPORT_METRES) is
+location data too: it goes with the location option (an estimated
+place's also with estimated_places), and only when the position it was
+found for goes (_Export.named_published: a track's with the routes, none
+in a trip's home area). The named places are looked up first (as the GPS
+check runs: named_places.run_safely), and they are OpenStreetMap data: an
+export that holds some carries the OpenStreetMap credit and licence
+(NAMED_CREDIT, maps/LICENSE.txt) also without the street maps.
 
 With the location and "street_maps" options (off by default) the street maps
 (street_maps.py, when they were downloaded) go along for the published
@@ -99,6 +108,15 @@ size, and the free space check counts them too. The site never asks another
 host for anything: every page says so in its Content-Security-Policy
 (EXPORT_CSP).
 
+With location the world map's tiles go along too (data/tiles, the NASA
+Blue Marble pyramid make_tiles.py makes; else tiles cut from the bundled
+small map), down to the zoom world_zoom (default 5) -- the pages draw a
+deeper zoom from those tiles, a little blurred, until the street maps
+take over: zoom 6 alone has three times the tiles of 0 to 5 together
+(8,192 against 2,730, about 36 MB against 16). The review and the log say
+how many tiles go and how large they are (world_map_size), and what the
+next zoom would add.
+
 An export can be limited to one manual album of the owner's (the album
 option, an album id; see albums.py): only the album's pictures of the
 library are candidates, and the privacy rules above still apply to them.
@@ -113,9 +131,11 @@ its export id and album: the album by its number, #2), so album:"Name",
 is:favorite and rating: work in the published site too. A smart album
 whose search cannot be published is left out: one limited to another
 library, or going by what the export leaves out (folder:, file:,
-place:, has:gps or the Place filter while the matching option is off;
-lib:), naming a picture or an album that is not published, or a person
-(person:, whose name it would publish).
+place:, has:gps, the Place filter or an area of the map while the
+matching option is off; lib:), naming a picture or an album that is not
+published, or a person (person:, whose name it would publish). An area of
+the map (map_areas.py) is location data: it goes only with location (and
+never one near home in a trip's export, see trip_export.py).
 
 Faces and their people (people.py, people_groups.py) are never published:
 no face, box or vector, and no name -- unless the "people_names" option is
@@ -224,6 +244,8 @@ import jobs
 import library_ops
 import local_times
 import looks
+import map_areas
+import named_places
 import place_estimates
 import places
 import prompts
@@ -346,8 +368,8 @@ DEFAULT_OPTIONS = {
     "images": "web",                # "web" (2048 px) | "original" | "none" (thumbnails only)
     "location": False,              # GPS positions, place names, the map, landmark/place-guess
     "estimated_places": False,      # with location: places estimated for pictures without a
-                                    # position (place_estimates.py; the owner's own places go
-                                    # with location)
+                                    # position (place_estimates.py; the owner's own places and
+                                    # those the files name go with location)
     "routes": False,                # with location: drives' routes and the positions of clips
                                     # from their GPS tracks (tracks.py)
     "routes_trim": tracks.DEFAULT_TRIM_METRES,  # metres left out where a drive starts or ends
@@ -355,6 +377,8 @@ DEFAULT_OPTIONS = {
                                     # published places and routes
     "street_km": 5,                 # with street_maps: km around each place (2 along routes)
     "street_zoom": 14,              # with street_maps: the most detailed zoom
+    "world_zoom": 5,                # with location: the most detailed zoom of the world map's
+                                    # tiles (data/tiles: zoom 6 has three times 0 to 5's)
     "file_names": False,
     "folders": False,
     "exclude_types": ["screenshot", "document"],    # photo types left out
@@ -383,9 +407,15 @@ _BOOLEAN_OPTIONS = ("location", "file_names", "folders", "exclude_private", "exc
 # The street maps an export may carry: km around each published place, and zooms.
 STREET_KM = (1, 50)
 STREET_ZOOMS = (10, 15)
+# The most detailed zoom of the world map's tiles an export may carry (world_zoom).
+WORLD_ZOOMS = (2, 12)
 # The credit at the foot of the pages of an export with street maps.
 STREETS_CREDIT = ('Street maps: &copy; OpenStreetMap contributors '
                   '(<a href="maps/LICENSE.txt" rel="license">ODbL</a>)')
+# ... and of one with the named places of the street maps but not the maps themselves
+# (capabilities "named_places"; the licence is maps/LICENSE.txt all the same).
+NAMED_CREDIT = ('Named places: &copy; OpenStreetMap contributors '
+                '(<a href="maps/LICENSE.txt" rel="license">ODbL</a>)')
 # The Content-Security-Policy of every exported page (a <meta> tag; export.py --serve
 # sends it too): scripts, styles, pictures and requests only from the site itself (a
 # browser takes the folder of a site opened from disk for that), so the site never asks
@@ -583,8 +613,9 @@ def validate_options(options, base=None):
                 errors[key] = "must be true or false"
             else:
                 result[key] = value
-        elif key in ("street_km", "street_zoom"):
-            low, high = STREET_KM if key == "street_km" else STREET_ZOOMS
+        elif key in ("street_km", "street_zoom", "world_zoom"):
+            low, high = {"street_km": STREET_KM, "street_zoom": STREET_ZOOMS,
+                         "world_zoom": WORLD_ZOOMS}[key]
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
                 errors[key] = "must be a whole number from %d to %d" % (low, high)
             else:
@@ -2460,6 +2491,10 @@ def preview_pictures(conn, config, libraries, options, only=None, extra=None, ho
     street_tiles, street_bytes = street_maps.export_size(levels) if levels else (0, 0)
     counts["street_maps"] = {"available": street_available, "on": street_on,
                              "tiles": street_tiles, "bytes": street_bytes}
+    # The world map's tiles that go along (with location).
+    world = world_map_size(options)
+    if world is not None:
+        counts["world_map"] = world
     vectors = _vector_sizes(conn, library_ids, options,
                             {record["i"] for record in chosen} | flagged_ids,
                             carried=_carried((record["i"], record) for record in published))
@@ -2468,6 +2503,7 @@ def preview_pictures(conn, config, libraries, options, only=None, extra=None, ho
     parts = {"thumbs": 0, "images": 0, "panos": 0, "data": 0, "videos": 0,
              "vectors": 0, "meaning": 0, "looks": 0, "raws": 0}
     parts["maps"] = street_bytes
+    parts["tiles"] = world["bytes"] if world is not None else 0
     raw_counts = {"total": 0, "included": 0, "location": 0}
     looked = {"vectors": 0, "missing": 0} if options["looks"] else None
     needs_folder = collections.Counter()
@@ -2656,8 +2692,9 @@ def _location(row):
 
 
 def _estimated_location(row, record, estimate):
-    """The map point ({lat, lon, and "e": 1 with "r", or "o": 1}) of a picture's estimated
-    place or the owner's own (a place_estimates row), or None: only when its record
+    """The map point ({lat, lon, and "e": 1 or "o": 1, with "r" when its radius is known})
+    of a picture's estimated place or the owner's own (a place_estimates row: an
+    estimate accepted keeps its radius, a town chosen has one), or None: only when its record
     holds that place (search_index.record_for_row: the picture has no place of its
     own and the export's options allow it) and it has a position (an area has none)."""
     if (estimate is None or record.get("ps") not in ("c", "t", "o") or record.get("gp")
@@ -2665,13 +2702,10 @@ def _estimated_location(row, record, estimate):
         return None
     point = {"lat": round(estimate["lat"], LOCATION_DECIMALS),
              "lon": round(estimate["lon"], LOCATION_DECIMALS)}
-    if record["ps"] == "o":
-        point["o"] = 1
-    else:
-        point["e"] = 1
-        radius = estimate.get("radius_km")
-        if isinstance(radius, (int, float)) and math.isfinite(radius):
-            point["r"] = round(radius, 3)
+    point["o" if record["ps"] == "o" else "e"] = 1
+    radius = estimate.get("radius_km")
+    if isinstance(radius, (int, float)) and math.isfinite(radius) and radius > 0:
+        point["r"] = round(radius, 3)
     return point
 
 
@@ -2699,6 +2733,83 @@ def published_places(conn, library_ids, pairs, routes):
              for route in routes.routes([row["id"] for row, _record in pairs])
              for clip in route["c"]]
     return points, lines
+
+
+_TILE_RE = re.compile(r"^tiles/(\d+)/\d+/\d+\.jpg$")
+_world_levels = {}              # (tiles folder, serve.tiles_version) -> world_tile_levels
+
+
+def world_tile_levels():
+    """{zoom: [tiles, bytes]} of the world map's tile pyramid (data/tiles, made by
+    make_tiles.py); {} without one. Counted again only when the pyramid changes
+    (serve.tiles_version: make_tiles.py writes its manifest again every time)."""
+    import serve
+    if serve.tiles_max_zoom() is None:
+        return {}
+    source = common.tiles_dir()
+    key = (os.path.abspath(source), serve.tiles_version())
+    found = _world_levels.get(key)
+    if found is None:
+        found = {}
+        for folder, _dirs, names in os.walk(source):
+            for name in names:
+                path = os.path.join(folder, name)
+                match = _TILE_RE.match("tiles/" + os.path.relpath(path, source)
+                                       .replace(os.sep, "/"))
+                if not match:
+                    continue
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                level = found.setdefault(int(match.group(1)), [0, 0])
+                level[0] += 1
+                level[1] += size
+        _world_levels.clear()
+        _world_levels[key] = found
+    return {zoom: list(level) for zoom, level in found.items()}
+
+
+def world_map_size(options):
+    """What an export with these options carries of the world map, or None without
+    location: {"available" (the pyramid's highest zoom; None: there is none, and tiles
+    are cut from the bundled small map), "zoom" (the highest that goes: world_zoom at
+    most), "tiles", "bytes" (0 for the bundled map's, which are small), "more" ({"zoom",
+    "tiles", "bytes"} of the next zoom the pyramid has, None at its top)}."""
+    if not options.get("location"):
+        return None
+    import serve
+    cap = options.get("world_zoom", DEFAULT_OPTIONS["world_zoom"])
+    available = serve.tiles_max_zoom()
+    if available is None:
+        zoom = min(serve.FALLBACK_MAX_ZOOM, cap)
+        return {"available": None, "zoom": zoom,
+                "tiles": sum(2 ** (level + 1) * 2 ** level for level in range(zoom + 1)),
+                "bytes": 0, "more": None}
+    levels = world_tile_levels()
+    zoom = min(available, cap)
+    result = {"available": available, "zoom": zoom,
+              "tiles": sum(levels.get(level, [0, 0])[0] for level in range(zoom + 1)),
+              "bytes": sum(levels.get(level, [0, 0])[1] for level in range(zoom + 1)),
+              "more": None}
+    if zoom < available and zoom + 1 in levels:
+        result["more"] = {"zoom": zoom + 1, "tiles": levels[zoom + 1][0],
+                          "bytes": levels[zoom + 1][1]}
+    return result
+
+
+def world_map_text(size):
+    """The log's line about the world map's tiles (world_map_size)."""
+    if size["available"] is None:
+        return ("World map: %d tile(s) cut from the bundled small map (zoom %d and less; "
+                "make_tiles.py makes a sharper one)." % (size["tiles"], size["zoom"]))
+    text = "World map: {:,} tile(s), {} (zoom {} and less".format(
+        size["tiles"], human_bytes(size["bytes"]), size["zoom"])
+    more = size["more"]
+    if more:
+        text += "; --world-zoom {} adds {:,} tile(s), {}".format(
+            more["zoom"], more["tiles"], human_bytes(more["bytes"]))
+    return text + ")."
 
 
 def street_levels(options, points, lines, home=None):
@@ -3073,8 +3184,11 @@ def render_page(template, title, page_title, capabilities, export_id, options,
     the page asks search engines not to index it (or its pictures) unless
     options allow it, and shows the credits line at its foot -- with the
     GeoNames credit when the export holds place names (capabilities
-    "places"; the map page, which has no foot, shows only that credit, in
-    a corner of the map). versions ({asset name: hash}) go into the addresses of the
+    "places"), the OpenStreetMap one when it holds street maps ("streets")
+    or only named places ("named_places"); the map page, which has no foot,
+    shows the GeoNames and named places credits in a corner of the map (the
+    world image and the street maps credit their own: map.html's
+    #map-streets-credit, streets.js showCredit). versions ({asset name: hash}) go into the addresses of the
     scripts and the style sheet. meaning ({"credit"}, when the export ships the
     query model of search by meaning) adds "Search by meaning: <credit> ·
     license" to the foot of the search and detail pages. extra: more page settings
@@ -3113,6 +3227,8 @@ def render_page(template, title, page_title, capabilities, export_id, options,
         credits.append(PLACES_CREDIT)
     if capabilities.get("streets"):
         credits.append(STREETS_CREDIT)
+    elif capabilities.get("named_places"):
+        credits.append(NAMED_CREDIT)
     if meaning is not None:
         # (Not on the map page, which has no foot and does not use the model.)
         credits.append('Search by meaning: %s<a href="data/%s" rel="license">license</a>' % (
@@ -3124,12 +3240,16 @@ def render_page(template, title, page_title, capabilities, export_id, options,
             raise ExportError("The page template %s has no page settings." % template)
         footer = '<footer class="export-credits">%s</footer>\n' % "<br>".join(credits)
         text = text.replace(anchor, footer + anchor, 1)
-    elif template == "map.html" and capabilities.get("places"):
+    elif template == "map.html" and (capabilities.get("places") or (
+            capabilities.get("named_places") and not capabilities.get("streets"))):
         anchor = '<div id="map-message"'
         if anchor not in text:
             raise ExportError("The page template %s has no map message." % template)
+        shown = ([PLACES_CREDIT] if capabilities.get("places") else []) + (
+            [NAMED_CREDIT] if capabilities.get("named_places")
+            and not capabilities.get("streets") else [])
         text = text.replace(anchor, '<p id="map-credit" class="export-credits map-credit">'
-                                    '%s</p>\n%s' % (PLACES_CREDIT, anchor), 1)
+                                    '%s</p>\n%s' % ("<br>".join(shown), anchor), 1)
     return text
 
 
@@ -3694,6 +3814,16 @@ class _Export:
 
     # -- data files -----------------------------------------------------------
 
+    def named_published(self, picture, estimate):
+        """True when the position a picture's named place was found for goes out: its own
+        (track_routes.position), or its estimate's or the owner's (as locations.js has
+        them: _estimated_location and track_routes.estimate)."""
+        if world_map.valid_position(picture.row["lat"], picture.row["lon"]):
+            return self.track_routes.position(picture.row)
+        return (estimate is not None
+                and _estimated_location(picture.row, picture.record, estimate) is not None
+                and self.track_routes.estimate(estimate))
+
     def records(self, pictures):
         """The final search records (export ids everywhere), sorted by id.
 
@@ -3728,7 +3858,17 @@ class _Export:
         self.track_routes = _Routes(self.conn, self.config, self.library_ids, self.options,
                                     home=self.home)
         dashcam_drives = set()
+        estimates = None
         for picture in pictures:
+            if picture.record.get("np") is not None:
+                # A named place (named_places.py) goes out only with the position it
+                # was found for: not a track's or an estimate's withheld here, nor one
+                # in a trip's home area.
+                if estimates is None:
+                    estimates = place_estimates.for_libraries(self.conn, self.library_ids)
+                if not self.named_published(picture, estimates.get(picture.row["id"])):
+                    for key in named_places.RECORD_KEYS:
+                        picture.record.pop(key, None)
             if not self.track_routes.position(picture.row):
                 picture.record.pop("gp", None)
                 picture.record.pop("km", None)
@@ -3860,6 +4000,7 @@ class _Export:
         search (query terms or filters) goes by what the export leaves out:
         folder: (the folders option), file: (file_names), place:, has:gps
         and the Place filter (location), lib: (the libraries' own names);
+        nor when its area of the map may not be published (area_published);
         nor when it looks for pictures like one that is not published
         (similar:, look:); nor when it looks for a person (person:: an
         export holds no people, and the search names one) -- but with
@@ -3881,6 +4022,9 @@ class _Export:
         filters.pop("library", None)
         if not self.options["location"] and (filters.get("place") or "gps" in (
                 filters.get("has") or [])):
+            return None
+        # (An area of the map is location data: see area_published.)
+        if options.get("area") and not self.area_published(options["area"]):
             return None
         if filters:
             options["filters"] = filters
@@ -3912,6 +4056,11 @@ class _Export:
             elif field == "album":
                 named.append(term)
         return {"options": options, "changes": changes, "albums": named}
+
+    def area_published(self, text):
+        """True when an area of the map (a smart album's, map_areas) may be published: only
+        with the location option (it tells where the owner looked)."""
+        return bool(self.options["location"]) and map_areas.parse(text) is not None
 
     def data_files(self, pictures, records, capabilities):
         """{relative path: text} of the data scripts, and the manifest (without its date)."""
@@ -4138,7 +4287,8 @@ class _Export:
         return "window.SEARCH_DATA_MANIFEST = %s;\n" % _js_json(manifest)
 
     def tiles(self):
-        """Write the map tiles (with location only); returns the highest zoom, or None.
+        """Write the map tiles (with location only), down to the zoom world_zoom; returns
+        the highest zoom written, or None.
 
         Incremental like every file of the export (Writer): a tile whose
         source is unchanged since the last export (same size and time of
@@ -4146,10 +4296,12 @@ class _Export:
         read nor written again, so a second export of a pyramid of 11,000
         tiles costs a stat per tile. A tile of the pyramid that is cut
         short (an interrupted make_tiles.py) is left out -- the map shows
-        a coarser tile in its place -- with a warning.
+        a coarser tile in its place -- with a warning. Tiles of a deeper
+        zoom than world_zoom that an earlier export wrote go (remove_stale).
         """
         import serve
         max_zoom = serve.tiles_max_zoom()
+        cap = self.options["world_zoom"]
         if max_zoom is not None:
             source = common.tiles_dir()
             damaged = 0
@@ -4159,7 +4311,8 @@ class _Export:
                         continue
                     path = os.path.join(folder, name)
                     rel = "tiles/" + os.path.relpath(path, source).replace(os.sep, "/")
-                    if not re.match(r"^tiles/\d+/\d+/\d+\.jpg$", rel):
+                    match = _TILE_RE.match(rel)
+                    if not match or int(match.group(1)) > cap:
                         continue
                     stat = os.stat(path)
                     sig = "tile:%d:%d" % (stat.st_size, stat.st_mtime_ns)
@@ -4175,7 +4328,8 @@ class _Export:
                 self.ctx.log("%d map tile(s) in %s are damaged (cut short) and were left out; "
                              "run make_tiles.py again to repair them." % (damaged, source),
                              "warn")
-            return max_zoom
+            self.ctx.log(world_map_text(world_map_size(self.options)))
+            return min(max_zoom, cap)
         # No pyramid: the tiles the server cuts from the bundled small map.
         try:
             stat = os.stat(serve.FALLBACK_BASEMAP)
@@ -4183,7 +4337,7 @@ class _Export:
             return None
         sig = "basemap:%d:%d:%d:%d" % (stat.st_size, stat.st_mtime_ns, serve.TILE_SIZE,
                                        serve.FALLBACK_TILE_VERSION)
-        for zoom in range(serve.FALLBACK_MAX_ZOOM + 1):
+        for zoom in range(min(serve.FALLBACK_MAX_ZOOM, cap) + 1):
             for x in range(2 ** (zoom + 1)):
                 for y in range(2 ** zoom):
                     rel = "tiles/%d/%d/%d.jpg" % (zoom, x, y)
@@ -4193,7 +4347,7 @@ class _Export:
                     if data is None:
                         return None
                     self.writer.write(rel, data, sig)
-        return serve.FALLBACK_MAX_ZOOM
+        return min(serve.FALLBACK_MAX_ZOOM, cap)
 
     def street_levels(self, pictures):
         """The street map tiles of the published pictures and routes (street_levels)."""
@@ -4347,7 +4501,7 @@ class _Export:
     def check_space(self, chosen, rows, sizes, extra=0):
         """Raise ExportError when the disk of the folder has too little room for the export
         (extra: bytes it writes besides the assets and the pictures' files: the street
-        maps)."""
+        maps and the world map's tiles)."""
         estimate = _asset_bytes(self.options) + extra
         for record in chosen:
             row = rows.get(record["i"])
@@ -4385,7 +4539,9 @@ class _Export:
             # Refused before anything is written: the folder and the record
             # of the last export stay as they were.
             self.check_sources(chosen, rows, sizes)
-            self.check_space(chosen, rows, sizes, extra=self.street_bytes(chosen, rows))
+            world = world_map_size(self.options)
+            self.check_space(chosen, rows, sizes, extra=self.street_bytes(chosen, rows)
+                             + (world["bytes"] if world else 0))
             self.mark()
             with cache.ThumbStore() as thumbs:
                 self.thumbs = thumbs
@@ -4425,6 +4581,10 @@ class _Export:
                 self.options["street_maps"] else {}
             if levels:
                 capabilities["streets"] = True
+            if location and any(record.get("np") for record in records):
+                # Named places of the street maps: OpenStreetMap data (render_page
+                # credits it; maps/LICENSE.txt below, when the maps do not go).
+                capabilities["named_places"] = True
             files, manifest = self.data_files(pictures, records, capabilities)
             for rel in sorted(files):
                 self.writer.write(rel, files[rel].encode("ascii"))
@@ -4445,6 +4605,9 @@ class _Export:
                 self.writer.write("assets/" + name, data)
             tiles_max = self.tiles() if location else None
             streets = self.write_streets(levels)
+            if streets is None and capabilities.get("named_places"):
+                self.writer.write("maps/LICENSE.txt",
+                                  street_maps.LICENSE_TEXT.encode("ascii"))
             settings = self.page_settings()
             if streets is not None:
                 settings = dict(settings or {}, streets=streets)
@@ -4632,6 +4795,9 @@ def export_library(ctx, conn, config, library_id, out_dir=None, options=None, he
             # the camera's time again).
             if gps_check.run_safely(conn, config, ctx) is not None:
                 local_times.after_check_safely(conn, config, ctx)
+            # The named places of the positions that changed since the last scan
+            # (none at all while they are off, or without street maps).
+            named_places.run_safely(conn, config, ctx)
         return job.run()
     finally:
         lock.release()
@@ -4668,7 +4834,7 @@ def _cli_options(args, library, current=None):
         if getattr(args, "include_" + name, None) is not None:
             options["exclude_" + name] = not getattr(args, "include_" + name)
     for name in ("title", "credits", "max_video_mb", "include_ids", "exclude_ids",
-                 "street_km", "street_zoom"):
+                 "street_km", "street_zoom", "world_zoom"):
         if getattr(args, name, None) is not None:
             options[name] = getattr(args, name)
     if getattr(args, "no_album", False):
@@ -4752,7 +4918,7 @@ def options_arguments(options, trip=False):
             include = "--include-" + key[len("exclude_"):]
             tokens.append("--no-" + include[2:] if value else include)
         elif key in ("images", "videos", "routes_trim", "max_video_mb", "title", "credits",
-                     "street_km", "street_zoom"):
+                     "street_km", "street_zoom", "world_zoom"):
             tokens += jobs.option_tokens(switch, value)
         elif key == "home_km" and trip:
             tokens += jobs.option_tokens(switch, value)
@@ -4969,6 +5135,11 @@ def main(argv=None):
     parser.add_argument("--street-zoom", type=int, metavar="Z",
                         help="with --street-maps: the most detailed zoom (%d to %d, default "
                              "%d)" % (STREET_ZOOMS + (DEFAULT_OPTIONS["street_zoom"],)))
+    parser.add_argument("--world-zoom", type=int, metavar="Z",
+                        help="with --location: the most detailed zoom of the world map's tiles "
+                             "that go along (%d to %d, default %d; each zoom has four times "
+                             "the tiles of the one before)"
+                             % (WORLD_ZOOMS + (DEFAULT_OPTIONS["world_zoom"],)))
     parser.add_argument("--file-names", action=argparse.BooleanOptionalAction,
                         help="include file names")
     parser.add_argument("--folders", action=argparse.BooleanOptionalAction,

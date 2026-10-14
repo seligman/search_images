@@ -27,6 +27,17 @@
                                    anything), or null. The pages show the
                                    compact record first and add this.
      SITE.loadLocations(callback)  [{id, lat, lon}] or null.
+     SITE.loadPlaces(callback, fresh)  where the pictures were taken, for an
+                                   area of the map (SearchCore's
+                                   index.setPlaces): {points (loadLocations'),
+                                   routes (loadRoutes')}, or null when they
+                                   could not be loaded (loaded once; asked
+                                   again after a failure, and with fresh).
+                                   An export without locations has none:
+                                   {points: [], routes: []}
+     SITE.hasAreas()               an area of the map can be searched here
+                                   (the server; an export that publishes
+                                   locations: SITE.mapUrl is not null)
      SITE.loadRoutes(callback)     the routes of drives (the GPS tracks of
                                    videos, see tracks.py and routes.js:
                                    [{d, l, c: [{i, o, p}]}]; server:
@@ -148,6 +159,8 @@
                                    one: detail.drive.preview); null in an
                                    export
      SITE.tileUrl(z, x, y), SITE.tilesMax(), SITE.tileSize()   map tiles
+                                   (on the server with the tiles' version,
+                                   "?v=...": see serve.tiles_version)
      SITE.streets()                the street maps ({url, v}: where their
                                    index and tile scripts are, see
                                    streets.js and street_maps.py; /maps/ on
@@ -185,7 +198,7 @@
    Search state in the address (SITE.searchState)
      read(search)  -> {q, lib, sort, filters: {group: [values]}, group,
                        size, hidden, junk, sensitive, ids, view, from, to,
-                       by, drives, typed}
+                       by, drives, typed, area, aname}
                        from a query string (default: the page's)
      params(state) -> the query string for a state ("" when all default)
      The facet selections use the group names of SearchCore.FACETS as
@@ -203,6 +216,11 @@
      one ("Fold drives" off: drives=0). typed lists the parts of q that
      plain-language search leaves as typed words (SearchCore.interpret's
      typed option: "*" for all of them, else keys joined by commas).
+     area is an area drawn or picked on the map (SearchCore's area
+     option: its text, see search-core.js "Areas on the map"; only its
+     form is checked here), aname its name ("Main Street": only with
+     area). Both are location data: the server's request log never shows
+     them (serve.py quiet_request_line).
 
    SITE.idList.encode(ids, records) -> the ids value for a list of picture
      ids; SITE.idList.decode(text, records) -> {ids: [...], stale} (stale:
@@ -285,11 +303,26 @@ var SITE = (function () {
     // The parts of a query left as typed (SearchCore.interpret): "*", or
     // keys (lower-case words) joined by commas.
     var TYPED_RE = /^(?:\*|[0-9a-z\u00c0-\uffff ]{1,80}(?:,[0-9a-z\u00c0-\uffff ]{1,80}){0,19})$/;
+    // An area of the map (SearchCore.areas reads it all), and its name.
+    var AREA_RE = /^[bpl](?:[1-9]\d{0,3})?(?:\.[0-9A-Za-z_-]+)+$/;
+    var MAX_AREA_TEXT = 6000;
+    var MAX_AREA_NAME = 100;
 
     function emptyState() {
         return {q: "", lib: "", sort: "", filters: {}, group: true, size: "",
                 hidden: false, junk: false, sensitive: "", ids: "", view: "", from: "", to: "",
-                by: "", drives: true, pick: "", typed: ""};
+                by: "", drives: true, pick: "", typed: "", area: "", aname: ""};
+    }
+
+    // An area's text when it has the form of one ("" if not), and its name.
+    function readArea(value) {
+        value = typeof value === "string" ? value : "";
+        return value.length <= MAX_AREA_TEXT && AREA_RE.test(value) ? value : "";
+    }
+
+    function readAreaName(value) {
+        return typeof value === "string" ? value.replace(/[\x00-\x1f\x7f]+/g, " ")
+            .replace(/^\s+|\s+$/g, "").slice(0, MAX_AREA_NAME) : "";
     }
 
     // A map view from an address: "lat,lon,zoom" with the latitude within
@@ -348,6 +381,8 @@ var SITE = (function () {
         state.by = BY.indexOf(by) >= 0 ? by : "";
         var typed = params.get("typed") || "";
         state.typed = state.q && TYPED_RE.test(typed) ? typed : "";
+        state.area = readArea(params.get("area"));
+        state.aname = state.area ? readAreaName(params.get("aname")) : "";
         return state;
     }
 
@@ -409,6 +444,14 @@ var SITE = (function () {
         }
         if (state.q && typeof state.typed === "string" && TYPED_RE.test(state.typed)) {
             params.set("typed", state.typed);
+        }
+        var area = readArea(state.area);
+        if (area) {
+            params.set("area", area);
+            var name = readAreaName(state.aname);
+            if (name) {
+                params.set("aname", name);
+            }
         }
         return params.toString();
     }
@@ -968,7 +1011,7 @@ var SITE = (function () {
             if (place.estimated === true) {
                 rec.pe = 1;     // (place_estimates.py: no position of its own)
             }
-            var sources = {copy: "c", time: "t", area: "a", owner: "o"};
+            var sources = {copy: "c", time: "t", area: "a", owner: "o", file: "f"};
             if (sources[place.source]) {
                 rec.ps = sources[place.source];
             }
@@ -1364,6 +1407,31 @@ var SITE = (function () {
             promise = getJson(cfg.api + "/locations");
         }
         promise.then(callback, function () {
+            callback(null);
+        });
+    }
+
+    var placesPromise = null;     // where the pictures were taken (null again after a failure)
+
+    function loadPlaces(callback, fresh) {
+        if (!placesPromise || fresh) {
+            placesPromise = new Promise(function (resolve, reject) {
+                loadLocations(function (points) {
+                    if (!points) {
+                        reject(new Error("no locations"));
+                        return;
+                    }
+                    loadRoutes(function (routes) {
+                        // (Without routes the clips count by their own positions.)
+                        resolve({points: points, routes: routes || []});
+                    });
+                });
+            });
+            placesPromise.catch(function () {
+                placesPromise = null;
+            });
+        }
+        placesPromise.then(callback, function () {
             callback(null);
         });
     }
@@ -2052,7 +2120,11 @@ var SITE = (function () {
             if (isStatic) {
                 return prefix + zoom + "/" + x + "/" + y + ".jpg";
             }
-            return prefix + "/" + zoom + "/" + x + "/" + y + ".jpg";
+            // (A browser keeps tiles a day: with the version, never those from
+            // before the tile pyramid was made, or made again.)
+            var version = typeof cfg.tilesVersion === "string" && cfg.tilesVersion
+                ? "?v=" + encodeURIComponent(cfg.tilesVersion) : "";
+            return prefix + "/" + zoom + "/" + x + "/" + y + ".jpg" + version;
         },
         tilesMax: function () {
             return typeof cfg.tilesMax === "number" ? cfg.tilesMax : null;
@@ -2070,6 +2142,8 @@ var SITE = (function () {
         loadRecord: loadRecord,
         loadLocations: loadLocations,
         loadRoutes: loadRoutes,
+        loadPlaces: loadPlaces,
+        hasAreas: hasMap,
         loadTrips: loadTrips,
         refreshTrips: refreshTrips,
         loadTripStory: loadTripStory,

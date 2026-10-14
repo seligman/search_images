@@ -1242,6 +1242,33 @@ var VIEWER = (function () {
         return text;
     }
 
+    /* "Harbour Aquarium": the named place on the street maps where a picture
+       was taken (np; see named_places.py), or "". */
+    function namedPlace(rec) {
+        return rec && typeof rec.np === "string" ? rec.np : "";
+    }
+
+    // The kinds of named places, in words (others: the kind with spaces).
+    var KIND_WORDS = {aerodrome: "airport", place_of_worship: "place of worship",
+                      fast_food: "fast food"};
+
+    /* "aquarium, 40 m away", "zoo, taken inside it": what a named place is
+       (nk) and how far it is (nd, or ni inside it), or "". An approximate
+       position (na: an estimate, or one that may be off by more than the
+       distance) says "nearby" or "probably taken inside it". */
+    function namedPlaceNote(rec) {
+        if (!namedPlace(rec)) {
+            return "";
+        }
+        var kind = typeof rec.nk === "string" && rec.nk
+            ? KIND_WORDS[rec.nk] || rec.nk.replace(/_/g, " ") : "";
+        var where = rec.ni ? (rec.na ? "probably taken inside it" : "taken inside it")
+            : typeof rec.nd === "number" && isFinite(rec.nd)
+                ? (rec.nd < 1 ? "right there" : Math.round(rec.nd) + " m away")
+                : rec.na ? "nearby" : "";
+        return [kind, where].filter(Boolean).join(", ");
+    }
+
     var ESTIMATED_PLACE = "(estimated from pictures taken around the same time)";
     var TRACK_PLACE = "(estimated from a video's GPS track)";
     var ESTIMATED_LABELS = {c: "(estimated from a copy of this picture)", t: ESTIMATED_PLACE,
@@ -1269,6 +1296,8 @@ var VIEWER = (function () {
         tagKey: tagKey,
         placeText: placeText,
         placeNames: placeNames,
+        namedPlace: namedPlace,
+        namedPlaceNote: namedPlaceNote,
         estimateReason: estimateReason,
         splitTags: splitTags,
         tagProblem: tagProblem,
@@ -4299,11 +4328,48 @@ var VIEWER = (function () {
                      attrs: {download: ""}})]);
     }
 
-    // The place of a picture, as a chip that finds the pictures taken there.
+    // The place of a picture: its named place on the street maps (np), a chip
+    // that finds the pictures taken there, then its town (townFact), with
+    // what the named place is and how far it is ("aquarium, 40 m away").
+    function placeFact(rec, context, detail) {
+        var town = townFact(rec, context, detail);
+        var name = namedPlace(rec);
+        if (!name) {
+            return town;
+        }
+        var note = namedPlaceNote(rec);
+        var query = window.SearchCore && SearchCore.namedPlaceQuery
+            ? SearchCore.namedPlaceQuery(name) : "";
+        var named = query ? chip(name, "q", query, context,
+                                 (note ? note.charAt(0).toUpperCase() + note.slice(1) +
+                                  " (on the street maps). " : "") +
+                                 "Show all pictures taken at " + name)
+            : el("span", {text: name});
+        if (matches(name, context.query, "np")) {
+            named.classList.add("is-match");
+        }
+        var box = el("span", {className: "info-place info-named-place"});
+        if (town) {
+            // (The dot stays with the named place when the line wraps.)
+            box.appendChild(el("span", {className: "info-place-named"}, [
+                named, el("span", {className: "info-place-sep", text: "\u00b7",
+                                   attrs: {"aria-hidden": "true"}})]));
+            box.appendChild(typeof town === "string" ? el("span", {text: town}) : town);
+        } else {
+            box.appendChild(named);
+        }
+        if (note) {
+            box.appendChild(el("span", {className: "info-place-note info-named-note",
+                                        text: note}));
+        }
+        return box;
+    }
+
+    // The town of a picture, as a chip that finds the pictures taken there.
     // An estimated place (pe) says where it comes from after it ("estimated
     // from ...", a button that shows the details); the owner's own place
     // (ps "o") says so to the admin.
-    function placeFact(rec, context, detail) {
+    function townFact(rec, context, detail) {
         var text = placeText(rec, admin());
         var value = text && window.SearchCore && SearchCore.placeOf ? SearchCore.placeOf(rec) : "";
         if (!value) {
@@ -4311,9 +4377,14 @@ var VIEWER = (function () {
         }
         var near = rec.ci || rec.rg || rec.co;
         if (!rec.pe && rec.ps !== "o") {
-            var own = chip(text, "place", value, context, rec.ci
-                ? "The town nearest to where it was taken. Show all pictures from " + near
-                : "Show all pictures from " + near);
+            // (ps "f": the place its file names, without a position -- or with
+            // one, its names instead of the nearest town's.)
+            var own = chip(text, "place", value, context, rec.ps === "f"
+                ? (rec.gp ? "The place its file names (the pin is its GPS position). "
+                    : "The place its file names (no position, so no pin on the map). ") +
+                  "Show all pictures from " + near
+                : rec.ci ? "The town nearest to where it was taken. Show all pictures from " + near
+                    : "Show all pictures from " + near);
             if (!(detail && detail.track && detail.track.position)) {
                 return own;
             }
@@ -4404,7 +4475,8 @@ var VIEWER = (function () {
     // The record keys a position changes (gps_check.RECORD_KEYS), and those
     // of its time, which the local time of a place changes with it
     // (local_times.RECORD_KEYS).
-    var LOCATION_KEYS = ["gp", "ci", "rg", "co", "cc", "km", "pe", "ps", "gx"];
+    var LOCATION_KEYS = ["gp", "ci", "rg", "co", "cc", "km", "pe", "ps", "gx",
+                         "np", "nk", "nd", "ni", "na"];
     var TIME_KEYS = ["dk", "ts"];
 
     // A record's position and place keys as the server's answer has them
@@ -4823,6 +4895,20 @@ var VIEWER = (function () {
         return button;
     }
 
+    // Whether a picture's file names a place that is its own when nothing else
+    // decides (its XMP location fields, kept in its exif as "XMPPlace":
+    // place_estimates.file_place needs a country; not with a position the
+    // GPS check set aside, as the names may come from it).
+    function fileNamesPlace(detail) {
+        var place = detail && detail.exif && detail.exif.XMPPlace;
+        if (detail && detail.location_check && detail.location_check.ignored) {
+            return false;
+        }
+        return !!(place && typeof place === "object" &&
+                  ((typeof place.country === "string" && place.country) ||
+                   (typeof place.cc === "string" && place.cc)));
+    }
+
     /* The admin's choices about a picture's estimated place (or own place),
        under the facts; null when there is nothing to choose (a picture with
        a GPS position, or one with no place at all: see adminActions). */
@@ -4835,7 +4921,16 @@ var VIEWER = (function () {
             ? detail.place_estimate : null;
         var note = el("div", {className: "info-place-estimate"});
         var row = el("div", {className: "info-place-row"});
-        if (estimate && estimate.choice === "reject" && !estimate.source) {
+        var rejected = estimate && estimate.choice === "reject" && !estimate.source;
+        if (rejected && fileNamesPlace(detail)) {
+            // (No place, although its file names one: the file's place comes back.)
+            note.appendChild(el("p", {className: "info-small", text: "You said the picture " +
+                                      "has no place, although its file names one."}));
+            row.appendChild(actionButton("Use its file's place", function (button) {
+                choosePlace(box, rec, detail, context, {choice: "clear"}, button,
+                            "The place its file names is back.");
+            }));
+        } else if (rejected) {
             note.appendChild(el("p", {className: "info-small",
                                       text: "You rejected the estimated place."}));
             row.appendChild(actionButton("Estimate again", function (button) {
@@ -4849,6 +4944,16 @@ var VIEWER = (function () {
                 choosePlace(box, rec, detail, context, {choice: "clear"}, button,
                             "Your place is cleared; the place is estimated again.");
             }));
+        } else if (rec.ps === "f") {
+            // (The place its file names, without a position: place_estimates.py.)
+            note.appendChild(el("p", {className: "info-small", text: "Its file names this " +
+                                      "place, without a position (no pin on the map)."}));
+            var none = actionButton("No place", function (button) {
+                choosePlace(box, rec, detail, context, {choice: "reject"}, button,
+                            "The picture has no place now; its file's place is set aside.");
+            }, "subtle-danger");
+            none.title = "No place for this picture, whatever its file says (kept across scans)";
+            row.appendChild(none);
         } else if (rec.pe) {
             note.appendChild(el("p", {className: "info-small",
                                       text: "Is the estimated place right?"}));
@@ -4867,8 +4972,8 @@ var VIEWER = (function () {
         } else {
             return null;
         }
-        row.appendChild(setPlaceButton(box, rec, detail, context, rec.pe || rec.ps === "o"
-            ? "Change place\u2026" : "Set place\u2026"));
+        row.appendChild(setPlaceButton(box, rec, detail, context,
+            rec.pe || rec.ps === "o" || rec.ps === "f" ? "Change place\u2026" : "Set place\u2026"));
         note.appendChild(row);
         return note;
     }

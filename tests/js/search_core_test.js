@@ -3095,6 +3095,59 @@ test("per-term coverage: a word whose pictures stand far out needs more than z 2
     assert.deepStrictEqual(result.items, []);
 });
 
+test("per-term coverage: not in a small set, where the whole query decides", function () {
+    // Nineteen pictures, as an export of a small library has. The coffee
+    // cups have neither "warm" nor "drink" in their words, and stand a
+    // little above the rest for the whole query (z 2.7), as the closest few
+    // of a small set do; on its own, "warm" (a word of another picture)
+    // puts them below the mean. In a library of hundreds of pictures cups
+    // even far above the rest for the whole query need each word's own
+    // meaning, and "warm" lacks.
+    function cups(fillers) {
+        var records = [
+            {i: 1, t: "Coffee cups on a cafe table", g: ["coffee", "cups", "table"],
+             dk: "2020-01-01", ds: 1},
+            {i: 2, t: "Warm light on a wall", g: ["warm", "light", "wall"], dk: "2020-01-02",
+             ds: 1}
+        ];
+        var vectors = {1: closeTo(fillers ? 0.9 : 0.5, 3), 2: closeTo(0.15, 4)};
+        if (fillers) {
+            return meaningIndex(records, vectors, fillers);
+        }
+        for (var k = 0; k < 17; k++) {
+            records.push({i: 100 + k, t: "Picture " + k, dk: "2020-02-01", ds: 1});
+            vectors[100 + k] = closeTo(0.05 + 0.3 * k / 16, 1 + (k % 2) * 4);
+        }
+        var ids = Object.keys(vectors).map(Number);
+        var data = new Int8Array(ids.length * MEANING_DIMS);
+        ids.forEach(function (id, n) {
+            data.set(vectors[id], n * MEANING_DIMS);
+        });
+        var index = SearchCore.prepare(records);
+        index.setVectors({dims: MEANING_DIMS, ids: ids, data: data});
+        return index;
+    }
+    var words = {warm: axisVector(4), drink: axisVector(3)};
+    var small = cups(0);
+    assert.strictEqual(small.vecCount, 19);
+    var whole = small.cosineStats(QUERY);
+    var at = small.position["1"];
+    var z = (whole.values[at] - whole.mean) / whole.std;
+    assert.ok(z > 2.2 && z < 3, String(z));
+    var warm = small.cosineStats(axisVector(4));
+    assert.ok((warm.values[at] - warm.mean) / warm.std < 0, "warm");
+    var result = small.search("warm drink", {vector: QUERY, termVectors: words});
+    assert.deepStrictEqual(result.items, [1]);
+    assert.deepStrictEqual(result.byMeaning, [1]);
+    // (No term was judged on its own.)
+    assert.deepStrictEqual(result.meaning.terms, []);
+    // A library of hundreds: "warm" is not covered.
+    var large = cups(400);
+    assert.deepStrictEqual(large.search("warm drink", {vector: QUERY, termVectors: words}).items,
+                           []);
+    assert.deepStrictEqual(large.search("warm drink", {vector: QUERY}).items, [1]);
+});
+
 test("per-term coverage: a folder's word that pictures show is no name", function () {
     // Ten pictures in "Wood Carving" (one says "carving"), all much like
     // the word; a carved wooden sculpture elsewhere is close to it too.
@@ -3167,6 +3220,45 @@ test("plain language: since, after and before a relative date; years with a dash
     // "2015 - 2019" typed with spaces, as "2015-2019".
     assert.strictEqual(query("2015 - 2019 beach"), "date:2015..2019 beach");
     assert.strictEqual(understood(index, "2015 - 2019 beach").rest, "beach");
+});
+
+test("plain language: words about taking the picture are left out", function () {
+    var index = SearchCore.prepare(plainRecords());
+    function check(text, query, dropped) {
+        var answer = understood(index, text);
+        assert.strictEqual(answer.query, query, text);
+        assert.deepStrictEqual(answer.dropped, dropped, text);
+        return answer;
+    }
+    // With a place, a date or a person understood.
+    var italy = check("taken in Italy", "place:italy OR italy", ["taken"]);
+    assert.deepStrictEqual(italy.parts.map(function (part) {
+        return part.label;
+    }), ["Place: Italy"]);
+    assert.strictEqual(italy.rest, "");
+    assert.deepStrictEqual(index.search(italy.query).items, [4]);
+    var lisbon = check("pictures taken in Lisbon", "pictures place:lisbon OR lisbon", ["taken"]);
+    assert.deepStrictEqual(index.search(lisbon.query).items.slice().sort(), [1, 2]);
+    check("something in Italy", "place:italy OR italy", ["something"]);
+    check("photographed in november 2024", "date:2024-11", ["photographed"]);
+    check("bridge shot in Italy", "bridge place:italy OR italy", ["shot"]);
+    // Before "in", "at", ... and more words: a place known only by the
+    // words of its pictures, or no place at all.
+    var beach = check("taken at the beach", "at the beach", ["taken"]);
+    assert.deepStrictEqual(index.search(beach.query).items.slice().sort(), [1, 3]);
+    check("Something on the bridge", "on the bridge", ["Something"]);
+    // Otherwise they stay words.
+    check("something warm to drink", "something warm to drink", []);
+    check("shot glass", "shot glass", []);
+    check("taken in", "taken in", []);
+    check("\"taken in\" lisbon", "\"taken in\" place:lisbon OR lisbon", []);
+    // As typed: everything stays.
+    var typed = understood(index, "taken in Italy", {typed: "*"});
+    assert.deepStrictEqual([typed.query, typed.dropped], ["taken in Italy", []]);
+    // Only the place as typed: "taken" still goes before "in" and more words.
+    var kept = understood(index, "taken in Italy", {typed: ["italy"]});
+    assert.deepStrictEqual([kept.query, kept.dropped, kept.kept], ["in Italy", ["taken"],
+                                                                  ["italy"]]);
 });
 
 test("plain language: us is a small word, US the country", function () {

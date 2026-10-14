@@ -493,7 +493,7 @@ WAITING_STAGE = "waiting for another scan to finish"
 # Kinds of job that are no library's, though their library_id is NULL as for a job of
 # every library: the library cards of the Manage page do not show them as their last job
 # (latest_by_library). (maps: the street maps, street_maps.py.)
-NO_LIBRARY_KINDS = ("delete_library", "delete_faces", "trip_stories", "maps")
+NO_LIBRARY_KINDS = ("delete_library", "delete_faces", "trip_stories", "maps", "named_places")
 # How the server's jobs name themselves when they hold the WorkerLock.
 WEB_JOB_LABEL = "web server job"
 LOG_LINES = 1000            # log lines kept for the browser (all jobs together)
@@ -527,6 +527,7 @@ STAGE_LABELS = {
     "street maps size": "Checking the size of the street maps",
     "street maps download": "Downloading the street maps",
     "street maps file": "Writing the street maps file",
+    "named places": "Finding named places on the street maps",
     "stories": "Writing trip stories",
 }
 # The job queue lives in data/jobs.db, a database of its own: a running scan
@@ -1632,7 +1633,20 @@ def run_describe(ctx, conn, config, params, helper=None):
                                         library_ids=library_ids,
                                         ids=ids, force=bool(params.get("force")),
                                         **_describe_options(params))
+    if summary.get("described"):
+        # (Where a picture was taken from -- indoors, outdoors, a vehicle -- says
+        # which named places fit it: named_places.picture_facts.)
+        _named_places(summary, conn, config, ctx)
     return _with_embed(summary, conn, config, ctx, library_ids)
+
+
+def _named_places(summary, conn, config, ctx):
+    """The named places of the pictures whose position (or description) changed
+    (named_places.run_safely), as the summary's "named_places"."""
+    import named_places
+    found = named_places.run_safely(conn, config, ctx)
+    if found is not None:
+        summary["named_places"] = found
 
 
 def _with_embed(summary, conn, config, ctx, library_ids):
@@ -1754,6 +1768,7 @@ def run_previews(ctx, conn, config, params, helper=None):
     localised = local_times.run_safely(conn, config, ctx)
     if localised is not None:
         summary["local_times"] = localised
+    _named_places(summary, conn, config, ctx)
     if params.get("library_id") and len(results) == 1 and results[0].get("offline"):
         summary["error"] = "The folder of %s is not available (offline?)." % results[0]["name"]
     return summary
@@ -1848,6 +1863,7 @@ def run_places(ctx, conn, config, params, helper=None):
         localised = local_times.run_safely(conn, config, ctx)
         if localised is not None:
             summary["local_times"] = localised
+        _named_places(summary, conn, config, ctx)
     except places.PlacesError as error:
         if ctx.should_stop():
             return summary          # (cancelled: no error)
@@ -1965,9 +1981,13 @@ def run_maps(ctx, conn, config, params, helper=None):
             ctx.log(street_maps.plan_words(found))
             return {"plan": street_maps.public_plan(found)}
         expect = params.get("expect_bytes")
-        return street_maps.download(conn, config, ctx, found=found, expect_bytes=expect
-                                    if isinstance(expect, int) and expect > 0 else None,
-                                    allow_large=params.get("allow_large") is True)
+        result = street_maps.download(conn, config, ctx, found=found, expect_bytes=expect
+                                      if isinstance(expect, int) and expect > 0 else None,
+                                      allow_large=params.get("allow_large") is True)
+        if not result.get("stopped"):
+            # (New street maps: every picture's named place is looked up again.)
+            _named_places(result, conn, config, ctx)
+        return result
     except street_maps.Stopped:
         return {"stopped": True}
     except street_maps.MapsError as error:
@@ -1975,6 +1995,24 @@ def run_maps(ctx, conn, config, params, helper=None):
     except OSError as error:
         raise JobError("A street maps file could not be written or read: %s"
                        % common.redact(error))
+
+
+def run_named_places(ctx, conn, config, params, helper=None):
+    """Named places from the street maps (named_places.py): look up the pictures whose
+    position changed since, or with params "redo" every picture again. Raises JobError
+    without street maps."""
+    import named_places
+    import street_maps
+    try:
+        summary = named_places.update(conn, config, ctx, redo=bool(params.get("redo")))
+    except (street_maps.MapsError, OSError) as error:
+        raise JobError("The street maps cannot be read: %s" % common.redact(str(error)))
+    if not summary["maps"]:
+        raise JobError("There are no street maps, so no named places: download them first "
+                       "(Street maps on the Manage page).")
+    if not summary["looked_up"] and not summary["removed"]:
+        ctx.log(named_places.summary_text(summary))
+    return summary
 
 
 def run_trip_stories(ctx, conn, config, params, helper=None):
@@ -2009,6 +2047,7 @@ RUNNERS = {
     "group_faces": run_group_faces,
     "delete_faces": run_delete_faces,
     "maps": run_maps,
+    "named_places": run_named_places,
     "trip_stories": run_trip_stories,
 }
 
@@ -2255,6 +2294,11 @@ def _maps_command(params, config):
     return "street_maps.py", street_maps.command_args(params)
 
 
+def _named_places_command(params, config):
+    import named_places
+    return "named_places.py", named_places.command_args(params)
+
+
 def _delete_faces_command(params, config):
     return "people.py", ["--delete-all", "--yes"]
 
@@ -2283,6 +2327,7 @@ COMMAND_BUILDERS = {
     "delete_faces": (_delete_faces_command, ("confirm",)),
     "trip_stories": (_trip_stories_command, ("trip", "redo", "trip_title")),
     "maps": (_maps_command, ("download", "expect_bytes", "source", "allow_large")),
+    "named_places": (_named_places_command, ("redo",)),
 }
 # Kinds of job that no command line does: kind -> why (logged after NO_COMMAND).
 NO_COMMAND_KINDS = {}

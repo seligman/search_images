@@ -11,6 +11,8 @@
 <div id="map-bar">
 <a id="map-back" href="#">Back to search</a>
 <span id="map-search"></span>
+<span id="map-area-chip" hidden></span>
+<button id="map-area-button" type="button" class="button small" aria-label="Search an area of the map" aria-expanded="false" aria-controls="map-area-tools">Search an area</button>
 <label id="map-estimated" class="map-toggle" hidden><input type="checkbox" id="map-estimated-toggle"> Show estimated places</label>
 <label id="map-routes" class="map-toggle" hidden><input type="checkbox" id="map-routes-toggle"> Show drive routes</label>
 <span id="map-status" aria-live="polite"></span>
@@ -19,12 +21,36 @@
 <canvas id="map-canvas" tabindex="0" role="application" aria-roledescription="map" aria-label="Map of the pictures. Arrow keys move it, plus and minus zoom, Enter lists the pictures of the pin nearest the middle."></canvas>
 <span id="map-target" class="visually-hidden" aria-live="polite"></span>
 <div id="map-route-tip" hidden></div>
+<div id="map-area-tools" role="group" aria-label="Search an area" hidden>
+<div class="map-area-modes">
+<button type="button" class="button small" data-mode="box" aria-pressed="false" aria-label="Draw a rectangle">Rectangle</button>
+<button type="button" class="button small" data-mode="draw" aria-pressed="false" aria-label="Draw around the area">Draw</button>
+<button type="button" class="button small" data-mode="pick" aria-pressed="false" aria-label="Street or place: pick one from the street maps">Street or place</button>
+<button id="map-area-view" type="button" class="button small" aria-label="This view: search what the map shows">This view</button>
+<button id="map-area-close" type="button" class="icon-button" aria-label="Close the area tools" title="Close (Esc)">&times;</button>
+</div>
+<p id="map-area-hint" aria-live="polite"></p>
+<div id="map-area-find" hidden>
+<div class="map-area-find-row">
+<input id="map-area-input" class="input" type="search" autocomplete="off" spellcheck="false" placeholder="Find a street or place of this view" aria-label="Find a street or place of this view" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="map-area-list">
+<label class="map-area-width">Within <select id="map-area-metres" aria-label="How far either side of a street, or around a place">
+<option value="25">25 m</option>
+<option value="50" selected>50 m</option>
+<option value="100">100 m</option>
+<option value="200">200 m</option>
+<option value="500">500 m</option>
+</select></label>
+</div>
+<ul id="map-area-list" role="listbox" aria-label="Streets and places of this view"></ul>
+</div>
+</div>
+<div id="map-area-menu" role="menu" aria-label="Which one?" hidden></div>
 <div id="map-zoom">
 <button id="zoom-in" type="button" aria-label="Zoom in" title="Zoom in (+)">+</button>
 <button id="zoom-out" type="button" aria-label="Zoom out" title="Zoom out (-)">&#8722;</button>
 </div>
 <div id="map-message" role="status" hidden></div>
-<p id="map-streets-credit" class="map-credit map-streets-credit" hidden>&copy; OpenStreetMap contributors (<a id="map-streets-licence" rel="license" target="_blank">ODbL</a>)</p>
+<p id="map-streets-credit" class="map-credit map-streets-credit"><span class="map-credit-world">Imagery: NASA Blue Marble</span><span class="map-credit-sep" aria-hidden="true" hidden> &middot; </span><span class="map-credit-osm" hidden>&copy; OpenStreetMap contributors (<a id="map-streets-licence" rel="license" target="_blank">ODbL</a>)</span></p>
 <p id="map-note" hidden>Zoomed in past the detail of the map; the pins are still exact.</p>
 <aside id="map-panel" aria-labelledby="map-panel-title" hidden>
 <div id="map-panel-head">

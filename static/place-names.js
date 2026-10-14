@@ -129,6 +129,12 @@
         if (estimates.owner) {
             text += " You set the place of " + fmt.plural(estimates.owner, "picture") + ".";
         }
+        if (estimates.file) {
+            // (place_estimates.file_place: names only, no position)
+            text += " " + fmt.plural(estimates.file, "picture") + " without a position " +
+                (estimates.file === 1 ? "has" : "have") + " the place " +
+                (estimates.file === 1 ? "its file names" : "their files name") + ".";
+        }
         return text;
     }
 

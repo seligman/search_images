@@ -48,7 +48,7 @@ test("the address keeps a search and reads it back", function () {
                  group: false, size: "l", hidden: true, junk: true, sensitive: "show",
                  ids: "5-2.2", view: "-17.5,179.9,4", from: "2019-03", to: "2019-05-14",
                  by: "meaning", drives: false, pick: "Trip: Lakes, day 2",
-                 typed: "anna,last summer"};
+                 typed: "anna,last summer", area: "l50.WYro8WaXz1m-1Wz3", aname: "Test Road"};
     var query = SITE.searchState.params(state);
     var back = SITE.searchState.read("?" + query);
     assert.deepStrictEqual(back, state);
@@ -204,6 +204,24 @@ test("server addresses", function () {
     assert.strictEqual(SITE.imageUrl({i: 5}), "/image/5");
     assert.strictEqual(SITE.isStatic, false);
 });
+
+test("the server's tile addresses carry the tiles' version (no tile kept from before)",
+     function () {
+         // (A browser keeps a tile a day under its address: the server's version of
+         // the tiles changes when the tile pyramid is made, or made again.)
+         var site = loadSite({mode: "server", api: "/api", tiles: "/tile", page: "map",
+                              tilesVersion: "1-18f0a2b3c4d5e6f7"});
+         assert.strictEqual(site.tileUrl(3, 2, 1), "/tile/3/2/1.jpg?v=1-18f0a2b3c4d5e6f7");
+         site = loadSite({mode: "server", api: "/api", tiles: "/tile", page: "map",
+                          tilesVersion: "a b&c"});
+         assert.strictEqual(site.tileUrl(0, 1, 0), "/tile/0/1/0.jpg?v=a%20b%26c");
+         // (Without one, as before; an export's tiles are files of its own.)
+         site = loadSite({mode: "server", api: "/api", tiles: "/tile", page: "map"});
+         assert.strictEqual(site.tileUrl(3, 2, 1), "/tile/3/2/1.jpg");
+         site = loadSite({mode: "static", data: "data/", tiles: "tiles/", page: "map",
+                          tilesVersion: "1-ab", capabilities: {static: true}});
+         assert.strictEqual(site.tileUrl(3, 2, 1), "tiles/3/2/1.jpg");
+     });
 
 test("static export addresses are relative", function () {
     var site = loadSite({mode: "static", data: "data/", tiles: "tiles/", page: "search",

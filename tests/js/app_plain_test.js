@@ -64,7 +64,9 @@ function records() {
          f: "Kowalski"},
         {i: 7, l: "lib", t: "Turtle painted on a wall", g: ["turtle", "wall"], dk: "2023-05-02", ds: 1}
     ];
-    for (var k = 0; k < 40; k++) {
+    // (Sixty more: a library, not a small set, where per-term coverage applies
+    // -- see search-core.js MEANING_SMALL.)
+    for (var k = 0; k < 60; k++) {
         list.push({i: 100 + k, l: "lib", t: "Filler " + k, g: ["filler"], dk: "2010-01-01",
                    ds: 1});
     }

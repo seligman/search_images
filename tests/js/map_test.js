@@ -471,13 +471,15 @@ test("the open list reads back from the address and finds its pin again", functi
     });
 });
 
-test("a chip of the viewer opens a new search, without the timeline's dates", function () {
+test("a chip of the viewer opens a new search, without the dates or the area", function () {
     var state = {q: "beach", lib: "lib_family1", filters: {type: ["photo"]}, from: "2019",
-                 to: "2019", view: "37.1,-8.2,9", ids: "", group: true};
+                 to: "2019", view: "37.1,-8.2,9", ids: "", group: true,
+                 area: "l50.WYro8WaXz1m-1Wz3", aname: "Test Road"};
     var target = MAP.chipState(state, "place", "Portugal|Algarve|Faro");
     assert.deepStrictEqual(target, {q: "", lib: "lib_family1",
                                     filters: {place: ["Portugal|Algarve|Faro"]},
-                                    from: "", to: "", view: "", ids: "", group: true});
+                                    from: "", to: "", view: "", ids: "", group: true,
+                                    area: "", aname: ""});
     target = MAP.chipState(state, "q", "tag:sunset");
     assert.strictEqual(target.q, "tag:sunset");
     assert.deepStrictEqual(target.filters, {});
@@ -560,9 +562,10 @@ function mapResponse(body) {
     });
 }
 
-/* The admin's map page at an address (searchText: its ?... part). page.urls:
-   the addresses it wrote; page.views() their views ([lat, lon, zoom]). */
-function mapPage(searchText) {
+/* The admin's map page at an address (searchText: its ?... part; records:
+   the search records, MAP_RECORDS by default). page.urls: the addresses it
+   wrote; page.views() their views ([lat, lon, zoom]). */
+function mapPage(searchText, records) {
     var urls = [];
     var document = FAKE.makeDocument();
     var config = {mode: "server", page: "map", api: "/api", tiles: "/tile", tilesMax: 8,
@@ -608,7 +611,7 @@ function mapPage(searchText) {
         var plain = String(url).split("?")[0];
         if (plain === "/api/index") {
             return mapResponse({version: 1, libraries: [{id: "lib", name: "Example"}],
-                                albums: [], records: MAP_RECORDS});
+                                albums: [], records: records || MAP_RECORDS});
         }
         if (plain === "/api/locations") {
             return mapResponse(MAP_POINTS);
@@ -731,6 +734,24 @@ test("a view from the address that shows none of her pictures is fitted to them"
     }).then(function (view) {
         // (Her pictures are in sight: the view stays as the address had it.)
         assert.deepStrictEqual(view, [45, 10, 4]);
+    });
+});
+
+test("a search whose picture has a place but no position says it has no position",
+     function () {
+    // (A place its file names: place_estimates.file_place, ps "f", no point.)
+    var named = {i: 5, l: "lib", t: "Kennel", g: ["dog"], dk: "2024-05-05", ds: 1,
+                 ci: "Coralport", co: "Examplia", cc: "XA", ps: "f"};
+    var page = mapPage("?q=coralport", MAP_RECORDS.concat([named]));
+    var box = page.document.getElementById("map-message");
+    return FAKE.waitFor(function () {
+        return !box.hidden && /position/.test(box.textContent);
+    }).then(function () {
+        assert.strictEqual(box.querySelector("h2").textContent,
+                           "The picture that matches has no position");
+        assert.ok(/a place named without a position has no pin/.test(box.textContent),
+                  box.textContent);
+        assert.ok(!/no location/.test(box.textContent), box.textContent);
     });
 });
 

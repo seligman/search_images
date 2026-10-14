@@ -456,6 +456,14 @@ body.map-panel-open #map-note {
     color: var(--text-muted);
 }
 
+.map-panel-place {
+    font-size: 11px;
+    color: var(--text-muted);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
 #map-panel-more {
     margin: 0 10px 10px;
 }
@@ -3107,9 +3115,24 @@ button.facet-title::after {
     color: var(--text-muted);
 }
 
-/* The OpenStreetMap credit in a corner of a map while it shows street maps
-   (streets.js): the map page's (above the GeoNames credit of an export),
-   a trip's map's and the viewer's map of a drive */
+/* The named places found on them (named_places.py) */
+
+.street-maps-named-title {
+    margin: 16px 0 4px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 14px;
+}
+
+.street-maps-named {
+    margin: 4px 0 8px;
+    font-size: 14px;
+}
+
+/* The credit in a corner of a map (streets.js creditNode): the world
+   image's (NASA's Blue Marble) while it shows, and OpenStreetMap's while
+   street maps show -- the map page's (above the GeoNames credit of an
+   export), a trip's map's and the viewer's map of a drive */
 
 #map-credit ~ #map-streets-credit {
     bottom: 34px;
@@ -5063,6 +5086,23 @@ a.info-chip:focus-visible {
     font-size: 12px;
 }
 
+/* The named place on the street maps (named_places.py) before the town */
+
+.info-place-named {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+}
+
+.info-place-sep {
+    color: var(--text-muted);
+}
+
+.info-named-note {
+    flex-basis: 100%;
+}
+
 /* The camera's clock under a time shown in the local time of its place
    (local_times.py) */
 
@@ -5511,6 +5551,238 @@ body.detail-page {
 
 #map-route-tip[hidden] {
     display: none;
+}
+
+/* An area of the map (map.js "Search an area"): its chip in the bar, the
+   tools over the map, and the menu of what is named where it was picked */
+
+#map-area-chip {
+    display: inline-flex;
+    min-width: 0;
+    max-width: 100%;
+}
+
+#map-area-chip[hidden] {
+    display: none;
+}
+
+#map-area-button {
+    white-space: nowrap;
+}
+
+#map-area-tools {
+    position: absolute;
+    z-index: 4;
+    top: 12px;
+    left: 12px;
+    width: min(560px, calc(100% - 72px));
+    padding: 10px 12px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+}
+
+#map-area-tools[hidden] {
+    display: none;
+}
+
+body.map-panel-open #map-area-tools {
+    left: 344px;
+    width: min(560px, calc(100% - 404px));
+}
+
+.map-area-modes {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+.map-area-modes .button[aria-pressed="true"] {
+    background: var(--accent-fill);
+    border-color: var(--accent-fill);
+    color: var(--accent-text);
+}
+
+#map-area-close {
+    margin-left: auto;
+}
+
+#map-area-hint {
+    margin: 8px 0 0;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--text-muted);
+    white-space: normal;
+}
+
+#map-area-find {
+    margin-top: 8px;
+}
+
+#map-area-find[hidden] {
+    display: none;
+}
+
+.map-area-find-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.map-area-find-row .input {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+}
+
+.map-area-width {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+.map-area-width select {
+    font: inherit;
+    padding: 4px 6px;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+}
+
+#map-area-list {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 0;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.map-area-name {
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 14px;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+
+.map-area-name:hover,
+.map-area-name.is-active {
+    background: var(--surface-2);
+}
+
+.map-area-what,
+.map-area-note {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.map-area-note {
+    padding: 6px 8px;
+    font-size: 13px;
+}
+
+#map-canvas.drawing,
+#map-canvas.picking {
+    cursor: crosshair;
+}
+
+#map-area-menu {
+    position: absolute;
+    z-index: 5;
+    min-width: 200px;
+    max-width: min(320px, calc(100% - 16px));
+    padding: 6px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+}
+
+#map-area-menu[hidden] {
+    display: none;
+}
+
+.map-area-menu-title {
+    margin: 2px 6px 4px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.map-area-option {
+    display: block;
+    width: 100%;
+    padding: 7px 8px;
+    font: inherit;
+    font-size: 14px;
+    text-align: left;
+    color: var(--text);
+    background: none;
+    border: 0;
+    border-radius: 6px;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+
+.map-area-option:hover {
+    background: var(--surface-2);
+}
+
+.map-area-option:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+@media (max-width: 600px) {
+    #map-area-tools,
+    body.map-panel-open #map-area-tools {
+        top: 8px;
+        left: 8px;
+        width: calc(100% - 64px);
+        padding: 8px 10px;
+    }
+
+    .map-area-find-row {
+        flex-wrap: wrap;
+    }
+
+    #map-area-list {
+        max-height: 30vh;
+    }
+
+    #map-area-button,
+    .map-area-modes .button,
+    .map-area-option {
+        min-height: 40px;
+    }
+
+    /* A searched area keeps the bar as it was: its chip (the name cut short)
+       and a short "Change" share the first row. While a rectangle or a shape
+       is drawn, the tools are one row (the mode drawn with, and close) over
+       less of the map. */
+    #map-area-chip {
+        flex: 1 1 120px;
+        min-width: 120px;
+    }
+
+    body.map-has-area #map-area-button {
+        font-size: 0;
+    }
+
+    body.map-has-area #map-area-button::after {
+        content: "Change";
+        font-size: 13px;
+    }
+
+    #map-area-tools.is-drawing .map-area-modes .button:not([aria-pressed="true"]) {
+        display: none;
+    }
 }
 
 .route-map {

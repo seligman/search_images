@@ -140,6 +140,8 @@
                 target.view = "";           // (a new search: the map fits it)
                 target.from = "";
                 target.to = "";
+                target.area = "";
+                target.aname = "";
                 if (group !== "q") {
                     target.filters[group] = [value];
                 }

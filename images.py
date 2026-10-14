@@ -1730,7 +1730,9 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
                         want_preview is False. For PNG/GIF/WebP/BMP/TIFF
                         originals it is a PNG when that is smaller (see
                         _encode_preview); check with sniff_mime().
-        exif            cleaned EXIF dict (json.dumps(allow_nan=False) safe)
+        exif            cleaned EXIF dict (json.dumps(allow_nan=False) safe),
+                        with "XMPPlace": the place names its XMP gives
+                        (imageinfo.xmp_place), when it gives any
         dhash           16 hex chars (see compute_dhash)
         content_hash    sha1 hex of the original bytes
         mime            sniffed from the content, not the extension
@@ -1848,6 +1850,11 @@ def read_image(path, helper=None, preview_edge=PREVIEW_EDGE, want_preview=True,
                              % _error_text(error)) from error
 
     meta = exif_metadata(exif, name, mtime)
+    place = imageinfo.xmp_place(xmp)
+    if place:
+        # (Where the file says it was taken, without a position: see
+        # place_estimates.file_place.)
+        exif["XMPPlace"] = place
     if raw is not None:
         # (The facts of the RAW file indexed on its own, see raw_photos.view.)
         exif["raw"] = raw_photos.alone_record(raw, (width, height))

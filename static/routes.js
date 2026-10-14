@@ -448,9 +448,7 @@ var ROUTES = (function () {
         ctx.fillRect(0, 0, w, h);
         var clear = STREETS.clearOf(this.credit, canvas);
         var drawn = this.basemap.draw(ctx, zoom, left, top, w, h, clear ? [clear] : []);
-        var creditWas = this.credit.hidden;
-        this.credit.hidden = !drawn.streets;
-        if (creditWas && !this.credit.hidden) {
+        if (STREETS.showCredit(this.credit, drawn)) {
             this.schedule();            // (names placed clear of it next time)
         }
         // The route, the clip that plays over it, and where it is.

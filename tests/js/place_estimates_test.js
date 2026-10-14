@@ -3,8 +3,9 @@
    place line of a picture whose place is estimated ("estimated", and why on
    a tap), the admin's Accept / Reject / Change place... and Set place...
    (the town search), what the route answers changing the record in place,
-   nothing of the choices for visitors, is:place-estimated, hollow pins on
-   the map, the export's "Estimated places" and the Manage page's count.
+   nothing of the choices for visitors, a place its file names (the
+   picture's own), is:place-estimated, hollow pins on the map, the export's
+   "Estimated places" and the Manage page's count.
    The real page scripts on the made-up DOM of tests/js/app_meaning_test.js,
    with a fake fetch() for the server's answers. Every place here is made up.
 
@@ -124,6 +125,9 @@ function serverPage(admin) {
                                                        place: "Coralport, North Coast, " +
                                                            "Examplia", lat: 5, lon: -150,
                                                        ids: []}});
+            }
+            if (body.choice === "clear" && log.cleared) {
+                return response(200, log.cleared);
             }
             if (body.choice === "reject") {
                 return response(200, {id: 2, record: {}, place: null, place_estimate: {
@@ -477,6 +481,114 @@ test("a picture without a place offers Set place... to the admin only", function
     });
 });
 
+test("a located picture whose file names its place: those names, its pin its position",
+     function () {
+    // (place_estimates.gps_file_columns: no distance, no note, nothing to choose.)
+    var named = {i: 8, l: "lib", t: "Village", ds: 1, gp: 1, ci: "Little Ford",
+                 rg: "Midlands", co: "Testland", cc: "XB", ps: "f"};
+    var detail = {id: 8, lat: 5, lon: -150,
+                  exif: {XMPPlace: {city: "Little Ford", region: "Midlands",
+                                    country: "Testland", cc: "XB"}},
+                  place: {city: "Little Ford", region: "Midlands", country: "Testland",
+                          cc: "XB", source: "file"},
+                  place_estimate: null, location_check: null};
+    assert.strictEqual(VIEWER.format.placeText(named), "Little Ford, Midlands, Testland");
+    var owner = serverPage(true);
+    return loaded(owner).then(function () {
+        var drawn = pane(owner, named, detail);
+        var chip = drawn.box.querySelectorAll(".info-chip").filter(function (node) {
+            return node.textContent === "Little Ford, Midlands, Testland";
+        })[0];
+        assert.ok(chip, "no place chip");
+        assert.strictEqual(chip.title, "The place its file names (the pin is its GPS " +
+                           "position). Show all pictures from Little Ford");
+        assert.strictEqual(drawn.box.querySelector(".info-place-estimate"), null);
+        assert.strictEqual(button(drawn.box, "Set place" + ELLIPSIS), undefined);
+    });
+});
+
+test("a place its file names is the picture's own: the admin may change it or say none",
+     function () {
+    var named = {i: 6, l: "lib", t: "Named", ds: 1, rg: "North Coast", co: "Examplia",
+                 cc: "XA", ps: "f"};
+    var fileEstimate = {source: "file", reason: "named in its file", radius_km: null,
+                        place: "North Coast, Examplia"};
+    var detail = {id: 6, lat: null, lon: null,
+                  exif: {XMPPlace: {region: "North Coast", country: "Examplia", cc: "XA"}},
+                  place: {city: "", region: "North Coast", country: "Examplia", cc: "XA",
+                          source: "file"},
+                  place_estimate: fileEstimate};
+    // Plain, like a place of its own (no "estimated", no distance), to everyone.
+    assert.strictEqual(VIEWER.format.placeText(named), "North Coast, Examplia");
+    assert.strictEqual(VIEWER.format.placeText(named, true), "North Coast, Examplia");
+    var visitor = serverPage(false);
+    var owner = serverPage(true);
+    var drawn = null;
+    return loaded(visitor).then(function () {
+        var seen = pane(visitor, named, detail);
+        assert.ok(/North Coast, Examplia/.test(seen.box.textContent));
+        assert.ok(!/estimated|file names/.test(seen.box.textContent), seen.box.textContent);
+        assert.strictEqual(seen.box.querySelector(".info-place-estimate"), null);
+        // Its chip says where the place comes from: not a town near a position.
+        var chip = seen.box.querySelectorAll(".info-chip").filter(function (node) {
+            return node.textContent === "North Coast, Examplia";
+        })[0];
+        assert.ok(chip, "no place chip");
+        assert.strictEqual(chip.title, "The place its file names (no position, so no pin on " +
+                           "the map). Show all pictures from North Coast");
+        return loaded(owner);
+    }).then(function () {
+        drawn = pane(owner, named, detail);
+        var note = drawn.box.querySelector(".info-place-estimate");
+        assert.ok(note, "no note");
+        assert.ok(/Its file names this place, without a position/.test(note.textContent),
+                  note.textContent);
+        assert.deepStrictEqual(buttons(note), ["No place", "Change place" + ELLIPSIS]);
+        // (It has a place: no "Set place..." among the actions.)
+        assert.strictEqual(button(drawn.box, "Set place" + ELLIPSIS), undefined);
+        // "No place": the owner's reject, kept across scans...
+        owner.log.cleared = {id: 6, record: {rg: "North Coast", co: "Examplia", cc: "XA",
+                                             ps: "f"},
+                             place: detail.place, place_estimate: fileEstimate};
+        button(note, "No place").click();
+        return waitFor(function () {
+            return drawn.state.edited === 1;
+        }).then(function () {
+            assert.deepStrictEqual(owner.log.sent[0], ["/images/6/place", {choice: "reject"}]);
+            assert.strictEqual(named.co, undefined);
+            assert.strictEqual(named.ps, undefined);
+            note = drawn.box.querySelector(".info-place-estimate");
+            assert.ok(/You said the picture has no place, although its file names one/.test(
+                note.textContent), note.textContent);
+            assert.deepStrictEqual(buttons(note), ["Use its file's place",
+                                                   "Set place" + ELLIPSIS]);
+            // ...and the file's place back (the estimates decide again: the file's first).
+            button(note, "Use its file's place").click();
+            return waitFor(function () {
+                return drawn.state.edited === 2;
+            });
+        });
+    }).then(function () {
+        assert.deepStrictEqual(owner.log.sent[1], ["/images/6/place", {choice: "clear"}]);
+        assert.strictEqual(named.ps, "f");
+        assert.strictEqual(named.co, "Examplia");
+        var note = drawn.box.querySelector(".info-place-estimate");
+        assert.ok(/Its file names this place/.test(note.textContent), note.textContent);
+        // A position the GPS check set aside: its file's names do not count (the
+        // estimates decide), so a reject is of the estimated place.
+        var aside = pane(owner, {i: 7, l: "lib", t: "Aside", ds: 1}, {
+            id: 7, lat: null, lon: null, location_check: {ignored: true, reason: "", choice: "",
+                                                          place: "", estimated: false},
+            exif: {XMPPlace: {country: "Examplia"}},
+            place_estimate: {source: "", reason: "you rejected the estimate",
+                             radius_km: null, place: "", choice: "reject", lat: null,
+                             lon: null, ids: []}});
+        note = aside.box.querySelector(".info-place-estimate");
+        assert.ok(/You rejected the estimated place/.test(note.textContent), note.textContent);
+        return settle(5);
+    });
+});
+
 test("an open place form survives the pane drawn again", function () {
     var page = serverPage(true);
     var drawn = null;
@@ -529,7 +641,7 @@ test("hollow pins on the map", function () {
 test("the export's Estimated places", function () {
     assert.ok(REVIEW.OPTIONS.estimated_places.label === "Estimated places");
     var options = {location: true, estimated_places: true};
-    assert.ok(/location \(GPS position and place names\) and estimated place\./.test(
+    assert.ok(/location \(GPS position, place names and named place\) and estimated place\./.test(
         REVIEW.detailsText(options)), REVIEW.detailsText(options));
     options.location = false;
     assert.ok(!/estimated/.test(REVIEW.detailsText(options)));
@@ -541,7 +653,7 @@ test("the Manage page counts the estimated places", function () {
                        pictures: {located: 5, named: 5, region_only: 0, far: 0, pending: 0},
                        gps_ignored: 0, city_km: 25, max_km: 200, job: null,
                        estimates: {estimated: 12, copy: 1, time: 4, area: 7, owner: 2,
-                                   rejected: 1},
+                                   file: 3, rejected: 1},
                        attribution_url: "https://example.invalid/a",
                        license_url: "https://example.invalid/l"};
     var box = page.document.createElement("section");
@@ -558,8 +670,9 @@ test("the Manage page counts the estimated places", function () {
         assert.ok(status.indexOf("12 pictures without a position have an estimated place: " +
                                  "1 from a copy, 4 from pictures taken around the same time, " +
                                  "7 from the library's area (region only) (search " +
-                                 "is:place-estimated). You set the place of 2 pictures.") >= 0,
-                  status);
+                                 "is:place-estimated). You set the place of 2 pictures. " +
+                                 "3 pictures without a position have the place their files " +
+                                 "name.") >= 0, status);
         return settle(5);
     });
 });

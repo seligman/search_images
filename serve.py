@@ -233,16 +233,23 @@ def place_of(row, estimate=None):
     {"city" ("" when no town is near enough), "region", "country", "cc",
     "km" (how far the town is, when there is one)}. A picture without a
     place of its own has its estimate's (estimate: its place_estimates
-    row, see place_estimates.py), with "source" ("copy", "time", "area" or
-    "owner") and "estimated": true (not for the owner's own place).
+    row, see place_estimates.py), with "source" ("copy", "time", "area",
+    "owner" or "file") and "estimated": true (not for the owner's own place
+    nor the place its file names). A picture with a position whose file
+    names its place has those names, with "source" "file" and no "km"
+    (place_estimates.gps_file_columns).
     """
+    named = place_estimates.gps_file_columns(row)
+    if named is not None:
+        return {"city": named["place_city"], "region": named["place_region"],
+                "country": named["place_country"], "cc": named["place_cc"], "source": "file"}
     if not row["place_country"]:
         if not place_estimates.usable(row, estimate) or not estimate["place_country"]:
             return None
         place = {"city": estimate["place_city"], "region": estimate["place_region"],
                  "country": estimate["place_country"], "cc": estimate["place_cc"],
                  "source": estimate["source"]}
-        if estimate["source"] != "owner":
+        if estimate["source"] not in place_estimates.OWN_SOURCES:
             place["estimated"] = True
         return place
     place = {"city": row["place_city"], "region": row["place_region"],
@@ -348,6 +355,25 @@ def tiles_max_zoom():
             return int(json.load(handle).get("max_zoom"))
     except (OSError, ValueError, TypeError, AttributeError):
         return None
+
+
+def tiles_version():
+    """A short text that changes whenever the tiles the tile route answers with may.
+
+    The pages add it to the tiles' addresses (SITE.tileUrl: "?v=..."). Browsers
+    keep a tile for a day (TILE_CACHE_SECONDS) under its address, and the same
+    address answers with the bundled map's cut (darker, coarser, with a dotted
+    15-degree grid) until make_tiles.py has made the tile pyramid and with the
+    pyramid's tile after: without the version, a tile looked at before would
+    stay the old one, a darker block among the new. Every make_tiles.py run
+    writes the manifest again (a new modification time), and
+    FALLBACK_TILE_VERSION covers a new cut of the bundled map.
+    """
+    try:
+        stat = os.stat(os.path.join(common.tiles_dir(), "manifest.json"))
+    except OSError:
+        return "%d" % FALLBACK_TILE_VERSION
+    return "%d-%x" % (FALLBACK_TILE_VERSION, stat.st_mtime_ns)
 
 
 def tile_zoom_limit(max_zoom):
@@ -712,6 +738,8 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
         if streets is not None:
             # (The street maps, street_maps.py: /maps/index.js and the tiles.)
             extra = dict(extra or {}, streets=streets)
+        # (The world tiles' version, in their addresses: tiles_version.)
+        extra = dict(extra or {}, tilesVersion=tiles_version())
         return render_template_file(name, "server", "/static/", None,
                                     tiles_max=tiles_max_zoom(),
                                     libraries=visible_libraries(state.config()),
@@ -935,19 +963,17 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
     def api_locations():
         """[{id, lat, lon}] of the located pictures, then the estimated positions
         (place_estimates.located) with "e": 1 and "r": their radius in km (the map's
-        hollow pins), and the owner's own places with "o": 1."""
+        hollow pins), and the owner's own places with "o": 1 (and "r" too when known: an
+        estimate accepted, a town chosen)."""
         library_ids = list(visible_libraries(state.config()))
         rows = world_map.collect_located_images(get_conn(), library_ids)
         points = [{"id": i, "lat": lat, "lon": lon} for i, lat, lon in rows]
         for image_id, lat, lon, radius, owner in place_estimates.located(get_conn(),
                                                                         library_ids):
             point = {"id": image_id, "lat": lat, "lon": lon}
-            if owner:
-                point["o"] = 1
-            else:
-                point["e"] = 1
-                if isinstance(radius, (int, float)) and math.isfinite(radius):
-                    point["r"] = round(radius, 3)
+            point["o" if owner else "e"] = 1
+            if isinstance(radius, (int, float)) and math.isfinite(radius) and radius > 0:
+                point["r"] = round(radius, 3)
             points.append(point)
         return jsonify(points)
 
@@ -1161,8 +1187,10 @@ def build_app(init_db=True, bind_host="127.0.0.1", job_manager=None):
             # The GPS check of the picture: why its position was set aside.
             record["location_check"] = gps_check.picture_view(get_conn(), row)
         elif row["lat"] is None and gps_check.is_ignored(get_conn(), image_id):
-            # A position set aside is nobody else's business, not even raw.
+            # A position set aside is nobody else's business, not even raw
+            # (nor the place names its XMP gives: often made from it).
             record["exif"].pop("GPS", None)
+            record["exif"].pop("XMPPlace", None)
         # Who is in it (people_groups.picture_view): the names, and the admin also the
         # boxes of its faces. Nobody else gets them unless People's "visitors" says so.
         found = None
@@ -1706,7 +1734,8 @@ _LOGGED_QUERY_RE = re.compile(r"(\s/[^\s?]*)\?(\S*)")
 # logged as they are. Any other value is logged as "...": words searched for
 # (q=, on the pages and in /api/embed, or a person's name in person:"Name"), a
 # place (place=), tags and the other facets, a trip's title (pick=), the map's
-# centre (view=), dates (from=, to=).
+# centre (view=), dates (from=, to=), an area drawn on the map and its name
+# (area=, aname=: see map_areas.py).
 _LOGGED_PARAMETERS = frozenset((
     "album", "by", "dialog", "drives", "hidden", "id", "kind", "lib", "limit", "log", "min",
     "offset", "page", "person", "since", "size", "sort", "stack", "step", "v", "which"))
@@ -1741,8 +1770,8 @@ class QueryLogFilter(logging.Filter):
     """Keeps what people type or choose out of the request log (quiet_request_line):
     the words of a search (/?q=..., /api/embed?q=... when searching by meaning, a
     person:"Name" from the People page), a place chosen (/?place=...), a trip's title
-    (/?pick=..., a trip page's Open in search), a town looked for in the viewer's
-    Place dialog (its q=)."""
+    (/?pick=..., a trip page's Open in search), an area of the map (/map?area=...&aname=...),
+    a town looked for in the viewer's Place dialog (its q=)."""
 
     def filter(self, record):
         try:

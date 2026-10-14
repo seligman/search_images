@@ -240,12 +240,12 @@ test("counts, size and details in words", function () {
     assert.strictEqual(R.detailsText(options), "Published with each picture: its title, " +
         "description, tags, any text read in the picture, the day it was taken (from the " +
         "camera or the file name) and camera model and settings. Not its file name, " +
-        "folder or location (GPS position and place names).");
+        "folder or location (GPS position, place names and named place).");
     options.file_names = options.folders = true;
-    assert.ok(/Not its location \(GPS position and place names\)\.$/.test(
+    assert.ok(/Not its location \(GPS position, place names and named place\)\.$/.test(
         R.detailsText(options)), R.detailsText(options));
     options.location = true;
-    assert.ok(/file name, folder and location \(GPS position and place names\)\.$/.test(
+    assert.ok(/folder and location \(GPS position, place names and named place\)\.$/.test(
         R.detailsText(options)));
     // The owner's marks are named only when they go.
     options.marks = true;
@@ -258,8 +258,17 @@ test("counts, size and details in words", function () {
     assert.strictEqual(R.headline({total: 0, exported: 0, album: {id: 3, name: "Trip"}}),
                        "The album has no pictures in this library.");
     assert.ok(R.OPTIONS.album.label && R.OPTIONS.marks.hint);
-    // The Location option says that it publishes the place names.
+    // The Location option says that it publishes the place names, the named places of
+    // the street maps and the areas of smart albums.
     assert.ok(/town, region and country/.test(R.OPTIONS.location.hint));
+    assert.ok(/named place on the street maps/.test(R.OPTIONS.location.hint));
+    assert.ok(/OpenStreetMap credit/.test(R.OPTIONS.location.hint));
+    assert.ok(/areas of the map of smart albums/.test(R.OPTIONS.location.hint));
+    // Nothing near home: no named place there either.
+    options.home_km = 10;
+    assert.ok(/no position, route, town or named place there\.$/.test(R.detailsText(options)),
+              R.detailsText(options));
+    delete options.home_km;
     // A trip's story goes with the location only (it names the trip's places).
     assert.ok(/^With Location/.test(R.OPTIONS.story.hint));
     options = defaults();
@@ -275,6 +284,27 @@ test("counts, size and details in words", function () {
     assert.strictEqual(R.serveCommand("C:\\Photos\\Family",
                                       {serve: "python \"program/export.py\" --serve x"}),
                        "python \"program/export.py\" --serve x");
+});
+
+test("the world map's tiles: how many, how large, and what the next zoom adds", function () {
+    var options = defaults();
+    var counts = {world_map: {available: 6, zoom: 5, tiles: 2730, bytes: 17300000,
+                              more: {zoom: 6, tiles: 8192, bytes: 37850000}}};
+    // Only with the location.
+    assert.strictEqual(R.worldText(counts, options), "");
+    options.location = true;
+    assert.strictEqual(R.worldText(counts, options), "World map: 2,730 tiles (16 MB), down " +
+                       "to zoom 5; zoom 6 would add 8,192 tiles (36 MB).");
+    counts.world_map.zoom = 6;
+    counts.world_map.more = null;
+    assert.ok(/, down to zoom 6\.$/.test(R.worldText(counts, options)));
+    // The bundled small map (no tile pyramid): nothing worth saying.
+    assert.strictEqual(R.worldText({world_map: {available: null, zoom: 3, tiles: 170,
+                                                bytes: 0, more: null}}, options), "");
+    assert.strictEqual(R.worldText({}, options), "");
+    assert.ok(/four times the tiles/.test(R.OPTIONS.world_zoom.hint));
+    assert.strictEqual(R.sizeText({size_estimate: 20000000, size_parts: {
+        data: 2700000, tiles: 17300000}}), "About 19 MB: pages and data 2.6 MB, world map 16 MB.");
 });
 
 test("search by meaning in the browser: its size, or why it cannot go", function () {

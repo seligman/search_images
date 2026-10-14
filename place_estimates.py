@@ -103,7 +103,34 @@ place of the owner's -- an estimate accepted, a town or position chosen
 (set_choice) -- and "reject" gives it none. The owner's place counts as
 the picture's own (not estimated); it never makes the picture a GPS
 picture (has:gps stays the file's GPS only), and it is no reference for
-other estimates.
+other estimates. It is as exact as it was chosen: an estimate accepted
+keeps its radius (the choice's detail "radius_km"), and a town chosen
+(its position a town's own, town_pick: its middle, not where the picture
+was taken) gets TOWN_PICK_KM -- so a search of a small area of the map
+does not find it there (the pages ask an area to hold half a place's
+radius around it), and the named places of the street maps
+(named_places.py) are not looked up for a town's middle.
+
+A picture without any GPS position whose file names where it was taken
+-- its XMP location fields (imageinfo.xmp_place; images.read_image keeps
+them in its exif as "XMPPlace"), as Lightroom, digiKam or exiftool write
+them -- gets that place instead of an estimate (file_place): source
+"file", the names only (no position, no pin; the country as the place
+names call the file's country code). Like the owner's place it counts as
+the picture's own, and the owner's choice comes first. A position the GPS
+check set aside does not make way for the names: programs often fill them
+in from that very position.
+
+A picture with a GPS position of its own whose file names where it was
+taken has those names as its place names (gps_file_columns), not the
+nearest town of the place names: the position stays for the pin, the map
+and areas, but a person (or a program they chose) wrote the names, while
+the nearest town of a list may be across a border (a picture taken in a
+Swiss village a few kilometres from Italy, whose nearest listed town is
+Italian). Its record has ps "f" with gp, and no km (how far the town
+is, which the file does not say); the named places of the street maps
+(named_places.py) are looked up for it only while the file's country is
+the position's (else a place across the border would be named).
 
 Estimates are worked out again after every GPS check (gps_check.run calls
 update: after each scan, previews and places job, before an export with
@@ -112,36 +139,40 @@ improve them. They are kept in index.db (ensure_tables; tables made on
 first use, not a schema version: they hold nothing that cannot be worked
 out again, except the owner's choices):
 
-    place_estimates  image_id, source ("copy", "time", "area" or "owner"),
-                     lat, lon (NULL for an area, a time estimate too rough
-                     for a position, or the owner's town or region),
+    place_estimates  image_id, source ("copy", "time", "area", "owner" or
+                     "file"), lat, lon (NULL for an area, a time estimate
+                     too rough for a position, the owner's town or region,
+                     or a file's place),
                      radius_km (how far off it may be; NULL: not known),
                      detail (JSON: "ids" the pictures it came from,
                      "seconds" their times less the picture's, "km" how
                      far apart they are, "kind" what made a copy one,
                      "track" when they include a video's GPS track,
                      "coarse" for a time estimate without a position),
+                     radius_km of the owner's place: an estimate accepted
+                     keeps its own, a town chosen TOWN_PICK_KM,
                      place_city, place_region, place_country, place_cc,
                      place_km (its place names: places.place_columns of
-                     the position, an area's region and country),
-                     updated
+                     the position, an area's region and country, the
+                     names a file gives), updated
     place_choices    content_key (gps_check.content_key), choice ("set" or
                      "reject"), lat, lon (the owner's position; NULL with
                      a town or region only), place_city, place_region,
                      place_country, place_cc (their names), detail (JSON:
                      "track" when the estimate accepted came from a video's
-                     GPS track: an export holds it as it holds the track's),
-                     updated
+                     GPS track: an export holds it as it holds the track's;
+                     "radius_km" of the estimate accepted), updated
 
 A change touches the picture's images.updated, so the search index
 notices. Search records (search_index) carry an estimate's names (ci, rg,
 co, cc), pe 1 and ps (its source: "c", "t" or "a"); the owner's place
-only ps "o". The map shows positioned estimates as hollow pins
-(located()). An export holds estimates only with its location and
-estimated_places options, the owner's places with location -- those from
-a video's GPS track (their detail's "track", an accepted one's too) only
-as it holds the track's own positions (export._Routes: with the routes
-option, and not near where a drive starts or ends).
+only ps "o", a file's only ps "f". The map shows positioned estimates as
+hollow pins (located()). An export holds estimates only with its location
+and estimated_places options, the owner's places and the files' with
+location -- the owner's from a video's GPS track (their detail's "track",
+an accepted one's too) only as it holds the track's own positions
+(export._Routes: with the routes option, and not near where a drive
+starts or ends).
 
 Settings: config.json "place_estimates" (see settings() and SETTINGS.md).
 
@@ -172,7 +203,9 @@ RANGES = {
 }
 
 # The search records' ps values (search_index) of the sources.
-RECORD_SOURCES = {"copy": "c", "time": "t", "area": "a", "owner": "o"}
+RECORD_SOURCES = {"copy": "c", "time": "t", "area": "a", "owner": "o", "file": "f"}
+# The sources that are the picture's own place, not an estimate (no pe in its record).
+OWN_SOURCES = ("owner", "file")
 
 COPY_LOOK_SECONDS = 600     # a picture that looks the same, taken this near: a copy
 RADIUS_MIN_KM = 0.1
@@ -181,6 +214,8 @@ VEHICLE_SECONDS = 120       # ... and on one side, after this long, at least ...
 VEHICLE_KMH = 50.0          # ... this much (the camera may have boarded a car)
 COARSE_KM = 25.0            # a radius above max_spread_km, up to this: no position, ...
 TOWN_KM = 10.0              # ... and up to this the town, beyond it the region only
+TOWN_PICK_KM = 5.0          # the owner's place at a town's own position: this far off
+TOWN_PICK_METRES = 20       # (a position this near a town's own is the town's)
 MIN_SIDE_SHOTS = 2          # shots on one side, at least ...
 MAX_SIDE_SHOTS = 3          # ... and the nearest this many must agree ...
 ONE_SIDE_SHARE = 0.5        # ... the nearest within this share of the window
@@ -197,13 +232,14 @@ FILE_TIME_SLACK = 120       # ... within this of their capture dates
 Estimate = collections.namedtuple("Estimate", "source lat lon radius_km detail area")
 Estimate.__doc__ = """A place estimate (see the module notes).
 
-source     "copy", "time", "area" or "owner"
-lat, lon   the position (None for an area, or the owner's region)
+source     "copy", "time", "area", "owner" or "file"
+lat, lon   the position (None for an area, the owner's region or a file's place)
 radius_km  how far off the position may be (None: not known)
 detail     {"ids", "seconds", "km", "kind"} as the detail column keeps it
 area       (region, country, cc) of an area (the library's, or the owner's region), or
            (region, country, cc, town) of a time estimate too rough for a position
-           (town "": the region only) or of the owner's town; else None
+           (town "": the region only), of the owner's town or of the place a file
+           names (file_place); else None
 """
 
 _TABLES = (
@@ -300,8 +336,8 @@ def _time_words(seconds):
 
 
 def reason_text(source, detail=None, area_name=""):
-    """Where an estimate comes from, in words (no full stop): "estimated from ..." or
-    "set by you"."""
+    """Where an estimate comes from, in words (no full stop): "estimated from ...", "set
+    by you" or "named in its file"."""
     detail = detail if isinstance(detail, dict) else {}
     seconds = [value for value in detail.get("seconds") or []
                if isinstance(value, (int, float)) and math.isfinite(value)]
@@ -309,6 +345,8 @@ def reason_text(source, detail=None, area_name=""):
     km = km if isinstance(km, (int, float)) and math.isfinite(km) else None
     if source == "owner":
         return "set by you"
+    if source == "file":
+        return "named in its file"
     if source == "copy":
         kind = detail.get("kind")
         if kind == "second":
@@ -752,7 +790,8 @@ def _area_fits(row, timing, area, times, across):
         area.lat, area.lon, nearest.lat, nearest.lon) <= AREA_KM
 
 
-def estimate(rows, check, options, across=True, looks=None, choices=None, owner_place=None):
+def estimate(rows, check, options, across=True, looks=None, choices=None, owner_place=None,
+             file_places=None):
     """The place estimates of the pictures without a usable position: {image id: Estimate}.
 
     rows: the GPS check's rows (gps_check.evaluate takes them; also path,
@@ -762,10 +801,12 @@ def estimate(rows, check, options, across=True, looks=None, choices=None, owner_
     {image id: look (search_index._look)} for the copy rule's looks
     (optional); choices: {content key: place_choices row as a dict}
     (optional); owner_place(choice) -> Estimate or None turns a "set" choice
-    into the owner's estimate (default: its position, or its region). Pure:
-    no database, no clock.
+    into the owner's estimate (default: its position, or its region);
+    file_places: {image id: file_place()} of the pictures whose file names
+    their place (optional). Pure: no database, no clock.
     """
     choices = choices or {}
+    file_places = file_places or {}
     references = check.references()
     by_clock = collections.defaultdict(list)
     for reference in references:
@@ -800,6 +841,12 @@ def estimate(rows, check, options, across=True, looks=None, choices=None, owner_
                 if found is not None:
                     result[row["id"]] = found
             continue            # (rejected: no estimate)
+        named = file_places.get(row["id"])
+        if named is not None and check.verdicts.get(row["id"]) is None:
+            # (The place its file names: its own, without a position. Not for a
+            # position set aside: the names may well come from it.)
+            result[row["id"]] = Estimate("file", None, None, None, {}, tuple(named))
+            continue
         if not options["enabled"]:
             continue
         timing = check.timing(row, trusted=row["id"] in trusted_files)
@@ -834,9 +881,9 @@ def targets(rows, check):
 
 
 def _choice_detail(choice):
-    """The detail an owner's place keeps of the estimate it was accepted from: {"track"}
-    when that came from a video's GPS track (an export treats it as the track's), else
-    {}."""
+    """The detail an owner's place keeps of the estimate it was accepted from: "track"
+    when that came from a video's GPS track (an export treats it as the track's), and
+    "radius_km" its radius (as approximate as it was); {} for neither."""
     detail = choice.get("detail")
     if isinstance(detail, str):
         try:
@@ -844,21 +891,74 @@ def _choice_detail(choice):
         except ValueError:
             detail = {}
     detail = detail if isinstance(detail, dict) else {}
-    return {"track": detail["track"]} if detail.get("track") in ("all", "some") else {}
+    kept = {"track": detail["track"]} if detail.get("track") in ("all", "some") else {}
+    radius = detail.get("radius_km")
+    if (isinstance(radius, (int, float)) and not isinstance(radius, bool)
+            and math.isfinite(radius) and radius > 0):
+        kept["radius_km"] = float(radius)
+    return kept
+
+
+def town_pick(lat, lon, index):
+    """True when a position is a town's own (index: a places.PlaceIndex, or None): the
+    owner chose a town, and the position is its middle, not where the picture was
+    taken."""
+    if index is None or not world_map.valid_position(lat, lon):
+        return False
+    hit = index.nearest(lat, lon, max_km=0.05)
+    return hit is not None and hit[1] <= TOWN_PICK_METRES / 1000.0
 
 
 def _owner_estimate(choice):
-    """The owner's place of a "set" choice (a place_choices row as a dict), or None."""
+    """The owner's place of a "set" choice (a place_choices row as a dict), or None: an
+    estimate accepted with its radius (the choice's detail)."""
     lat, lon = choice.get("lat"), choice.get("lon")
     if world_map.valid_position(lat, lon):
-        return Estimate("owner", float(lat), float(lon), None, _choice_detail(choice), None)
+        detail = _choice_detail(choice)
+        radius = detail.pop("radius_km", None)
+        return Estimate("owner", float(lat), float(lon), radius, detail, None)
     if choice.get("place_country"):
         names = (choice.get("place_region") or "", choice["place_country"],
                  choice.get("place_cc") or "")
         if choice.get("place_city"):
             names += (choice["place_city"],)
-        return Estimate("owner", None, None, None, _choice_detail(choice), names)
+        detail = _choice_detail(choice)
+        detail.pop("radius_km", None)
+        return Estimate("owner", None, None, None, detail, names)
     return None
+
+
+def file_place(exif, countries=None):
+    """(region, country, cc, town) of the place a picture's file names (exif: its exif
+    column as a dict, with "XMPPlace" from images.read_image), or None when it names no
+    country ("" for a name it does not give).
+
+    countries: {cc: name} of the place names' countries (places.PlaceIndex):
+    the file's country code then names the country as the place names do
+    (and a country the file names without a code gets its code), so its
+    pictures are in the same country as the others.
+    """
+    place = exif.get("XMPPlace") if isinstance(exif, dict) else None
+    if not isinstance(place, dict):
+        return None
+
+    def text(key):
+        value = place.get(key)
+        return " ".join(value.split()) if isinstance(value, str) else ""
+
+    cc, country = text("cc").upper(), text("country")
+    countries = countries or {}
+    if cc in countries:
+        country = countries[cc]
+    elif country and not cc:
+        wanted = places.fold(country)
+        for code, name in countries.items():
+            if places.fold(name) == wanted:
+                cc, country = code, name
+                break
+    if not country:
+        return None
+    return (text("region"), country, cc, text("city"))
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1056,71 @@ def _looks_for(conn, rows, check, options):
     return result
 
 
+def _countries():
+    """{cc: name} of the place names' countries (places.PlaceIndex; {} without place
+    names), for file_place."""
+    index = places.shared()
+    if index is None:
+        return {}
+    return {cc: name for cc, name in index.countries.values() if cc}
+
+
+def gps_file_columns(row):
+    """The place columns (place_city, place_region, place_country, place_cc; place_km
+    None: the file does not say how far) of the place the file of a picture with a GPS
+    position of its own names (file_place; see the module notes), or None: for a
+    picture without a usable position (the estimates' "file" source is for those),
+    or a file that names no country. row: an images row with lat, lon and its exif --
+    or "fexif", the exif of a located row that has "XMPPlace" in it, else "" (as
+    search_index and named_places select it)."""
+    if not world_map.valid_position(row["lat"], row["lon"]):
+        return None
+    keys = row.keys()
+    text = row["fexif"] if "fexif" in keys else row["exif"] if "exif" in keys else ""
+    if not isinstance(text, str) or '"XMPPlace"' not in text:
+        return None
+    try:
+        exif = json.loads(text)
+    except ValueError:
+        return None
+    found = file_place(exif, _countries())
+    if found is None:
+        return None
+    region, country, cc, town = found
+    return {"place_city": town, "place_region": region, "place_country": country,
+            "place_cc": cc, "place_km": None}
+
+
+# The SQL of an images row's "fexif" (gps_file_columns): its exif when it has a position
+# and names a place in it, else "" (reading every row's exif would be slow).
+FEXIF_SQL = ("CASE WHEN lat IS NOT NULL AND instr(exif, '\"XMPPlace\"') > 0 THEN exif "
+             "ELSE '' END AS fexif")
+
+
+def _file_places(conn, rows, check):
+    """{image id: file_place()} of the pictures without any GPS position whose file
+    names their place (the GPS check's rows hold no EXIF of those: read here)."""
+    ids = [row["id"] for row in rows if check.verdicts.get(row["id"]) is None
+           and not world_map.valid_position(row.get("lat"), row.get("lon"))]
+    found = {}
+    countries = None
+    for start in range(0, len(ids), 500):
+        part = ids[start:start + 500]
+        for image_id, text in conn.execute(
+                "SELECT id, exif FROM images WHERE id IN (%s) AND instr(exif, '\"XMPPlace\"') > 0"
+                % ",".join("?" * len(part)), part).fetchall():
+            if countries is None:
+                countries = _countries()
+            try:
+                exif = json.loads(text or "{}")
+            except ValueError:
+                continue
+            place = file_place(exif, countries)
+            if place is not None:
+                found[image_id] = place
+    return found
+
+
 def _place_of(found, index, memo):
     """The place columns of an Estimate (index: a PlaceIndex, or None)."""
     if found.area is not None:
@@ -994,7 +1159,7 @@ def update(conn, config, rows, check, ctx=None, now=None, changed=None):
             ctx.log("Place estimates go without looks (%s)." % error, "warn")
     across = gps_check.settings(config)["across_libraries"]
     found = estimate(rows, check, options, across=across, looks=looks,
-                     choices=choices(conn))
+                     choices=choices(conn), file_places=_file_places(conn, rows, check))
     index = None
     if any(item.lat is not None for item in found.values()):
         index = places.shared()
@@ -1011,6 +1176,10 @@ def update(conn, config, rows, check, ctx=None, now=None, changed=None):
         touched = []
         for image_id, item in found.items():
             counts[item.source] += 1
+            if (item.source == "owner" and item.lat is not None and item.radius_km is None
+                    and town_pick(item.lat, item.lon, index)):
+                # (A town chosen: its middle, not where the picture was taken.)
+                item = item._replace(radius_km=TOWN_PICK_KM)
             values = {"source": item.source, "lat": item.lat, "lon": item.lon,
                       "radius_km": item.radius_km, "detail": _detail_text(item)}
             values.update(_place_of(item, index, memo))
@@ -1040,7 +1209,8 @@ def update(conn, config, rows, check, ctx=None, now=None, changed=None):
         raise
     if changed is not None:
         changed.update(touched)
-    summary["estimated"] = sum(count for source, count in counts.items() if source != "owner")
+    summary["estimated"] = sum(count for source, count in counts.items()
+                               if source not in OWN_SOURCES)
     summary["by_source"] = dict(counts)
     summary["changed"] = len(touched)
     summary["seconds"] = round(time.perf_counter() - started, 3)
@@ -1057,12 +1227,18 @@ def summary_text(summary):
         ("area", "from the library's area")) if by_source.get(source)]
     text = "Estimated places: {:,} picture{} without a position".format(
         summary["estimated"], "" if summary["estimated"] == 1 else "s")
+    if not summary["estimated"] and (by_source.get("owner") or by_source.get("file")):
+        text = "Estimated places: none"
     if parts:
         text += " (" + ", ".join(parts) + ")"
     if by_source.get("owner"):
         text += "; {:,} with a place you set".format(by_source["owner"])
+    if by_source.get("file"):
+        text += "; {:,} with the place their file names".format(by_source["file"])
     if summary["changed"]:
         text += "; {:,} changed".format(summary["changed"])
+    if not summary["estimated"]:
+        return text + "."
     return text + ". The admin finds them with is:place-estimated."
 
 
@@ -1165,7 +1341,7 @@ def place_record(estimate_row):
         if isinstance(value, str) and value.strip():
             record[key] = value.strip()
     source = estimate_row.get("source")
-    if source != "owner":
+    if source not in OWN_SOURCES:
         record["pe"] = 1
     if source in RECORD_SOURCES:
         record["ps"] = RECORD_SOURCES[source]
@@ -1173,9 +1349,11 @@ def place_record(estimate_row):
 
 
 def status(conn):
-    """{"estimated", "copy", "time", "area", "owner", "rejected"}: how many present pictures
-    have an estimated place (by source) or the owner's, for the Manage page."""
-    result = {"estimated": 0, "copy": 0, "time": 0, "area": 0, "owner": 0, "rejected": 0}
+    """{"estimated", "copy", "time", "area", "owner", "file", "rejected"}: how many present
+    pictures have an estimated place (by source), the owner's or the one their file names,
+    for the Manage page."""
+    result = {"estimated": 0, "copy": 0, "time": 0, "area": 0, "owner": 0, "file": 0,
+              "rejected": 0}
     if not _have_tables(conn):
         return result
     for source, count in conn.execute(
@@ -1241,7 +1419,7 @@ def set_choice(conn, image_id, choice, lat=None, lon=None, now=None):
     detail = {}
     if choice == "accept":
         found = for_picture(conn, image_id)
-        if found is None or found["source"] == "owner":
+        if found is None or found["source"] in OWN_SOURCES:
             raise ChoiceError(409, "This picture has no estimated place to accept.")
         lat, lon = found["lat"], found["lon"]
         if lat is None:
@@ -1249,8 +1427,13 @@ def set_choice(conn, image_id, choice, lat=None, lon=None, now=None):
             names = (found["place_region"], found["place_country"], found["place_cc"],
                      found["place_city"])
         # (A place from a video's GPS track stays one: an export holds it as
-        # it holds the track's, see export._Routes.)
+        # it holds the track's, see export._Routes. And as approximate as it
+        # was: its radius.)
         detail = _choice_detail({"detail": found.get("detail")})
+        radius = found.get("radius_km")
+        if (lat is not None and isinstance(radius, (int, float))
+                and math.isfinite(radius) and radius > 0):
+            detail["radius_km"] = round(float(radius), 3)
     elif choice == "set":
         if not world_map.valid_position(lat, lon):
             raise ChoiceError(400, "Send a position: lat from -90 to 90 and lon from -180 "

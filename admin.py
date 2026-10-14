@@ -54,6 +54,7 @@ import llm
 import local_server
 import local_times
 import looks
+import named_places
 import not_duplicates
 import opening_views
 import people
@@ -1944,6 +1945,13 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         finished = [job for job in jobs_now["recent"] if job["kind"] == "maps"]
         result["job"] = waiting[0] if waiting else None
         result["last"] = finished[0] if finished else None
+        # The named places found on them (named_places.py), with their job.
+        named = named_places.status(get_conn(), config)
+        named["job"] = next((job for job in [jobs_now["current"]] + jobs_now["queue"]
+                             if job is not None and job["kind"] == "named_places"), None)
+        named["last"] = next((job for job in jobs_now["recent"]
+                              if job["kind"] == "named_places"), None)
+        result["named"] = named
         return result
 
     @bp.route("/maps", methods=["GET"])
@@ -1956,9 +1964,19 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         map's directories); download {expect_bytes, source, allow_large}: download them
         as the last size check said (a job; one of street_maps.LARGE_BYTES or more only
         with allow_large: true); remove: delete them (not while a job, or a command
-        line tool, holds the job lock: a download may be running)."""
+        line tool, holds the job lock: a download may be running); named {redo}: find
+        the named places on them (a "named_places" job: the pictures whose position
+        changed, or with redo: true every picture again)."""
         import street_maps
         data = body()
+        if action == "named":
+            if not named_places.maps_key():
+                raise AdminError(409, "There are no street maps yet: download them first.")
+            if not isinstance(data.get("redo", False), bool):
+                raise AdminError(400, "redo must be true or false.")
+            job, added = manager.enqueue("named_places", None,
+                                         {"redo": True} if data.get("redo") else {})
+            return jsonify({"job": job, "added": added, "maps": maps_view()}), 202
         if action == "plan":
             params = {}
         elif action == "download":
@@ -1987,9 +2005,15 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                  % (lock.holder() or "another process"))
             try:
                 removed = street_maps.remove()
+                # (The named places found on them go too.)
+                named_places.clear(get_conn())
             except OSError as error:
                 raise AdminError(409, "The street maps could not be deleted: %s"
                                  % common.redact(str(error)))
+            except sqlite3.OperationalError as error:
+                raise AdminError(503, "The street maps are deleted, but their named places "
+                                      "could not be forgotten (%s); the next scan does it."
+                                 % error)
             finally:
                 lock.release()
             return jsonify({"removed": removed, "maps": maps_view()})
@@ -2144,7 +2168,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
 
     def edit_answer(conn, image_id, edit, model):
         """What the edit routes answer: the edit, the description with it and the record keys."""
-        record = search_index.picture_record(conn, image_id, edit) or {}
+        record = search_index.picture_record(conn, image_id, edit, state.config()) or {}
         return {"id": image_id, "edited": not image_edits.is_empty(edit),
                 "edits": image_edits.view(edit), "info": image_edits.apply(model, edit),
                 "model_info": model,
@@ -2246,14 +2270,17 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                 raise AdminError(404, "Picture %d has no GPS position." % image_id)
             gps_check.run(conn, config, changed=changed)
             times = local_times.after_check(conn, config, changed)
+            # (A position used or ignored names another place, or none.)
+            named_places.after_check(conn, config, changed)
         except sqlite3.OperationalError as error:
             raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
 
         def keys(picture_id):
             record = search_index.picture_record(conn, picture_id,
-                                                 image_edits.load(conn, picture_id)) or {}
-            wanted = gps_check.RECORD_KEYS + (local_times.RECORD_KEYS if picture_id in times
-                                              else ())
+                                                 image_edits.load(conn, picture_id),
+                                                 config) or {}
+            wanted = gps_check.RECORD_KEYS + named_places.RECORD_KEYS + (
+                local_times.RECORD_KEYS if picture_id in times else ())
             return {key: record[key] for key in wanted if key in record}
 
         others = sorted((set(ids) | changed) - {image_id})
@@ -2337,6 +2364,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                 place_estimates.set_choice(conn, image_id, choice, lat, lon)
             gps_check.run(conn, config)
             times = local_times.after_check(conn, config)
+            named_places.after_check(conn, config)
         except place_estimates.ChoiceError as error:
             raise AdminError(error.status, str(error))
         except sqlite3.OperationalError as error:
@@ -2345,11 +2373,12 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
         estimate = place_estimates.for_picture(conn, image_id)
         record = search_index.picture_record(conn, image_id,
-                                             image_edits.load(conn, image_id)) or {}
+                                             image_edits.load(conn, image_id), config) or {}
         return jsonify({"id": image_id, "place": serve.place_of(row, estimate),
                         "place_estimate": place_estimates.view(conn, row, estimate, admin=True),
                         "time": local_times.detail(conn, row),
-                        "record": {key: record[key] for key in gps_check.RECORD_KEYS + (
+                        "record": {key: record[key] for key in gps_check.RECORD_KEYS
+                                   + named_places.RECORD_KEYS + (
                                        local_times.RECORD_KEYS if image_id in times else ())
                                    if key in record}})
 

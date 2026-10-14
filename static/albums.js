@@ -16,9 +16,11 @@
    pictures and the albums come from SITE.loadIndex, and the counts and
    covers from SearchCore (a smart album's search runs here, by meaning
    too when the server can embed it, and with the people of
-   SITE.peopleForSearch when it names a person), so they agree with the
-   search page. A smart album that names a person cannot be copied until
-   the people have come (nor where there are none to have).
+   SITE.peopleForSearch when it names a person, and with where the
+   pictures were taken, SITE.loadPlaces, when it has an area of the map),
+   so they agree with the search page. A smart album that names a person
+   cannot be copied until the people have come (nor where there are none to
+   have), nor one with an area until the places have.
 
    Pages are built with DOM calls and textContent only (never innerHTML).
 */
@@ -51,6 +53,10 @@
         render();
     }, adminOn);
     var PERSON_TERM = /(^|\s)-?person:/i;
+    // Where the pictures were taken, for the smart albums with an area of the
+    // map (SearchCore's setPlaces): asked for once; the list is drawn again.
+    var places = null;
+    var placesAsked = false;
 
     /* ---------- Albums and their pictures ---------------------------------- */
 
@@ -154,6 +160,26 @@
         return result.items;
     }
 
+    function hasArea(album) {
+        return album.kind === "smart" && album.options && typeof album.options.area === "string" &&
+            Boolean(album.options.area);
+    }
+
+    // Smart albums with an area of the map need the places: asked for once.
+    function wantPlaces() {
+        if (placesAsked || !data.albums.some(hasArea)) {
+            return;
+        }
+        placesAsked = true;
+        SITE.loadPlaces(function (answer) {
+            places = answer;
+            if (places && data) {
+                data.index.setPlaces(places.points, places.routes);
+                render();
+            }
+        });
+    }
+
     // Smart albums that name a person need the people: asked for once.
     function wantPeople() {
         peopleSearch.want(data.albums.filter(function (album) {
@@ -166,6 +192,9 @@
     /* Why a smart album's pictures cannot be copied now ('' when they can):
        it names a person and the people have not come (or there are none). */
     function notCopyable(album) {
+        if (hasArea(album) && !places) {
+            return "Wait a moment: where the pictures were taken is on its way.";
+        }
         if (!PERSON_TERM.test(album.query || "")) {
             return "";
         }
@@ -196,7 +225,8 @@
         var url = SITE.searchUrl({q: album.query || "", filters: options.filters || {},
                                   sort: options.sort || "", by: options.by || "",
                                   lib: options.lib || "", from: options.from || "",
-                                  to: options.to || ""});
+                                  to: options.to || "", area: options.area || "",
+                                  aname: options.aname || ""});
         if (!adminOn) {
             return url;
         }
@@ -222,6 +252,9 @@
         }
         if (options.from || options.to) {
             parts.push(SearchCore.rangeLabel(options.from || "", options.to || ""));
+        }
+        if (options.area) {
+            parts.push("area: " + SearchCore.areas.label(options.area, options.aname));
         }
         if (options.by === "meaning") {
             parts.push("by meaning");
@@ -924,6 +957,9 @@
         if (looksAsked) {
             SITE.attachLooks(data.index);
         }
+        if (places) {
+            data.index.setPlaces(places.points, places.routes);
+        }
     }
 
     // After a change: the index again (counts, covers and names come from it).
@@ -932,6 +968,7 @@
             if (loaded) {
                 setData(loaded);
                 wantPeople();
+                wantPlaces();
             }
             go(arranging ? arranging.album.id : null, false);
         });
@@ -951,6 +988,7 @@
             }
             setData(loaded);
             wantPeople();
+            wantPlaces();
             go(wanted(), false);
             wantLooks();
             // Smart albums that search by meaning: their counts once the
