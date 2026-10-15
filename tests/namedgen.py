@@ -2,14 +2,22 @@
 
 Vector tiles (MVT, gzip) of a made-up area, as the Protomaps basemap has
 them: an "earth" layer (land everywhere), "pois" (named points of
-interest: kind, name, min_zoom) and "landuse" (outlined areas: kind; their
-names are on the point of interest with the same id), written into a
-PMTiles archive (street_maps.ArchiveWriter) at data/maps/streets.pmtiles.
-Every place and name here is made up.
+interest: kind, name, min_zoom), "landuse" (outlined areas: kind; their
+names are on the point of interest with the same id) and "buildings"
+(building outlines, at the most detailed zoom only: a building's id is
+that of the point of interest it is, if any; and address points),
+written into a PMTiles archive (street_maps.ArchiveWriter) at
+data/maps/streets.pmtiles. Every place and name here is made up.
 
     poi(fid, name, kind, lat, lon, min_zoom=15)
     area(fid, kind, ring)                      ring: [(lat, lon), ...]
-    write_streets(features, zooms=range(10, 16))
+    building(fid, ring, holes=(), kind="building")
+    address(fid, lat, lon)
+    write_streets(features, zooms=range(10, 16), buffer=None)
+
+With buffer (tile units), a polygon reaching further past a tile's border
+is cut there, as the real tiles are (buffer=64); without, each tile holds
+the whole of every polygon that reaches into it.
 """
 
 import gzip
@@ -133,6 +141,27 @@ def area(fid, kind, ring):
             "type": 3}
 
 
+def building(fid, ring, holes=(), kind="building"):
+    """A building's outline (kind "building" or "building_part"), with holes (rings inside
+    it: a stadium's field), at the most detailed zoom."""
+    return {"layer": "buildings", "id": fid, "props": {"kind": kind, "sort_rank": 400},
+            "points": list(ring), "holes": [list(hole) for hole in holes], "type": 3}
+
+
+def address(fid, lat, lon, number="1"):
+    """An address point of the buildings layer (named_places reads no address)."""
+    return {"layer": "buildings", "id": fid, "props": {"kind": "address",
+                                                       "addr_housenumber": number},
+            "points": [(lat, lon)], "type": 1}
+
+
+def _clockwise(units, outer):
+    """A ring in the winding MVT wants (outer rings one way, holes the other)."""
+    area = sum(units[k][0] * units[(k + 1) % len(units)][1]
+               - units[(k + 1) % len(units)][0] * units[k][1] for k in range(len(units)))
+    return units if (area > 0) == outer else list(reversed(units))
+
+
 def road(name, kind, line):
     """A road (a line), drawn by the pages' street maps."""
     return {"layer": "roads", "id": None, "props": {"kind": kind, "name": name},
@@ -148,13 +177,68 @@ def _units(lat, lon, z, x, y):
     return int(round((fx - x) * EXTENT)), int(round((fy - y) * EXTENT))
 
 
-def tile_of(features, z, x, y, top):
+def _clip(ring, low, high):
+    """A ring cut to the square low..high (tile units; Sutherland and Hodgman), or [] when
+    none of it is inside."""
+    def across(x):
+        return lambda a, b: (x, int(round(a[1] + (b[1] - a[1]) * (x - a[0])
+                                          / float(b[0] - a[0]))))
+
+    def along(y):
+        return lambda a, b: (int(round(a[0] + (b[0] - a[0]) * (y - a[1])
+                                       / float(b[1] - a[1]))), y)
+
+    points = list(ring)
+    for keep, cross in ((lambda p: p[0] >= low, across(low)),
+                        (lambda p: p[0] <= high, across(high)),
+                        (lambda p: p[1] >= low, along(low)),
+                        (lambda p: p[1] <= high, along(high))):
+        out = []
+        for k, point in enumerate(points):
+            last = points[k - 1]
+            if keep(point):
+                if not keep(last):
+                    out.append(cross(last, point))
+                out.append(point)
+            elif keep(last):
+                out.append(cross(last, point))
+        points = out
+    return points
+
+
+def tile_of(features, z, x, y, top, buffer=None):
     """The tile (z, x, y) of features: each point of interest in the tile (from its
     min_zoom on; every one at the top zoom), each area and road that reaches into it,
-    and land under all of it."""
-    pois, landuse, roads = [], [], []
+    and land under all of it (buffer: polygons cut that far past its border)."""
+    pois, landuse, roads, buildings = [], [], [], []
+    margin = buffer or 0
+
+    def cut(rings):
+        if buffer is None:
+            return rings
+        return [ring for ring in (_clip(ring, -buffer, EXTENT + buffer) for ring in rings)
+                if len(ring) >= 3]
+
+    def away(units):
+        xs = [px for px, _py in units]
+        ys = [py for _px, py in units]
+        return max(xs) < -margin or min(xs) >= EXTENT + margin or max(ys) < -margin or \
+            min(ys) >= EXTENT + margin
+
     for feature in features:
         units = [_units(lat, lon, z, x, y) for lat, lon in feature["points"]]
+        if feature["layer"] == "buildings":
+            if z < top or away(units):
+                continue
+            if feature["type"] == 1:
+                buildings.append((feature["id"], 1, feature["props"], [units]))
+                continue
+            rings = cut([_clockwise(units, True)] + [
+                _clockwise([_units(lat, lon, z, x, y) for lat, lon in hole], False)
+                for hole in feature.get("holes", ())])
+            if rings:
+                buildings.append((feature["id"], 3, feature["props"], rings))
+            continue
         if feature["type"] == 1:
             px, py = units[0]
             if not (0 <= px < EXTENT and 0 <= py < EXTENT):
@@ -163,20 +247,26 @@ def tile_of(features, z, x, y, top):
                 continue
             pois.append((feature["id"], 1, feature["props"], [units]))
             continue
-        xs = [px for px, _py in units]
-        ys = [py for _px, py in units]
-        if max(xs) < 0 or min(xs) >= EXTENT or max(ys) < 0 or min(ys) >= EXTENT:
+        if away(units):
             continue
-        target = landuse if feature["layer"] == "landuse" else roads
-        target.append((feature["id"], feature["type"], feature["props"], [units]))
+        if feature["layer"] == "landuse":
+            rings = cut([units])
+            if rings:
+                landuse.append((feature["id"], feature["type"], feature["props"], rings))
+            continue
+        roads.append((feature["id"], feature["type"], feature["props"], [units]))
     earth = [(None, 3, {"kind": "earth"}, [[(0, 0), (EXTENT, 0), (EXTENT, EXTENT),
                                              (0, EXTENT)]])]
-    return tile([("earth", earth), ("landuse", landuse), ("roads", roads), ("pois", pois)])
+    layers = [("earth", earth), ("landuse", landuse), ("roads", roads)]
+    if buildings:
+        layers.append(("buildings", buildings))
+    return tile(layers + [("pois", pois)])
 
 
-def write_streets(features, zooms=range(10, 16), margin_km=1.0, path=None):
+def write_streets(features, zooms=range(10, 16), margin_km=1.0, path=None, buffer=None):
     """Write the street maps of features (made-up tiles of every zoom of zooms around
-    them) to data/maps/streets.pmtiles (or path); returns {zoom: set of (x, y)}."""
+    them) to data/maps/streets.pmtiles (or path; buffer: polygons cut that far past each
+    tile's border, see tile_of); returns {zoom: set of (x, y)}."""
     lats = [lat for feature in features for lat, _lon in feature["points"]]
     lons = [lon for feature in features for _lat, lon in feature["points"]]
     south, west = min(lats), min(lons)
@@ -196,7 +286,7 @@ def write_streets(features, zooms=range(10, 16), margin_km=1.0, path=None):
     top = zooms[-1]
     for tid in street_maps.tile_ids(levels):
         z, x, y = street_maps.tile_zxy(tid)
-        writer.add(tid, tile_of(features, z, x, y, top))
+        writer.add(tid, tile_of(features, z, x, y, top, buffer))
     writer.finish({"vector_layers": [], "version": "4.9.0"},
                   (box[1], box[0], box[3], box[2]))
     street_maps.shared.forget()

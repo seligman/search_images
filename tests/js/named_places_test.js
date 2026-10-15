@@ -85,6 +85,28 @@ test("plain-language search offers a named place as a place", function () {
     assert.strictEqual(found.parts[0].label, "Place: City Zoo");
 });
 
+test("a shop named only for a picture that shows one is found by what the viewer calls it",
+     function () {
+         var shops = records().concat([
+             {i: 6, l: "lib", t: "A new car", g: ["car"], ds: 1, dk: "2021-03-08", gp: 1,
+              np: "Example Motors", nk: "car", nd: 20},
+             {i: 7, l: "lib", t: "Trying on a shirt", g: ["shirt"], ds: 1, dk: "2021-03-08",
+              gp: 1, np: "Example Outfitters", nk: "clothes", nd: 8}]);
+         function found(query) {
+             return SearchCore.search(shops, query, {}).items.slice().sort();
+         }
+         ["kind:car", "kind:\"car dealer\"", "kind:\"car dealers\""].forEach(function (query) {
+             assert.deepStrictEqual(found(query), [6], query);
+         });
+         assert.deepStrictEqual(found("kind:\"clothes shop\""), [7]);
+         assert.strictEqual(VIEWER.format.namedPlaceNote(shops[5]), "car dealer, 20 m away");
+         var said = SearchCore.interpret(shops, "car dealers", {});
+         assert.deepStrictEqual(said.parts.map(function (part) {
+             return part.label;
+         }), ["Kind of place: car dealers"]);
+         assert.deepStrictEqual(SearchCore.search(shops, said.query, {}).items, [6]);
+     });
+
 /* ---------- The viewer -------------------------------------------------------- */
 
 test("what a named place is and how far it is", function () {
@@ -102,6 +124,14 @@ test("what a named place is and how far it is", function () {
                        "zoo, probably taken inside it");
     assert.strictEqual(note(records()[3]), "");
     assert.strictEqual(VIEWER.format.namedPlace(records()[3]), "");
+    // A museum whose building holds the position, and a shop named for a picture that
+    // shows one, by what it sells.
+    assert.strictEqual(note({np: "Toy Museum", nk: "museum", ni: 1}),
+                       "museum, taken inside it");
+    assert.strictEqual(note({np: "Example Motors", nk: "car", nd: 20}),
+                       "car dealer, 20 m away");
+    assert.strictEqual(note({np: "Example Outfitters", nk: "clothes", nd: 8}),
+                       "clothes shop, 8 m away");
 });
 
 function response(status, body) {

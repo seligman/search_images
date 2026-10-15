@@ -564,7 +564,8 @@ class ExportTest(ExportFixture):
             if not source.startswith("data:")]
         self.assertEqual([source.split("?")[0] for source in sources],
                          ["assets/style.css", "assets/site.js", "assets/shell.js",
-                          "assets/search-core.js", "assets/streets.js", "assets/routes.js",
+                          "assets/search-core.js", "assets/english-words.js",
+                          "assets/streets.js", "assets/routes.js",
                           "assets/viewer.js", "assets/app.js"])
         for source in sources:
             rel, version = source.split("?v=")
@@ -1089,12 +1090,15 @@ class ExportTest(ExportFixture):
         self.assertTrue(manifest["capabilities"]["map"])
         with open(os.path.join(out, "index.html"), encoding="utf-8") as handle:
             html = handle.read()
-        self.assertIn('<footer class="export-credits">Photos &lt;by&gt; me &amp; co</footer>',
-                      html)
-        # The map credits the world image (NASA's Blue Marble) in a corner.
+        self.assertIn('<footer id="credits" class="export-credits">Photos &lt;by&gt; me &amp; '
+                      'co</footer>', html)
+        # The map credits the world image (NASA's Blue Marble) in a corner, and links to
+        # the photo credits.
         with open(os.path.join(out, "map.html"), encoding="utf-8") as handle:
-            self.assertIn('<span class="map-credit-world">Imagery: NASA Blue Marble</span>',
-                          handle.read())
+            html = handle.read()
+        self.assertIn('<span class="map-credit-world">Imagery: NASA Blue Marble</span>', html)
+        self.assertIn('<p id="map-credit" class="export-credits map-credit">%s</p>' %
+                      (export.PHOTO_CREDITS_LINK % "index.html"), html)
         # Still no GPS in the pictures themselves.
         with open(os.path.join(out, "images", picnic["i"] + ".jpg"), "rb") as handle:
             self.assert_clean_jpeg(handle.read(), "picnic")
@@ -1803,6 +1807,49 @@ class OptionsTest(unittest.TestCase):
                                        os.path.join(exports, "trips-lib-c"),
                                        os.path.join(exports, "trips-lib-d")])
             self.assertEqual(export.library_slug("\u65e5\u672c"), "")
+
+
+class MapCreditsTest(unittest.TestCase):
+    """The map page lists pictures but has no foot: with a credits line, it links to it."""
+
+    def map_credit(self, capabilities, credits="Photos by A. Maker & co", extra=None):
+        options = export.validate_options({"credits": credits, "location": True})
+        page = export.render_page("map.html", "Trips", "Map - Trips", capabilities, "x",
+                                  options, extra=extra)
+        self.assertNotIn("<footer", page)
+        self.assertNotIn("A. Maker", page)          # (the line itself stays on the search page)
+        found = re.findall(r'<p id="map-credit" class="export-credits map-credit">(.*?)</p>',
+                           page)
+        self.assertLessEqual(len(found), 1)
+        return found[0] if found else None
+
+    def test_the_map_page_links_to_the_photo_credits(self):
+        # (A class: on a narrow phone, where the corner's lines wrap, the link goes to the
+        # next line whole.)
+        link = ('<a class="map-photo-credits" href="index.html#credits" title="The photo '
+                'credits are at the foot of the search page">Photo credits</a>')
+        # Alone in the corner, or on the last line of the credits there (as many lines
+        # as before: the street maps' credit sits right above them).
+        self.assertEqual(self.map_credit({}), link)
+        self.assertEqual(self.map_credit({"places": True}),
+                         export.PLACES_CREDIT + " &middot; " + link)
+        self.assertEqual(self.map_credit({"places": True, "named_places": True}),
+                         export.PLACES_CREDIT + "<br>" + export.NAMED_CREDIT + " &middot; " +
+                         link)
+        self.assertEqual(self.map_credit({"streets": True, "named_places": True}), link)
+        # A trip's export: its search page is search.html (index.html is the trip).
+        self.assertEqual(self.map_credit({}, extra={"searchPage": "search.html"}),
+                         link.replace("index.html", "search.html"))
+        # Without a credits line: no link (and no corner without other credits).
+        self.assertIsNone(self.map_credit({}, credits=""))
+        self.assertEqual(self.map_credit({"places": True}, credits=""), export.PLACES_CREDIT)
+        # The search and details pages' foot is where the link goes.
+        options = export.validate_options({"credits": "Photos by A. Maker", "location": True})
+        for template in ("page.html", "detail.html"):
+            page = export.render_page(template, "Trips", "Trips", {}, "x", options)
+            self.assertEqual(re.findall(r'<footer id="credits" class="export-credits">(.*?)'
+                                        r'</footer>', page), ["Photos by A. Maker"])
+        self.assertTrue(link.isascii())
 
 
 @unittest.skipIf(imagegen is None, "Pillow is not installed")

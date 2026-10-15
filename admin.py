@@ -59,6 +59,7 @@ import not_duplicates
 import opening_views
 import people
 import people_groups
+import people_suggest
 import place_estimates
 import prompts
 import refine
@@ -880,7 +881,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
     process's own, which the jobs use too).
     """
     model_servers = model_servers or local_server.default_manager()
-    from flask import Blueprint, g, jsonify, request
+    from flask import Blueprint, Response, g, jsonify, request
     from werkzeug.exceptions import HTTPException
 
     bp = Blueprint("admin", __name__, url_prefix=URL_PREFIX)
@@ -930,7 +931,9 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
 
     @bp.after_request
     def no_store(response):
-        response.headers["Cache-Control"] = "no-store"
+        # (But for an answer asked again by its ETag: people/suggest.)
+        if not g.get("by_etag"):
+            response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
@@ -1686,6 +1689,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         job, added = manager.enqueue(kind, library_id, params)
         if kind == "delete_faces":
             forget_undo()       # (the names an undo kept go with the face data)
+            people_suggest.forget()     # (and those the suggestions keep)
         answer.update(job=job, added=added, jobs=snapshot(config))
         return jsonify(answer), 202
 
@@ -1832,12 +1836,69 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
 
     @bp.route("/people/<int:person_id>/merge", methods=["POST"])
     def person_merge(person_id):
-        """{into: person id}: every face of this person goes to the other one."""
-        target = person_id_of(body().get("into"), "into")
+        """{into: person id, face?, undo?}: every face of this person goes to the other
+        one. face (the viewer's "Name Person 12 as X", asked about one of its faces):
+        refused (409) when that face is not in this person (any more). With "undo": true
+        the answer's "undo" is a token that undoes it (POST /people/undo; null when it
+        cannot be: the two hold more than people_groups.UNDO_MERGE_FACES faces)."""
+        data = body()
+        target = person_id_of(data.get("into"), "into")
+        face = data.get("face")
+        if face is not None and (isinstance(face, bool) or not isinstance(face, int)
+                                 or not 0 < face <= IMAGE_ID_MAX):
+            raise AdminError(400, "face is a face's id (a number).", {"face": "A face's id."})
         quality = people.settings(state.config())["group_quality"]
-        return jsonify({"person": with_people(
-            lambda store: people_groups.merge(store, person_id, target, group_quality=quality),
-            write=True)})
+
+        def work(store):
+            def change():
+                if face is not None and people_groups.face_person(store, face) != person_id:
+                    raise AdminError(409, "That face is not in this person any more (a "
+                                          "grouping or another change moved it): look at it "
+                                          "again.")
+                return {"person": people_groups.merge(store, person_id, target,
+                                                      group_quality=quality)}
+            if data.get("undo") is not True:
+                return change()
+            # (Every face of both: a merge makes the clear ones the owner's.)
+            reply, snap = people_groups.undoable(
+                store, lambda: (people_groups.person_faces(store, person_id) +
+                                people_groups.person_faces(store, target)),
+                [person_id, target], change, limit=people_groups.UNDO_MERGE_FACES)
+            reply["undo"] = undo_token(store, snap) if snap is not None else None
+            return reply
+        return jsonify(with_people(work, write=True))
+
+    @bp.route("/people/suggest", methods=["GET"])
+    def people_suggestions():
+        """?face=<id>: the named people that face most likely is, for the viewer's naming
+        popover (people_suggest.suggest; a face of an unnamed person: what that person
+        most likely is). The browser keeps the answer and asks again by its ETag (the
+        face data's state, the settings): 304 while the people are as they were."""
+        try:
+            face_id = int(request.args.get("face", ""))
+        except ValueError:
+            face_id = 0
+        if not 0 < face_id <= IMAGE_ID_MAX:
+            raise AdminError(400, "face is a face's id (a number).", {"face": "A face's id."})
+        config = state.config()
+
+        def work(store):
+            if store is None:
+                people_suggest.forget()     # (no face data: no names kept either)
+                return None, None
+            tag = people_suggest.etag(store, config, face_id)
+            if request.if_none_match.contains(tag):
+                return tag, None
+            return tag, people_suggest.suggest(store, face_id, config)
+        tag, answer = with_people(work)
+        if tag is None:
+            return jsonify({"face": face_id, "basis": "missing", "people": [],
+                            "preselect": None})
+        response = jsonify(answer) if answer is not None else Response(status=304)
+        response.set_etag(tag)
+        response.headers["Cache-Control"] = "private, no-cache"
+        g.by_etag = True
+        return response
 
     @bp.route("/people/faces", methods=["POST"])
     def people_faces():
@@ -2429,11 +2490,14 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         position lat, lon: a town picked from /places/towns, or one typed),
         "reject" (no estimate) or "clear" (the estimates decide again); see
         place_estimates.set_choice. The GPS check and the estimates run again
-        at once, and so do the local times (local_times.after_check). Answers
-        the picture's "place" and "place_estimate" (as /api/image has them),
-        its "time" (local_times.detail) and "record", the keys of its search
-        record a place changes (absent: none), and those of its time when it
-        changed.
+        at once, and so do the local times (local_times.after_check) and the
+        named places (the other pictures of its visit may take its place).
+        Answers the picture's "place" and "place_estimate" (as /api/image has
+        them), its "time" (local_times.detail) and "record", the keys of its
+        search record a place changes (absent: none), and those of its time
+        when it changed -- and "others": {id: those keys} of the other
+        pictures whose position, place or time changed (at most
+        gps_check.OTHERS_MAX; "more": how many more there are).
         """
         data = body()
         choice = data.get("choice")
@@ -2449,28 +2513,36 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
             raise AdminError(404, "There is no picture %d." % image_id)
         conn = get_conn()
         config = state.config()
+        changed = set()
         try:
             with conn:
                 place_estimates.set_choice(conn, image_id, choice, lat, lon)
-            gps_check.run(conn, config)
-            times = local_times.after_check(conn, config)
-            named_places.after_check(conn, config)
+            gps_check.run(conn, config, changed=changed)
+            times = local_times.after_check(conn, config, changed)
+            named_places.after_check(conn, config, changed)
         except place_estimates.ChoiceError as error:
             raise AdminError(error.status, str(error))
         except sqlite3.OperationalError as error:
             raise AdminError(503, "The database is busy (%s); try again in a moment." % error)
         import serve
+
+        def keys(picture_id):
+            record = search_index.picture_record(conn, picture_id,
+                                                 image_edits.load(conn, picture_id),
+                                                 config) or {}
+            wanted = gps_check.RECORD_KEYS + named_places.RECORD_KEYS + (
+                local_times.RECORD_KEYS if picture_id in times else ())
+            return {key: record[key] for key in wanted if key in record}
+
+        others = sorted(changed - {image_id})
         row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
         estimate = place_estimates.for_picture(conn, image_id)
-        record = search_index.picture_record(conn, image_id,
-                                             image_edits.load(conn, image_id), config) or {}
         return jsonify({"id": image_id, "place": serve.place_of(row, estimate),
                         "place_estimate": place_estimates.view(conn, row, estimate, admin=True),
-                        "time": local_times.detail(conn, row),
-                        "record": {key: record[key] for key in gps_check.RECORD_KEYS
-                                   + named_places.RECORD_KEYS + (
-                                       local_times.RECORD_KEYS if image_id in times else ())
-                                   if key in record}})
+                        "time": local_times.detail(conn, row), "record": keys(image_id),
+                        "others": {str(other): keys(other)
+                                   for other in others[:gps_check.OTHERS_MAX]},
+                        "more": max(0, len(others) - gps_check.OTHERS_MAX)})
 
     @bp.route("/places/towns", methods=["GET"])
     def find_towns():

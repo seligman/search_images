@@ -124,7 +124,13 @@ function serverPage(admin) {
                                                        radius_km: null, choice: "set",
                                                        place: "Coralport, North Coast, " +
                                                            "Examplia", lat: 5, lon: -150,
-                                                       ids: []}});
+                                                       ids: []},
+                                      // (Another picture of its visit took a named place.)
+                                      others: {1: {gp: 1, ci: "Coralport", rg: "North Coast",
+                                                   co: "Examplia", cc: "XA", km: 1,
+                                                   np: "Example Museum", nk: "museum",
+                                                   na: 1}},
+                                      more: 0});
             }
             if (body.choice === "clear" && log.cleared) {
                 return response(200, log.cleared);
@@ -386,6 +392,10 @@ test("the admin accepts an estimate", function () {
         assert.deepStrictEqual(page.scrolled, [["Clear", "center"]]);
         assert.strictEqual(rec.ps, "o");
         assert.strictEqual(rec.pe, undefined);
+        // The other record the answer has changes in place too.
+        var other = page.data.records[0];
+        assert.deepStrictEqual([other.np, other.nk, other.na, other.ci, other.gp],
+                               ["Example Museum", "museum", 1, "Coralport", 1]);
         assert.strictEqual(drawn.state.detail.place_estimate.choice, "set");
         var note = drawn.box.querySelector(".info-place-estimate");
         assert.ok(/You set this place/.test(note.textContent), note.textContent);

@@ -1270,6 +1270,96 @@ test("did you mean", function () {
     assert.strictEqual(SearchCore.suggest(records, ""), null);
 });
 
+test("did you mean: never another word for a word of the language", function () {
+    var records = [
+        {i: 1, g: ["woods", "trail"], d: "A trail through the woods", dk: "2020-01-01"},
+        {i: 2, g: ["meadow"], d: "Sheep in a meadow", dk: "2020-01-02"}
+    ];
+    try {
+        // Without the words of the language, the closest word the pictures have.
+        SearchCore.setWords(null);
+        assert.strictEqual(SearchCore.suggest(records, "words").text, "woods");
+        assert.strictEqual(SearchCore.isWord("words"), false);
+        // A word of the language (or its singular) is meant as typed.
+        SearchCore.setWords(["word", "meadows"]);
+        assert.strictEqual(SearchCore.isWord("Words"), true);
+        assert.strictEqual(SearchCore.suggest(records, "words"), null);
+        assert.strictEqual(SearchCore.suggest(records, "beach words"), null);
+        // A misspelling still gets its correction.
+        assert.strictEqual(SearchCore.suggest(records, "wodos").text, "woods");
+        assert.strictEqual(SearchCore.suggest(records, "meadwo").text, "meadow");
+        SearchCore.setWords("word meadows");
+        assert.strictEqual(SearchCore.suggest(records, "words"), null);
+        // The page's list is a Bloom filter (static/english-words.js).
+        var filter = require(path.join(__dirname, "..", "..", "static", "english-words.js"));
+        SearchCore.setWords(filter);
+        ["house", "water", "garden", "words", "cold", "sheep"].forEach(function (word) {
+            assert.strictEqual(SearchCore.isWord(word), true, word);
+        });
+        ["wodos", "meadwo", "qzxwvb", "trailz", "blorptif"].forEach(function (word) {
+            assert.strictEqual(SearchCore.isWord(word), false, word);
+        });
+        assert.strictEqual(SearchCore.suggest(records, "words"), null);
+        assert.strictEqual(SearchCore.suggest(records, "wodos").text, "woods");
+        // Small: a sixth of the words as text, and quick to ask.
+        assert.ok(filter.size / 5 < 70000 && filter.count > 20000, filter.size);
+        var started = Date.now();
+        for (var k = 0; k < 20000; k++) {
+            SearchCore.isWord("word" + String.fromCharCode(97 + k % 26));
+        }
+        assert.ok(Date.now() - started < 1000);
+    } finally {
+        SearchCore.setWords(null);
+    }
+});
+
+test("did you mean: the first letter of a short word stays, and two edits need six letters",
+     function () {
+    var records = [
+        {i: 1, g: ["old", "barn"], d: "An old barn", dk: "2020-01-01"},
+        {i: 2, g: ["meadow", "doors", "bridge"], d: "Doors of a barn by a bridge",
+         dk: "2020-01-02"}
+    ];
+    SearchCore.setWords(null);
+    // Not "old": a short word keeps its first letter (none added or dropped).
+    assert.strictEqual(SearchCore.suggest(records, "cold"), null);
+    assert.strictEqual(SearchCore.suggest(records, "bran").text, "barn");
+    // A longer word may have its first letter wrong, in one edit...
+    assert.strictEqual(SearchCore.suggest(records, "vridge").text, "bridge");
+    // ... but not in two.
+    assert.strictEqual(SearchCore.suggest(records, "beadoe"), null);
+    assert.strictEqual(SearchCore.suggest(records, "meadoe").text, "meadow");
+    // Two edits only for a word of six letters or more: a name of five
+    // letters is no misspelling of "doors".
+    assert.strictEqual(SearchCore.suggest(records, "doups"), null);
+    assert.strictEqual(SearchCore.suggest(records, "doosr").text, "doors");
+    assert.strictEqual(SearchCore.suggest(records, "breidhe").text, "bridge");
+});
+
+test("did you mean: nothing when the closest word has another first letter", function () {
+    var records = [
+        {i: 1, g: ["gold", "ring"], d: "A gold ring", dk: "2020-01-01"},
+        {i: 2, g: ["gold", "coin"], d: "A gold coin", dk: "2020-01-02"},
+        {i: 3, g: ["old", "barn"], d: "An old barn", dk: "2020-01-03"},
+        {i: 4, g: ["home", "garden"], d: "A home with a garden", dk: "2020-01-04"},
+        {i: 5, g: ["home", "porch"], d: "The porch of a home", dk: "2020-01-05"},
+        {i: 6, g: ["one", "tree"], d: "One tree on a hill", dk: "2020-01-06"},
+        {i: 7, g: ["master", "bedroom"], d: "A master bedroom", dk: "2020-01-07"},
+        {i: 8, g: ["master", "key"], d: "A master key", dk: "2020-01-08"},
+        {i: 9, g: ["hammer", "nail"], d: "A hammer and a nail", dk: "2020-01-09"}
+    ];
+    SearchCore.setWords(null);
+    // The first two letters swapped keep the first letter: "gold", not "old".
+    assert.strictEqual(SearchCore.suggest(records, "ogld").text, "gold");
+    assert.strictEqual(SearchCore.suggest(records, "hmoe").text, "home");
+    // "ome" is closest to "home", whose first letter it lacks: no suggestion,
+    // rather than the next closest word that keeps it ("one").
+    assert.strictEqual(SearchCore.suggest(records, "ome"), null);
+    // The same two edits away: "master", not "hammer", is closest to "hamster".
+    assert.strictEqual(SearchCore.suggest(records, "hamster"), null);
+    assert.strictEqual(SearchCore.suggest(records, "hamemr").text, "hammer");
+});
+
 /* ---------- Synonyms, real things and text-only matches --------------------- */
 
 test("synonyms find other words, below the word itself", function () {
@@ -2385,6 +2475,48 @@ test("similar: in a small set, the closest pictures (z 3 is out of reach)", func
     assert.deepStrictEqual(smallIndex([1, 0.7]).similar(1, 8), [2]);
     assert.deepStrictEqual(smallIndex([1, 0.4]).similar(1, 8), []);
     assert.deepStrictEqual(smallIndex([1]).search("similar:1").items, [1]);
+});
+
+test("similar: the picture's duplicate stack right after it, then the closest others", function () {
+    // A small set (z 3 is out of reach): picture 1 and its near twin 2 are
+    // a duplicate stack with 10, a burst shot further off; 3 and 4 show
+    // something like it, the rest do not. The twin (cosine 0.99) must not
+    // set "closest": the margin below it would leave out everything else.
+    var cosines = {1: 1, 2: 0.99, 3: 0.86, 4: 0.84, 5: 0.5, 6: 0.45, 7: 0.4, 8: 0.35, 9: 0.3,
+                   10: 0.7};
+    var records = [];
+    var ids = [];
+    var data = new Int8Array(10 * MEANING_DIMS);
+    Object.keys(cosines).forEach(function (key, k) {
+        var id = Number(key);
+        var rec = {i: id, t: "Picture " + id, dk: "2020-01-" + (id < 10 ? "0" + id : id), ds: 1};
+        if (id === 1 || id === 2 || id === 10) {
+            rec.dg = 1;
+        }
+        records.push(rec);
+        ids.push(id);
+        data.set(closeTo(cosines[key], 1 + (k % 5)), k * MEANING_DIMS);
+    });
+    var index = SearchCore.prepare(records);
+    assert.ok(!index.hasVector(1));         // (the vectors are not there yet)
+    index.setVectors({dims: MEANING_DIMS, ids: ids.slice(0, 9),
+                      data: data.subarray(0, 9 * MEANING_DIMS)});
+    assert.ok(index.hasVector(1));
+    assert.ok(!index.hasVector(10));        // (none of its own)
+    assert.ok(!index.hasVector(999));
+    index.setVectors({dims: MEANING_DIMS, ids: ids, data: data});
+    assert.ok(index.hasVector(10));
+    assert.deepStrictEqual(index.search("similar:1").items, [1, 2, 10, 3, 4]);
+    // Grouped, the stack is one picture (its cover), first.
+    var grouped = index.search("similar:1", {group: true});
+    assert.deepStrictEqual(grouped.items, [1, 3, 4]);
+    assert.deepStrictEqual(grouped.groups, {1: [1, 2, 10]});
+    // From the twin: the same others; its stack first.
+    var fromTwin = index.search("similar:2").items;
+    assert.deepStrictEqual(fromTwin.slice(0, 3), [2, 1, 10]);
+    assert.deepStrictEqual(fromTwin.slice(3), [3, 4]);
+    // The viewer's strip shows the same pictures (its stack newest first).
+    assert.deepStrictEqual(index.similar(1, 8), [10, 2, 3, 4]);
 });
 
 test("similar: a set of one theme still has pictures that stand out", function () {

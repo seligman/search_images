@@ -83,8 +83,8 @@ end). A camera's files copied from its card often keep their times; files
 downloaded, exported or copied by an app get the time of the copy, and so
 do the pictures around them.
 
-The rules and their defaults were chosen by hiding the positions of about
-1,800 located pictures (a tenth at a time, three times over) and
+The rules and their defaults were chosen by hiding the positions of the
+located pictures of one library (a tenth at a time, three times over) and
 estimating them: 61% got an estimate (two in five of those from a copy,
 such as a photo's JPEG beside its HEIC); of those with a position 99.6% in
 the right town, none more than 1.5 km off (the median 1 m) and 99.5%
@@ -130,7 +130,20 @@ Swiss village a few kilometres from Italy, whose nearest listed town is
 Italian). Its record has ps "f" with gp, and no km (how far the town
 is, which the file does not say); the named places of the street maps
 (named_places.py) are looked up for it only while the file's country is
-the position's (else a place across the border would be named).
+the position's (else a place across the border would be named). What the
+file leaves out below what it names comes from the position's place names
+when the two agree (_filled_in): a file naming the region and country
+but no town (a program filled in only those) gets the position's town,
+as long as the country is the position's and the region is too -- or a
+region the place names do not have in that country at all (the file
+divides the country otherwise, or names the region in another language);
+a file naming the town but no region gets the region of that same town.
+A town filled in has its km, as any picture's nearest town (it may be
+further away than the file's names let one think). These names are
+worked out whenever the records are made (nothing is kept);
+FILE_PLACE_RULES is in the ETags of the pages' records and trips. (A
+trip export knows a town of home named with a file's own region:
+trip_export.home_town.)
 
 Estimates are worked out again after every GPS check (gps_check.run calls
 update: after each scan, previews and places job, before an export with
@@ -206,6 +219,11 @@ RANGES = {
 RECORD_SOURCES = {"copy": "c", "time": "t", "area": "a", "owner": "o", "file": "f"}
 # The sources that are the picture's own place, not an estimate (no pe in its record).
 OWN_SOURCES = ("owner", "file")
+# How gps_file_columns names the place of a located picture whose file names one; raise
+# it when that changes (2: the parts the file leaves out are filled in, _filled_in, a
+# town filled in with its km). The ETags of the search records and of the trips include
+# it, as nothing kept changes.
+FILE_PLACE_RULES = 2
 
 COPY_LOOK_SECONDS = 600     # a picture that looks the same, taken this near: a copy
 RADIUS_MIN_KM = 0.1
@@ -1067,8 +1085,9 @@ def _countries():
 
 def gps_file_columns(row):
     """The place columns (place_city, place_region, place_country, place_cc; place_km
-    None: the file does not say how far) of the place the file of a picture with a GPS
-    position of its own names (file_place; see the module notes), or None: for a
+    None: the file does not say how far -- but the row's for a town filled in from its
+    position, _filled_in) of the place the file of a picture with a GPS position of its
+    own names (file_place; see the module notes), or None: for a
     picture without a usable position (the estimates' "file" source is for those),
     or a file that names no country. row: an images row with lat, lon and its exif --
     or "fexif", the exif of a located row that has "XMPPlace" in it, else "" (as
@@ -1086,9 +1105,52 @@ def gps_file_columns(row):
     found = file_place(exif, _countries())
     if found is None:
         return None
-    region, country, cc, town = found
+    region, country, cc, town, km = _filled_in(found, row)
     return {"place_city": town, "place_region": region, "place_country": country,
-            "place_cc": cc, "place_km": None}
+            "place_cc": cc, "place_km": km}
+
+
+def _filled_in(found, row):
+    """(region, country, cc, town, km): a located picture's file_place() (region,
+    country, cc, town) with the smaller parts its file leaves out taken from the place
+    names of its position (row's place_* columns, when it has them), if the parts the
+    file gives agree with those: the same country; the same region, none, or one the
+    place names do not have in that country (the file divides it otherwise, or names it
+    in another language); the same town or none. A file naming only "North Coast,
+    Examplia" of a picture taken in Coralport then reads "Coralport, North Coast,
+    Examplia", as the pictures beside it whose files name the town do (see the module
+    notes). km: how far the position's town is (its place_km) when the town is filled
+    in -- it may be further than the file's names suggest -- else None."""
+    region, country, cc, town = found
+    found = found + (None,)
+    keys = row.keys()
+
+    def column(name):
+        value = row[name] if name in keys else ""
+        return " ".join(value.split()) if isinstance(value, str) else ""
+
+    their_country, their_cc = column("place_country"), column("place_cc").upper()
+    if not their_country:
+        return found
+    if cc and their_cc:
+        if cc != their_cc:
+            return found
+    elif places.fold(country) != places.fold(their_country):
+        return found
+    their_city, their_region = column("place_city"), column("place_region")
+    if town and places.fold(town) != places.fold(their_city):
+        return found
+    if region and places.fold(region) != places.fold(their_region):
+        index = places.shared()
+        if index is None or index.knows_region(cc or their_cc, region):
+            return found
+    km = None
+    if not town and their_city:
+        value = row["place_km"] if "place_km" in keys else None
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0):
+            km = float(value)
+    return (region or their_region, country, cc, town or their_city, km)
 
 
 # The SQL of an images row's "fexif" (gps_file_columns): its exif when it has a position

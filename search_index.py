@@ -57,7 +57,8 @@ its value is empty, zero, or the "nothing" value noted below:
          -- these with pe -- or "o" the owner (a place set or an estimate
          accepted), "f" the picture's file (the place its XMP names, no
          position; with gp: the names its file gives, which ci, rg, co
-         and cc hold instead of the nearest town's, and no km, see
+         and cc hold instead of the nearest town's, and no km but for a
+         town filled in from the position, see
          place_estimates.gps_file_columns) -- an export: these two with
          location
     gx   1 when the GPS check set the picture's position aside (server,
@@ -231,9 +232,9 @@ DAY_INDEX_SIZE = 64
 # came out at about the same cosine in every library, while what two
 # pictures taken at random come to depends on what else a library holds,
 # and a cut-off taken from that changed when a picture was added or hidden.
-# They were set on about 12,000 photos with EmbeddingGemma 2 at 256
-# dimensions (two pictures taken at random: 0.65 to 0.82 by library), by
-# looking at the pairs:
+# They were set on the photos of real libraries with EmbeddingGemma 2 at
+# 256 dimensions (two pictures taken at random: 0.65 to 0.82 by library),
+# by looking at the pairs:
 # - Two pictures taken at most LOOK_STACK_SECONDS apart stack when their
 #   looks are at least LOOK_STACK_COSINE close, however far apart their
 #   dHashes are (a crop, a filter, a re-saved copy, the next shot of a
@@ -587,7 +588,7 @@ def fisheye_record(geometry):
 def add_place(record, row):
     """Add the place names of a row (place_* columns, see places.py) to a record: those its
     file gives when it has a position of its own (place_estimates.gps_file_columns: ps
-    "f", no km)."""
+    "f", no km but for a town filled in from the position)."""
     named = place_estimates.gps_file_columns(row) if "fexif" in row.keys() else None
     columns = named or row
     if not columns["place_country"]:
@@ -598,8 +599,7 @@ def add_place(record, row):
             record[key] = value
     if named:
         record["ps"] = place_estimates.RECORD_SOURCES["file"]
-        return
-    km = row["place_km"]
+    km = columns["place_km"]
     if (record.get("ci") and isinstance(km, (int, float)) and math.isfinite(km)
             and km >= 0):
         record["km"] = int(round(km))
@@ -1976,6 +1976,7 @@ def index_etag(conn, libraries, include_hidden, state=None, *, marks=None,
     key.append(albums.people_searches_shown(config, include_hidden))
     # (Named places turned off, or the street maps gone: the records have none.)
     key.append(named_places.shown_key(config))
+    key.append(place_estimates.FILE_PLACE_RULES)
     return hashlib.sha1(json.dumps(key, separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
 
 

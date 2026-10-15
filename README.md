@@ -937,7 +937,12 @@ the page header or the filters.
   how many: they can only be found by file name, date and camera until then.
 - When nothing matches, the page says what left the pictures out (a filter,
   "Hide sensitive pictures", the library) with a button to change it, or
-  suggests a spelling.
+  suggests a spelling. A word that is itself a word of the language
+  ("cold") is taken as you typed it, never "corrected" to another one the
+  pictures have ("old"); nor is the first letter of a short word (four
+  letters or fewer), or of any word two letters off, changed (other than
+  swapped with the second): when the closest spelling would change it,
+  none is suggested.
 
 ### Search syntax
 
@@ -1244,14 +1249,18 @@ search of filters or quoted phrases only).
 
 **More like this** (in the viewer, `M`, and on the details page) searches
 `similar:<picture>`: the pictures closest in meaning to that one, best
-first, after the picture itself. Close means much closer than the other
+first, after the picture itself and the other pictures of its stack of
+duplicates. Close means much closer than the other
 pictures are; when few stand out like that (a small published library,
-say), the closest few still show if they are close enough. It needs no
+say), the closest few still show if they are close enough (the picture's
+own stack, nearly the same picture, takes no part in that). It needs no
 model, only the vectors, so
 it also works in a published site (see [Publishing a
 library](#publishing-a-library)). The viewer's strip shows the closest
-few, one per stack of duplicates. A picture without a vector (not
-described yet) finds pictures sharing its tags, scene or time instead.
+few, one per stack of duplicates; when nothing else is close enough (the
+strip is empty, so the search would find only the picture itself), the
+button is not offered. A picture without a vector (not described yet)
+finds pictures sharing its tags, scene or time instead.
 
 The page downloads the vectors once (about 256 bytes a picture, and again
 only when they change) and compares them in the browser, as it does the
@@ -1276,6 +1285,8 @@ its poster frame), not from its description. **Looks like this** in the
 viewer (`L`, next to **More like this**) and on the details page searches
 `look:<picture>`: the pictures that look most like that one, best first,
 after the picture itself, with a strip of them under **More like this**.
+When nothing else looks close enough (the strip would be empty, so the
+search would find only the picture itself), the button is not offered.
 It finds what descriptions miss (the same kind of light, the same view,
 the same pattern) and only partly overlaps **More like this**, which goes
 by meaning. Words, filters and the timeline still choose among them
@@ -1495,11 +1506,19 @@ by those names, not by the nearest town of the place names (someone, or
 a program they chose, wrote them; the nearest town of a list may be
 across a border: a picture taken in a Swiss village a few kilometres
 from Italy would otherwise read as Italian), without a distance; its pin
-and its areas of the map are its position's. Its [named
-place](#named-places), if any, comes first, unless the names are of
-another country than the position's (then it gets none). A position the
-GPS check sets aside does not make way for the names (programs often
-fill them in from that very position).
+and its areas of the map are its position's. What the file leaves out
+comes from the position's place names when what it does name agrees with
+them: a file naming only "Tuscany, Italy" of a picture taken in Lucca
+reads "Lucca, Tuscany, Italy" (and is found by `lucca`) -- as long as
+the country is the position's, and the region is too, or is one the
+place names do not have in that country (the file divides the country
+otherwise, or names the region in another language); a file naming the
+position's town but no region gets the town's region. A town filled in
+says how far it is, as any picture's nearest town does ("Lucca, Tuscany,
+Italy (3 km)"). Its [named place](#named-places), if any, comes first,
+unless the names are of another country than the position's (then it
+gets none). A position the GPS check sets aside does not make way for
+the names (programs often fill them in from that very position).
 
 The names are read when a scan reads the file (a new or changed one).
 Pictures indexed by an older version were read without them: `python
@@ -1640,13 +1659,16 @@ How far off a position may be: what the file says (`GPSHPositioningError`,
 which phones write; 30 m when it says nothing, 65 m for a picture taken
 indoors, where a phone's position is often worse); for an [estimated
 place](#estimated-places), its radius (only estimates of at most 0.3 km
-get a named place, never a place to eat, shop or stay, and only one that
-reaches as far as the radius); for a dashcam clip's position from its GPS
-track, how far the drive goes (so only an area it stays inside names it:
-a drive passes many places); a position you set gets one too (an
-estimate you accepted as an estimate, by its radius; a town you chose
-none: its position is the town's middle). A position that may
-be more than 150 m off gets an area only. The picture counts too:
+get a named place, by their own position never a place to eat, shop or
+stay, and only one that reaches as far as the radius); for a dashcam
+clip's position from its GPS track, how far the drive goes (so only an
+area it stays inside names it: a drive passes many places); a position
+you set gets one too (an estimate you accepted as an estimate, by its
+radius; a town you chose none: its position is the town's middle). A
+position that may be more than 150 m off gets an area only by itself.
+An estimate, or a position more than 150 m off, can still take the place
+the other pictures of its visit agree on, when that fits what it shows
+(see below). The picture counts too:
 
 - a place its description names wins ("the Harbour Museum and the Old
   Tower at dusk", "a Gull Cafe cup on a table"), and a place of the kind
@@ -1658,35 +1680,94 @@ be more than 150 m off gets an area only. The picture counts too:
 - a restaurant, a cafe or a bar only for a picture of food or a meal, or
   one whose scene, title or tags say it was taken in one (a shop, a
   theatre or a hotel room is not the cafe beside it); a meal indoors names
-  the restaurant before the casino down the street (but the aquarium,
-  not its restaurant);
+  the restaurant before the casino down the street (by an aquarium, a
+  picture that shows no meal names the aquarium, and a meal the
+  restaurant: see the indoor rules below);
 - in a street or a square, only landmarks (and areas) count from further
   than 20 m: the museum across the street is not where a street scene was
-  taken; indoors, the point of an area (a college's) only from close by.
+  taken; indoors, the point of an area (a college's) only from close by;
+- a restaurant whose cuisine is not that of the food shown does not count
+  (the burger is not from the Thai place next door; a coffee goes with
+  anything).
 
-Tried on a library of about 2,500 pictures with a position (60 more were
-taken from a plane: none), 46 % of the photos with their own GPS position
-got a named place (a third of the phone videos, 40 % of the estimates of
-0.3 km or less). Of 60 pictures picked at random with theirs, 51 were
-right and 9 near enough (the hotel a view was taken from, the gallery
-next to the one it was taken in), none wrong; of 109 pictures picked
-because they looked wrong under earlier rules (45 were), 7 are wrong now
-and 28 have no named place. Some right ones go too: two cafes, or two
-restaurants, a phone's position cannot tell apart are both left out.
+Indoors a phone's position often drifts into the building next door, so
+for a picture taken indoors -- or one whose description shows a kind of
+venue (an aquarium's tanks, a stage, a hotel room, a shop's aisles) and is
+no street scene -- the building outlines of the street maps and what the
+picture shows count too:
+
+- a place in the building the position is in wins over a nearer one
+  outside it (a building part -- a lobby, a wing mapped on its own -- and
+  the building around it are one building), and the building's own place
+  (a hotel, a museum: the outline is theirs) over what is mapped inside
+  it (the cafe in the hotel's lobby) -- unless the picture shows that (a
+  coffee: the cafe);
+- a place whose kind is what the picture shows wins over a nearer one
+  that is not (the aquarium's tanks name the aquarium though the position
+  is in its restaurant's building next door; a meal there names the
+  restaurant), and so does one whose sign the picture shows from a little
+  further, or a restaurant whose food the picture shows; shops of most
+  kinds are never named, but a clothes shop, a car dealer, a warehouse
+  store and the like are, for a picture that shows one (a fitting room, a
+  showroom);
+- when the picture cannot tell two such places apart -- two restaurants
+  in one building, two galleries side by side -- neither is named;
+- a place that neither fits the picture nor holds the position (its
+  building does not, or is not right by it) is not named; a picture taken
+  in a parking garage gets an area only (the park around it, or none),
+  and a plate eaten outdoors by a mall, a theatre or a station is not
+  theirs; a picture of an airport taken at the edge of its outline is the
+  airport's;
+- the pictures of one visit (taken minutes apart, near each other) agree:
+  one with only a weak place or none -- a close-up of a fish whose position
+  is 200 m off, or an estimated place -- takes the place the others chose
+  surely, when it is near enough and fits what it shows (or, when it shows
+  nothing, at least two other shots chose it; copies of one shot count
+  once);
+- the viewer says "taken inside it" when the place's own building holds
+  the position ("museum, taken inside it"), or the outline of the area
+  its visit agreed on does ("nearby" when it is outside it).
+
+Tried on one library (its pictures taken from a plane got none), 48 % of
+the photos with their own GPS position got a named place (a third of the
+phone videos, 55 % of the estimates of 0.3 km or less; under the rules
+before the indoor ones, 46 % and 40 %).
+Of 60 pictures picked at random with theirs under those earlier rules,
+51 were right and 9 near enough (the hotel a view was taken from, the
+gallery next to the one it was taken in), none wrong; of 109 pictures
+picked because they looked wrong under the rules before those (45 were),
+7 were still wrong under them and 28 had no named place. Some right ones
+go too: two cafes, or two restaurants, a phone's position cannot tell
+apart are both left out. The indoor rules were measured on about 500
+pictures of that library judged by looking at each (two thirds taken
+indoors or of a venue): 86 % get the right named place or rightly none
+(76 % before them), 8 % a less specific one (the area around it), 1.4 %
+a wrong one (5.7 % before) and 4.5 % none where one is right (7.5 %
+before). That is one library, and the rules were chosen with those very
+pictures in view, so on others they may do a little worse (of its other
+pictures whose place changed, more than nine in ten look right or
+likely, and the rest could be either of two places to eat side by side).
+About 4 % more of its pictures got a named place than before, and a
+look-up of every picture again takes no longer than before.
 
 Scans look up the pictures whose position changed (and those described
-since), and so do the places job and a download of the street maps (then
-every picture again: about half a minute for 2,500 positions, the first
-time); **Find named places** (Manage, under Street maps)
-does it at once, **Look up all again** for every picture, and the
-viewer's location choices for the pictures they change (and the first
-update after a new version changes how places are named does every
-picture again too). A place the street maps give several names
-(`Harbour Hall;Hall of the Harbour`) shows, searches and publishes
-the first. Deleting the
-street maps forgets them (street maps downloaded down to zoom 14 only,
-`"max_zoom": 14`, hold fewer of the small places: cafes, minor sights). From
-the command line:
+since, or whose time changed), each with the other pictures of its visit
+as it is now and as it was, and so do the places job and a download of the
+street maps (then every picture again, the first time); **Find named
+places** (Manage, under Street maps) does it at once, **Look up all
+again** for every picture, and the viewer's location and place choices for
+the pictures they change (at once when they are 200 or fewer -- with the
+other pictures of their visits when those make 200 or fewer too, else the
+rest of the visits with the next job; and the first update after a new
+version changes how places are named does every picture again too: until
+then, Manage and `--status` say how many were looked up under the older
+rules). A place the street maps give several names
+(`Harbour Hall;Hall of the Harbour`) shows, searches and publishes the
+first. Deleting the street
+maps forgets them (street maps downloaded down to zoom 14 only,
+`"max_zoom": 14`, hold fewer of the small places: cafes, minor sights; and
+the building outlines are only at zoom 15, so with them indoors only what
+the picture shows counts). From the command line:
 
     python named_places.py [--status]        how many pictures have one
     python named_places.py --update          look up the pictures that changed
@@ -1701,7 +1782,8 @@ location data: other computers see it as they see positions, and an
 export publishes it only with **Location** -- and only when it publishes
 the position it was found for (an estimated place's only with **Estimated
 places**, a dashcam clip's only with its route, none in the area around
-home of a trip's export, nor a smart album that searches for one there),
+home of a trip's export -- nor one found there for a picture of the visit
+taken out of it -- nor a smart album that searches for one there),
 its distance rounded to 10 m, with the OpenStreetMap credit at the foot of
 the pages (and `maps/LICENSE.txt`) also without the street maps. Turned
 off (`"enabled": false`), or with the street maps deleted, none show at
@@ -1746,6 +1828,9 @@ the word names most of what the kind holds does it find the kind: a
 church, a temple, a mosque and a synagogue are all places of worship, a
 wildlife park and a safari park are zoos. A shore or a coast is no beach
 (most pictures of one were taken elsewhere), and an aquarium is no zoo.
+The shops named only for a picture that shows one go by what the viewer
+calls them: `car dealers`, `clothes shops`, `warehouse stores`,
+`supermarkets`, `DIY stores` (`kind:car`, `kind:clothes`, ... too).
 Plain language offers only the kinds some of your pictures were taken
 at, and a word with another everyday meaning (`park`, `bar`, `garden`,
 `station`, `theater`, `library`, `tower`, `fort`, `resort`, ...) only on
@@ -1763,16 +1848,16 @@ of its pictures at one) publishes a smart album saved from plain
 language with the words typed for the kind, and leaves out one that
 searches `kind:` itself.
 
-Tried on a library of about 11,700 pictures (880 with a named place):
-`zoos` found 71 more pictures (animals at a wildlife park whose
-descriptions never say zoo), `viewpoints` 19, `aquariums` 37 (the
-aquarium's pools and its restaurant, ranked after the fish), `hotels in
-2020` 18, `museums in 2019` 4, `wildlife park` 73, `theme parks` 9;
-`beaches` none (every picture at a named beach already said beach), and
-`churches` and `lighthouses`, which none was taken at, stayed words. Of
-more than 200 searches tried, none lost a picture it found before: kinds
-of several words, such as `coffee shop` and `gift shop`, keep what their
-words and their meaning found.
+Tried on one library: `zoos` found more pictures than the word alone
+(animals at a wildlife park whose descriptions never say zoo), and so did
+`viewpoints`, `aquariums` (the aquarium's pools, ranked after the fish; a
+meal at its restaurant is the restaurant's), `hotels` and `museums` in a
+given year, `wildlife park` and `theme parks`; `beaches` none (every
+picture at a named beach already said beach), and `churches` and
+`lighthouses`, which none was taken at, stayed words. Of more than 200
+searches tried, none lost a picture it found before: kinds of several
+words, such as `coffee shop` and `gift shop`, keep what their words and
+their meaning found.
 
 ### Searching an area of the map
 
@@ -1964,8 +2049,8 @@ to be right: a camera without GPS whose clock is an hour off (one that
 ignores daylight saving) gets the places where the others were an hour
 earlier or later.
 
-Tried on about 1,800 located pictures whose positions were hidden (a tenth
-at a time, three times over) and estimated again: 61% got an estimate
+Tried on the located pictures of one library, their positions hidden (a
+tenth at a time, three times over) and estimated again: 61% got an estimate
 (two in five of those from a copy, such as a photo's JPEG beside its
 HEIC); of those with a position, 99.6% in the right town, none more than
 1.5 km off and 99.5% within the distance they say they may be off; those
@@ -2679,12 +2764,41 @@ zoomed-in picture is brought into sight. In a crowd, where the names
 under the faces would cover each other, a face's name shows when you
 point at it, reach it with Tab or name it.
 
+- Before you type anything, the named people the face most likely is
+  come first: up to three of them, closest first, each with its face,
+  how close in words (**very like**, **like**, **a little like**) and
+  the closeness itself (1 would be the same face), then the other named
+  people as before. A person less alike than **a little like** is not
+  offered (such a first suggestion was never right when measured), so
+  for most faces the list is just the named people. When one is clearly
+  ahead of the others it is marked, and Enter puts the face there;
+  otherwise nothing is marked and Enter does nothing until you type or
+  choose. A person this face was said not to be (**Not Ann**) is never
+  offered; a hidden person says so and is never marked; a person with
+  another face in the same picture comes last of them and is never
+  marked (two faces of one picture are two people -- but a mirror, the
+  two edges of a 360-degree picture or a photo of a photo can show one
+  person twice).
+- For a face of an unnamed person they are for that person as a whole:
+  **Name Person 12 as Ann** (all its faces, as **Merge into...** on the
+  People page); the named people below them take this face alone (**just
+  this face**). It is marked only when clearly ahead and when each of
+  Person 12's clearest faces (up to 40) -- and this one -- is clearly
+  most like Ann: a person the grouping mixed up (one face of someone
+  else among those) is not marked. Never a named person that a face of
+  Person 12 was said not to be (or one with a face said not to be Person
+  12), and one seen in two or more of its pictures comes last ("also in
+  2 of its pictures"). For a face of a named person nothing new is
+  suggested.
 - Type the first letters of a name and press Enter: the people whose
   name (or a word of it: "lee" finds "Ann Lee") starts so are listed
   with their faces, the first one marked, and Enter puts this face in
   that person (as **Move to...** on the People page: it stays there,
-  and never goes back to the person it came from). The arrow keys
-  choose another; a click or a tap takes one. With nothing typed, the
+  and never goes back to the person it came from). A suggested person
+  comes first of the names that match as well; letters never take a
+  whole person: **Name Person 12 as Ann** comes after every person and
+  is chosen with the arrows or a click. The arrow keys choose another;
+  a click or a tap takes one. With nothing typed, the
   named people are listed (hidden ones say so); a person without a name
   is found by its number ("12"). Enter pressed before the people have
   arrived waits for them, and then takes a person the letters name --
@@ -2701,21 +2815,45 @@ point at it, reach it with Tab or name it.
 - **Not Ann** takes the face out of its person for good (as **Not
   <name>** on the People page); **Not a face** marks it as no face.
 
+How close a face is to a named person: the average of the five highest
+cosines between its vector and those of that person's clear faces (the
+faces the grouping groups by: of at least `group_quality`, whoever put
+them in the person -- a blurred face you gave a name to with Enter does
+not make the next blurred stranger look like that person), so a face
+like the person's pictures of one time (glasses, a beard, younger)
+counts as close. While a named person has fewer than five clear faces,
+all of its faces count, and it is offered but never marked. An unnamed
+person's closeness is its best faces' on average (a person of one or two
+faces must be as clearly ahead as a single face). When one is "clearly
+ahead" was set by measurement, on faces judged by looking at them, to be
+right far more often than not -- but not always: check the face before
+Enter. Expect few faces of nobody to be marked (the grouping left them
+out because they are unsure: small, blurred, turned away, and relatives
+look alike) and more unnamed people. When nothing is marked, the first
+one offered is only a hint (most faces of nobody are of people you have
+not named): measured on one library by looking at the faces, it was the
+right person for about one face in four (about one in five when only
+**a little like**) and seldom for an unnamed person -- though when the
+right person was offered at all, it was the first one.
+
 Each change shows a message with **Undo** (or press Ctrl+Z while it
 shows; in the viewer, Tab reaches its Undo too): everything is as it was
-before, also a person that went with its last face. Only the last change
-can be undone, and only while nothing else changed the people since
+before, also a person that went with its last face, or one that went
+into another with **Name Person 12 as Ann** (unless the two have more
+than 5000 faces together). Only the last change can be undone, and
+only while nothing else changed the people since
 (another change, here or on the People page, a grouping, or Delete face
 data) and the server has not been started again since (it keeps the
 change in memory only); then put it right on the People page. **Name
 Person 12** is refused when a grouping has moved that face to another
-person meanwhile: look at it again. The names in the pane and on the
-boxes change at once; the People page and `person:` searches see the
-new names the next time they look (the search page's next search). Esc
-(or a click elsewhere) closes the box and gives the keyboard back to the
-face. For a video or a 360-degree picture, use its faces in the pane: a
-face of a video also moves the video to the moment it was seen at, and
-a face of a 360-degree photo turns the view to it. This is the admin's
+person meanwhile (so is **Name Person 12 as Ann**): look at it again.
+The names in the pane and on the boxes change at once; the People page
+and `person:` searches see the new names the next time they look (the
+search page's next search). Esc (or a click elsewhere) closes the box
+and gives the keyboard back to the face. For a video or a 360-degree
+picture, use its faces in the pane: a face of a video also moves the
+video to the moment it was seen at, and a face of a 360-degree photo
+turns the view to it. This is the admin's
 only, on this computer: never visitors (even with `"visitors": true`),
 never a published site.
 
@@ -3109,8 +3247,10 @@ it off (the dialog asks for it by name, so an empty field never does):
 - With **Location**, no position in the area is published: its pictures
   keep their region and country but not their town, their named place,
   nor the AI model's landmark and place-guess words, and neither does any
-  picture whose town
-  has pictures in the area; estimated places in it are not shown, and
+  picture whose town has pictures in the area (a town of that name in the
+  same country, unless the place names put it in another region: a
+  file's own place names may give the town with a region of their own);
+  estimated places in it are not shown, and
   drive routes are cut at its edge (besides the 500 m left out at both
   ends of every drive), and a RAW file holding a position in it, or whose
   picture was taken in it, stays home. With **Street maps** no street map
@@ -3429,13 +3569,16 @@ tiles that are whole and writes the missing or damaged ones.
   environment's packages (`requirements-people-pinned.txt`: the versions
   tested, with their hashes); `people_groups.py` groups the faces into people
   and keeps what you say about them, and answers the server's
-  `/api/people`, `/face/<id>` and the People page
+  `/api/people`, `/face/<id>` and the People page; `people_suggest.py`
+  suggests who a face is (the viewer's naming box)
 - `export.py` - publish one library as a static website
 - `trip_export.py` - publish one trip as a static website (`export.py
   --trip`), home kept out
 - `compare_models.py` - compare how endpoints describe the same images
 - `progress.py`, `world_map.py`, `make_tiles.py`, `make_places.py` - see
   [Other tools](#other-tools)
+- `english_words.py` - makes `static/english-words.js`, the words of the
+  language that "did you mean" leaves alone (see [Credits](#credits))
 - `videos.py` - videos: what ffprobe says, posters, contact sheets,
   copies without metadata and playable copies (ffmpeg); 360-degree videos
   (their LRV, stitched frames, the lens geometry the viewer uses)
@@ -3494,6 +3637,8 @@ tiles that are whole and writes the missing or damaged ones.
   by every page; `site.js` is where the pages get their data, from the
   server or from a static export; `search-core.js` is the search engine and
   `viewer.js` the picture viewer, both shared with a static export;
+  `english-words.js` holds the words of the language that "did you mean"
+  leaves alone (made by `english_words.py`, see [Credits](#credits));
   `routes.js` draws drive routes, for the map and the viewer;
   `streets.js` draws the maps' ground, the world image and the street
   maps;
@@ -3767,3 +3912,20 @@ Place names (downloaded when you ask for them, see [Place
 names](#place-names)) are from GeoNames, https://www.geonames.org/, under
 the Creative Commons Attribution 4.0 licence
 (https://creativecommons.org/licenses/by/4.0/).
+
+The words of the language that "did you mean" leaves alone
+(`static/english-words.js`, a Bloom filter that `english_words.py` makes;
+it holds no word as text) are the whole words of the vocabulary of the
+mdbr-leaf-ir model (MongoDB, Apache License 2.0,
+https://www.apache.org/licenses/LICENSE-2.0), which is the uncased
+WordPiece vocabulary of BERT (Google, https://github.com/google-research/bert,
+Apache License 2.0). `python english_words.py --model MODEL.gguf` makes the
+file again from a model of your own (or `--list WORDS.txt` from a list).
+With the mdbr-leaf-ir model, this makes the file as shipped, these credits
+in its notes included (and so does `--list vocab.txt` in place of
+`--model`, with the model's WordPiece vocabulary as text, one piece a
+line):
+
+```
+python english_words.py --model MODEL.gguf --source "the whole words of the WordPiece vocabulary of the mdbr-leaf-ir model (MongoDB), which is the uncased vocabulary of BERT (Google); both under the Apache License 2.0"
+```

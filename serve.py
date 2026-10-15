@@ -236,13 +236,18 @@ def place_of(row, estimate=None):
     row, see place_estimates.py), with "source" ("copy", "time", "area",
     "owner" or "file") and "estimated": true (not for the owner's own place
     nor the place its file names). A picture with a position whose file
-    names its place has those names, with "source" "file" and no "km"
-    (place_estimates.gps_file_columns).
+    names its place has those names, with "source" "file" and no "km" but
+    for a town filled in from its position (place_estimates.gps_file_columns).
     """
     named = place_estimates.gps_file_columns(row)
     if named is not None:
-        return {"city": named["place_city"], "region": named["place_region"],
-                "country": named["place_country"], "cc": named["place_cc"], "source": "file"}
+        place = {"city": named["place_city"], "region": named["place_region"],
+                 "country": named["place_country"], "cc": named["place_cc"],
+                 "source": "file"}
+        km = finite(named["place_km"])
+        if place["city"] and km is not None and km >= 0:
+            place["km"] = km
+        return place
     if not row["place_country"]:
         if not place_estimates.usable(row, estimate) or not estimate["place_country"]:
             return None

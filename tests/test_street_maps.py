@@ -343,9 +343,13 @@ class PlanAndDownloadTest(support.TempBaseMixin, unittest.TestCase):
             first = int(re.match(r"^bytes=(\d+)-", ranges).group(1))
             self.assertLess(first, data_start)
             self.assertEqual(agent, street_maps.USER_AGENT)
-        # What is kept of the check says nothing of where the pictures are.
+        # What is kept of the check says nothing of where the pictures are. (Its time
+        # may hold the same digits by chance, as this one does: a time, not a place.)
+        found["at"] = 1792077420.48
         street_maps.save_plan(found)
-        kept = json.dumps(street_maps.status()["plan"])
+        plan = street_maps.status()["plan"]
+        self.assertEqual(plan.pop("at"), 1792077420.48)
+        kept = json.dumps(plan)
         self.assertNotIn("10.3", kept)
         self.assertNotIn("20.4", kept)
         self.assertNotIn("bounds", kept)

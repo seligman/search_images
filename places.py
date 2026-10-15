@@ -614,8 +614,12 @@ class PlaceIndex:
         try:
             self.countries = {row[0]: (row[1], row[2])
                               for row in conn.execute("SELECT id, cc, name FROM countries")}
-            self.regions = {row[0]: row[1]
-                            for row in conn.execute("SELECT id, name FROM regions")}
+            self.regions = {}
+            # {cc: the names of the country's regions, folded} (knows_region)
+            self.region_names = {}
+            for region_id, code, name in conn.execute("SELECT id, code, name FROM regions"):
+                self.regions[region_id] = name
+                self.region_names.setdefault(code.split(".")[0], set()).add(fold(name))
             self.zone_names = ({row[0]: row[1] for row in conn.execute(
                 "SELECT id, name FROM zones")} if self.has_zones else {})
             self.lat = array.array("d")
@@ -698,6 +702,11 @@ class PlaceIndex:
                 "country": country, "cc": cc, "lat": math.degrees(self.lat[index]),
                 "lon": math.degrees(self.lon[index]),
                 "zone": self.zone_names.get(self.zone[index], "")}
+
+    def knows_region(self, cc, name):
+        """True when name (any case, accents or spacing) is the name of a region of the
+        country with ISO code cc ("US") in the place names."""
+        return fold(name) in self.region_names.get(str(cc or "").upper(), ())
 
     def zone_of(self, lat, lon):
         """(time zone id, km) of the nearest town at most MAX_KM away when it has a time

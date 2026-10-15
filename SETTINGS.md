@@ -1232,7 +1232,10 @@ changes them).
   threshold for "the same person" is about 0.36.
 - `group_quality` - the faces of at least this quality (0 to 1, default
   0.25) are grouped; the others (small, blurred, turned away) only join a
-  person afterwards.
+  person afterwards. The viewer's suggestions of who a face is measure it
+  against these faces of each named person, whoever put them there (all
+  of its faces while it has fewer than five such; it is then never
+  marked) (README, "Naming a face in the viewer").
 - `min_faces` - a group of at least this many faces (1 to 100, default 3)
   is a person, when they are in pictures of at least two different
   moments: pictures whose dHashes are at most 10 bits apart (copies of one
@@ -1252,8 +1255,9 @@ changes them).
 
 Changing `match`, `group_quality` or `min_faces` takes effect with the next
 grouping: **Group faces again** on the People page (or the next run that
-finds faces). What you said about people (names, merges, moved faces,
-"not this person", hidden people, "not a face") is kept.
+finds faces); the viewer's suggestions follow `group_quality` at once.
+What you said about people (names, merges, moved faces, "not this
+person", hidden people, "not a face") is kept.
 
 `python people.py --check` starts the helper, loads the models and looks
 for a face drawn by the program; it says what is wrong when that fails.
@@ -1347,7 +1351,9 @@ and **Download** on the Manage page download. All keys are optional:
   default 5; 0: none along them).
 - `max_zoom` - the most detailed zoom downloaded (8 to 15, default 15:
   every building; 14, the streets, is two to three times smaller). The
-  maps zoom three steps past it.
+  maps zoom three steps past it. The named places of pictures taken
+  indoors use the building outlines, which only zoom 15 has (README,
+  "Named places").
 - `whole_degrees` - `true` (the default) asks the map's host for every
   tile of the whole-degree squares (about 111 km from south to north) the
   areas touch, and keeps only the areas: the host learns no more than
@@ -1389,7 +1395,13 @@ optional:
 - `max_estimate_km` - an estimated place (see `place_estimates`) gets a
   named place only when it may be off by at most this much (0 to 2,
   default 0.3 km); estimates of more than 0.15 km get an area only (a
-  park, a zoo) they lie deep enough inside of.
+  park, a zoo) they lie deep enough inside of -- or the place the other
+  pictures of the visit agree on, when it fits (README, "Named places").
+
+The rules for pictures taken indoors (the street maps' building outlines,
+what the picture shows, the pictures of a visit agreeing) have no
+settings of their own: they need the street maps of `"max_zoom": 15` for
+the building outlines (see `street_maps`) and described pictures.
 
 Changing them takes effect at the next scan, or at once with **Find named
 places** (or **Look up all again**) under Street maps on the Manage page.
@@ -1551,7 +1563,8 @@ A list of folders to scan. Each library is one object:
     Hidden pictures are never published.
   - `credits` - a line of plain text shown at the foot of the pages (at
     most 4,000 characters: enough to name every creator of a mixed set of
-    pictures).
+    pictures). The map page, which has no foot, links to it instead
+    ("Photo credits" in the corner of the map).
   - `zip` - `true` also writes `<folder>.zip` next to the output folder.
     An existing file of that name is only replaced when an earlier export
     made it and it was not changed since; otherwise the export stops.

@@ -25,6 +25,7 @@ import db
 import drives
 import export
 import jobs
+import place_estimates
 import places
 import tracks
 import trip_export
@@ -52,6 +53,7 @@ NODE = shutil.which("node")
 NODE_TESTS = os.path.join(support.REPO, "tests", "js", "export_test.js")
 SHELF_NAME = "SecretShelfName"
 PHONE_NAME = "PhoneLibraryName"
+OUTSKIRTS = (40.0, -99.53)          # about 40 km east of HOME: outside a 10 km home area
 
 
 def quiet(*_args, **_kwargs):
@@ -167,6 +169,70 @@ class HomeAreaTest(unittest.TestCase):
         same = area.trim({"d": 3, "l": "lib", "c": [
             {"i": 3, "o": 0.0, "p": tracks.encode_points(far)}]})
         self.assertNotIn("t", same["c"][0])
+
+
+class _PlaceNames:
+    """What a trip export asks of the place names (places.PlaceIndex) of the made-up
+    country: its name, and the names of its regions."""
+    countries = {1: ("CL", "Countryland")}
+
+    def knows_region(self, cc, name):
+        return cc == "CL" and places.fold(name) in ("region one", "region two", "region three")
+
+
+class HomeTownTest(unittest.TestCase):
+
+    def test_a_town_of_home(self):
+        towns = {HOME_PLACE, LAKE_PLACE[:3] + ("",)}
+        with mock.patch.object(places, "shared", _PlaceNames):
+            self.assertTrue(trip_export.home_town(HOME_PLACE, towns))
+            # Any case or accents; the country by its code when both have one.
+            self.assertTrue(trip_export.home_town(("HOMET\u00d3WN", "region one",
+                                                   "Countryland", ""), towns))
+            self.assertTrue(trip_export.home_town(("Hometown", "Region One", "CL Land",
+                                                   "cl"), towns))
+            self.assertTrue(trip_export.home_town(("Lakeside", "Region Two", "Countryland",
+                                                   "CL"), towns))
+            # A region that cannot tell them apart: none, or one the place names do not
+            # have (a file's own: its town may be the position's).
+            for region in ("", "Home Province"):
+                self.assertTrue(trip_export.home_town(("Hometown", region, "Countryland",
+                                                       "CL"), towns), region)
+            # A town of that name in another region of the place names is another town;
+            # so is one of another country, and another town of home's region.
+            self.assertFalse(trip_export.home_town(("Hometown", "Region Two", "Countryland",
+                                                    "CL"), towns))
+            self.assertFalse(trip_export.home_town(("Hometown", "Region One", "Otherland",
+                                                    "OL"), towns))
+            self.assertFalse(trip_export.home_town(("Farville",) + HOME_PLACE[1:], towns))
+            self.assertFalse(trip_export.home_town(("",) + HOME_PLACE[1:], towns))
+            self.assertFalse(trip_export.home_town(HOME_PLACE, set()))
+        # Without the place names no region tells them apart.
+        with mock.patch.object(places, "shared", lambda: None):
+            self.assertTrue(trip_export.home_town(("Hometown", "Region Two", "Countryland",
+                                                   "CL"), towns))
+
+    def test_every_town_a_files_place_is_filled_in_with_is_home(self):
+        # place_estimates._filled_in gives a file's place without a town its position's
+        # town when the regions cannot tell them apart; home_town must take each such
+        # place of a picture at home for home's town (the two rules written apart).
+        row = dict(zip(("place_city", "place_region", "place_country", "place_cc",
+                        "place_km"), HOME_PLACE + (1.0,)))
+        filled = 0
+        for shared in (_PlaceNames, lambda: None):
+            with mock.patch.object(places, "shared", shared):
+                for region in ("", "Region One", "REGION ONE", "Région One",
+                               "Home Province", "Region Two", "Region Three"):
+                    for country, cc in (("Countryland", "CL"), ("Countryland", ""),
+                                        ("Otherland", "OL")):
+                        town_region, town_country, town_cc, town, _km = \
+                            place_estimates._filled_in((region, country, cc, ""), row)
+                        if town:
+                            filled += 1
+                            self.assertTrue(trip_export.home_town(
+                                (town, town_region, town_country, town_cc), {HOME_PLACE}),
+                                (region, country, cc))
+        self.assertGreater(filled, 4)
 
 
 class OptionsTest(unittest.TestCase):
@@ -631,6 +697,67 @@ class TripExportTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual((data["title"], data["start"], data["end"]),
                          ("Otherplace, Region Three", "2024-03-06", "2024-03-06"))
         self.assertNotIn("Farville", json.dumps(trip_data(out)))
+
+    def test_a_town_of_home_named_with_a_files_own_region_stays_home(self):
+        # A picture of the trip 40 km from home (outside the home area) whose nearest
+        # town is home's, and whose file names a region the place names do not have and
+        # the country: its town comes from its position (place_estimates._filled_in),
+        # with the file's region -- and is still home's town, which does not go.
+        folder = [library["path"] for library in common.load_config()["libraries"]
+                  if library["id"] == LAKES][0]
+        imagegen.jpeg_with_exif(folder, "outskirts.jpg",
+                                image=imagegen.textured_image((160, 120)),
+                                date="2024:05:10 08:00:00", offset="+00:00", gps=OUTSKIRTS)
+        import scan
+        scan.run(common.load_config(), jobs.JobContext("test"), describe_images=False)
+        row = self.conn.execute(
+            "SELECT id, exif FROM images WHERE path = 'outskirts.jpg'").fetchone()
+        exif = dict(json.loads(row["exif"]), XMPPlace={
+            "region": "Home Province", "country": "Countryland", "cc": "CL"})
+        self.conn.execute(
+            "UPDATE images SET exif = ?, info = ?, described = 1, prompt_ver = 5, "
+            "place_city = ?, place_region = ?, place_country = ?, place_cc = ?, "
+            "place_km = 40.0 WHERE id = ?",
+            (json.dumps(exif), json.dumps(info("Picture outskirts", ["view"])))
+            + HOME_PLACE + (row["id"],))
+        self.conn.commit()
+        with mock.patch.object(places, "shared", _PlaceNames):
+            out, _summary = self.export("outskirts", {"location": True, "story": True})
+        records = [record for record in read_records(out)
+                   if record.get("t") == "Picture outskirts"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual({key: records[0].get(key) for key in ("ci", "km", "rg", "co", "ps")},
+                         {"ci": None, "km": None, "rg": "Home Province", "co": "Countryland",
+                          "ps": "f"})
+        for rel, text in self.texts(out).items():
+            self.assertNotIn("Hometown", text, rel)
+
+    def test_a_town_of_home_only_the_files_name_stays_home(self):
+        # The pictures at home whose files name their town (their records show it, not
+        # the place names' Hometown), and a picture of the trip at the lake whose file
+        # names that town too: it is home's town, which does not go.
+        town = {"city": "Example Springs", "region": "Region One", "country": "Countryland",
+                "cc": "CL"}
+        homes = [self.ids["home-%02d.jpg" % day] for day in (1, 2)]
+        lake = self.ids["10-0.jpg"]
+        for image_id in homes + [lake]:
+            row = self.conn.execute("SELECT exif FROM images WHERE id = ?",
+                                    (image_id,)).fetchone()
+            self.conn.execute("UPDATE images SET exif = ? WHERE id = ?",
+                              (json.dumps(dict(json.loads(row["exif"]), XMPPlace=town)),
+                               image_id))
+        self.conn.commit()
+        with mock.patch.object(places, "shared", _PlaceNames):
+            self.assertIn(("Example Springs", "Region One", "Countryland", "CL"),
+                          trip_export.home_towns(self.conn,
+                                                 trip_export.HomeArea(HOME, trip_export.HOME_KM)))
+            out, _summary = self.export("file-town", {"location": True, "story": True})
+        records = {record.get("t"): record for record in read_records(out)}
+        self.assertEqual((records["Picture 10-0"].get("ci"), records["Picture 10-0"].get("rg")),
+                         (None, "Region One"))
+        self.assertEqual(records["Picture 10-1"].get("ci"), "Lakeside")
+        for rel, text in self.texts(out).items():
+            self.assertNotIn("Example Springs", text, rel)
 
     def test_preview_and_command_line(self):
         result = trip_export.preview_trip(self.conn, common.load_config(), LAKES,

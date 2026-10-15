@@ -1229,6 +1229,9 @@ test("a picked place's circle: as far as named places reach for its kind", funct
     assert.strictEqual(STREETS.placeWithin("aquarium"), 185);
     assert.strictEqual(STREETS.placeWithin("cafe"), 45);
     assert.strictEqual(STREETS.placeWithin("gift"), 25);
+    // (A kind of shop named only for a picture that shows one: named_places.SHOWN_SHOPS.)
+    assert.strictEqual(STREETS.placeWithin("clothes"), 25);
+    assert.strictEqual(STREETS.placeWithin("car"), 45);
     assert.strictEqual(STREETS.placeWithin("bus_stop"), null);
     assert.strictEqual(STREETS.placeWithin(undefined), null);
     assert.strictEqual(STREETS.placeWithin("constructor"), null);

@@ -8,8 +8,9 @@ web-size pictures. It can be copied to any static web host, or opened from
 disk by double-clicking index.html.
 
     index.html  detail.html  [map.html]
-    assets/     style.css shell.js site.js search-core.js routes.js viewer.js
-                app.js detail.js [map.js] [embed-engine.js embed-kernel.js]
+    assets/     style.css shell.js site.js search-core.js english-words.js
+                streets.js routes.js viewer.js app.js detail.js [map.js]
+                [embed-engine.js embed-kernel.js]
     data/       manifest.js  window.SEARCH_DATA_MANIFEST = {...}
                 index-NNN.js  SEARCH_DATA.push([records])
                 detail-NNN.js SEARCH_DATA.detail({picture id: details})
@@ -89,8 +90,9 @@ ni, na in its record; nd rounded to named_places.EXPORT_METRES) is
 location data too: it goes with the location option (an estimated
 place's also with estimated_places), and only when the position it was
 found for goes (_Export.named_published: a track's with the routes, none
-in a trip's home area); with it, kind: and plain language's "beaches" find
-the pictures taken at a kind of place in the published site. The named
+in a trip's home area, nor one found for a position there); with it,
+kind: and plain language's "beaches" find the pictures taken at a kind
+of place in the published site. The named
 places are looked up first (as the GPS check runs:
 named_places.run_safely), and they are OpenStreetMap data: an
 export that holds some carries the OpenStreetMap credit and licence
@@ -292,8 +294,8 @@ PLACES_CREDIT = ('Place names: <a href="%s">GeoNames</a> (<a href="%s" rel="lice
                                      html.escape(places.LICENSE_URL)))
 MAX_ID_LIST = 100000
 # Scripts and the style sheet every export carries (map.js only with the map).
-ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "streets.js", "routes.js",
-          "viewer.js", "app.js", "detail.js")
+ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "english-words.js", "streets.js",
+          "routes.js", "viewer.js", "app.js", "detail.js")
 MAP_ASSETS = ("map.js",)
 # (file in the export, template)
 PAGES = (("index.html", "page.html"), ("detail.html", "detail.html"))
@@ -420,6 +422,13 @@ STREETS_CREDIT = ('Street maps: &copy; OpenStreetMap contributors '
 # (capabilities "named_places"; the licence is maps/LICENSE.txt all the same).
 NAMED_CREDIT = ('Named places: &copy; OpenStreetMap contributors '
                 '(<a href="maps/LICENSE.txt" rel="license">ODbL</a>)')
+# The map page lists pictures too but has no foot for the credits option's line: with
+# one, it links to where that line is (the foot of the search page, id CREDITS_ID). Short,
+# to keep the corner's credits on one line on a phone; where they wrap, the link goes to
+# the next line whole (.map-photo-credits, style.css).
+CREDITS_ID = "credits"
+PHOTO_CREDITS_LINK = ('<a class="map-photo-credits" href="%s#' + CREDITS_ID + '" title="The '
+                      'photo credits are at the foot of the search page">Photo credits</a>')
 # The Content-Security-Policy of every exported page (a <meta> tag; export.py --serve
 # sends it too): scripts, styles, pictures and requests only from the site itself (a
 # browser takes the folder of a site opened from disk for that), so the site never asks
@@ -3268,11 +3277,15 @@ def render_page(template, title, page_title, capabilities, export_id, options,
     or only named places ("named_places"); the map page, which has no foot,
     shows the GeoNames and named places credits in a corner of the map (the
     world image and the street maps credit their own: map.html's
-    #map-streets-credit, streets.js showCredit). versions ({asset name: hash}) go into the addresses of the
-    scripts and the style sheet. meaning ({"credit"}, when the export ships the
-    query model of search by meaning) adds "Search by meaning: <credit> ·
-    license" to the foot of the search and detail pages. extra: more page settings
-    (a trip export's: its pages' names, see trip_export.py).
+    #map-streets-credit, streets.js showCredit), and with a credits line a
+    link to it at the foot of the search page (PHOTO_CREDITS_LINK; the
+    trip export's search page is extra's "searchPage"; map.js stacks the
+    map's other credits above that corner however many lines it takes).
+    versions ({asset name: hash}) go into the addresses of the scripts and
+    the style sheet. meaning ({"credit"}, when the export ships the query
+    model of search by meaning) adds "Search by meaning: <credit> ·
+    license" to the foot of the search and detail pages. extra: more page
+    settings (a trip export's: its pages' names, see trip_export.py).
     """
     import serve
     location = options["location"]
@@ -3318,18 +3331,23 @@ def render_page(template, title, page_title, capabilities, export_id, options,
         anchor = '<script type="application/json" id="app-config">'
         if anchor not in text:
             raise ExportError("The page template %s has no page settings." % template)
-        footer = '<footer class="export-credits">%s</footer>\n' % "<br>".join(credits)
+        footer = '<footer id="%s" class="export-credits">%s</footer>\n' % (
+            CREDITS_ID, "<br>".join(credits))
         text = text.replace(anchor, footer + anchor, 1)
-    elif template == "map.html" and (capabilities.get("places") or (
-            capabilities.get("named_places") and not capabilities.get("streets"))):
-        anchor = '<div id="map-message"'
-        if anchor not in text:
-            raise ExportError("The page template %s has no map message." % template)
+    elif template == "map.html":
         shown = ([PLACES_CREDIT] if capabilities.get("places") else []) + (
             [NAMED_CREDIT] if capabilities.get("named_places")
             and not capabilities.get("streets") else [])
-        text = text.replace(anchor, '<p id="map-credit" class="export-credits map-credit">'
-                                    '%s</p>\n%s' % ("<br>".join(shown), anchor), 1)
+        if options["credits"]:
+            # (On the last line: the corner keeps as many lines as before.)
+            photos = PHOTO_CREDITS_LINK % html.escape(extra.get("searchPage") or PAGES[0][0])
+            shown = shown[:-1] + [shown[-1] + " &middot; " + photos] if shown else [photos]
+        if shown:
+            anchor = '<div id="map-message"'
+            if anchor not in text:
+                raise ExportError("The page template %s has no map message." % template)
+            text = text.replace(anchor, '<p id="map-credit" class="export-credits map-credit">'
+                                        '%s</p>\n%s' % ("<br>".join(shown), anchor), 1)
     return text
 
 
@@ -3954,7 +3972,9 @@ class _Export:
             if picture.record.get("np") is not None:
                 # A named place (named_places.py) goes out only with the position it
                 # was found for: not a track's or an estimate's withheld here, nor one
-                # in a trip's home area.
+                # in a trip's home area -- nor, in a trip's export, one found for any
+                # position there (a visit's place is found for the positions of the
+                # other pictures of the visit: trip_export's named_published).
                 if estimates is None:
                     estimates = place_estimates.for_libraries(self.conn, self.library_ids)
                 if not self.named_published(picture, estimates.get(picture.row["id"])):

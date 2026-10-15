@@ -753,7 +753,9 @@ var EXPORT_REVIEW = (function () {
 
     /* "Looks like this" in the export (counts.looks of the preview: {vectors,
        missing}; parts: its size_parts): for how many pictures, and its size;
-       "" when the option is off or nothing would go. */
+       "" when the option is off or nothing would go. (A look vector makes the
+       search possible; the viewer offers it only on a picture others look
+       like: viewer.js renderInfo.) */
     function looksText(counts, options, parts) {
         var looked = counts && counts.looks;
         var exported = Number(counts && counts.exported) || 0;
@@ -771,7 +773,8 @@ var EXPORT_REVIEW = (function () {
             (bytesEach ? " (about " + number(bytesEach) + " bytes a picture, " +
              bytes(parts.looks) + " in all)" : "") + (looked.missing ? "; " +
             number(looked.missing) + (looked.missing === 1 ? " has" : " have") + " no look " +
-            "vector yet (Update looks on the Manage page first)" : "") + ".";
+            "vector yet (Update looks on the Manage page first)" : "") + ". It is offered " +
+            "on a picture when other published pictures look like it.";
     }
 
     /* What goes of the street maps (counts.street_maps of the preview:

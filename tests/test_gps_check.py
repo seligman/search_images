@@ -60,17 +60,20 @@ DAY = "2021-03-04"
 OFFSET = "-10:00"
 
 
-def install_towns():
-    """data/places/places.db of the current SETTINGS_BASE from the made-up towns."""
+def install_towns(towns=None, regions=None):
+    """data/places/places.db of the current SETTINGS_BASE from the made-up towns (towns,
+    regions: others than TOWNS and REGIONS)."""
+    towns = TOWNS if towns is None else towns
+    regions = REGIONS if regions is None else regions
     folder = places.places_dir()
     os.makedirs(folder, exist_ok=True)
     import zipfile
     with zipfile.ZipFile(os.path.join(folder, places.CITIES_FILE), "w") as archive:
-        archive.writestr(places.CITIES_TEXT, test_places.cities_text(TOWNS))
+        archive.writestr(places.CITIES_TEXT, test_places.cities_text(towns))
     with open(os.path.join(folder, places.REGIONS_FILE), "w", encoding="utf-8",
               newline="\n") as handle:
         handle.write("".join("%s\t%s\t%s\t1\n" % (code, name, name)
-                             for code, name in REGIONS.items()))
+                             for code, name in regions.items()))
     lines = ["#ISO\tISO3\tISO-Numeric\tfips\tCountry\tCapital"]
     for cc, name in COUNTRIES.items():
         lines.append("\t".join([cc, cc + "X", "0", cc, name, "", "0", "0", "XX", "", "", "",

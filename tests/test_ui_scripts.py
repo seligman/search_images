@@ -41,7 +41,8 @@ NODE_TESTS = os.path.join(support.REPO, "tests", "js", "ui_test.js")
 MAP_TESTS = os.path.join(support.REPO, "tests", "js", "map_test.js")
 NODE = shutil.which("node")
 SCRIPTS = ("site.js", "viewer.js", "app.js", "detail.js", "map.js", "duplicates.js",
-           "embed-engine.js", "embed-kernel.js", "albums.js", "streets.js", "street-maps.js")
+           "embed-engine.js", "embed-kernel.js", "albums.js", "streets.js", "street-maps.js",
+           "english-words.js")
 
 
 def read(*parts):
@@ -372,7 +373,8 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
     def test_search_page_loads_the_engine_and_the_viewer_first(self):
         html = self.page("/?q=beach&type=photo#id=3")
         self.assertEqual(scripts_of(html), ["/static/site.js", "/static/shell.js",
-                                            "/static/search-core.js", "/static/streets.js",
+                                            "/static/search-core.js",
+                                            "/static/english-words.js", "/static/streets.js",
                                             "/static/routes.js",
                                             "/static/viewer.js",
                                             "/static/app.js"])

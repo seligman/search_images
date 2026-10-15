@@ -1002,16 +1002,17 @@ def mark_not_face(store, face_ids, not_face=True, now=None):
 # Undo (the viewer's, for the last face named there)
 
 UNDO_FACES = 100            # faces a change may name and still be undone
+UNDO_MERGE_FACES = 5000     # ... and the faces of the two people a merge may hold
 
 
-def snapshot(store, face_ids=(), person_ids=()):
+def snapshot(store, face_ids=(), person_ids=(), limit=UNDO_FACES):
     """What undoing a change of faces face_ids and people person_ids needs (restore), as
     it is now: each face's person (with owner), its "not this person" and "not a face",
     and the rows of those people and of the faces' people (with the "not this person"
     of every face they hold: deleting a person deletes those). Take it right before the
     change, in the change's own write (undoable), and settle_snapshot() right after.
-    None for more than UNDO_FACES faces (or a list that is not one of face ids: the
-    change refuses it)."""
+    None for more than limit faces (or a list that is not one of face ids: the change
+    refuses it)."""
     # (The counters first: a change another connection makes while the rest is read
     # shows in them, and settle_snapshot then refuses to undo.)
     epoch = _meta_value(store, "epoch")
@@ -1024,7 +1025,7 @@ def snapshot(store, face_ids=(), person_ids=()):
         except GroupError:
             return None
     face_ids = list(face_ids or ())
-    if len(face_ids) > UNDO_FACES:
+    if len(face_ids) > limit:
         return None
     faces = {face_id: {"person": None, "rejects": [], "mark": None} for face_id in face_ids}
     persons = {value for value in person_ids
@@ -1062,16 +1063,19 @@ def _data_version(store):
     return store.execute("PRAGMA data_version").fetchone()[0]
 
 
-def undoable(store, face_ids, person_ids, change):
+def undoable(store, face_ids, person_ids, change, limit=UNDO_FACES):
     """change() -- a change of the people (move_faces, reject_faces, mark_not_face,
-    update_person: each commits) -- made so that it can be undone: (its answer, the
-    snapshot() of faces face_ids and people person_ids taken right before it, or None).
-    The snapshot and the change are one write (BEGIN IMMEDIATE): no change of another
-    connection comes between them. settle_snapshot() then says whether it can be
-    undone."""
+    update_person, merge: each commits) -- made so that it can be undone: (its answer,
+    the snapshot() of faces face_ids (or what face_ids() returns, read in the same
+    write) and people person_ids taken right before it, or None: more than limit
+    faces). The snapshot and the change are one write (BEGIN IMMEDIATE): no change of
+    another connection comes between them. settle_snapshot() then says whether it can
+    be undone."""
     store.execute("BEGIN IMMEDIATE")
     try:
-        snap = snapshot(store, face_ids, person_ids)
+        if callable(face_ids):
+            face_ids = face_ids()
+        snap = snapshot(store, face_ids, person_ids, limit)
         answer = change()
         if store.in_transaction:
             store.commit()
@@ -1154,7 +1158,9 @@ def _put_back(store, snap):
     others = set(_existing_faces(store, sorted({face_id for kept in snap["people"].values()
                                                 for face_id, _updated in kept["rejects"]})))
     for person_id, kept in snap["people"].items():
-        # ("Not this person" of other faces, gone with a person the change deleted.)
+        # ("Not this person" of other faces, as it was: gone with a person the change
+        # deleted, or moved to another by a merge.)
+        store.execute("DELETE FROM face_rejects WHERE person_id = ?", (person_id,))
         store.executemany("INSERT OR IGNORE INTO face_rejects (face_id, person_id, updated) "
                           "VALUES (?, ?, ?)", [(face_id, person_id, updated) for
                                                face_id, updated in kept["rejects"]

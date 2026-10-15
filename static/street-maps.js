@@ -196,6 +196,12 @@
                 (named.named === 1 ? "has" : "have") + " a named place on the street maps " +
                 "(a park, a beach, a museum, a cafe): the viewer shows it before the town, " +
                 "and searches find it (place:\"name\"). Scans look up new pictures.";
+            if (named.older) {
+                text += " " + fmt.number(named.older) + " of the " +
+                    fmt.number(named.pictures) + " " + (named.older === 1 ? "was" : "were") +
+                    " looked up with older rules or street maps: Find named places looks " +
+                    (named.older === 1 ? "it" : "them") + " up again.";
+            }
         } else {
             text = "Not looked up yet: the next scan looks them up, or Find named places now.";
         }

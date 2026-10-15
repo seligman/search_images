@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import support
 
@@ -1254,6 +1255,130 @@ class RouteTest(PassFixture, unittest.TestCase):
         places.release()
         answer = self.towns("coral").get_json()
         self.assertEqual((answer["available"], answer["towns"]), (False, []))
+
+
+class FilledInTest(PassFixture, unittest.TestCase):
+    """A located picture whose file names only part of its place: the parts it leaves out
+    come from the place names of its position when the parts it gives agree with them
+    (place_estimates._filled_in)."""
+
+    def setUp(self):
+        super().setUp()
+        # (A second region of Examplia, with a town far from Coralport.)
+        test_gps_check.install_towns(
+            test_gps_check.TOWNS + [(104, "Eastbay", 5.0, -140.0, "PPL", "XA", "02", 5000)],
+            dict(test_gps_check.REGIONS, **{"XA.02": "East Shore"}))
+
+    def named(self, names, position=COAST):
+        """A picture taken at position whose file names names (its id)."""
+        return self.insert(position, "14:00", exif=json.dumps({"GPS": {}, "XMPPlace": names}))
+
+    def place(self, picture):
+        """(ci, rg, co, cc, ps, km) of a picture's search record."""
+        record = search_index.picture_record(self.conn, picture)
+        return tuple(record.get(key) for key in ("ci", "rg", "co", "cc", "ps", "km"))
+
+    def test_the_parts_a_file_leaves_out(self):
+        index = places.shared()
+        self.assertTrue(index.knows_region("xa", "  east   SHORE "))
+        self.assertFalse(index.knows_region("XB", "East Shore"))
+        # The region and country, no town: the town is the position's (with how far it
+        # is: in it).
+        region = self.named({"region": "North Coast", "country": "Examplia", "cc": "XA"})
+        self.assertEqual(self.place(region),
+                         ("Coralport", "North Coast", "Examplia", "XA", "f", 0))
+        # A region the place names do not have in Examplia (the file divides it
+        # otherwise): the file's region, the position's town.
+        other = self.named({"region": "Coast Province", "country": "Examplia"})
+        self.assertEqual(self.place(other),
+                         ("Coralport", "Coast Province", "Examplia", "XA", "f", 0))
+        # The country alone: the position's town and region.
+        self.assertEqual(self.place(self.named({"cc": "XA"})),
+                         ("Coralport", "North Coast", "Examplia", "XA", "f", 0))
+        # The town and country: the region of that town.
+        self.assertEqual(self.place(self.named({"city": "coralport", "country": "Examplia"})),
+                         ("coralport", "North Coast", "Examplia", "XA", "f", None))
+        # Out at sea, no town near enough: the region only.
+        self.assertEqual(self.place(self.named({"country": "Examplia"}, (5.0, -151.0))),
+                         (None, "North Coast", "Examplia", "XA", "f", None))
+        # Nothing is filled in when the parts the file gives disagree: another region
+        # of the same country, another town, another country.
+        self.assertEqual(self.place(self.named({"region": "East Shore", "country": "Examplia"})),
+                         (None, "East Shore", "Examplia", "XA", "f", None))
+        self.assertEqual(self.place(self.named({"city": "Little Ford", "country": "Examplia"})),
+                         ("Little Ford", None, "Examplia", "XA", "f", None))
+        self.assertEqual(self.place(self.named({"region": "Midlands", "country": "Testland"})),
+                         (None, "Midlands", "Testland", "XB", "f", None))
+        # Without the place names (the pictures keep the names their positions were
+        # given), a region they might not have is not taken for one.
+        os.remove(places.places_db_path())
+        places.release()
+        self.assertEqual(self.place(other), (None, "Coast Province", "Examplia", None, "f", None))
+        self.assertEqual(self.place(region),
+                         ("Coralport", "North Coast", "Examplia", "XA", "f", 0))
+
+    @unittest.skipIf(flask is None, "Flask is not installed")
+    def test_a_town_filled_in_says_how_far_it_is(self):
+        # 33 km out of Coralport, its nearest town: a file naming the region and country
+        # reads as the pictures there without a place of their file do, how far included
+        # -- the file did not say it was taken in Coralport.
+        import serve
+        out_of_town = (5.0, -150.3)
+        plain = self.insert(out_of_town, "13:00")
+        region = self.named({"region": "North Coast", "country": "Examplia"}, out_of_town)
+        town = self.named({"city": "Coralport", "country": "Examplia"}, out_of_town)
+        self.assertEqual(self.place(plain),
+                         ("Coralport", "North Coast", "Examplia", "XA", None, 33))
+        self.assertEqual(self.place(region),
+                         ("Coralport", "North Coast", "Examplia", "XA", "f", 33))
+        self.assertAlmostEqual(serve.place_of(self.picture(region))["km"], 33.2, delta=0.1)
+        exported = {record["i"]: record for record in search_index.build_records(
+            self.conn, self.config, ["lib_trips001"], for_export=True,
+            export_options={"location": True})}
+        self.assertEqual((exported[region].get("ci"), exported[region].get("km")),
+                         ("Coralport", 33))
+        # A file that names the town says where it was taken: no distance.
+        self.assertEqual(self.place(town),
+                         ("Coralport", "North Coast", "Examplia", "XA", "f", None))
+        self.assertNotIn("km", serve.place_of(self.picture(town)))
+
+    @unittest.skipIf(flask is None, "Flask is not installed")
+    def test_everywhere_the_place_is_shown(self):
+        import serve
+        import trips
+        picture = self.named({"region": "North Coast", "country": "Examplia"})
+        self.insert(near(COAST, 1), "14:05")
+        self.check_all()
+        row = self.picture(picture)
+        self.assertEqual(serve.place_of(row), {"city": "Coralport", "region": "North Coast",
+                                               "country": "Examplia", "cc": "XA",
+                                               "source": "file", "km": 0.0})
+        self.assertEqual(trips._Picture(row, None).place,
+                         ("Coralport", "North Coast", "Examplia", "XA"))
+        exported = {record["i"]: record for record in search_index.build_records(
+            self.conn, self.config, ["lib_trips001"], for_export=True,
+            export_options={"location": True})}
+        self.assertEqual({key: exported[picture].get(key) for key in ("ci", "rg", "ps", "km")},
+                         {"ci": "Coralport", "rg": "North Coast", "ps": "f", "km": 0})
+        app = serve.build_app(init_db=False, job_manager=jobs.JobManager())
+        app.testing = True
+        self.addCleanup(app.extensions["search_images"].close)
+        detail = app.test_client().get("/api/image/%d" % picture).get_json()
+        self.assertEqual(detail["place"]["city"], "Coralport")
+
+    def test_the_pages_do_not_keep_names_of_older_rules(self):
+        # (Nothing kept changes: the ETags of the records and of the trips say the rules.)
+        import trips
+        libraries = {"lib_trips001": "Trips"}
+        service = trips.TripsService()
+        before = (search_index.index_etag(self.conn, libraries, False, config=self.config),
+                  service.respond(self.conn, self.config, libraries)[2]["ETag"])
+        with mock.patch.object(place_estimates, "FILE_PLACE_RULES",
+                               place_estimates.FILE_PLACE_RULES + 1):
+            after = (search_index.index_etag(self.conn, libraries, False, config=self.config),
+                     service.respond(self.conn, self.config, libraries)[2]["ETag"])
+        self.assertNotEqual(before[0], after[0])
+        self.assertNotEqual(before[1], after[1])
 
 
 class PaneScriptTest(unittest.TestCase):

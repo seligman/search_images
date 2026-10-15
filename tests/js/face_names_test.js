@@ -7,7 +7,10 @@
    its faces) or for this face alone, "Not <name>", "Not a face"; the pane and the
    boxes follow; Undo (its message, Ctrl+Z); Esc gives the keyboard back; a video's
    faces in the pane; nothing of it for visitors; the search pages' people asked for
-   again. All people and pictures are made up.
+   again; the likeliest people first (the server's suggestions), the one clearly ahead
+   taken by Enter, "Name Person 12 as ..." for a face of an unnamed person, for a video's
+   face in the pane too; the chosen line kept in sight in a list too short for all of
+   them. All people and pictures are made up.
 
    Run by tests/test_face_names.py, or directly:
        node tests/js/face_names_test.js
@@ -232,7 +235,8 @@ function faces() {
 
 /* A picture on the details page with its faces shown, the server answering:
    /api/people (PEOPLE), /api/image/4 (the picture's people now: state.people),
-   and the admin's changes (reply(path, body), or a reply of its own). */
+   the admin's changes (reply(path, body), or a reply of its own) and the
+   suggestions for a face (suggest(url): none unless given). */
 function pictureWithFaces(options) {
     options = options || {};
     var state = {people: {names: [{id: 5, label: "Ada Lind", named: true},
@@ -245,7 +249,13 @@ function pictureWithFaces(options) {
         if (url === "/api/image/4") {
             return response(200, {id: 4, people: state.people});
         }
+        if (url.indexOf("/api/admin/people/suggest?") === 0) {
+            return options.suggest ? options.suggest(url, state) : null;
+        }
         if (url.indexOf("/api/admin/") === 0) {
+            if (!body) {
+                return null;    // (the header's jobs, asked for now and then: none here)
+            }
             var path = url.slice("/api/admin".length);
             if (options.reply) {
                 return options.reply(path, body, state);
@@ -850,9 +860,9 @@ test("an Undo after moving on leaves the boxes of the picture shown", function (
 });
 
 /* A picture with faces whose /api/people answers only when let go: page.release(). */
-function slowPeople() {
+function slowPeople(options) {
     var waiting = [];
-    var page = pictureWithFaces();
+    var page = pictureWithFaces(options);
     var answer = page.context.fetch;
     page.context.fetch = function (url, init) {
         if (String(url) === "/api/people?hidden=1") {
@@ -1116,6 +1126,560 @@ test("the popover: units, a list that can be empty, by its face, errors said", f
             var errors = page.document.querySelectorAll(".toast-error");
             return errors.length && /Ada Lind is busy/.test(errors[0].textContent);
         });
+    });
+});
+
+/* ---------- The likeliest people first (people_suggest.py) ------------------------- */
+
+// The server's answers (GET /api/admin/people/suggest?face=): for face 303 (nobody), and
+// for face 302 (of Person 12: what that person most likely is).
+function suggestFace(preselect) {
+    return {face: 303, basis: "face", preselect: preselect === undefined ? 6 : preselect,
+            people: [
+                {id: 6, name: "Bram", label: "Bram", faces: 4, cover: 12, hidden: false,
+                 score: 0.712, words: "very like", in_picture: false},
+                {id: 8, name: "Adele", label: "Adele", faces: 2, cover: 14, hidden: false,
+                 score: 0.41, words: "a little like", in_picture: false},
+                {id: 5, name: "Ada Lind", label: "Ada Lind", faces: 9, cover: 11,
+                 hidden: false, score: 0.362, words: "a little like", in_picture: true}]};
+}
+
+function suggestPerson() {
+    return {face: 302, basis: "person", preselect: 5,
+            person: {id: 12, label: "Person 12", faces: 37}, people: [
+                {id: 5, name: "Ada Lind", label: "Ada Lind", faces: 9, cover: 11,
+                 hidden: false, score: 0.661, words: "very like", in_picture: false},
+                {id: 7, name: "Dot", label: "Dot", faces: 3, cover: 13, hidden: true,
+                 score: 0.402, words: "a little like", in_picture: false},
+                {id: 6, name: "Bram", label: "Bram", faces: 4, cover: 12, hidden: false,
+                 score: 0.383, words: "a little like", in_picture: true, shared: 2}]};
+}
+
+// faceChoices with suggestions: "~" marks a suggestion, "merge:" a "Name Person 12 as".
+function suggested(face, text, answer, people) {
+    var format = require(path.join(STATIC, "viewer.js")).format;
+    return format.faceChoices(people === undefined ? PEOPLE : people, face, text, answer)
+        .map(function (choice) {
+            if (choice.kind === "merge") {
+                return "merge:" + choice.person.label;
+            }
+            if (choice.kind === "person") {
+                return (choice.suggested ? "~" : "") + choice.person.label;
+            }
+            return choice.kind + ":" + (choice.kind === "name" ? choice.person + ":" : "") +
+                choice.name;
+        });
+}
+
+test("the likeliest people first, as the server says, then the others", function () {
+    var nobody = {person: null, named: false};
+    // Nothing typed: the suggestions in the server's order, then the named people not
+    // suggested (each once: taking either puts this face there).
+    assert.deepStrictEqual(suggested(nobody, "", suggestFace()),
+                           ["~Bram", "~Adele", "~Ada Lind", "Dot"]);
+    // Typing filters them as the others, and they keep their order among the names
+    // that match as well.
+    assert.deepStrictEqual(suggested(nobody, "ad", suggestFace()),
+                           ["~Adele", "~Ada Lind", "new:ad"]);
+    assert.deepStrictEqual(suggested(nobody, "b", suggestFace()), ["~Bram", "new:b"]);
+    assert.deepStrictEqual(suggested(nobody, "d", suggestFace()), ["Dot", "new:d"]);
+    // A whole name typed comes first, and is no new name.
+    assert.deepStrictEqual(suggested(nobody, "ada lind", suggestFace()), ["~Ada Lind"]);
+    var people = [PEOPLE[0], {id: 9, name: "Ada", label: "Ada", cover: 17, faces: 6}];
+    var answer = suggestFace();
+    answer.people = [{id: 5, name: "Ada Lind", label: "Ada Lind", faces: 9, score: 0.6,
+                      words: "very like", in_picture: false, hidden: false}];
+    assert.deepStrictEqual(suggested(nobody, "ada", answer, people), ["Ada", "~Ada Lind"]);
+    // A name that starts with the letters before one with a later word that does: the
+    // letters say whom they mean, the suggestions do not overrule them.
+    var three = [{id: 21, name: "Olav Strand", label: "Olav Strand", cover: 31, faces: 7},
+                 {id: 22, name: "Sam Hill", label: "Sam Hill", cover: 32, faces: 6},
+                 {id: 23, name: "Ada", label: "Ada", cover: 33, faces: 5}];
+    var close = {face: 303, basis: "face", preselect: null, people: [
+        {id: 21, name: "Olav Strand", label: "Olav Strand", score: 0.41,
+         words: "a little like"},
+        {id: 22, name: "Sam Hill", label: "Sam Hill", score: 0.38, words: "a little like"},
+        {id: 23, name: "Ada", label: "Ada", score: 0.36, words: "a little like"}]};
+    assert.deepStrictEqual(suggested(nobody, "", close, three),
+                           ["~Olav Strand", "~Sam Hill", "~Ada"]);
+    assert.deepStrictEqual(suggested(nobody, "s", close, three),
+                           ["~Sam Hill", "~Olav Strand", "new:s"]);
+    // Before /api/people came: the server's own names, faces and covers.
+    var format = require(path.join(STATIC, "viewer.js")).format;
+    var early = format.faceChoices(null, nobody, "", suggestFace());
+    assert.deepStrictEqual(early.map(function (choice) {
+        return [choice.person.label, choice.person.cover, choice.person.faces,
+                choice.suggested.score];
+    }), [["Bram", 12, 4, 0.712], ["Adele", 14, 2, 0.41], ["Ada Lind", 11, 9, 0.362]]);
+    // Once they came, one they do not list (of a library not shown) is left out.
+    assert.deepStrictEqual(suggested(nobody, "", suggestFace(), PEOPLE.filter(function (person) {
+        return person.id !== 6;
+    })), ["~Adele", "~Ada Lind", "Dot"]);
+    // A face of an unnamed person: "Name Person 12 as ..." (all its faces) first, and
+    // the people as before (they take this face alone). Letters typed take this face
+    // alone: the people they name first, "Name Person 12 as" after them all.
+    var unnamed = {person: 12, named: false};
+    assert.deepStrictEqual(suggested(unnamed, "", suggestPerson()),
+                           ["merge:Ada Lind", "merge:Dot", "merge:Bram", "Ada Lind", "Bram",
+                            "Dot", "Adele"]);
+    assert.deepStrictEqual(suggested(unnamed, "ad", suggestPerson()),
+                           ["Ada Lind", "Adele", "merge:Ada Lind", "name:12:ad", "new:ad"]);
+    assert.deepStrictEqual(suggested(unnamed, "ada lind", suggestPerson()),
+                           ["Ada Lind", "merge:Ada Lind"]);
+    assert.deepStrictEqual(suggested(unnamed, "b", suggestPerson()),
+                           ["Bram", "merge:Bram", "name:12:b", "new:b"]);
+    var merge = format.faceChoices(PEOPLE, unnamed, "", suggestPerson())[0];
+    assert.deepStrictEqual([merge.kind, merge.from, merge.faces, merge.person.id,
+                            merge.suggested.words], ["merge", 12, 37, 5, "very like"]);
+    // An answer that is not for this face's kind is not used: nothing changes.
+    var plain = choices(unnamed, "");
+    assert.deepStrictEqual(suggested(unnamed, "", suggestFace()), plain);
+    assert.deepStrictEqual(suggested({person: 120, named: false}, "", suggestPerson()),
+                           choices({person: 120, named: false}, ""));
+    assert.deepStrictEqual(suggested(nobody, "", suggestPerson()), choices(nobody, ""));
+    // A face of a named person: nothing new.
+    assert.deepStrictEqual(suggested({person: 5, named: true}, "", suggestFace()),
+                           choices({person: 5, named: true}, ""));
+    assert.deepStrictEqual(suggested(nobody, "", {basis: "face", people: "x"}),
+                           choices(nobody, ""));
+    // How close, in words and to two places.
+    assert.strictEqual(format.closenessText({score: 0.712, words: "very like"}),
+                       "very like \u00b7 0.71");
+    assert.strictEqual(format.closenessText({score: 0.3649, words: "a little like",
+                                             in_picture: true}, "person"),
+                       "a little like \u00b7 0.36 \u00b7 also in this picture");
+    // (For a "Name Person 12 as": in how many of that person's pictures.)
+    assert.strictEqual(format.closenessText({score: 0.383, words: "a little like",
+                                             in_picture: true, shared: 2}, "merge"),
+                       "a little like \u00b7 0.38 \u00b7 also in 2 of its pictures");
+    // (Never under 0: "the same face" is 1, nothing alike about 0.)
+    assert.strictEqual(format.closenessText({score: -0.04, words: "hardly like"}),
+                       "hardly like \u00b7 0.00");
+    assert.strictEqual(format.closenessText(null), "");
+});
+
+function closeness(page) {
+    return popover(page).querySelectorAll(".face-pop-option").map(function (node) {
+        var close = node.querySelector(".face-pop-close");
+        return close ? close.textContent : "";
+    });
+}
+
+function hint(page) {
+    var node = popover(page).querySelector(".face-pop-hint");
+    return node.hidden ? "" : node.textContent;
+}
+
+test("a face of nobody: the likeliest first, and Enter takes the one clearly ahead",
+     function () {
+    var page = pictureWithFaces({suggest: function (url) {
+        return url === "/api/admin/people/suggest?face=303" ? response(200, suggestFace())
+            : null;
+    }});
+    key(box(page, 303), "Enter");
+    return waitFor(function () {
+        return popover(page) && options(page).length === 4 && options(page)[0] === "* Bram";
+    }).then(function () {
+        assert.ok(page.log.requests.indexOf("/api/admin/people/suggest?face=303") >= 0);
+        assert.deepStrictEqual(options(page), ["* Bram", "Adele", "Ada Lind", "Dot"]);
+        assert.deepStrictEqual(closeness(page), [
+            "very like \u00b7 0.71", "a little like \u00b7 0.41",
+            "a little like \u00b7 0.36 \u00b7 also in this picture", ""]);
+        var nodes = popover(page).querySelectorAll(".face-pop-option");
+        assert.deepStrictEqual(nodes.map(function (node) {
+            return node.classList.contains("is-suggested") + "/" +
+                node.classList.contains("is-last-suggested");
+        }), ["true/false", "true/false", "true/true", "false/false"]);
+        assert.strictEqual(nodes[0].querySelector("small").textContent, "4 faces");
+        assert.ok(/How like Bram's faces this face is: 0\.71/.test(nodes[0].title));
+        assert.ok(/Ada Lind is in this picture too/.test(nodes[2].title));
+        assert.strictEqual(hint(page), "Enter: Bram, clearly the closest.");
+        var input = popover(page).querySelector(".face-pop-input");
+        assert.strictEqual(input.getAttribute("aria-activedescendant"), nodes[0].id);
+        // (The arrows away from it: its "Enter: ..." goes; back: it comes again.)
+        key(input, "ArrowDown");
+        assert.deepStrictEqual(options(page), ["Bram", "* Adele", "Ada Lind", "Dot"]);
+        assert.strictEqual(hint(page), "");
+        key(input, "ArrowUp");
+        assert.strictEqual(hint(page), "Enter: Bram, clearly the closest.");
+        key(input, "Enter");
+        return waitFor(function () {
+            return page.log.sent.length === 1;
+        });
+    }).then(function () {
+        assert.deepStrictEqual(page.log.sent[0], ["/api/admin/people/faces", {
+            action: "move", faces: [303], to: 6, undo: true}]);
+    });
+});
+
+test("none clearly ahead: nothing marked, Enter does nothing; typing filters", function () {
+    var page = pictureWithFaces({suggest: function () {
+        return response(200, suggestFace(null));
+    }});
+    key(box(page, 303), "Enter");
+    return waitFor(function () {
+        return popover(page) && options(page)[0] === "Bram";
+    }).then(function () {
+        assert.deepStrictEqual(options(page), ["Bram", "Adele", "Ada Lind", "Dot"]);
+        assert.strictEqual(hint(page), "");
+        var input = popover(page).querySelector(".face-pop-input");
+        key(input, "Enter");
+        assert.strictEqual(page.log.sent.length, 0);
+        type(page, "ad");
+        assert.deepStrictEqual(options(page), ["* Adele", "Ada Lind",
+                                               "A new person \u201cad\u201d"]);
+        // (A whole name typed: that person, though another was suggested first.)
+        type(page, "ada lind");
+        assert.deepStrictEqual(options(page), ["* Ada Lind"]);
+        type(page, "");
+        assert.deepStrictEqual(options(page), ["Bram", "Adele", "Ada Lind", "Dot"]);
+    });
+});
+
+test("a face of an unnamed person: Name Person 12 as the likeliest (all its faces)",
+     function () {
+    var page = pictureWithFaces({suggest: function (url) {
+        return url === "/api/admin/people/suggest?face=302" ? response(200, suggestPerson())
+            : null;
+    }, reply: function (path, body, state) {
+        if (path === "/people/12/merge") {
+            state.people = {names: [{id: 5, label: "Ada Lind", named: true}],
+                            faces: faces().map(function (face) {
+                                if (face.person === 12) {
+                                    face.person = 5;
+                                    face.label = "Ada Lind";
+                                }
+                                return face;
+                            })};
+            return response(200, {person: {id: 5, label: "Ada Lind", faces: 46},
+                                  undo: "token-m"});
+        }
+        return response(200, {undone: true});
+    }});
+    key(box(page, 302), "Enter");
+    return waitFor(function () {
+        return popover(page) && options(page).length === 7;
+    }).then(function () {
+        assert.deepStrictEqual(options(page), [
+            "* Name Person 12 as Ada Lind", "Name Person 12 as Dot", "Name Person 12 as Bram",
+            "Ada Lind", "Bram", "Dot", "Adele"]);
+        var smalls = popover(page).querySelectorAll(".face-pop-option small").map(
+            function (node) {
+                return node.textContent;
+            });
+        // (The people's lines next to them take this face alone, and say so.)
+        assert.deepStrictEqual(smalls, ["all 37 faces", "all 37 faces, hidden",
+                                        "all 37 faces", "just this face", "just this face",
+                                        "just this face, hidden", "just this face"]);
+        assert.strictEqual(popover(page).querySelectorAll(".face-pop-option")[3].title,
+                           "Just this face goes to Ada Lind");
+        assert.deepStrictEqual(closeness(page).slice(0, 3), [
+            "very like \u00b7 0.66", "a little like \u00b7 0.40",
+            "a little like \u00b7 0.38 \u00b7 also in 2 of its pictures"]);
+        assert.strictEqual(hint(page), "Enter: name Person 12 as Ada Lind (all 37 faces), " +
+                           "clearly the closest.");
+        var nodes = popover(page).querySelectorAll(".face-pop-option");
+        assert.ok(/Person 12's faces are, on average: 0\.66/.test(nodes[0].title));
+        assert.ok(/Bram is in pictures of Person 12 too/.test(nodes[2].title));
+        key(popover(page).querySelector(".face-pop-input"), "Enter");
+        return waitFor(function () {
+            return boxes(page)[1] === "302:Ada Lind";
+        });
+    }).then(function () {
+        // As Merge on the People page, with the face (refused if it left Person 12).
+        assert.deepStrictEqual(page.log.sent[0], ["/api/admin/people/12/merge",
+                                                  {into: 5, face: 302, undo: true}]);
+        assert.strictEqual(page.document.querySelector(".toast .toast-text").textContent,
+                           "Person 12 is Ada Lind now (its 37 faces; 46 faces in all).");
+        // Undo, as for any change made here.
+        page.document.querySelector(".toast .toast-action").click();
+        return waitFor(function () {
+            return page.log.sent.length === 2;
+        });
+    }).then(function () {
+        assert.deepStrictEqual(page.log.sent[1], ["/api/admin/people/undo", {undo: "token-m"}]);
+    });
+});
+
+test("a named face asks for nothing; a late answer keeps the arrows' choice", function () {
+    var release = null;
+    var late = new Promise(function (resolve) {
+        release = resolve;
+    });
+    var asked = [];
+    var page = pictureWithFaces({suggest: function (url) {
+        asked.push(url);
+        return late.then(function () {
+            return response(200, url.slice(-3) === "303" ? suggestFace() : suggestPerson());
+        });
+    }});
+    key(box(page, 301), "Enter");
+    return opened(page).then(function () {
+        // A face of a named person: it has its name, nothing is asked.
+        assert.deepStrictEqual(asked, []);
+        key(popover(page).querySelector(".face-pop-input"), "Escape");
+        key(box(page, 303), "Enter");
+        return opened(page);
+    }).then(function () {
+        assert.deepStrictEqual(asked, ["/api/admin/people/suggest?face=303"]);
+        var input = popover(page).querySelector(".face-pop-input");
+        // The arrows choose Adele (the people as before) ...
+        key(input, "ArrowUp");
+        assert.deepStrictEqual(options(page), ["Ada Lind", "Bram", "Dot", "* Adele"]);
+        release();
+        return waitFor(function () {
+            return options(page)[0].indexOf("Bram") >= 0;
+        });
+    }).then(function () {
+        // ... and Adele stays chosen when the suggestions come (not Bram, preselected).
+        assert.deepStrictEqual(options(page), ["Bram", "* Adele", "Ada Lind", "Dot"]);
+        // An answer that comes after its popover went changes nothing.
+        key(popover(page).querySelector(".face-pop-input"), "Escape");
+        late = new Promise(function (resolve) {
+            release = resolve;
+        });
+        key(box(page, 302), "Enter");
+        return opened(page);
+    }).then(function () {
+        key(popover(page).querySelector(".face-pop-input"), "Escape");
+        release();
+        return settle(30);
+    }).then(function () {
+        assert.strictEqual(popover(page), null);
+        assert.strictEqual(page.log.sent.length, 0);
+    });
+});
+
+test("letters typed for a face of an unnamed person take this face alone", function () {
+    var page = pictureWithFaces({suggest: function () {
+        return response(200, suggestPerson());
+    }});
+    key(box(page, 302), "Enter");
+    return waitFor(function () {
+        return popover(page) && options(page).length === 7;
+    }).then(function () {
+        type(page, "ad");
+        assert.deepStrictEqual(options(page), [
+            "* Ada Lind", "Adele", "Name Person 12 as Ada Lind", "Name Person 12 \u201cad\u201d",
+            "Just this face: a new person \u201cad\u201d"]);
+        key(popover(page).querySelector(".face-pop-input"), "Enter");
+        return waitFor(function () {
+            return page.log.sent.length === 1;
+        });
+    }).then(function () {
+        // As without suggestions: this face goes to Ada Lind -- Person 12 stays as it is.
+        assert.deepStrictEqual(page.log.sent[0], ["/api/admin/people/faces", {
+            action: "move", faces: [302], to: 5, undo: true, person: 12}]);
+        // Enter pressed before the people came, the suggestions already there: a person
+        // the letters name, never "Name Person 12 as" (it was never marked).
+        var early = slowPeople({suggest: function () {
+            return response(200, suggestPerson());
+        }});
+        key(box(early, 302), "Enter");
+        return waitFor(function () {
+            return popover(early) && /Name Person 12 as Ada Lind/.test(popover(early).textContent);
+        }).then(function () {
+            type(early, "ad");
+            assert.strictEqual(popover(early).querySelectorAll(".face-pop-option.is-active")
+                               .length, 0);
+            key(popover(early).querySelector(".face-pop-input"), "Enter");
+            return settle(20);
+        }).then(function () {
+            assert.strictEqual(early.log.sent.length, 0);
+            early.release();
+            return waitFor(function () {
+                return early.log.sent.length === 1;
+            });
+        }).then(function () {
+            assert.deepStrictEqual(early.log.sent[0], ["/api/admin/people/faces", {
+                action: "move", faces: [302], to: 5, undo: true, person: 12}]);
+        });
+    });
+});
+
+test("suggestions that come while letters are typed leave the chosen line as it is",
+     function () {
+    var release = null;
+    var late = new Promise(function (resolve) {
+        release = resolve;
+    });
+    var page = pictureWithFaces({suggest: function () {
+        return late.then(function () {
+            return response(200, suggestFace());
+        });
+    }});
+    key(box(page, 303), "Enter");
+    return opened(page).then(function () {
+        return waitFor(function () {
+            return options(page).length === 4;      // (the people came)
+        });
+    }).then(function () {
+        type(page, "a");
+        assert.deepStrictEqual(options(page), ["* Ada Lind", "Adele",
+                                               "A new person \u201ca\u201d"]);
+        release();
+        return waitFor(function () {
+            return popover(page).querySelectorAll(".face-pop-option.is-suggested").length === 2;
+        });
+    }).then(function () {
+        // (Adele, suggested first, comes first -- but Enter still takes Ada Lind.)
+        assert.deepStrictEqual(options(page), ["Adele", "* Ada Lind",
+                                               "A new person \u201ca\u201d"]);
+        key(popover(page).querySelector(".face-pop-input"), "Enter");
+        return waitFor(function () {
+            return page.log.sent.length === 1;
+        });
+    }).then(function () {
+        assert.deepStrictEqual(page.log.sent[0], ["/api/admin/people/faces", {
+            action: "move", faces: [303], to: 5, undo: true}]);
+        // (A list too long for the room gives way, not the hint and buttons under it.)
+        var css = read("style.css");
+        assert.ok(/\.face-popover\[open\] \{\s*display: flex;\s*flex-direction: column;/
+            .test(css));
+        assert.ok(/\.face-pop-list \{\s*flex: 0 1 auto;\s*min-height: 40px;/.test(css));
+    });
+});
+
+test("a video's face in the pane: the likeliest people first, Enter takes the marked one",
+     function () {
+    function videoPeople(person) {
+        return {names: [{id: 5, label: "Ada Lind", named: true, at: [3.5]}].concat(
+            person ? [{id: 6, label: "Bram", named: true, at: [72.25]}] : []),
+                faces: [{id: 401, x: 0.2, y: 0.3, w: 0.1, h: 0.1, person: 5,
+                         label: "Ada Lind", quality: 0.9, at: 3.5},
+                        {id: 402, x: 0.6, y: 0.3, w: 0.1, h: 0.1, person: person || null,
+                         label: person ? "Bram" : "", quality: 0.4, at: 72.25}]};
+    }
+    var asked = [];
+    var page = pictureWithFaces({rec: {i: 4, l: "lib", t: "Party", mv: 1, dr: 90},
+                                 mode: "video", people: videoPeople(null),
+                                 suggest: function (url) {
+                                     asked.push(url);
+                                     var answer = suggestFace();
+                                     answer.face = 402;
+                                     return response(200, answer);
+                                 }, reply: function (path, body, state) {
+                                     state.people = videoPeople(6);
+                                     return response(200, {person: {id: 6, label: "Bram",
+                                                                    faces: 5},
+                                                           undo: "token-v"});
+                                 }});
+    page.state.people = videoPeople(null);
+    var strip = page.info.querySelectorAll(".info-face");
+    assert.deepStrictEqual(strip.map(function (node) {
+        return node.textContent;
+    }), ["Ada Lind0:03", "?1:12"]);
+    // Its face of nobody: the video goes to that moment, and the popover asks the server
+    // who it most likely is.
+    strip[1].click();
+    assert.deepStrictEqual(page.seeks, [72.25]);
+    return waitFor(function () {
+        return popover(page) && options(page).length === 4 && options(page)[0] === "* Bram";
+    }).then(function () {
+        assert.deepStrictEqual(asked, ["/api/admin/people/suggest?face=402"]);
+        assert.deepStrictEqual(options(page), ["* Bram", "Adele", "Ada Lind", "Dot"]);
+        assert.deepStrictEqual(closeness(page), [
+            "very like \u00b7 0.71", "a little like \u00b7 0.41",
+            "a little like \u00b7 0.36 \u00b7 also in this picture", ""]);
+        assert.strictEqual(hint(page), "Enter: Bram, clearly the closest.");
+        assert.ok(strip[1].classList.contains("is-naming"));
+        key(popover(page).querySelector(".face-pop-input"), "Enter");
+        return waitFor(function () {
+            return page.log.sent.length === 1;
+        });
+    }).then(function () {
+        assert.deepStrictEqual(page.log.sent[0], ["/api/admin/people/faces", {
+            action: "move", faces: [402], to: 6, undo: true}]);
+        // The pane's face row says who it is now, at its moment.
+        return waitFor(function () {
+            return page.info.querySelectorAll(".info-face").map(function (node) {
+                return node.textContent;
+            }).join(" | ") === "Ada Lind0:03 | Bram1:12";
+        });
+    }).then(function () {
+        assert.strictEqual(popover(page), null);
+        // A face of a named person in the row asks for nothing.
+        page.info.querySelectorAll(".info-face")[0].click();
+        return opened(page);
+    }).then(function () {
+        assert.deepStrictEqual(asked, ["/api/admin/people/suggest?face=402"]);
+    });
+});
+
+/* The popover's list laid out as a browser does, short (height px: room for a few
+   lines): the popover at the top of the screen, its list under the head and the field
+   (120 px further down), lines of 40 px. A line's offsetTop is measured from the
+   popover, not from the list (the list is not placed: position static), as in a browser.
+   page.inSight() says whether the chosen line is wholly in the list's box. */
+function shortList(page, height) {
+    var LIST_TOP = 120;
+    var create = page.document.createElement;
+    page.document.createElement = function (tag) {
+        var node = create.apply(page.document, arguments);
+        var name = String(tag).toLowerCase();
+        if (name === "ul") {
+            node.scrollTop = 0;
+            Object.defineProperty(node, "clientHeight", {get: function () {
+                return node.classList.contains("face-pop-list") ? height : 800;
+            }});
+            node.getBoundingClientRect = function () {
+                return {left: 0, top: LIST_TOP, right: 340, bottom: LIST_TOP + height,
+                        width: 340, height: height};
+            };
+        } else if (name === "li") {
+            var place = function () {
+                var lines = node.parentNode ? node.parentNode.children : [];
+                return lines.indexOf(node) * 40;
+            };
+            Object.defineProperty(node, "offsetTop", {get: function () {
+                return LIST_TOP + place();
+            }});
+            node.getBoundingClientRect = function () {
+                var top = LIST_TOP + place() - (node.parentNode ? node.parentNode.scrollTop : 0);
+                return {left: 0, top: top, right: 340, bottom: top + 40, width: 340, height: 40};
+            };
+        }
+        return node;
+    };
+    page.inSight = function () {
+        var list = popover(page).querySelector(".face-pop-list");
+        var active = popover(page).querySelector(".face-pop-option.is-active");
+        var box = list.getBoundingClientRect();
+        var line = active.getBoundingClientRect();
+        return line.top >= box.top && line.bottom <= box.bottom;
+    };
+    page.scrolled = function () {
+        return popover(page).querySelector(".face-pop-list").scrollTop;
+    };
+}
+
+test("the chosen line stays in sight in a short list: the marked one and the arrows'",
+     function () {
+    var page = pictureWithFaces({suggest: function () {
+        return response(200, suggestFace());
+    }});
+    // (Room for two and a half lines: a popover squeezed by its face low on the screen.)
+    shortList(page, 100);
+    key(box(page, 303), "Enter");
+    return waitFor(function () {
+        return popover(page) && options(page).length === 4 && options(page)[0] === "* Bram";
+    }).then(function () {
+        // The marked suggestion, first: the list is not scrolled away from it.
+        assert.ok(page.inSight(), "the marked line is out of sight");
+        assert.strictEqual(page.scrolled(), 0);
+        var input = popover(page).querySelector(".face-pop-input");
+        // Down through the list and round again, then up: always in sight.
+        var seen = [];
+        ["ArrowDown", "ArrowDown", "ArrowDown", "ArrowDown", "ArrowDown", "ArrowUp",
+         "ArrowUp"].forEach(function (name) {
+            key(input, name);
+            seen.push(options(page).filter(function (text) {
+                return text.charAt(0) === "*";
+            })[0] + (page.inSight() ? "" : " (out of sight)") + " @" + page.scrolled());
+        });
+        // (Scrolled no more than it takes.)
+        assert.deepStrictEqual(seen, ["* Adele @0", "* Ada Lind @20", "* Dot @60", "* Bram @0",
+                                      "* Adele @0", "* Bram @0", "* Dot @60"]);
     });
 });
 

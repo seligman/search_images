@@ -52,7 +52,33 @@ The picture's description counts too (picture_facts, Facts):
   - in a street or a square (STREET_WORDS) only areas and
     landmarks (labelled from LANDMARK_ZOOM out) count from further than
     NEAR_M: the museum across the street is not where a street scene was
-    taken; indoors, the point of an area (a college's) only within NEAR_M.
+    taken; indoors, the point of an area (a college's) only within NEAR_M;
+  - a place to eat whose cuisine is not that of the food shown (CUISINES:
+    the burger is not from the Thai place next door) does not count.
+
+Indoors (refine: a picture taken indoors, or whose description shows a
+kind of venue and is no street scene) a fix often drifts into the
+building next door, so the building outlines of the street maps (their
+"buildings" layer, read only for these pictures) and what the picture
+shows (Facts.shows: SHOW_HINTS over its scene, title, subjects and tags)
+count too: choose()'s place stays unless something fits the picture
+better -- a place of the building outline the position is in (that
+building's own place, a hotel or a museum whose outline carries its id,
+before the cafe mapped inside it), or one within its reach whose kind is
+what the picture shows (the aquarium's tanks, though the fix is in its
+restaurant's building next door), or a kind of shop KINDS leaves out
+(SHOWN_SHOPS) for a picture of one. Two that fit as well in one building,
+or side by side, are in doubt (none is named); a choice that neither fits
+nor holds the position (its building does, or is right by it) is
+dropped; a parking garage (NOWHERE_WORDS) gets an area only; outdoors, a
+picture of food is not of the mall or the theatre (ROOMS) by where it
+was eaten; a picture of an airport near the edge of its outline is the
+airport's. Then the pictures of one visit agree (visits, agree: taken
+minutes apart, near each other): one with only a weak place or none takes
+the place the others chose on strong evidence, when it is near enough
+and fits (the close-up of a fish whose fix is 200 m off, between the
+aquarium's tanks). A place chosen so whose own building outline holds
+the position is "taken inside it" (inside).
 
 How far off a position may be (accuracy_m):
 
@@ -70,19 +96,23 @@ How far off a position may be (accuracy_m):
             the same time (place_estimates.py), with a radius of at most
             max_estimate_km (default 0.3): that radius; an approximate
             position, which gets no place to eat, shop or stay and only
-            points of interest whose reach is at least the radius
+            points of interest whose reach is at least the radius --
+            unless the pictures of its visit agree on one (agree, below)
   owner     a position the owner set (or an estimate the owner accepted:
             its radius, approximate as an estimate); a town the owner chose
             (its middle: place_estimates.town_pick) has no named place
 
 A position that may be more than MAX_ACCURACY_M off gets no point of
-interest, only an area it is deep enough inside of. The distance shown
-(record_keys) is left out when the position may be off by more than it,
-or is approximate: "nearby", "probably taken inside it".
+interest, only an area it is deep enough inside of -- or the place the
+pictures of its visit agree on (agree: up to VISIT_ACCURACY_M off, when
+it fits what the picture shows). The distance shown (record_keys) is left
+out when the position may be off by more than it, or is approximate:
+"nearby", "probably taken inside it".
 
 The rules and their numbers were chosen by looking at some 170 pictures
-of a real library and the place found for each (see the README's "Named
-places").
+of a real library and the place found for each, and the indoor ones
+(RULES_VERSION 4) on some 500 pictures judged by looking at each (see the
+README's "Named places").
 
 The named places are kept in index.db (ensure_table; a table made on
 first use, not a schema version: everything in it can be worked out
@@ -91,23 +121,29 @@ again), one row for each picture looked up (also when none was found):
     named_places  image_id, name ('' when none), kind (the point of
                   interest's kind: "museum", "park", ...), metres (how far
                   it is; 0 inside an area), inside (1 for an area the
-                  position is in), source ("gps", "track", "estimate" or
+                  position is in, or a place whose own building outline
+                  holds it), source ("gps", "track", "estimate" or
                   "owner"), lat, lon, accuracy_m (the position looked up
-                  and how far off it may be), maps (the street maps and
-                  rules it was found with: maps_key), updated
+                  and how far off it may be), facts (what its description
+                  says and when it was taken: _facts_text), maps (the
+                  street maps and rules it was found with: maps_key, ""
+                  when its visit is to be looked up again), updated
 
-update() looks up the pictures whose position (or its source or accuracy)
-changed since, and all of them when the street maps or RULES_VERSION
-changed; a change touches the picture's images.updated, so the search
-index notices. It runs after each scan, previews and places job, after the
-street maps are downloaded, when the owner decides about a picture's place
-(at once, for a few pictures) and as a job of its own ("named_places",
-python named_places.py). Without street maps there are none: deleting
+update() looks up the pictures whose position (or its source or accuracy,
+what its description says, or when it was taken) changed since -- the
+whole visit of one (visits), as it is now and as it was (also for a
+picture that lost its position) -- and all of them when the street maps
+or RULES_VERSION changed; a change touches the picture's images.updated,
+so the search index notices. It runs after each scan, previews and places
+job, after the street maps are downloaded, when the owner decides about a
+picture's place (at once, for a few pictures) and as a job of its own
+("named_places", python named_places.py). Without street maps there are none: deleting
 them forgets them (clear).
 
 Search records (search_index) carry the name (np), the kind (nk) and the
-distance in metres (nd; left out inside an area, with ni 1, and for an
-approximate position or distance, with na 1): the viewer
+distance in metres (nd; left out inside an area or the place's own
+building outline, with ni 1, and for an approximate position or
+distance, with na 1): the viewer
 shows it before the town ("Harbour Aquarium", then "Seaport, Region, Country"),
 the search finds its words (place: too) and plain-language search offers
 it as a place; the map lists it with its pictures. A named place is
@@ -130,6 +166,7 @@ This module uses only the standard library.
 
 import argparse
 import collections
+import datetime
 import gzip
 import json
 import math
@@ -147,8 +184,9 @@ import street_maps
 import world_map
 
 # Raise when the rules (KINDS, the scores, how areas are named) change: every
-# picture is looked up again. (3: one name per place, see first_name.)
-RULES_VERSION = 3
+# picture is looked up again. (3: one name per place, see first_name; 4: indoors, the
+# building outlines and what the picture shows, see refine; visits agree.)
+RULES_VERSION = 4
 # The tiles read: the most detailed zoom of the street maps (at most this),
 # and, for the names of areas whose label is elsewhere, the tiles at the
 # position down to LABEL_ZOOM_MIN.
@@ -322,6 +360,136 @@ KIND_HINTS = tuple((re.compile(r"\b(%s)\b" % words), frozenset(kinds)) for words
     (r"marina", ("marina",)),
     (r"(?:ice|skating) rink", ("ice_rink",)),
 ))
+# What a picture shows (its scene, title, subjects and tags) and the kinds of place that
+# fit it (Facts.shows: a wider net than KIND_HINTS, which say it more surely; see refine).
+# The words name the place, not what is also found elsewhere: a hotel bed, not a bed of
+# rice or a flower bed; an exhibitor's booth, not a diner's; sea lions are on a dock; model
+# trains are at home; an airport's terminal, not a ferry's.
+SHOW_HINTS = tuple((re.compile(r"\b(%s)\b" % words), frozenset(kinds)) for words, kinds in (
+    (r"aquariums?|fish tanks?|jellyfish|sharks?|stingrays?|sea turtles?|coral reef|"
+     r"tropical fish|moray eels?|octopus|starfish|seahorses?|touch pool", ("aquarium",)),
+    (r"zoo|giraffes?|elephants?|(?<!sea )lions?|tigers?|zebras?|gorillas?|penguins?|enclosure",
+     ("zoo",)),
+    (r"theat(?:er|re)s?|auditorium|stage|performance|performers?|concert|musical|orchestra|"
+     r"audience|curtain call|playbill|luau|hula|magic show|comedy show|ballet|opera",
+     ("theatre", "arts_centre", "events_venue", "cinema")),
+    (r"cinemas?|movie theat(?:er|re)|movie screen|film screening", ("cinema",)),
+    (r"museums?|exhibits?|exhibition|display case|artifacts?|paintings?|sculptures?|artworks?|"
+     r"art gallery|galler(?:y|ies)|fossils?|dinosaurs?|skeleton|installation",
+     ("museum", "gallery", "arts_centre", "exhibition_centre", "aquarium", "zoo",
+      "planetarium")),
+    (r"stadium|ballpark|arena|baseball|football|soccer|hockey|basketball|bleachers|"
+     r"scoreboard|mascot|dugout|ball game", ("stadium", "sports_centre", "events_venue")),
+    (r"hotels?|motels?|hostel|resort|hotel room|hotel beds?|lobby|suite|pillows?|"
+     r"headboard|room service", ("hotel", "motel", "hostel", "resort")),
+    (r"conference|convention|keynote|expo|trade show|(?:exhibitor|exhibition|trade show) "
+     r"booths?|lecture|seminar|badges?|sponsors?|registration|panel discussion",
+     ("conference_centre", "exhibition_centre", "events_venue")),
+    (r"casino|slot machines?|gaming tables?|poker|blackjack|roulette", ("casino",)),
+    (r"(?:shopping )?malls?|shopping cent(?:er|re)|storefronts?|food court",
+     ("mall", "department_store", "marketplace")),
+    (r"shops?|stores?|souvenirs?|boutique|retail|merchandise|gift shop|checkout",
+     ("gift", "department_store", "marketplace", "chocolate", "confectionery", "deli",
+      "cheese", "wine", "books", "art", "antiques", "mall")),
+    (r"bookstores?|bookshops?", ("books",)),
+    (r"clothing stores?|clothes shops?|fitting rooms?|apparel|boutique|menswear|"
+     r"dress shop", ("clothes",)),
+    (r"shoe stores?|shoe shops?", ("shoes",)),
+    (r"car showroom|car dealer(?:ship)?|dealership|showroom", ("car",)),
+    (r"furniture stores?|furniture showroom|mattress(?:es)?", ("furniture", "bed")),
+    (r"warehouse stores?|wholesale|supermarket|grocery stores?",
+     ("wholesale", "supermarket")),
+    (r"jewel(?:le)?ry stores?|jewel(?:le)?ry shops?", ("jewelry",)),
+    (r"electronics stores?|phone stores?", ("electronics", "mobile_phone")),
+    (r"toy stores?|toy shops?", ("toys",)),
+    (r"sporting goods|sports stores?|outdoor stores?", ("sports", "outdoor")),
+    (r"music stores?|record stores?|guitar shops?", ("music",)),
+    (r"florist|flower shops?", ("florist",)),
+    (r"hardware stores?|home improvement", ("doityourself", "hardware")),
+    (r"church|cathedral|chapel|altar|pews?|stained glass|temple|mosque|synagogue|shrine|"
+     r"basilica|cloister", ("place_of_worship",)),
+    (r"observation deck|observatory|lookout|view from (?:the )?top|viewing platform",
+     ("viewpoint", "observatory", "tower", "attraction")),
+    (r"(?<!model )(?<!toy )(?:trains?|railway)|subway|metro|station platform|train platform|"
+     r"tram|light rail", ("station",)),
+    (r"airports?|airport terminal|airlines?|airliners?|jet ?bridge|boarding gates?|"
+     r"departure gates?|departure lounge|baggage claim", ("aerodrome", "airport")),
+    (r"brewery|taproom|beer flight|brewing", ("brewery",)),
+    (r"winery|vineyard|wine tasting|barrel room", ("winery",)),
+    (r"library|reading room", ("library",)),
+    (r"planetarium", ("planetarium",)),
+    (r"lighthouse", ("lighthouse",)),
+    (r"castle|palace|fortress|throne", ("castle", "fort")),
+    (r"ice rink|skating rink|ice skating", ("ice_rink",)),
+    (r"arcade|pinball", ("amusement_arcade",)),
+))
+# A view from above (its scene or title) was taken from a tower or a lookout, whatever it
+# shows below (Facts.shows).
+VIEW_WORDS = re.compile(r"\b(aerial views?|views? from above|bird'?s[- ]eye|observation deck|"
+                        r"viewing platform|from the top)\b")
+VIEW_KINDS = frozenset(("tower", "viewpoint", "observatory", "attraction"))
+# Where no named place is, by a scene or title indoors (Facts.nowhere): a parking garage,
+# a car's inside -- not the arts centre whose building holds the garage.
+NOWHERE_WORDS = re.compile(r"\b(parking (?:garages?|decks?|structures?|ramps?|levels?)|"
+                           r"car parks?|multi-stor(?:e)?y car park|car interior|"
+                           r"inside (?:a|the) car|steering wheel|back ?seat|driver'?s seat)\b")
+# The cuisines of the food a picture shows (Facts.cuisines: its title, subjects, food,
+# description and text) and how a place to eat says it serves one (its kind_detail or
+# cuisine values, or a word of its name): (key, dishes, details, name words). A place to
+# eat of another known cuisine does not fit the picture (_level: the burger is not from
+# the Thai place next door); drinks (DRINKS) only fit, they never contradict (coffee
+# with a burger).
+CUISINES = tuple((key, re.compile(r"\b(%s)\b" % dishes), frozenset(details),
+                  re.compile(r"\b(%s)\b" % names))
+                 for key, dishes, details, names in (
+    ("sushi", r"sushi|sashimi|nigiri|maki|temaki", ("sushi", "japanese", "asian"),
+     r"sushi|sashimi"),
+    ("ramen", r"ramen|udon|soba", ("ramen", "japanese", "noodle", "noodles", "asian"),
+     r"ramen|udon|noodles?"),
+    ("vietnamese", r"pho|banh mi|vietnamese", ("vietnamese", "pho", "asian"), r"pho|banh mi"),
+    ("thai", r"pad thai|thai|green curry|tom yum", ("thai", "asian"), r"thai"),
+    ("chinese", r"dim sum|dumplings?|chow mein|lo mein|kung pao|chinese",
+     ("chinese", "dim_sum", "dumplings", "asian"), r"dim sum|dumplings?|wok"),
+    ("korean", r"bibimbap|bulgogi|kimchi|korean", ("korean", "asian"), r"korean"),
+    ("indian", r"curry|naan|tikka|biryani|masala|samosas?|indian", ("indian", "curry"),
+     r"curry|tandoori?|masala"),
+    ("mexican", r"tacos?|burritos?|quesadillas?|nachos|enchiladas?|guacamole|mexican",
+     ("mexican", "tex-mex", "taco", "burrito"), r"tacos?|taqueria|burritos?|cantina"),
+    ("pizza", r"pizzas?", ("pizza", "italian"), r"pizza|pizzeria"),
+    ("italian", r"pasta|spaghetti|lasagna|risotto|ravioli|gnocchi|italian",
+     ("italian", "pizza", "pasta"), r"pasta|trattoria|osteria"),
+    ("burger", r"burgers?|cheeseburgers?|hamburgers?", ("burger", "american", "diner"),
+     r"burgers?"),
+    ("seafood", r"seafood|clams?|oysters?|crabs?|lobsters?|shrimp|prawns?|mussels|scallops?|"
+     r"chowder|fish and chips|poke", ("seafood", "fish_and_chips", "fish", "poke", "oyster",
+                                     "crab"),
+     r"seafood|fish|oysters?|crab|lobster|clams?|poke|chowder"),
+    ("steak", r"steaks?|ribeye|sirloin|filet mignon", ("steak_house", "steak", "american"),
+     r"steak|steakhouse|chophouse"),
+    ("barbecue", r"barbecue|bbq|brisket|pulled pork|ribs", ("barbecue", "bbq", "american"),
+     r"barbecue|bbq|smokehouse"),
+    ("fondue", r"fondue", ("fondue", "swiss"), r"fondue"),
+    ("coffee", r"coffee|latte|cappuccino|espresso|mocha", ("coffee_shop", "coffee"),
+     r"coffee|espresso"),
+    ("donut", r"donuts?|doughnuts?", ("donut",), r"donuts?|doughnuts?"),
+    ("ice_cream", r"ice cream|gelato|sundae", ("ice_cream", "frozen_yogurt", "gelato"),
+     r"ice cream|gelato|creamery"),
+    ("sandwich", r"sandwich(?:es)?", ("sandwich", "deli"), r"sandwich(?:es)?|subs"),
+    ("chicken", r"fried chicken|chicken tenders|wings", ("chicken", "wings"),
+     r"chicken|wings"),
+    ("breakfast", r"pancakes?|waffles?|omelett?es?|eggs benedict", ("breakfast", "pancake",
+                                                                     "diner", "american"),
+     r"pancakes?|waffles?|breakfast"),
+))
+DRINKS = frozenset(("coffee",))
+# Shops of kinds KINDS leaves out (most shops name no place a picture is taken at), named
+# only for a picture that shows such a shop (SHOW_HINTS: a clothes shop's fitting room, a
+# car dealer's showroom; see refine): kind -> reach in metres.
+SHOWN_SHOPS = {"clothes": 15, "shoes": 15, "car": 30, "furniture": 25, "bed": 20,
+               "wholesale": 40, "supermarket": 30, "jewelry": 15, "electronics": 20,
+               "toys": 15, "sports": 20, "outdoor": 20, "music": 15, "florist": 15,
+               "cosmetics": 15, "doityourself": 30, "hardware": 20, "variety_store": 20,
+               "mobile_phone": 15}
 # Of a name, the words that do not count when looking for it in a description, and
 # the one-word names too common to be looked for ("Waterfront", "Central").
 NAME_STOP = frozenset(("the", "of", "and", "at", "on", "in", "de", "la", "le", "les", "el",
@@ -364,7 +532,9 @@ POINT_SPAN = {SIGHT: 1.0, VENUE: 1.2, AREA: 1.0, NATURE: 1.0}
 VENUE_RANK_M = 45.0
 # A meal indoors (Facts.meal): a place to eat counts this much more (as specific as a
 # sight: the restaurant, not the casino down the street), unless the position is in a
-# destination (DISTINCT) or near one (DESTINATIONS: the aquarium's own restaurant).
+# destination (DISTINCT) or near one (DESTINATIONS: the aquarium's own restaurant) --
+# choose()'s ranking; refine then names the place to eat that fits the meal (the
+# aquarium's restaurant, for a meal there).
 MEAL_BONUS = 0.5
 AREA_BASE = {SIGHT: 1.5, VENUE: 1.6, AREA: 1.75, NATURE: 2.6}
 AREA_SIZE_STEP = 0.05
@@ -400,24 +570,69 @@ SCALED_LEAST = 0.4
 MINOR_ZOOM = 14
 MINOR_STEP = 0.1
 
+# Indoors (refine): the building outlines of the street maps (their "buildings" layer, at
+# the most detailed zoom; decoded only for the pictures refine weighs, BUILDING_CACHE tiles
+# kept, each indexed in BUILDING_GRID x BUILDING_GRID cells).
+BUILDING_CACHE = 64
+BUILDING_GRID = 32
+# A place's building holds a position this close to its outline too (metres; at most how
+# far off the position may be): a fix indoors is seldom right.
+HOLD_M = 20.0
+# The points of interest refine weighs are at most this far from the position.
+REFINE_M = 250.0
+# A place the description names counts this much further than its reach (a shop's sign),
+# and a place to eat that fits what the picture shows as surely as its scene or title says
+# or by its cuisine (level 2) this much further (at most how far off the position may
+# be): its reach is where one sits in it. A sight's reach is already that of seeing it
+# from around it, and the kind a scene word says may be another's (a museum's exhibits
+# fit a gallery too): no further.
+NAMED_EXTRA_M = 30.0
+FIT_EXTRA_M = 25.0
+# A picture that shows an airport, taken inside an airport's outline (however near its
+# edge) or at most this far outside it: the airport.
+AIRPORT_NEAR_M = 60.0
+# Outdoors, a picture of food was not taken inside one of these (the mall, the theatre or
+# the station by the lot where it was eaten), unless the picture shows that kind of place.
+ROOMS = frozenset(("mall", "department_store", "casino", "theatre", "cinema", "arts_centre",
+                   "gallery", "library", "station", "bus_station", "conference_centre",
+                   "exhibition_centre", "events_venue", "townhall"))
+# Visits (agree): pictures taken at most VISIT_GAP_S after the last one of a visit, at most
+# VISIT_M from it (plus how far off each may be, at most VISIT_ACCURACY_M of it). The votes
+# of the pictures taken within VISIT_NEAR_S of one count first; a place nothing in the
+# picture fits needs VISIT_VOTES of them.
+VISIT_GAP_S = 30 * 60
+VISIT_NEAR_S = 10 * 60
+VISIT_M = 150.0
+VISIT_ACCURACY_M = 2000.0
+VISIT_VOTES = 2
+# Why a place was chosen (Place.why) when it may vote in a visit: the description names
+# it, the building holding the position is its, it fits what the picture shows, or
+# choose()'s place holds the position or fits.
+STRONG = frozenset(("named", "building", "fits", "strong"))
+
 Place = collections.namedtuple("Place", "name kind metres inside score zoom at named "
-                                        "hinted")
-Place.__new__.__defaults__ = (99, None, False, False)
+                                        "hinted why")
+Place.__new__.__defaults__ = (99, None, False, False, "")
 Place.__doc__ = """A named place found for a position.
 
 name    its name, as the street maps have it
 kind    the kind of the point of interest that carries the name ("museum")
-metres  how far it is from the position (0 inside an area), whole metres
-inside  True for an area the position is inside of
+metres  how far it is from the position (0 inside an area or the place's building), whole
+        metres
+inside  True for an area the position is inside of, or a place whose building outline
+        holds the position (refine)
 score   how well it fits (lower is better; see candidates)
 zoom    the min_zoom of its label (how close the map must be to show it)
 at      (lat, lon) of a point of interest (None for an area)
 named   True when the picture's description names it (named_in)
 hinted  True when its kind is one the description's scene or title says (KIND_HINTS)
+why     why it was chosen (find; "" for candidates): "named", "building", "fits",
+        "strong", "weak" (see refine) or "visit" (agree)
 """
 
 Facts = collections.namedtuple("Facts", "points shops eat meal street indoor approximate "
-                                        "hints words flying")
+                                        "hints words flying shows cuisines food nowhere")
+Facts.__new__.__defaults__ = (frozenset(), frozenset(), False, False)
 Facts.__doc__ = """What a picture's description and position say fits it (picture_facts).
 
 points       points of interest count (not for a video's track, nor a picture taken
@@ -432,14 +647,23 @@ indoor       taken indoors (a fix there is often worse: INDOOR_ACCURACY_M; the p
              of an area counts within NEAR_M only)
 approximate  an estimated place (or the owner's, with a radius): no place to eat,
              shop or stay, and only points of interest whose reach is the radius
+             (by its own position: the place its visit agrees on may be one, agree)
 hints        the kinds of place its scene or title says (KIND_HINTS; a frozenset)
 words        its description's words (title, description, landmarks, tags, subjects,
              text; plain_words): a point of interest it names wins (named_in)
 flying       taken from a plane, by its description (FLIGHT_WORDS; or an aerial view
              with a plane): no named place at all
+shows        the kinds of place what it shows fits (SHOW_HINTS over its scene, title,
+             subjects and tags, and hints; VIEW_KINDS for a view from above; a frozenset):
+             see refine
+cuisines     the cuisines of the food it shows (CUISINES keys; a frozenset): a place to eat
+             of another cuisine does not fit it
+food         it shows food or a meal (its food, or its event is a meal)
+nowhere      taken indoors where no place is named (NOWHERE_WORDS: a parking garage)
 """
 # A picture nothing is known of: everything counts.
-ANY = Facts(True, True, True, False, False, False, False, frozenset(), "", False)
+ANY = Facts(True, True, True, False, False, False, False, frozenset(), "", False,
+            frozenset(), frozenset(), False, False)
 _FACT_LETTERS = "psemtia"
 
 
@@ -592,6 +816,13 @@ def decode_tile(data, layers=("pois", "landuse"), keep=None):
             extent = 4096
             for lnumber, _lwire, lvalue in _fields(value):
                 if lnumber == 1:
+                    # (A layer not read is skipped before its values are decoded.)
+                    name = bytes(lvalue).decode("utf-8", "replace")
+                    break
+            if name not in layers:
+                continue
+            for lnumber, _lwire, lvalue in _fields(value):
+                if lnumber == 1:
                     name = bytes(lvalue).decode("utf-8", "replace")
                 elif lnumber == 2:
                     features.append(lvalue)
@@ -643,7 +874,7 @@ def _keep(layer, props, kind):
 
 def _latin(text):
     """True when text is written in Latin letters (and digits, punctuation)."""
-    return all(ord(char) < 0x250 or not char.isalpha() for char in text)
+    return text.isascii() or all(ord(char) < 0x250 or not char.isalpha() for char in text)
 
 
 def first_name(text):
@@ -684,14 +915,57 @@ def display_name(props):
 
 class Reader:
     """The tiles of a street maps archive (street_maps.Archive), decoded once (the
-    last TILE_CACHE kept)."""
+    last TILE_CACHE kept), and their building outlines (outlines: decoded on first use,
+    the last BUILDING_CACHE kept)."""
 
     def __init__(self, archive):
         self.archive = archive
         self.zoom = max(0, min(ZOOM, archive.header["max_zoom"]))
         self.cache = collections.OrderedDict()
+        self.built = collections.OrderedDict()
+        self.cut = collections.OrderedDict()
         self.read = 0
         self.failed = 0
+
+    def cuts(self, z, x, y):
+        """_cuts of the outlined areas (the "landuse" layer) of a tile (the last TILE_CACHE
+        kept)."""
+        key = (z, x, y)
+        found = self.cut.get(key)
+        if found is not None:
+            self.cut.move_to_end(key)
+            return found
+        layer = self.tile(z, x, y).get("landuse")
+        found = _cuts([feature.parts for feature in layer[1]], layer[0]) if layer \
+            else (frozenset(), frozenset())
+        self.cut[key] = found
+        while len(self.cut) > TILE_CACHE:
+            self.cut.popitem(last=False)
+        return found
+
+    def outlines(self, x, y):
+        """The building outlines (Outlines) of the tile x, y of the reader's zoom (none when
+        it has none, or cannot be read)."""
+        key = (x, y)
+        found = self.built.get(key)
+        if found is not None:
+            self.built.move_to_end(key)
+            return found
+        extent, features = 4096, []
+        try:
+            data = self.archive.get(self.zoom, x, y)
+            if data:
+                layer = decode_tile(data, layers=("buildings",), keep=_keep_building) \
+                    .get("buildings")
+                if layer:
+                    extent, features = layer
+        except (TileError, street_maps.MapsError, OSError):
+            self.failed += 1
+        found = Outlines(extent or 4096, features)
+        self.built[key] = found
+        while len(self.built) > BUILDING_CACHE:
+            self.built.popitem(last=False)
+        return found
 
     def tile(self, z, x, y):
         """decode_tile's layers of a tile ({} when there is none, or it cannot be read)."""
@@ -713,6 +987,139 @@ class Reader:
         while len(self.cache) > TILE_CACHE:
             self.cache.popitem(last=False)
         return found
+
+
+# ---------------------------------------------------------------------------
+# Building outlines (the street maps' "buildings" layer; refine)
+
+def _keep_building(layer, props, kind):
+    """The features of the buildings layer refine reads: the outlines of buildings and of
+    building parts (a museum may be mapped as a part only), not the address points."""
+    return kind == 3 and props.get("kind") in ("building", "building_part")
+
+
+def _ring_area(ring):
+    """Twice the signed area of a ring (grid units; the sign says which way it winds)."""
+    total = 0
+    count = len(ring)
+    for k in range(count):
+        x1, y1 = ring[k]
+        x2, y2 = ring[(k + 1) % count]
+        total += x1 * y2 - x2 * y1
+    return total
+
+
+def _solid(parts):
+    """The outer rings of a polygon, its holes left out (filled: the point of a stadium in
+    the middle of its stands is in it). The first ring is an outer one; the rings that
+    wind the other way are holes."""
+    rings = [ring for ring in parts if len(ring) >= 3]
+    if not rings:
+        return []
+    outer = _ring_area(rings[0]) >= 0
+    return [ring for ring in rings if (_ring_area(ring) >= 0) == outer]
+
+
+class Outlines:
+    """The building outlines of one tile: items [(id, rings (holes filled), box (x0, y0,
+    x1, y1))] in its grid units (extent across), indexed by the BUILDING_GRID cells their
+    boxes touch and by id (an outline cut by the tile's border is that tile's part of it;
+    cuts: where the border cut them, see _cuts)."""
+
+    def __init__(self, extent, features):
+        self.extent = extent
+        self.items = []
+        self.cells = {}
+        self.ids = {}
+        kept = []
+        for feature in features:
+            rings = _solid(feature.parts) if feature.id is not None else []
+            if not rings:
+                continue
+            kept.append(rings)
+            xs = [x for ring in rings for x, _y in ring]
+            ys = [y for ring in rings for _x, y in ring]
+            box = (min(xs), min(ys), max(xs), max(ys))
+            index = len(self.items)
+            self.items.append((feature.id, rings, box))
+            self.ids.setdefault(feature.id, []).append(index)
+            for cx in range(self._cell(box[0]), self._cell(box[2]) + 1):
+                for cy in range(self._cell(box[1]), self._cell(box[3]) + 1):
+                    self.cells.setdefault((cx, cy), []).append(index)
+        self.cuts = _cuts(kept, extent)
+
+    def _cell(self, value):
+        return max(0, min(BUILDING_GRID - 1, int(value * BUILDING_GRID // self.extent)))
+
+    def holding(self, px, py):
+        """The ids of the outlines that hold a point of the tile (grid units; a frozenset:
+        a building part and the building around it, say)."""
+        found = set()
+        for index in self.cells.get((self._cell(px), self._cell(py)), ()):
+            fid, rings, box = self.items[index]
+            if box[0] <= px <= box[2] and box[1] <= py <= box[3] and \
+                    any(_inside(px, py, [ring]) for ring in rings):
+                found.add(fid)
+        return frozenset(found)
+
+    def distance(self, fid, px, py):
+        """How far a point (grid units, also beyond the tile) is from the outline fid (0
+        inside it), in grid units; None when the tile has no such outline."""
+        best = None
+        for index in self.ids.get(fid, ()):
+            _fid, rings, _box = self.items[index]
+            if any(_inside(px, py, [ring]) for ring in rings):
+                return 0.0
+            units = _edge_distance(px, py, rings, self.extent, self.cuts)
+            best = units if best is None else min(best, units)
+        return best
+
+
+def _outlines_at(reader, lat, lon):
+    """(Outlines, px, py) of a position: the building outlines of its tile (the reader's
+    zoom) and where it is in it (grid units)."""
+    z = reader.zoom
+    n = 1 << z
+    fx, fy = _tile_xy(lat, lon, z)
+    tx, ty = int(math.floor(fx)), min(n - 1, max(0, int(math.floor(fy))))
+    outlines = reader.outlines(tx % n, ty)
+    return outlines, (fx - tx) * outlines.extent, (fy - ty) * outlines.extent
+
+
+def buildings_at(reader, lat, lon):
+    """The ids of the building outlines that hold a position (a frozenset, empty when none
+    does: a building part and the building around it are both its building)."""
+    outlines, px, py = _outlines_at(reader, lat, lon)
+    return outlines.holding(px, py)
+
+
+def building_of(reader, poi_id, lat, lon):
+    """(ids, own) of the building of a point of interest at lat, lon (a frozenset): the
+    outline with its id (own True: a hotel's, a museum's own outline), else those that
+    hold its point (own False; empty when none does)."""
+    outlines, px, py = _outlines_at(reader, lat, lon)
+    if poi_id is not None and poi_id in outlines.ids:
+        return frozenset((poi_id,)), True
+    return outlines.holding(px, py), False
+
+
+def building_metres(reader, buildings, lat, lon, from_lat, from_lon):
+    """Metres from a position (from_lat, from_lon) to the nearest of the outlines buildings
+    (ids) of a place at lat, lon (0 inside one), as the position's own tile has them --
+    else the place's (an outline cut by the border of a tile is that tile's part of
+    it); None when neither tile has one of them."""
+    z = reader.zoom
+    n = 1 << z
+    gx, gy = _tile_xy(from_lat, from_lon, z)
+    for fx, fy in ((gx, gy), _tile_xy(lat, lon, z)):
+        tx, ty = int(math.floor(fx)), min(n - 1, max(0, int(math.floor(fy))))
+        outlines = reader.outlines(tx % n, ty)
+        found = [units for units in (
+            outlines.distance(building, (gx - tx) * outlines.extent, (gy - ty) * outlines.extent)
+            for building in buildings) if units is not None]
+        if found:
+            return min(found) * _metres_per_unit(from_lat, z, outlines.extent)
+    return None
 
 
 def _tile_xy(lat, lon, z):
@@ -743,17 +1150,43 @@ def _inside(px, py, rings):
     return inside
 
 
-def _edge_distance(px, py, rings, extent):
+def _cuts(polygons, extent):
+    """Where a tile's border cut its polygons (polygons: [rings], of one layer): (xs, ys),
+    the x of the lines across and the y of the lines along which it cut them. A tile holds
+    what reaches a little past its border (its buffer: the same all around), and a polygon
+    reaching further is cut there -- at the least or the most coordinate of them all, when
+    that is at or beyond the tile's edge."""
+    low_x = low_y = high_x = high_y = None
+    for rings in polygons:
+        for ring in rings:
+            for x, y in ring:
+                if low_x is None:
+                    low_x = high_x = x
+                    low_y = high_y = y
+                    continue
+                low_x, high_x = min(low_x, x), max(high_x, x)
+                low_y, high_y = min(low_y, y), max(high_y, y)
+    if low_x is None:
+        return frozenset(), frozenset()
+    return (frozenset(value for value, cut in ((low_x, low_x <= 0), (high_x, high_x >= extent))
+                      if cut),
+            frozenset(value for value, cut in ((low_y, low_y <= 0), (high_y, high_y >= extent))
+                      if cut))
+
+
+def _edge_distance(px, py, rings, extent, cuts=None):
     """The distance (grid units) from (px, py) to the nearest edge of the polygon,
-    leaving out the edges the tile's border cut it along."""
+    leaving out the edges the tile's border cut it along (cuts: _cuts of the tile's
+    layer; default: of this polygon alone) -- not the polygon's own edges just past the
+    border."""
+    cut_x, cut_y = _cuts([rings], extent) if cuts is None else cuts
     best = None
     for ring in rings:
         count = len(ring)
         for k in range(count):
             x1, y1 = ring[k]
             x2, y2 = ring[(k + 1) % count]
-            if (x1 <= 0 and x2 <= 0) or (x1 >= extent and x2 >= extent) or \
-                    (y1 <= 0 and y2 <= 0) or (y1 >= extent and y2 >= extent):
+            if (x1 == x2 and x1 in cut_x) or (y1 == y2 and y1 in cut_y):
                 continue        # (the tile's edge, not the area's)
             dx, dy = x2 - x1, y2 - y1
             length = dx * dx + dy * dy
@@ -828,9 +1261,11 @@ def _points(tiles, reader):
     return pois
 
 
-def _areas(lat, lon, accuracy_m, reader, pois):
+def _areas(lat, lon, accuracy_m, reader, pois, facts=ANY):
     """([Place] of the outlined areas the position is inside of (deep enough), the ids
-    of every outlined area of its tile)."""
+    of every outlined area of its tile). For a picture that shows an airport, an
+    airport the position is inside of however near its edge, or at most AIRPORT_NEAR_M
+    outside it (its terminal is at the edge of the outline)."""
     z = reader.zoom
     n = 1 << z
     fx, fy = _tile_xy(lat, lon, z)
@@ -843,11 +1278,15 @@ def _areas(lat, lon, accuracy_m, reader, pois):
     extent, features = layer
     px, py = (fx - tx) * extent, (fy - ty) * extent
     metres = _metres_per_unit(lat, z, extent)
+    airport = bool(facts.shows & DOMINANT) and facts.points and not facts.approximate
     for feature in features:
         if feature.id is None:
             continue
         outlined.add(feature.id)
-        if feature.props.get("kind") in EXCLUDED or not _inside(px, py, feature.parts):
+        if feature.props.get("kind") in EXCLUDED:
+            continue
+        inside = _inside(px, py, feature.parts)
+        if not inside and not airport:
             continue
         label = pois.get(feature.id)
         if label is None:
@@ -862,7 +1301,12 @@ def _areas(lat, lon, accuracy_m, reader, pois):
         name = display_name(props)
         if fits is None or not name:
             continue
-        if _edge_distance(px, py, feature.parts, extent) * metres < accuracy_m * 0.5:
+        edge = _edge_distance(px, py, feature.parts, extent,
+                              reader.cuts(z, tx % n, ty)) * metres
+        if airport and kind in DOMINANT:
+            if not inside and edge > AIRPORT_NEAR_M:
+                continue        # (an airport by its terminal: inside, or just outside)
+        elif not inside or edge < accuracy_m * 0.5:
             continue            # (the position may well be outside it)
         level = _min_zoom(props, 15)
         larger = max(0.0, 15 - max(5, min(15, level)))
@@ -960,13 +1404,19 @@ def candidates(lat, lon, accuracy_m, reader, facts=ANY):
     vehicle: a drive passes them), places to eat, shop and stay, a meal, a street
     scene, indoors, an approximate position, the kinds its scene says (hinted, a little
     better) and the names its description says (named: much better, and whatever the
-    picture's other facts -- but never for an approximate position)."""
+    picture's other facts -- but never for an approximate position). A place to eat of
+    another cuisine than the food the picture shows (_level) is left out."""
+    return _candidates(lat, lon, accuracy_m, reader, facts)[0]
+
+
+def _candidates(lat, lon, accuracy_m, reader, facts):
+    """(candidates(), the points of interest read: _points)."""
     z = reader.zoom
     fx, fy = _tile_xy(lat, lon, z)
     accuracy_m = max(0.0, float(accuracy_m or 0.0))
     reach_tiles = (400.0 + min(accuracy_m, 400.0)) / _metres_per_unit(lat, z, 1)
     pois = _points(_tiles_around(fx, fy, z, reach_tiles), reader)
-    areas, outlined = _areas(lat, lon, accuracy_m, reader, pois)
+    areas, outlined = _areas(lat, lon, accuracy_m, reader, pois, facts)
     dominant = [place for place in areas if place.kind in DOMINANT]
     if dominant:
         areas = dominant
@@ -984,6 +1434,17 @@ def candidates(lat, lon, accuracy_m, reader, facts=ANY):
             group, reach = fits
             if group in (AREA, NATURE) and feature.id is not None and feature.id in outlined:
                 continue        # (an outlined area names only what is inside it)
+            level = _min_zoom(props, 99)
+            if kind in SCALED:
+                scaled = int(_min_zoom(props, 16))
+                reach *= 1.0 if scaled <= 13 else SCALED_REACH.get(scaled, SCALED_LEAST)
+            if facts.approximate and reach < accuracy_m:
+                continue        # (an estimate of 100 m is not at a fountain of 60)
+            allowed = reach + min(accuracy_m, reach) * 0.5
+            distance = math.hypot(math.radians(plon - lon) * cos_lat * EARTH_M,
+                                  math.radians(plat - lat) * EARTH_M)
+            if distance > allowed:
+                continue        # (out of reach: its names need not be read)
             name = display_name(props)
             if not name or (kind == "attraction" and OPERATOR.search(name)):
                 continue
@@ -992,20 +1453,14 @@ def candidates(lat, lon, accuracy_m, reader, facts=ANY):
                     not facts.eat if kind in EAT
                     else not facts.shops and kind not in LODGING)):
                 continue
-            level = _min_zoom(props, 99)
-            if kind in SCALED:
-                scaled = int(_min_zoom(props, 16))
-                reach *= 1.0 if scaled <= 13 else SCALED_REACH.get(scaled, SCALED_LEAST)
-            if facts.approximate and reach < accuracy_m:
-                continue        # (an estimate of 100 m is not at a fountain of 60)
-            allowed = reach + min(accuracy_m, reach) * 0.5
+            if kind in EAT and facts.cuisines and not named and _cuisine_fit(
+                    facts.cuisines, cuisines_of(props, name)) < 0:
+                continue        # (the burger is not from the Thai place next door)
             if not named and ((facts.street and level > LANDMARK_ZOOM)
                               or (facts.indoor and group in (AREA, NATURE))):
                 allowed = min(allowed, NEAR_M)
-            distance = math.hypot(math.radians(plon - lon) * cos_lat * EARTH_M,
-                                  math.radians(plat - lat) * EARTH_M)
-            if distance > allowed:
-                continue
+                if distance > allowed:
+                    continue
             minor = max(0.0, _min_zoom(props, MINOR_ZOOM) - MINOR_ZOOM) * MINOR_STEP
             if group == VENUE:
                 share = min(1.0, distance / VENUE_RANK_M)
@@ -1031,7 +1486,8 @@ def candidates(lat, lon, accuracy_m, reader, facts=ANY):
                 for place in near]
     if not in_distinct and not any(place.kind in DESTINATIONS for place in near):
         # (A meal indoors, a restaurant's table: the restaurant, before the casino down
-        # the street -- but in or by an aquarium, the aquarium.)
+        # the street -- but in or by an aquarium, the aquarium; refine may name its
+        # restaurant for the meal.)
         near = [place._replace(score=place.score - (
             MEAL_BONUS if facts.meal and place.kind in EAT else 0.0) - (
             HINT_BONUS if place.hinted and KINDS[place.kind][0] == VENUE else 0.0))
@@ -1043,7 +1499,7 @@ def candidates(lat, lon, accuracy_m, reader, facts=ANY):
         if place.name.lower() not in seen:
             seen.add(place.name.lower())
             result.append(place)
-    return result
+    return result, pois
 
 
 def choose(found, accuracy_m):
@@ -1076,28 +1532,507 @@ def choose(found, accuracy_m):
 
 
 def find(lat, lon, accuracy_m, reader, facts=ANY):
-    """The named place of a position (a Place), or None (see candidates and choose)."""
+    """The named place of a position (a Place, with why), or None: candidates and choose,
+    and then for a picture taken indoors (or of a kind of venue) refine."""
     if not world_map.valid_position(lat, lon):
         return None
-    return choose(candidates(float(lat), float(lon), accuracy_m, reader, facts), accuracy_m)
+    lat, lon = float(lat), float(lon)
+    accuracy_m = max(0.0, float(accuracy_m or 0.0))
+    found, pois = _candidates(lat, lon, accuracy_m, reader, facts)
+    return refine(lat, lon, accuracy_m, facts, found, choose(found, accuracy_m), pois, reader)
+
+
+# ---------------------------------------------------------------------------
+# Indoors: the building the position is in, and what the picture shows
+#
+# refine() keeps choose()'s place unless strong evidence says otherwise, for a picture
+# taken indoors (or of a kind of venue, not a street scene; _indoorish). How well a place
+# fits what the picture shows (_level): 3 the description names it, 2 its kind is one the
+# scene or title says (Facts.hints) or it serves the cuisine of the food shown, 1 its kind
+# is one the picture shows (Facts.shows) or it is a place to eat for a picture of food, 0
+# nothing known, -1 a place to eat of another cuisine. A place that fits better than the
+# chosen one wins: one in a building outline the position is in (whatever its distance: a
+# fix indoors drifts; the building's own place first; a building part and the building
+# around it are one building), else one within its reach (a place to eat that fits at
+# level 2 FIT_EXTRA_M further: sat in from 25 to 30 m, it is often further from a fix
+# indoors; a named one NAMED_EXTRA_M further when the chosen one does not fit at level
+# 2) -- the nearest, unless the position cannot tell it from another as good of its class
+# (_doubted: two restaurants in one building, two galleries side by side). Indoors, when
+# nothing fits: the building's own place (a hotel, a museum: its outline carries its id)
+# when the chosen one is outside that building; and a chosen point of interest that neither
+# holds the position (its building does, or is at most HOLD_M from it) nor fits is dropped
+# (the area the position is in, or none) -- but not a place to stay for a picture that
+# shows no kind of place (a room, a hall). An airport (DOMINANT) stays the place of
+# everything inside it but a place the description names. Taken indoors where no place is
+# (Facts.nowhere: a parking garage), only an area; outdoors, a picture of food is not of a
+# room (ROOMS) by where it was eaten.
+# agree() then lets the pictures of one visit (taken minutes apart, near each other)
+# agree: a place chosen on strong evidence (STRONG) by the pictures taken around one
+# (within VISIT_NEAR_S; else by the visit) is the place of a picture of the visit with
+# only a weak place or none, when it is near enough and fits what that picture shows (or
+# VISIT_VOTES shots chose it -- copies of one count once -- and the picture shows no other
+# kind of place) -- also when that picture's own position is approximate (an estimate)
+# or more than MAX_ACCURACY_M off (up to VISIT_ACCURACY_M), which alone would give it an
+# area at most: what the visit agrees on is surer than its position.
+
+Near = collections.namedtuple("Near", "name kind group metres allowed at fid named level "
+                                      "home own zoom")
+Near.__doc__ = """A point of interest refine weighs (_near).
+
+metres   how far its point is from the position; allowed: its reach (and half how far
+         off the position may be)
+fid      its id; level: how well it fits the picture (_level)
+home     it is in a building outline that holds the position (one that holds its point,
+         or its own); own: the outline with its id is its own
+"""
+
+
+def _details(props):
+    found = set()
+    for key in ("kind_detail", "cuisine"):
+        value = props.get(key)
+        if isinstance(value, str):
+            found.update(part.strip().lower() for part in value.split(";") if part.strip())
+    return found
+
+
+def cuisines_of(props, name):
+    """The cuisines (CUISINES keys) a place to eat serves by its kind_detail (or cuisine)
+    and its name."""
+    details = _details(props)
+    plain = plain_words(name)
+    found = set(key for key, _dishes, wanted, names in CUISINES
+                if details & wanted or names.search(plain))
+    if props.get("kind") == "ice_cream":
+        found.add("ice_cream")
+    return found
+
+
+def _cuisine_fit(shown, served):
+    """1 when a place to eat serves a cuisine of the food a picture shows, -1 when it is
+    known to serve only others (drinks aside: DRINKS fit, but never contradict), else 0."""
+    if not shown or not served:
+        return 0
+    if shown & served:
+        return 1
+    return -1 if (shown - DRINKS) and (served - DRINKS) else 0
+
+
+def _reach(kind):
+    """The reach of a kind of place (KINDS, SHOWN_SHOPS), metres."""
+    fits = _kind_of(kind)
+    return fits[1] if fits is not None else SHOWN_SHOPS.get(kind, 0)
+
+
+def _class(kind):
+    """point_class of a kind ("shop" for one of SHOWN_SHOPS)."""
+    return "shop" if kind in SHOWN_SHOPS else point_class(kind)
+
+
+def _level(kind, named, facts, cuisines, eat=None):
+    """How well a kind of place fits what a picture shows (see the notes above). cuisines:
+    those a place to eat serves (cuisines_of); eat: the picture shows food or a meal, or
+    such a place (default facts.eat)."""
+    if named:
+        return 3
+    if kind in EAT:
+        if not (facts.eat if eat is None else eat):
+            return 1 if kind in facts.shows else 0
+        fit = _cuisine_fit(facts.cuisines, cuisines)
+        if fit:
+            return 2 if fit > 0 else -1
+        return 2 if facts.indoor and kind in facts.hints else 1
+    if kind in facts.hints:
+        return 2
+    return 1 if kind in facts.shows else 0
+
+
+def _indoorish(facts):
+    """True when refine weighs a picture: taken indoors, or showing a kind of venue (not a
+    street scene, nor taken from a vehicle), with a position of its own."""
+    return facts.points and not facts.approximate and (
+        facts.indoor or (bool(facts.shows) and not facts.street))
+
+
+def _name_words(name):
+    return set(word for word in plain_words(name).split()
+               if len(word) >= 4 and word not in NAME_STOP and word not in COMMON_NAMES)
+
+
+def _same_place(first, second):
+    """True when two points of interest (Near) are one place by their names: the same
+    name, or of one kind with a word of their names in common (four letters or more,
+    not a common one: two names of one station)."""
+    if first.name.lower() == second.name.lower():
+        return True
+    return first.kind == second.kind and bool(_name_words(first.name) & _name_words(second.name))
+
+
+def _as_place(near, facts, why):
+    """The Place of a Near: taken inside it when the position is in its own building
+    outline."""
+    inside = near.home and near.own
+    return Place(near.name, near.kind, 0 if inside else int(round(near.metres)), inside, 0.0,
+                 near.zoom, near.at, near.named, near.kind in facts.hints, why)
+
+
+def _one(found, accuracy_m):
+    """The nearest of some Near, or None when the position cannot tell it from another of
+    its class (see choose; one place by its names is no other)."""
+    if not found:
+        return None
+    found = sorted(found, key=lambda near: (near.metres, near.name))
+    best = found[0]
+    margin = max(float(accuracy_m or 0.0), MARGIN_M)
+    group = _class(best.kind)
+    for other in found[1:]:
+        if _same_place(best, other) or _class(other.kind) != group:
+            continue
+        if other.metres - best.metres >= margin or other.zoom > best.zoom + RIVAL_ZOOMS:
+            continue
+        if group == SIGHT and _metres_between(best.at, other.at) <= SAME_SPOT_M:
+            continue
+        return None
+    return best
+
+
+def _doubted(pick, near, accuracy_m):
+    """True when the position cannot tell a place that fits the picture (a Near, level 1
+    or more) from another of its class that fits as well: both in the building that holds
+    the position (two restaurants in one pier building), the other there and the pick
+    not, or neither there and their distances differ by less than how far off the
+    position may be (at least MARGIN_M) -- or, the other beyond its reach (at most
+    MARGIN_M), by less than MARGIN_M (two galleries side by side). Never for a named
+    place or a building's own."""
+    if pick.named or pick.own or pick.level < 1:
+        return False
+    margin = max(float(accuracy_m or 0.0), MARGIN_M)
+    group = _class(pick.kind)
+    for other in near:
+        if other.fid == pick.fid or _same_place(pick, other) or _class(other.kind) != group \
+                or other.level < pick.level or other.zoom > pick.zoom + RIVAL_ZOOMS:
+            continue
+        if other.home or pick.home:
+            if other.home:
+                return True
+            continue
+        beyond = other.metres > other.allowed
+        if other.metres > other.allowed + MARGIN_M or \
+                abs(other.metres - pick.metres) >= (MARGIN_M if beyond else margin):
+            continue
+        if group == SIGHT and _metres_between(pick.at, other.at) <= SAME_SPOT_M:
+            continue        # (one tower, two names)
+        return True
+    return False
+
+
+def _fallback(found):
+    """The best area the position is inside of (choose's answer when in doubt), or None."""
+    return next((place for place in found if place.inside), None)
+
+
+def _mine(near, name):
+    """The Near of the chosen place among near, by its name (lower case): the one whose own
+    building outline holds the position when there is one (a venue mapped twice: a point
+    inside its building, and the building with its id), else the nearest; None."""
+    same = [each for each in near if each.name.lower() == name]
+    if not same:
+        return None
+    return min(same, key=lambda each: (not (each.own and each.home), each.metres))
+
+
+def _near(lat, lon, accuracy_m, facts, pois, reader, home):
+    """[Near] of the points of interest refine weighs for a position (home: the ids of the
+    building outlines that hold it, buildings_at)."""
+    said = _Said(facts.words) if facts.words else None
+    cos_lat = math.cos(math.radians(lat))
+    near = []
+    for _zoom, feature, plat, plon in pois.values():
+        props = feature.props
+        kind = props.get("kind")
+        fits = _kind_of(kind)
+        if fits is None and kind in SHOWN_SHOPS and kind in facts.shows:
+            fits = (VENUE, SHOWN_SHOPS[kind])
+        if fits is None or fits[0] in (AREA, NATURE):
+            continue
+        group, reach = fits
+        name = display_name(props)
+        if not name or (kind == "attraction" and OPERATOR.search(name)):
+            continue
+        distance = math.hypot(math.radians(plon - lon) * cos_lat * EARTH_M,
+                              math.radians(plat - lat) * EARTH_M)
+        if distance > REFINE_M:
+            continue
+        if kind in SCALED:
+            scaled = int(_min_zoom(props, 16))
+            reach *= 1.0 if scaled <= 13 else SCALED_REACH.get(scaled, SCALED_LEAST)
+        allowed = reach + min(accuracy_m, reach) * 0.5
+        buildings, own = (frozenset(), False) if not home else building_of(
+            reader, feature.id, plat, plon)
+        inside = bool(buildings & home)
+        if not inside and distance > allowed + max(NAMED_EXTRA_M, FIT_EXTRA_M):
+            continue            # (too far to count, outside the building)
+        named = said is not None and any(said.names(each) for each in all_names(props))
+        if group == VENUE and not named and (
+                not facts.eat if kind in EAT else not facts.shops and kind not in LODGING):
+            continue
+        level = _level(kind, named, facts, cuisines_of(props, name) if kind in EAT else ())
+        near.append(Near(name, kind, group, distance, allowed, (plat, plon), feature.id, named,
+                         level, inside, own, _min_zoom(props, 99)))
+    return near
+
+
+def refine(lat, lon, accuracy_m, facts, found, chosen, pois, reader):
+    """The named place of a picture (a Place, with why; or None): choose()'s (chosen, of
+    found: candidates; pois: the points of interest read) unless strong evidence says
+    otherwise (see the notes above). why: "named" (the description names it), "building"
+    (the building that holds the position is its), "fits" (it fits what the picture
+    shows), "strong" (choose()'s, which holds the position or fits), "weak" (choose()'s,
+    nothing for or against it), "dropped" (choose()'s was dropped: an area, or None)."""
+    def keep(place, why):
+        return None if place is None else place._replace(why=why)
+
+    if chosen is not None and chosen.named:
+        if chosen.at is not None and not chosen.inside and facts.indoor \
+                and _indoorish(facts) and accuracy_m <= MAX_ACCURACY_M and not facts.nowhere:
+            # (Taken indoors in its own building: "taken inside it". Outdoors, a sign is
+            # most often seen from outside.)
+            home = buildings_at(reader, lat, lon)
+            mine = _mine(_near(lat, lon, accuracy_m, facts, pois, reader, home),
+                         chosen.name.lower()) if home else None
+            if mine is not None and mine.own and mine.home:
+                return _as_place(mine._replace(named=True), facts, "named")
+        return keep(chosen, "named")
+    if chosen is not None and chosen.at is not None and facts.food and not facts.indoor \
+            and chosen.kind in ROOMS and _level(chosen.kind, False, facts, ()) <= 0:
+        return keep(_fallback(found), "dropped")    # (eaten by the mall, not in it)
+    if not _indoorish(facts) or accuracy_m > MAX_ACCURACY_M:
+        return keep(chosen, "weak")
+    if facts.nowhere:
+        if chosen is None or chosen.inside:
+            return keep(chosen, "weak")
+        return keep(_fallback(found), "dropped")    # (a parking garage)
+    home = buildings_at(reader, lat, lon)
+    near = _near(lat, lon, accuracy_m, facts, pois, reader, home)
+    mine = None if chosen is None or chosen.at is None else _mine(near, chosen.name.lower())
+    holds = chosen is not None and (chosen.inside or (mine is not None and mine.home))
+    outlined = holds
+    if mine is not None and not holds:
+        # (Its building, when it has one: a position just outside it is in it.)
+        buildings, _own = building_of(reader, mine.fid, mine.at[0], mine.at[1])
+        if buildings:
+            outlined = True
+            metres = building_metres(reader, buildings, mine.at[0], mine.at[1], lat, lon)
+            holds = metres is not None and metres <= min(HOLD_M, accuracy_m)
+    if chosen is None:
+        level = None
+    elif mine is not None:
+        level = mine.level
+    else:
+        level = _level(chosen.kind, False, facts, ())
+    dominant = chosen is not None and chosen.inside and chosen.kind in DOMINANT
+    sure = level is not None and (level >= 2 or (holds and level >= 1))
+
+    def counts(each):
+        if each.level <= 0:
+            return False
+        if not facts.indoor and each.level < 3 and not (each.kind in EAT and each.level >= 2):
+            return False        # (outdoors, what a picture shows is seen from outside)
+        if each.level >= 3:
+            if each.metres <= each.allowed:
+                return True
+            return not sure and (each.home or each.metres <= each.allowed + NAMED_EXTRA_M)
+        if dominant:
+            return False
+        if each.home:
+            return True
+        if each.level >= 2 and each.kind in EAT:
+            return each.metres <= each.allowed + min(accuracy_m, FIT_EXTRA_M)
+        return each.metres <= each.allowed
+
+    better = [each for each in near if counts(each) and (level is None or each.level > level)]
+    if better:
+        top = max(each.level for each in better)
+        best = [each for each in better if each.level == top]
+        mapped = [each for each in best if each.home]
+        owns = [each for each in mapped if each.own]
+        # (In a building, its own place before the places mapped inside it.)
+        pick = min(owns, key=lambda each: each.metres) if owns else _one(mapped, accuracy_m)
+        if pick is None:
+            pick = _one(best, accuracy_m)
+        if pick is not None:
+            if _doubted(pick, near, accuracy_m):
+                return keep(_fallback(found), "dropped")
+            return _as_place(pick, facts, "named" if pick.named else "building" if pick.home
+                             else "fits")
+    if chosen is not None and level >= 1:
+        if mine is not None and _doubted(mine, near, accuracy_m):
+            return keep(_fallback(found), "dropped")
+        if mine is not None and mine.own and mine.home:
+            return _as_place(mine, facts, "strong")
+        return keep(chosen, "strong")
+    if facts.indoor and home and not holds and not dominant:
+        own = [each for each in near if each.home and each.own and each.kind not in EAT
+               and (each.level >= 1 or (each.level == 0 and not facts.shows
+                                        and each.kind not in SHOWN_SHOPS))]
+        if own:
+            return _as_place(min(own, key=lambda each: each.metres), facts, "building")
+    if chosen is not None and not chosen.inside and not holds and (
+            level < 0 or (facts.indoor and outlined
+                          and not (chosen.kind in LODGING and not facts.shows))):
+        return keep(_fallback(found), "dropped")
+    if chosen is None:
+        return None
+    if mine is not None and mine.own and mine.home:
+        return _as_place(mine, facts, "strong")
+    return keep(chosen, "strong" if holds else "weak")
+
+
+# ---------------------------------------------------------------------------
+# Visits: the pictures of one visit agree
+
+def _seconds(taken):
+    """Seconds of a taken_at ("YYYY-MM-DDTHH:MM:SS", local time), or None."""
+    try:
+        stamp = datetime.datetime.strptime(str(taken or "")[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return (stamp - datetime.datetime(1970, 1, 1)).total_seconds()
+
+
+def visits(positions):
+    """[[(seconds, Position)]] of the visits among positions (two pictures or more each):
+    pictures taken at most VISIT_GAP_S after the last one of a visit, at most VISIT_M from
+    it (plus how far off each may be, at most VISIT_ACCURACY_M of it), in the order they
+    were taken. Pictures without a time taken, or whose points of interest do not count
+    (a track, a vehicle), are in none."""
+    timed = []
+    for position in positions:
+        seconds = _seconds(position.taken)
+        if seconds is not None and position.facts.points:
+            timed.append((seconds, position))
+    timed.sort(key=lambda item: (item[0], item[1].image_id))
+    going = []          # [last seconds, last position, members]
+    found = []
+    for seconds, position in timed:
+        going = [visit for visit in going if seconds - visit[0] <= VISIT_GAP_S]
+        best = None
+        for visit in going:
+            last = visit[1]
+            apart = _metres_between((last.lat, last.lon), (position.lat, position.lon))
+            allowed = VISIT_M + min(last.accuracy_m, VISIT_ACCURACY_M) + min(
+                position.accuracy_m, VISIT_ACCURACY_M)
+            if apart <= allowed and (best is None or apart < best[0]):
+                best = (apart, visit)
+        if best is None:
+            visit = [seconds, position, [(seconds, position)]]
+            going.append(visit)
+            found.append(visit[2])
+        else:
+            best[1][0], best[1][1] = seconds, position
+            best[1][2].append((seconds, position))
+    return [members for members in found if len(members) > 1]
+
+
+def _visit_level(place, facts):
+    """_level of a visit's place for a picture (a place to eat: for a picture of food or a
+    meal, or of such a place, also when its position is approximate; of its cuisine by
+    its name)."""
+    eat = facts.eat or bool(facts.cuisines) or bool(facts.shows & EAT)
+    return _level(place.kind, False, facts, cuisines_of({}, place.name)
+                  if place.kind in EAT else (), eat=eat)
+
+
+def _area_holds(reader, lat, lon, name):
+    """True when a position is inside the outlined area of that name (candidates' areas,
+    however near its edge)."""
+    return any(place.inside and place.name == name for place in candidates(
+        lat, lon, 0.0, reader, ANY._replace(points=False)))
+
+
+def agree(results, members, reader=None):
+    """Let the pictures of one visit agree (see the notes above refine): results {image id:
+    Place or None} of its members ([(seconds, Position)]: visits) is changed in place.
+    The votes are those of distinct shots (copies of one, taken at the same time and
+    place, count once). A visit's area is "taken inside it" only for a picture whose
+    position is inside its outline (by reader: a Reader; without one, never). Returns how
+    many changed."""
+    voters = [(seconds, position, results[position.image_id]) for seconds, position in members
+              if results.get(position.image_id) is not None
+              and results[position.image_id].why in STRONG]
+    changed = 0
+    for seconds, position in members if voters else ():
+        if position.image_id not in results:
+            continue
+        place = results[position.image_id]
+        facts = position.facts
+        if place is not None and (place.why in STRONG or place.why == "visit"
+                                  or place.at is None):
+            continue
+        if facts.street or facts.nowhere or (place is not None and not _indoorish(
+                facts._replace(approximate=False))):
+            continue
+        close = [voter for voter in voters if abs(voter[0] - seconds) <= VISIT_NEAR_S
+                 and voter[1].image_id != position.image_id]
+        pool = close or [voter for voter in voters if voter[1].image_id != position.image_id]
+        shots = collections.defaultdict(set)
+        for voter in pool:
+            shots[voter[2].name].add((voter[0], round(voter[1].lat, 6), round(voter[1].lon, 6)))
+        votes = collections.Counter(dict((name, len(each)) for name, each in shots.items()))
+        if not votes:
+            continue
+        ranked = votes.most_common(2)
+        name, count = ranked[0]
+        if len(ranked) > 1 and ranked[1][1] * 2 > count:
+            continue            # (the visit does not agree)
+        venue = next(voter[2] for voter in pool if voter[2].name == name)
+        level = _visit_level(venue, facts)
+        if level < 0 or (level == 0 and (count < VISIT_VOTES or facts.shows)):
+            continue
+        if level == 0 and _class(venue.kind) in ("eat", "shop", "stay") and not (
+                venue.kind in LODGING and facts.indoor):
+            continue            # (a place to eat or shop: for a picture that shows one)
+        accuracy_m = min(position.accuracy_m, VISIT_ACCURACY_M)
+        if venue.at is None:
+            metres = min(_metres_between((position.lat, position.lon),
+                                         (voter[1].lat, voter[1].lon))
+                         for voter in pool if voter[2].name == name)
+            if metres > VISIT_M + accuracy_m:
+                continue
+            # (Outside its outline, near it: "nearby".)
+            metres, inside = 0, reader is not None and _area_holds(
+                reader, position.lat, position.lon, venue.name)
+        else:
+            metres, inside = _metres_between((position.lat, position.lon), venue.at), False
+            if metres > _reach(venue.kind) + accuracy_m:
+                continue
+        results[position.image_id] = venue._replace(
+            metres=int(round(metres)), inside=inside, named=False,
+            hinted=venue.kind in facts.hints, why="visit")
+        changed += 1
+    return changed
 
 
 # ---------------------------------------------------------------------------
 # The pictures' positions
 
-Position = collections.namedtuple("Position", "image_id lat lon accuracy_m source facts")
+Position = collections.namedtuple("Position", "image_id lat lon accuracy_m source facts taken")
+Position.__new__.__defaults__ = ("",)
 Position.__doc__ = """A picture's position to look up (see positions).
 
 source    "gps", "track", "estimate" or "owner"
 facts     what fits the picture (a Facts: its description, how it moved, how
           approximate the position is)
+taken     when it was taken (images.taken_at; "" when unknown): the pictures of a visit
+          agree (visits)
 """
 
 _IMAGES_SQL = """
-    SELECT id, content_hash, media, lat, lon, exif, info, described, camera, place_cc
+    SELECT id, content_hash, media, lat, lon, exif, info, described, camera, place_cc,
+        taken_at
     FROM images WHERE missing_since IS NULL AND lat IS NOT NULL AND library_id IN (%s)"""
 _ESTIMATES_SQL = """
-    SELECT e.image_id, e.lat, e.lon, e.radius_km, e.source, i.info, i.described
+    SELECT e.image_id, e.lat, e.lon, e.radius_km, e.source, i.info, i.described, i.taken_at
     FROM place_estimates AS e JOIN images AS i ON i.id = e.image_id
     WHERE i.missing_since IS NULL AND i.lat IS NULL AND e.lat IS NOT NULL
         AND i.library_id IN (%s)"""
@@ -1124,8 +2059,11 @@ def picture_facts(info_text, described=True):
     such a place (EAT_WORDS in its scene, title or tags); shops not outdoors without
     food; a street scene (STREET_WORDS in its scene) outdoors; the kinds of place its
     scene and title say (KIND_HINTS); its words (for the names it says); taken from a
-    plane (FLIGHT_WORDS, AERIAL_WORDS with PLANE_WORDS). An undescribed picture (or one
-    whose description cannot be read): ANY."""
+    plane (FLIGHT_WORDS, AERIAL_WORDS with PLANE_WORDS); the kinds of place what it shows
+    fits (SHOW_HINTS over its scene, title, subjects and tags; VIEW_KINDS for a view from
+    above); the cuisines of its food (CUISINES); food; taken indoors where no place is
+    (NOWHERE_WORDS in its scene or title). An undescribed picture (or one whose
+    description cannot be read): ANY."""
     if not described or not info_text:
         return ANY
     try:
@@ -1147,11 +2085,23 @@ def picture_facts(info_text, described=True):
     words = plain_words(" ".join((_words(info, ("title", "description", "landmarks", "tags",
                                                  "subjects", "location_guess")),
                                   _words(info, ("text",))[:WORDS_TEXT])))
+    shown = " ".join((seen, _words(info, ("subjects", "tags"))))
+    shows = hints | frozenset(kind for pattern, kinds in SHOW_HINTS if pattern.search(shown)
+                              for kind in kinds)
+    if VIEW_WORDS.search(seen):
+        shows = VIEW_KINDS      # (a view from above shows what is below, not where it is)
+    cuisines = frozenset()
+    if food or eating:
+        dishes = " ".join((_words(info, ("title", "subjects", "food", "description")),
+                           _words(info, ("text",))[:WORDS_TEXT]))
+        cuisines = frozenset(key for key, pattern, _details, _names in CUISINES
+                             if pattern.search(dishes))
     return Facts(points=setting != "vehicle", shops=not outdoor or food, eat=food or eating,
                  meal=food and setting == "indoor",
                  street=outdoor and bool(STREET_WORDS.search(scene)),
                  indoor=setting == "indoor", approximate=False, hints=hints, words=words,
-                 flying=flying)
+                 flying=flying, shows=shows, cuisines=cuisines, food=food,
+                 nowhere=setting == "indoor" and bool(NOWHERE_WORDS.search(seen)))
 
 
 def _gps(exif_text):
@@ -1223,7 +2173,7 @@ def positions(conn, config, library_ids=None, index=None):
         if tracks.is_position(track, row["lat"], row["lon"]):
             result.append(Position(row["id"], float(row["lat"]), float(row["lon"]),
                                    (track.extent_km or 0.0) * 1000.0, "track",
-                                   facts._replace(points=False)))
+                                   facts._replace(points=False), row["taken_at"] or ""))
             continue
         gps = _gps(row["exif"])
         moved = motion(gps, row["camera"])
@@ -1234,7 +2184,7 @@ def positions(conn, config, library_ids=None, index=None):
         if moved:
             facts = facts._replace(points=False)
         result.append(Position(row["id"], float(row["lat"]), float(row["lon"]),
-                               _gps_accuracy(gps, facts), "gps", facts))
+                               _gps_accuracy(gps, facts), "gps", facts, row["taken_at"] or ""))
     if not place_estimates._have_tables(conn):
         return result
     limit = settings(config)["max_estimate_km"]
@@ -1259,15 +2209,15 @@ def positions(conn, config, library_ids=None, index=None):
             if isinstance(radius, (int, float)) and radius > 0:
                 # (An estimate the owner accepted: as approximate as it was.)
                 result.append(Position(row["image_id"], lat, lon, radius * 1000.0, "owner",
-                                       approximate))
+                                       approximate, row["taken_at"] or ""))
             else:
                 result.append(Position(row["image_id"], lat, lon, DEFAULT_ACCURACY_M, "owner",
-                                       facts))
+                                       facts, row["taken_at"] or ""))
             continue
         if not isinstance(radius, (int, float)) or radius > limit:
             continue
         result.append(Position(row["image_id"], lat, lon, max(radius * 1000.0, 0.0),
-                               "estimate", approximate))
+                               "estimate", approximate, row["taken_at"] or ""))
     return result
 
 
@@ -1319,15 +2269,27 @@ def maps_key():
     return "%d:%d:%d" % (RULES_VERSION, stat.st_size, int(stat.st_mtime))
 
 
+def _minute(taken):
+    """The minute a picture was taken ("YYYY-MM-DDTHH:MM", of images.taken_at), or ""."""
+    return str(taken)[:16] if _seconds(taken) is not None else ""
+
+
 def _facts_text(position):
-    """The Facts of a position as letters (_FACT_LETTERS: one for each that is true), and
-    a checksum of its hints and words ("psi:1a2b3c4d") when it has any."""
+    """The Facts of a position as letters (_FACT_LETTERS: one for each that is true), a
+    checksum of its hints, words and what it shows when it has any, and the minute it was
+    taken when known ("psi:1a2b3c4d@2024-05-01T10:05": a picture whose time changed is in
+    another visit, and its earlier visit is found by it; see update)."""
     facts = position.facts
-    letters = "".join(letter for letter, value in zip(_FACT_LETTERS, facts) if value)
-    if not facts.hints and not facts.words:
-        return letters
-    said = "|".join(sorted(facts.hints)) + "|" + facts.words
-    return "%s:%08x" % (letters, zlib.crc32(said.encode("utf-8")) & 0xffffffff)
+    text = "".join(letter for letter, value in zip(_FACT_LETTERS, facts) if value)
+    shown = facts.shows or facts.cuisines or facts.food or facts.nowhere
+    if facts.hints or facts.words or shown:
+        said = "|".join(sorted(facts.hints)) + "|" + facts.words
+        if shown:
+            said += "|%s|%s|%d%d" % (",".join(sorted(facts.shows)),
+                                     ",".join(sorted(facts.cuisines)), facts.food, facts.nowhere)
+        text += ":%08x" % (zlib.crc32(said.encode("utf-8")) & 0xffffffff)
+    minute = _minute(position.taken)
+    return text + ("@" + minute if minute else "")
 
 
 def _same_spot(row, position):
@@ -1399,16 +2361,16 @@ def applies(named, lat, lon, sources):
 def approximate(named):
     """True when a named_places row was found for an approximate position: an estimated
     place, or the owner's with a radius (Facts.approximate, its facts letter "a")."""
-    letters = str(named.get("facts") or "").split(":", 1)[0]
+    letters = re.match("[a-z]*", str(named.get("facts") or "")).group(0)
     return named.get("source") == "estimate" or "a" in letters
 
 
 def record_keys(named, for_export=False):
     """The search record keys of a named_places row: np (the name), nk (its kind), and
-    ni 1 (inside an area) or nd (how far, in metres; for_export: rounded to
-    EXPORT_METRES, at least that). na 1 says the position is approximate: inside an
-    area, probably; else nd is left out ("nearby") -- also when the position may be off
-    by more than the distance."""
+    ni 1 (inside an area, or the place's own building outline) or nd (how far, in
+    metres; for_export: rounded to EXPORT_METRES, at least that). na 1 says the position
+    is approximate: inside an area, probably; else nd is left out ("nearby") -- also
+    when the position may be off by more than the distance."""
     # (first_name: a row found before RULES_VERSION 3 may hold several names.)
     keys = {"np": first_name(named["name"]), "nk": named["kind"] or ""}
     rough = approximate(named)
@@ -1469,9 +2431,66 @@ def _tile_order(position):
     return (int(x) >> 2, int(y) >> 2, int(x), int(y), position.image_id)
 
 
+def _units(todo, together):
+    """The pictures to look up in the order they are looked up: [[(seconds, Position)]],
+    a visit's together (together: visits) and every other picture alone, in the order of
+    their tiles (_tile_order; a visit where its first picture is)."""
+    wanted = set(position.image_id for position in todo)
+    visit_of = {}
+    for members in together:
+        if all(position.image_id in wanted for _seconds, position in members):
+            for _seconds, position in members:
+                visit_of[position.image_id] = members
+    done = set()
+    units = []
+    for position in sorted(todo, key=_tile_order):
+        members = visit_of.get(position.image_id)
+        if members is None:
+            units.append([(None, position)])
+        elif id(members) not in done:
+            done.add(id(members))
+            units.append(members)
+    return units
+
+
+def _earlier(row):
+    """A stand-in (a Position with the negative of its id, ANY facts) for a picture where
+    and when its named_places row says it was (its position, accuracy and minute taken:
+    _facts_text); None when the row does not say when, or is a track's (in no visit)."""
+    text = str(row.get("facts") or "")
+    if "@" not in text or row.get("lat") is None or row.get("lon") is None \
+            or row.get("source") == "track":
+        return None
+    return Position(-int(row["image_id"]), float(row["lat"]), float(row["lon"]),
+                    float(row.get("accuracy_m") or 0.0), row.get("source") or "", ANY,
+                    text.rsplit("@", 1)[1] + ":00")
+
+
+def _visit_mates(found, together, todo, earlier):
+    """[Position] of the pictures of found not in todo that share a visit with one in todo:
+    as the visits are now (together: visits(found)), and as they were for the rows earlier
+    (of pictures whose position or time changed, or that have none any more: the pictures
+    that agreed with them then, see _earlier)."""
+    start = set(position.image_id for position in todo)
+    groups = list(together)
+    stand_ins = [each for each in (_earlier(row) for row in earlier) if each is not None]
+    if stand_ins:
+        groups += visits(list(found) + stand_ins)
+    chosen = set(start)
+    more = []
+    for members in groups:
+        if any(position.image_id in start or position.image_id < 0
+               for _seconds, position in members):
+            for _seconds, position in members:
+                if position.image_id > 0 and position.image_id not in chosen:
+                    chosen.add(position.image_id)
+                    more.append(position)
+    return more
+
+
 def _empty_summary():
     return {"pictures": 0, "named": 0, "looked_up": 0, "changed": 0, "removed": 0,
-            "stopped": False, "maps": False, "seconds": 0.0}
+            "agreed": 0, "stopped": False, "maps": False, "seconds": 0.0}
 
 
 def update(conn, config, ctx=None, redo=False, ids=None, limit=None, now=None, changed=None,
@@ -1480,14 +2499,19 @@ def update(conn, config, ctx=None, redo=False, ids=None, limit=None, now=None, c
     with redo, or when the street maps or the rules changed) and keep them.
 
     ids: only these pictures (the admin's choices; None: all); limit: look up at
-    most that many, else none (they wait for the next job). Rows of pictures without
-    a position any more are deleted. Without street maps (or with named places off)
-    every row is deleted. A change touches the picture's images.updated; changed (a
-    set, optional) gets those ids. Looks up without holding the write lock, and writes
-    every COMMIT_ROWS rows or COMMIT_SECONDS in a short transaction; stops when ctx
-    says so (what was done is kept). Returns {"pictures" (with a position), "named"
-    (with a named place), "looked_up", "changed", "removed", "stopped", "maps" (there
-    are street maps), "seconds"}.
+    most that many, else none (they wait for the next job). The pictures of a visit
+    (visits) are looked up together, and all of them when one is (they agree): the visit
+    a changed picture is in now, and the one its row says it was in (_visit_mates; also
+    for a picture without a position any more) -- past limit, only the changed pictures
+    now, and the rest of their visits (their rows' maps cleared) with them in the next
+    job. Rows of pictures without a position any more are deleted. Without street maps
+    (or with named places off) every row is deleted. A change touches the picture's
+    images.updated; changed (a set, optional) gets those ids. Looks up without holding
+    the write lock, and writes every COMMIT_ROWS rows or COMMIT_SECONDS (after a visit)
+    in a short transaction; stops when ctx says so (what was done is kept). Returns
+    {"pictures" (with a position), "named" (with a named place), "looked_up",
+    "changed", "removed", "agreed" (took their visit's place: agree), "stopped",
+    "maps" (there are street maps), "seconds"}.
     """
     started = time.perf_counter()
     summary = _empty_summary()
@@ -1513,16 +2537,34 @@ def update(conn, config, ctx=None, redo=False, ids=None, limit=None, now=None, c
     gone = [image_id for image_id in old if image_id not in wanted
             and (ids is None or image_id in ids)]
     if limit is not None and len(todo) > limit:
-        todo = []
+        todo = []           # (their rows still say what changed: the next job)
+    together = visits(found)
+    stale = []
+    if (todo or gone) and len(todo) < len(found):
+        # (The pictures of a visit agree: a visit is looked up whole -- the one a changed
+        # picture is in now, and the one it was in.)
+        more = _visit_mates(found, together, todo, [
+            old[position.image_id] for position in todo if position.image_id in old] + [
+            old[image_id] for image_id in gone])
+        if limit is not None and len(todo) + len(more) > limit:
+            # (Too many at once: the changed pictures alone now, the rest of their visits
+            # with them in the next job.)
+            stale = [position.image_id for position in more if position.image_id in old]
+        else:
+            todo.extend(more)
     if conn.in_transaction:
         conn.commit()
     touched = []
-    if gone:
+    if gone or stale:
         conn.execute("BEGIN IMMEDIATE")
         try:
             for start in range(0, len(gone), 500):
                 part = gone[start:start + 500]
                 conn.execute("DELETE FROM named_places WHERE image_id IN (%s)"
+                             % ",".join("?" * len(part)), part)
+            for start in range(0, len(stale), 500):
+                part = stale[start:start + 500]
+                conn.execute("UPDATE named_places SET maps = '' WHERE image_id IN (%s)"
                              % ",".join("?" * len(part)), part)
             shown = [image_id for image_id in gone if _shown(old[image_id]) is not None]
             _touch(conn, shown, now)
@@ -1568,22 +2610,30 @@ def update(conn, config, ctx=None, redo=False, ids=None, limit=None, now=None, c
             summary["looked_up"] += len(batch)
 
         try:
-            todo.sort(key=_tile_order)
             batch = []
             last = time.monotonic()
-            for position in todo:
-                if ctx is not None and ctx.should_stop():
-                    summary["stopped"] = True
-                    break
-                # (Read and decoded with no lock held: the slow part.)
-                batch.append((position, find(position.lat, position.lon,
-                                             position.accuracy_m, reader, position.facts)))
-                if ctx is not None:
-                    ctx.step()
+            for unit in _units(todo, together):
+                looked = {}
+                for _seconds, position in unit:
+                    if ctx is not None and ctx.should_stop():
+                        summary["stopped"] = True
+                        break
+                    # (Read and decoded with no lock held: the slow part.)
+                    looked[position.image_id] = find(position.lat, position.lon,
+                                                     position.accuracy_m, reader, position.facts)
+                    if ctx is not None:
+                        ctx.step()
+                if len(looked) > 1:
+                    summary["agreed"] += agree(looked, [member for member in unit
+                                                        if member[1].image_id in looked], reader)
+                batch.extend((position, looked[position.image_id]) for _seconds, position in unit
+                             if position.image_id in looked)
                 if len(batch) >= COMMIT_ROWS or time.monotonic() - last >= COMMIT_SECONDS:
                     write(batch)
                     batch = []
                     last = time.monotonic()
+                if summary["stopped"]:
+                    break
             if batch:
                 write(batch)
         finally:
@@ -1610,6 +2660,8 @@ def summary_text(summary):
         parts.append("{:,} looked up".format(summary["looked_up"]))
     if summary["changed"]:
         parts.append("{:,} changed".format(summary["changed"]))
+    if summary.get("agreed"):
+        parts.append("{:,} by the other pictures of their visit".format(summary["agreed"]))
     if summary["removed"]:
         parts.append("{:,} without a place any more".format(summary["removed"]))
     if parts:
@@ -1639,9 +2691,11 @@ def run_safely(conn, config, ctx=None):
 def after_check(conn, config, changed=None):
     """update() right after the owner decided about a picture's position or place (admin.py):
     the pictures whose position changed are looked up at once -- when they are few
-    (QUICK_LIMIT; else the next job does it) and the named places were looked up before
-    with these street maps. changed (a set) gets the ids whose named place changed.
-    Never raises for the street maps; a busy database raises sqlite3.OperationalError."""
+    (QUICK_LIMIT; else the next job does it), with the other pictures of their visits when
+    those are few too (else the rest of the visits in the next job) -- when the named
+    places were looked up before with these street maps. changed (a set) gets the ids
+    whose named place changed. Never raises for the street maps; a busy database raises
+    sqlite3.OperationalError."""
     if not have_table(conn) or not maps_key():
         return set()
     found = set()
@@ -1656,18 +2710,24 @@ def after_check(conn, config, changed=None):
 
 def status(conn, config=None):
     """{"available" (street maps), "enabled", "pictures" (looked up), "named", "by_source":
-    {source: named}, "command"} for the Manage page."""
-    result = {"available": bool(maps_key()), "enabled": settings(config or {})["enabled"],
-              "pictures": 0, "named": 0, "by_source": {}, "command": update_command()}
+    {source: named}, "older" (of pictures, those looked up with other rules or street
+    maps than today's: the next update looks them up again), "command"} for the Manage
+    page."""
+    key = maps_key()
+    result = {"available": bool(key), "enabled": settings(config or {})["enabled"],
+              "pictures": 0, "named": 0, "by_source": {}, "older": 0,
+              "command": update_command()}
     if conn is None or not have_table(conn):
         return result
-    for source, total, named in conn.execute(
-            "SELECT n.source, COUNT(*), SUM(n.name <> '') FROM named_places AS n "
-            "JOIN images AS i ON i.id = n.image_id WHERE i.missing_since IS NULL "
-            "GROUP BY n.source"):
+    for source, total, named, older in conn.execute(
+            "SELECT n.source, COUNT(*), SUM(n.name <> ''), SUM(COALESCE(n.maps, '') <> ?) "
+            "FROM named_places AS n JOIN images AS i ON i.id = n.image_id "
+            "WHERE i.missing_since IS NULL GROUP BY n.source", (key,)):
         result["pictures"] += total
         result["named"] += named or 0
         result["by_source"][source] = named or 0
+        if key:
+            result["older"] += older or 0
     return result
 
 
@@ -1795,6 +2855,12 @@ def main(argv=None):
                     "" if not found["by_source"] else " (%s)" % ", ".join(
                         "%s %s" % ("{:,}".format(count), source)
                         for source, count in sorted(found["by_source"].items()))))
+                if found["older"]:
+                    one = found["older"] == 1
+                    print("%s of them %s looked up with older rules or street maps: %s "
+                          "looks %s up again." % ("{:,}".format(found["older"]),
+                                                  "was" if one else "were", found["command"],
+                                                  "it" if one else "them"))
             return 0
         lock = jobs.WorkerLock()
         if not lock.acquire("named_places.py"):

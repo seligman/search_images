@@ -3130,6 +3130,99 @@ test("in the viewer L is Looks like this, also with the focus on the player", fu
     });
 });
 
+test("Looks like this is not offered when nothing else looks like the picture", function () {
+    var records = {10: {i: 10, w: 400, hgt: 300, t: "Cat"},
+                   11: {i: 11, w: 400, hgt: 300, t: "Kitten"}};
+    return onLightboxPage({webgl: false, fetch: false}, function (viewer, page) {
+        var proto = page.box.constructor.prototype;
+        proto.querySelector = function (selector) {
+            return /^\.[\w-]+$/.test(selector) ? byClass(this, selector.slice(1))[0] || null
+                : null;
+        };
+        var alike = [];
+        var asked = [];
+        assert.ok(viewer.open({ids: [10, 11], index: 0, get: function (id) {
+            return records[id] || null;
+        }, hasLook: function () {
+            return true;
+        }, looksLike: function () {
+            return alike;
+        }, onLooksLike: function (id) {
+            asked.push(id);
+        }}));
+        // The picture has a look vector, but its strip would be empty: the search
+        // would find only the picture itself. No button, no strip, and L does nothing.
+        assert.strictEqual(byClass(page.document.body, "info-look").length, 0);
+        assert.strictEqual(byClass(page.document.body, "info-looks-section").length, 0);
+        assert.strictEqual(page.key("l").prevented, false);
+        assert.deepStrictEqual(asked, []);
+        // Once another picture looks like it, both come.
+        alike = [11];
+        viewer.refreshInfo();
+        assert.strictEqual(byClass(page.document.body, "info-look").length, 1);
+        assert.strictEqual(byClass(page.document.body, "info-looks-section").length, 1);
+        viewer.close();
+        // (A page that cannot say what looks like it keeps the button.)
+        assert.ok(viewer.open({ids: [10, 11], index: 0, get: function (id) {
+            return records[id] || null;
+        }, hasLook: function () {
+            return true;
+        }, onLooksLike: function (id) {
+            asked.push(id);
+        }}));
+        assert.strictEqual(byClass(page.document.body, "info-look").length, 1);
+        viewer.close();
+    });
+});
+
+test("More like this is not offered when nothing else is like the picture", function () {
+    var records = {10: {i: 10, w: 400, hgt: 300, t: "Cat", ds: 1},
+                   11: {i: 11, w: 400, hgt: 300, t: "Kitten", ds: 1}};
+    return onLightboxPage({webgl: false, fetch: false}, function (viewer, page) {
+        var proto = page.box.constructor.prototype;
+        proto.querySelector = function (selector) {
+            return /^\.[\w-]+$/.test(selector) ? byClass(this, selector.slice(1))[0] || null
+                : null;
+        };
+        proto.click = function () {
+            var click = {type: "click", button: 0, preventDefault: function () {}};
+            ((this.listeners || {}).click || []).forEach(function (listener) {
+                listener(click);
+            });
+        };
+        var like = [];
+        var vector = false;
+        var asked = [];
+        assert.ok(viewer.open({ids: [10, 11], index: 0, get: function (id) {
+            return records[id] || null;
+        }, similar: function () {
+            return like;
+        }, hasVector: function () {
+            return vector;
+        }, moreLikeThis: function (id) {
+            asked.push(id);
+        }}));
+        // Before its meaning vector is there, the button stays (the vectors may be on
+        // their way; without them it searches by words).
+        assert.strictEqual(byClass(page.document.body, "info-like").length, 1);
+        // With it, and an empty strip: the search would find only the picture itself.
+        // No button, no strip, and M does nothing.
+        vector = true;
+        viewer.refreshInfo();
+        assert.strictEqual(byClass(page.document.body, "info-like").length, 0);
+        assert.strictEqual(byClass(page.document.body, "info-similar").length, 0);
+        assert.strictEqual(page.key("m").prevented, false);
+        assert.deepStrictEqual(asked, []);
+        // Once another picture is like it, both come.
+        like = [11];
+        viewer.refreshInfo();
+        assert.strictEqual(byClass(page.document.body, "info-like").length, 1);
+        assert.strictEqual(byClass(page.document.body, "info-similar").length, 1);
+        assert.ok(page.key("m").prevented);
+        assert.deepStrictEqual(asked, [10]);
+    });
+});
+
 test("the viewer draws its More like this pictures again when asked", function () {
     var records = {10: {i: 10, w: 400, hgt: 300, t: "Cat"}, 11: {i: 11, w: 400, hgt: 300,
                                                                   t: "Kitten"}};

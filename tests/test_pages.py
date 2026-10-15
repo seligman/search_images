@@ -35,6 +35,10 @@ PAGES = (("/", "page.html", "app.js"), ("/detail", "detail.html", "detail.js"),
 CREATED_IDS = {"shell-header", "shell-toasts", "shell-library", "shell-job",
                "no-endpoint-notice", "no-ffmpeg-notice", "meaning-notice",
                "server-gone"}
+# Element ids only an export's pages have (export.render_page: the credits line at the
+# foot, export.CREDITS_ID, which the search page brings into sight for the map page's
+# link to it; the map page's corner credit, which map.js stacks the other credits above).
+EXPORT_IDS = {"credits", "map-credit"}
 
 
 quiet = support.quiet
@@ -134,7 +138,7 @@ class ScriptTest(unittest.TestCase):
             html = read(TEMPLATES, template)
             present = set(re.findall(r'\sid="([^"]+)"', html))
             wanted = ids_looked_up(read(STATIC, script)) | shell_ids
-            missing = wanted - present - CREATED_IDS
+            missing = wanted - present - CREATED_IDS - EXPORT_IDS
             self.assertEqual(missing, set(), "%s looks up ids missing from %s"
                              % (script, template))
 

@@ -192,6 +192,11 @@ test("in a small set, the closest few count, judged by the looks' own spread", f
     // Only pictures well above a typical pair of pictures: 0.75 is not.
     assert.deepStrictEqual(small([1, 0.75, 0.72, 0.7, 0.68, 0.66, 0.64, 0.62, 0.6])
         .search("look:1").items, [1]);
+    // (Its strip is empty then too: the viewer offers no "Looks like this" for it.)
+    assert.deepStrictEqual(small([1, 0.75, 0.72, 0.7, 0.68, 0.66, 0.64, 0.62, 0.6])
+        .similar(1, 8, {by: "look"}), []);
+    assert.deepStrictEqual(small([1, 0.97, 0.95, 0.93, 0.92, 0.7, 0.66, 0.62, 0.6])
+        .similar(1, 8, {by: "look"}), [2, 3, 4, 5]);
     // The spread the thresholds go by is the looks' own (not the meaning one's).
     var index = small([1, 0.97, 0.95, 0.93, 0.92, 0.7, 0.66, 0.62, 0.6]);
     var spread = index.lookView().pairSpread();
@@ -259,6 +264,9 @@ test("the export review says what Looks like this adds", function () {
                                {looks: 1050});
     assert.ok(/every published picture/.test(all), all);
     assert.ok(/about 350 bytes a picture/.test(all), all);
+    // (The viewer offers it only where other pictures look alike: not on every one.)
+    assert.ok(/\. It is offered on a picture when other published pictures look like it\.$/
+        .test(all), all);
     var some = REVIEW.looksText({exported: 4, looks: {vectors: 3, missing: 1}}, options,
                                 {looks: 1050});
     assert.ok(/3 of 4 pictures/.test(some) && /1 has no look vector yet/.test(some), some);

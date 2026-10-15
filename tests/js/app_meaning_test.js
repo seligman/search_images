@@ -476,8 +476,8 @@ function base64(numbers) {
 
 /* A fresh exported search page. options: {meaning (false: an export without
    its model), saveData, check (the self-check's cosine), fail (the model
-   cannot load), words (Words chosen on an earlier visit)}. page.log lists
-   the scripts added. */
+   cannot load), words (Words chosen on an earlier visit), hash (of the
+   address)}. page.log lists the scripts added. */
 function exportPage(options) {
     options = options || {};
     var data = records();
@@ -506,7 +506,8 @@ function exportPage(options) {
         document: document,
         navigator: {userAgent: "test", connection: {saveData: Boolean(options.saveData)},
                     clipboard: null},
-        location: {search: "", hash: "", pathname: "/x/index.html", protocol: "file:",
+        location: {search: "", hash: options.hash || "", pathname: "/x/index.html",
+                   protocol: "file:",
                    href: "file:///x/index.html", origin: "null"},
         history: {state: null, scrollRestoration: "auto", pushState: function (state) {
             this.state = state;
@@ -946,6 +947,46 @@ test("with Save-Data on, a button downloads the model", function () {
     }).then(function () {
         assert.strictEqual(page.context.localStorage.getItem("searchImages.meaningDownload"),
                            "1");
+    });
+});
+
+test("the map page's link to the credits line brings it into sight", function () {
+    // (An export's credits line is at the foot of its search page, id "credits"; the
+    // map page has no foot and links there: index.html#credits.)
+    function withCredits(hash, height) {
+        var page = exportPage({meaning: false, hash: hash});
+        var footer = page.document.createElement("footer");
+        footer.setAttribute("id", "credits");
+        footer.textContent = "Photos by A. Maker";
+        // (2,400 px down the page; a long credits line on a small phone is taller
+        // than its window, 900 px here.)
+        footer.getBoundingClientRect = function () {
+            return {top: 2400, bottom: 2400 + height, left: 0, right: 1000, width: 1000,
+                    height: height};
+        };
+        page.scrolled = [];
+        page.context.scrollBy = function (x, y) {
+            page.scrolled.push([x, y]);
+        };
+        footer.scrollIntoView = function (how) {
+            page.scrolled.push(JSON.stringify(how));
+        };
+        page.document.body.appendChild(footer);
+        return page;
+    }
+    var linked = withCredits("#credits", 60);
+    var tall = withCredits("#credits", 1500);
+    var plain = withCredits("", 60);
+    return Promise.all([loaded(linked), loaded(tall), loaded(plain)]).then(function () {
+        // Once the pictures above it are laid out (60 of them here): its start just
+        // below the search bar (40 px tall in this made-up page), which sticks at the
+        // top. (A short line at the foot then shows at the bottom: the browser
+        // scrolls no further than the page goes.)
+        assert.strictEqual(shown(linked).length, 60);
+        assert.deepStrictEqual(linked.scrolled, [[0, 2400 - 40 - 8]]);
+        // Taller than the window: from its start, not its end.
+        assert.deepStrictEqual(tall.scrolled, [[0, 2400 - 40 - 8]]);
+        assert.deepStrictEqual(plain.scrolled, []);
     });
 });
 

@@ -38,7 +38,13 @@ one is four of the next smaller size), so exports made with different sizes
 tell no more together than the one of the smallest size. With the location
 option, no position in the home area goes out (the picture keeps its region
 and country, not its town, nor the AI model's landmark and place-guess words;
-nor does any picture whose town has pictures in the home area), no route
+nor does any picture whose town has pictures in the home area -- a town of the
+same name and country, in the same region or one that cannot tell them apart:
+none, or one the place names do not have, as a file's own place names may give
+its position's town with a region of the file's: home_town; home_towns has the
+towns the place names and the files' own place names give there), no picture
+has a named place found for a position there (a visit's place is found for the
+other pictures of the visit too: _TripExport.named_published), no route
 enters it (routes are cut at its edge, besides routes_trim at both ends of
 every drive), and no estimated place in it is shown. Whatever the options, a
 dashcam's clip whose GPS track enters the home area, or that has no fix (its
@@ -82,6 +88,7 @@ day moves keeps its folder and picture ids.
 """
 
 import collections
+import functools
 import math
 import os
 
@@ -96,6 +103,7 @@ import local_times
 import map_areas
 import named_places
 import place_estimates
+import places
 import search_index
 import tracks
 import trips
@@ -374,38 +382,92 @@ def home_flags(conn, config, library_ids, ids, area):
     return flags
 
 
+_HOME_COLUMNS = ("lat", "lon", "place_city", "place_region", "place_country", "place_cc",
+                 "place_km", "fexif")
+
+
 def home_towns(conn, area):
-    """{(town, region, country)} of the places of the pictures (and estimated places)
-    in the area: towns a trip export never names."""
+    """{(town, region, country, cc)} of the places of the pictures (and estimated
+    places) in the area -- by the place names, and by the files' own place names
+    (place_estimates.gps_file_columns), as their records have them: towns a trip
+    export never names (home_town)."""
     towns = set()
     if area is None:
         return towns
-    for row in conn.execute("SELECT lat, lon, place_city, place_region, place_country FROM "
-                            "images WHERE missing_since IS NULL AND lat IS NOT NULL AND "
-                            "place_city IS NOT NULL AND place_city <> ''"):
-        if area.contains(row[0], row[1]):
-            towns.add((row[2], row[3] or "", row[4] or ""))
+    for values in conn.execute(
+            "SELECT lat, lon, place_city, place_region, place_country, place_cc, place_km, "
+            "%s FROM images WHERE missing_since IS NULL AND lat IS NOT NULL AND "
+            "(COALESCE(place_city, '') <> '' OR instr(exif, '\"XMPPlace\"') > 0)"
+            % place_estimates.FEXIF_SQL):
+        row = dict(zip(_HOME_COLUMNS, values))
+        if not area.contains(row["lat"], row["lon"]):
+            continue
+        named = place_estimates.gps_file_columns(row)
+        for place in (row, named):
+            if place is not None and place["place_city"]:
+                towns.add((place["place_city"], place["place_region"] or "",
+                           place["place_country"] or "", place["place_cc"] or ""))
     try:
-        rows = conn.execute("SELECT lat, lon, place_city, place_region, place_country FROM "
-                            "place_estimates WHERE lat IS NOT NULL AND place_city <> ''"
-                            ).fetchall()
+        rows = conn.execute("SELECT lat, lon, place_city, place_region, place_country, "
+                            "place_cc FROM place_estimates WHERE lat IS NOT NULL AND "
+                            "place_city <> ''").fetchall()
     except Exception:           # (no estimates yet: sqlite3.OperationalError)
         rows = []
     for row in rows:
         if area.contains(row[0], row[1]):
-            towns.add((row[2], row[3] or "", row[4] or ""))
+            towns.add((row[2], row[3] or "", row[4] or "", row[5] or ""))
     return towns
+
+
+# (places.fold of the names of the towns of home, again and again: home_town.)
+_fold = functools.lru_cache(maxsize=4096)(places.fold)
+
+
+def home_town(place, towns):
+    """True when a picture's place (town, region, country, cc) is a town of home (towns:
+    home_towns): the same town (any case or accents) of the same country (by its code
+    when both have one), in the same region or in one that cannot tell them apart --
+    none on either side, or a region the place names do not have in that country. A
+    file's own place names (place_estimates.gps_file_columns) may give its position's
+    town with the file's region ("Home Province" for the place names' "Region One"):
+    it is still home's town. A town of that name in another region of the place
+    names is another town."""
+    town = _fold(place[0] or "")
+    if not town or not towns:
+        return False
+    region, country = _fold(place[1] or ""), _fold(place[2] or "")
+    cc = str((place[3] if len(place) > 3 else "") or "").upper()
+    unknown = None
+    for home in towns:
+        if _fold(home[0]) != town:
+            continue
+        home_cc = str((home[3] if len(home) > 3 else "") or "").upper()
+        if cc and home_cc:
+            if cc != home_cc:
+                continue
+        elif country != _fold(home[2]):
+            continue
+        home_region = _fold(home[1])
+        if not region or not home_region or region == home_region:
+            return True
+        if unknown is None:
+            index = places.shared()
+            unknown = index is None or not index.knows_region(cc or home_cc, place[1])
+        if unknown:
+            return True
+    return False
 
 
 def near_home(picture, area, towns):
     """True when a trip's picture (trips._Picture) was taken in the home area (its
-    position or estimated position), or its place is a town with pictures there."""
+    position or estimated position), or its place is a town with pictures there
+    (home_town)."""
     if area is None:
         return False
     for position in (picture.position, picture.estimated):
         if position is not None and area.contains(position[0], position[1]):
             return True
-    return picture.place is not None and tuple(picture.place[:3]) in towns
+    return picture.place is not None and home_town(picture.place, towns)
 
 
 def export_title(trip, options, ids, area, towns):
@@ -561,6 +623,7 @@ class _TripExport(export._Export):
         # smart_search; plain_words each.)
         self.home_names = set()
         self.published_names = set()
+        self.named_home = None          # named_at_home, once named_published asks
         self.withheld = set()           # clips of drives that lose their words
         self.trip_data = None
         self.story_days = 0             # days of the trip's story published
@@ -695,6 +758,19 @@ class _TripExport(export._Export):
         home.update(self.named_at_home())
         return home, published
 
+    def named_published(self, picture, estimate):
+        """As a library's export, but never a named place found for a position in the home
+        area (named_at_home), whatever picture has it: a picture of a visit out of the
+        area may have the place the visit agreed on, found for the positions of the
+        others (named_places.agree), up to a few km from its own."""
+        if not export._Export.named_published(self, picture, estimate):
+            return False
+        if self.home is None:
+            return True
+        if self.named_home is None:
+            self.named_home = self.named_at_home()
+        return named_places.plain_words(picture.record.get("np") or "") not in self.named_home
+
     def named_at_home(self):
         """The named places (plain_words) found for positions in the home area, of any
         picture of the libraries (named_places.py)."""
@@ -747,7 +823,8 @@ class _TripExport(export._Export):
         if (estimate is not None and (record.get("ps") or record.get("pe"))
                 and self.home.contains(estimate.get("lat"), estimate.get("lon"))):
             return True
-        return (record.get("ci") or "", record.get("rg") or "", record.get("co") or "") in towns
+        return home_town((record.get("ci"), record.get("rg"), record.get("co"), record.get("cc")),
+                         towns)
 
     def trip_view(self, pictures):
         """data/trips.js's {enabled, best_per_day, trips: [the trip]} (see the module notes)."""

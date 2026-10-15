@@ -13,6 +13,7 @@ the network.
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -36,7 +37,7 @@ import serve
 import street_maps
 import tracks
 import trip_export
-from namedgen import area, offset, poi, square, write_streets
+from namedgen import address, area, building, offset, poi, square, write_streets
 from test_search_index import insert_image
 
 try:
@@ -282,8 +283,11 @@ class FindTest(Fixture, unittest.TestCase):
         plain = named_places.picture_facts(json.dumps(INDOOR))._asdict()
         self.assertEqual(self.find(DINER, 65, **plain), ("Lucky Casino", "casino", False))
         self.assertEqual(self.find(DINER, 65, **meal), ("Corner Diner", "restaurant", False))
-        # ... but by an aquarium, the aquarium (its own restaurant).
-        self.assertEqual(self.find(BASE, 65, **meal), ("Harbour Aquarium", "aquarium", False))
+        # By an aquarium, the place to eat the picture was taken in, the aquarium's own
+        # (named_places 4: what the picture shows, see IndoorTest); a picture that shows
+        # nothing to eat, the aquarium.
+        self.assertEqual(self.find(BASE, 65, **meal), ("Seaside Cafe", "cafe", False))
+        self.assertEqual(self.find(BASE, 65, **plain), ("Harbour Aquarium", "aquarium", False))
 
     def test_places_to_eat_shop_and_stay_go_by_their_distance(self):
         # (A gift shop 14 m away, a snack bar 16 m: the gift shop, whatever their reach.)
@@ -380,6 +384,529 @@ class FindTest(Fixture, unittest.TestCase):
                                                         "max_estimate_km": 1.0})
         self.assertEqual(named_places.settings({"named_places": {
             "enabled": "no", "max_estimate_km": 99}}), named_places.DEFAULTS)
+
+
+# Indoors: a made-up quay (far from the rest) with building outlines.
+QUAY = offset(*BASE, east_m=6000)
+AQUARIUM_HALL = offset(*QUAY, east_m=80)            # (the aquarium's own building)
+HOTEL_HALL = offset(*QUAY, north_m=300)             # (a hotel's own large building)
+PIER_HALL = offset(*QUAY, north_m=-300)             # (one building, two restaurants)
+GALLERIES = offset(*QUAY, east_m=600)
+THAI = offset(*QUAY, east_m=600, north_m=300)
+OUTFITTERS = offset(*QUAY, east_m=600, north_m=-300)
+FIELD = offset(*QUAY, east_m=-600)                  # (an airport's outline, east of it)
+ARTS_HALL = offset(*QUAY, east_m=-600, north_m=300)
+MARKET = offset(*QUAY, east_m=-600, north_m=-300)
+STADIUM = offset(*QUAY, east_m=1200)
+INDOOR_FEATURES = [
+    building(9001, square(*AQUARIUM_HALL, 25)),
+    poi(9001, "Reef Aquarium", "aquarium", *AQUARIUM_HALL, min_zoom=15),
+    # The aquarium's restaurant, in a building of its own next door (the position).
+    building(9100, square(*QUAY, 15)),
+    poi(9101, "Reef Grill", "restaurant", *offset(*QUAY, north_m=5), min_zoom=17),
+    address(9150, *offset(*QUAY, north_m=-5)),
+    # A hotel's building (its own id), its label 100 m from its lobby; a cafe in it.
+    building(9201, square(*HOTEL_HALL, 70)),
+    # (Its lobby a building part inside it, as buildings mapped in 3D have them.)
+    building(9203, square(*offset(*HOTEL_HALL, east_m=-50), 15), kind="building_part"),
+    poi(9201, "Harbour View Hotel", "hotel", *offset(*HOTEL_HALL, east_m=50), min_zoom=16),
+    poi(9202, "Lobby Coffee", "cafe", *offset(*HOTEL_HALL, east_m=-45), min_zoom=17),
+    # A pier building with a chip shop counter and a sushi bar.
+    building(9300, square(*PIER_HALL, 30)),
+    poi(9301, "Pier Chips", "restaurant", *offset(*PIER_HALL, north_m=8), min_zoom=17),
+    poi(9302, "Pier Sushi", "restaurant", *offset(*PIER_HALL, north_m=-25, east_m=-25),
+        min_zoom=17, kind_detail="sushi"),
+    # Two galleries side by side, outside any building outline.
+    poi(9401, "North Gallery", "gallery", *offset(*GALLERIES, north_m=50), min_zoom=16),
+    poi(9402, "South Gallery", "gallery", *offset(*GALLERIES, north_m=-72), min_zoom=16),
+    poi(9501, "Lotus Thai", "restaurant", *offset(*THAI, north_m=10), min_zoom=17,
+        kind_detail="thai"),
+    poi(9502, "Example Outfitters", "clothes", *offset(*OUTFITTERS, north_m=8), min_zoom=17),
+    area(9601, "aerodrome", square(*offset(*FIELD, east_m=230), 200)),
+    poi(9601, "Quay Field Airport", "aerodrome", *offset(*FIELD, east_m=230), min_zoom=12),
+    # A ferry terminal by the airport's outline (30 m west of it).
+    poi(9602, "Example Ferry Terminal", "ferry_terminal", *offset(*FIELD, north_m=150),
+        min_zoom=16),
+    building(9701, square(*ARTS_HALL, 40)),
+    poi(9701, "Example Arts Hall", "arts_centre", *offset(*ARTS_HALL, east_m=10), min_zoom=16),
+    poi(9801, "Quay Market Mall", "mall", *offset(*MARKET, east_m=80), min_zoom=15),
+    # A stadium's stands around its field (a hole in its outline), its point mid-field.
+    building(9901, square(*STADIUM, 120), holes=[square(*STADIUM, 70)]),
+    poi(9901, "Example Park Stadium", "stadium", *STADIUM, min_zoom=14),
+    building(9902, square(*offset(*STADIUM, east_m=150), 20), kind="building_part"),
+]
+TANK = {"title": "Fish in a tank", "setting": "indoor", "scene": "aquarium",
+        "subjects": ["fish tank", "fish"], "food": []}
+LUNCH = {"title": "Lunch", "setting": "indoor", "scene": "dining table",
+         "food": ["salad"], "event": "meal"}
+ROOM = {"title": "A bed", "setting": "indoor", "scene": "hotel room", "food": []}
+
+
+class IndoorTest(Fixture, unittest.TestCase):
+    """Indoors: the building outlines and what the picture shows (refine), against the
+    nearest place alone (choose)."""
+
+    def setUp(self):
+        super().setUp()
+        write_streets(FEATURES + INDOOR_FEATURES)
+
+    def find(self, where, info, accuracy=20.0):
+        facts = named_places.picture_facts(json.dumps(info))
+        found = named_places.find(where[0], where[1], accuracy, self.reader(), facts)
+        return (found.name, found.kind, found.inside) if found else None
+
+    def nearest(self, where, info, accuracy=20.0):
+        """What the place was before the building outlines and what the picture shows
+        counted: choose()'s, by the position and what the description says in words."""
+        facts = named_places.picture_facts(json.dumps(info))._replace(
+            shows=frozenset(), cuisines=frozenset(), food=False, nowhere=False)
+        return named_places.choose(named_places.candidates(where[0], where[1], accuracy,
+                                                           self.reader(), facts), accuracy)
+
+    def test_the_buildings_layer_is_read_with_holes_filled(self):
+        reader = self.reader()
+        self.assertEqual(reader.zoom, 15)
+        self.assertEqual(named_places.buildings_at(reader, *QUAY), {9100})
+        self.assertEqual(named_places.buildings_at(reader, *offset(*QUAY, east_m=40)), set())
+        # (A stadium's point mid-field: in the stands' outline, its hole filled; a
+        # building part counts as a building, and so does the building around it.)
+        self.assertEqual(named_places.buildings_at(reader, *STADIUM), {9901})
+        self.assertEqual(named_places.buildings_at(reader, *offset(*STADIUM, north_m=100)),
+                         {9901})
+        self.assertEqual(named_places.buildings_at(reader, *offset(*STADIUM, east_m=150)),
+                         {9902})
+        self.assertEqual(named_places.buildings_at(reader, *offset(*HOTEL_HALL, east_m=-50)),
+                         {9201, 9203})
+        self.assertEqual(named_places.building_of(reader, 9001, *AQUARIUM_HALL), ({9001}, True))
+        self.assertEqual(named_places.building_of(reader, 9101, *offset(*QUAY, north_m=5)),
+                         ({9100}, False))
+        self.assertEqual(named_places.building_of(reader, 9202, *offset(*HOTEL_HALL,
+                                                                        east_m=-45)),
+                         ({9201, 9203}, False))
+        metres = named_places.building_metres(reader, {9001}, *AQUARIUM_HALL, *QUAY)
+        self.assertTrue(53 <= metres <= 57, metres)
+        # (Only buildings and building parts: no address point.)
+        outlines = reader.outlines(*[int(value) for value in named_places._tile_xy(
+            QUAY[0], QUAY[1], reader.zoom)])
+        self.assertNotIn(9150, outlines.ids)
+
+    def test_a_meal_in_the_restaurant_next_to_the_aquarium_names_the_restaurant(self):
+        # (The fix is in the restaurant's building; the aquarium's point is 80 m off.)
+        self.assertEqual(self.nearest(QUAY, LUNCH).name, "Reef Aquarium")
+        self.assertEqual(self.find(QUAY, LUNCH), ("Reef Grill", "restaurant", False))
+        # ... but the tanks the picture shows name the aquarium, whatever building the
+        # fix drifted into.
+        self.assertEqual(self.find(QUAY, TANK), ("Reef Aquarium", "aquarium", False))
+        # Taken inside the aquarium's own building: "taken inside it".
+        self.assertEqual(self.find(offset(*AQUARIUM_HALL, north_m=15), TANK),
+                         ("Reef Aquarium", "aquarium", True))
+
+    def test_a_venue_named_in_the_picture_is_taken_inside_its_own_building(self):
+        # (A sign, or the title, naming the aquarium: no less "taken inside it".)
+        inside = offset(*AQUARIUM_HALL, north_m=15)
+        for info in (dict(TANK, text="REEF AQUARIUM - feeding at noon"),
+                     dict(TANK, title="Fish in a tank at the Reef Aquarium")):
+            facts = named_places.picture_facts(json.dumps(info))
+            found = named_places.find(inside[0], inside[1], 20.0, self.reader(), facts)
+            self.assertEqual((found.name, found.metres, found.inside, found.named, found.why),
+                             ("Reef Aquarium", 0, True, True, "named"), info)
+        # Outside its building (the restaurant's next door), in a parking garage in it, or
+        # taken outdoors (a sign is most often seen from outside): named, not inside.
+        signed = dict(TANK, text="REEF AQUARIUM")
+        self.assertEqual(self.find(QUAY, signed), ("Reef Aquarium", "aquarium", False))
+        for info in (dict(signed, scene="parking garage"), dict(signed, setting="outdoor")):
+            self.assertEqual(self.find(inside, info), ("Reef Aquarium", "aquarium", False),
+                             info)
+
+    def test_a_venue_mapped_twice_is_taken_inside_its_own_building(self):
+        # The aquarium also mapped as a point inside its own outline, 2 m from the position
+        # (nearer than the outline's own place, which is its building's): still "taken
+        # inside it", with or without a sign naming it.
+        write_streets(FEATURES + INDOOR_FEATURES + [
+            poi(9003, "Reef Aquarium", "aquarium", *offset(*AQUARIUM_HALL, north_m=13),
+                min_zoom=16)])
+        inside = offset(*AQUARIUM_HALL, north_m=15)
+        for info in (TANK, dict(TANK, text="REEF AQUARIUM")):
+            self.assertEqual(self.find(inside, info), ("Reef Aquarium", "aquarium", True), info)
+
+    def test_the_buildings_own_place_before_what_is_mapped_inside_it(self):
+        lobby = offset(*HOTEL_HALL, east_m=-50)
+        # (The hotel's label is 100 m from the lobby: too far for its reach.)
+        self.assertIsNone(self.nearest(lobby, ROOM, accuracy=65.0))
+        self.assertEqual(self.find(lobby, ROOM, accuracy=65.0),
+                         ("Harbour View Hotel", "hotel", True))
+        # A coffee: the cafe in it.
+        coffee = {"title": "A latte", "setting": "indoor", "scene": "cafe",
+                  "food": ["latte"]}
+        self.assertEqual(self.find(lobby, coffee, accuracy=65.0),
+                         ("Lobby Coffee", "cafe", False))
+
+    def test_a_building_part_and_the_building_around_it_are_one_building(self):
+        # (The lobby is a building part inside the hotel's own outline: taken inside the
+        # hotel, also for a picture that shows no kind of place.)
+        lobby = offset(*HOTEL_HALL, east_m=-50)
+        hall = {"title": "Waiting", "setting": "indoor", "scene": "hall", "food": []}
+        self.assertEqual(self.find(lobby, hall, accuracy=65.0),
+                         ("Harbour View Hotel", "hotel", True))
+        self.assertEqual(self.find(offset(*lobby, north_m=30), hall, accuracy=65.0),
+                         ("Harbour View Hotel", "hotel", True))
+
+    def test_a_building_across_a_tile_border_is_measured_where_the_position_is(self):
+        # A museum's own building reaches 15 m past the east border of its tile; the
+        # tiles are cut 64 units past their borders, as the real ones are. A picture
+        # 5 m east of its wall, in the next tile, is by the museum's building: the
+        # museum (that the picture shows no kind of place does not drop it).
+        near = offset(*QUAY, north_m=-900)
+        fx, _fy = named_places._tile_xy(near[0], near[1], 15)
+        edge = (near[0], (math.floor(fx) + 1) / float(1 << 15) * 360.0 - 180.0)
+        museum = offset(*edge, east_m=-20)
+        write_streets(FEATURES + INDOOR_FEATURES + [
+            building(9951, [offset(*edge, -40, -40), offset(*edge, -40, 15),
+                            offset(*edge, 40, 15), offset(*edge, 40, -40)]),
+            poi(9951, "Example Border Museum", "museum", *museum, min_zoom=16)], buffer=64)
+        reader = self.reader()
+        position = offset(*edge, east_m=20)
+        self.assertNotEqual(named_places._tile_xy(position[0], position[1], 15)[0] // 1,
+                            fx // 1)
+        metres = named_places.building_metres(reader, {9951}, *museum, *position)
+        self.assertTrue(3 <= metres <= 7, metres)
+        hall = {"title": "A hall", "setting": "indoor", "scene": "hall", "food": []}
+        self.assertEqual(self.find(position, hall, accuracy=30.0),
+                         ("Example Border Museum", "museum", False))
+
+    def test_the_edges_a_tiles_border_cut_are_left_out_not_those_just_past_it(self):
+        # (Tile units: one building whose west wall is 30 units past the tile's west
+        # border, another cut by the border 64 units past it.)
+        Feature = named_places.Feature
+        outlines = named_places.Outlines(4096, [
+            Feature(1, 3, {}, [[(-30, 1000), (500, 1000), (500, 1200), (-30, 1200)]]),
+            Feature(2, 3, {}, [[(-64, 2000), (300, 2000), (300, 2200), (-64, 2200)]])])
+        self.assertEqual(outlines.cuts, ({-64}, set()))
+        self.assertAlmostEqual(outlines.distance(1, -50, 1100), 20.0)
+        self.assertAlmostEqual(outlines.distance(2, -80, 2100), math.hypot(16, 100))
+        self.assertEqual(named_places._cuts([[[(10, 10), (20, 10), (20, 20)]]], 4096),
+                         (set(), set()))
+
+    def test_two_restaurants_in_one_building_name_neither_unless_the_food_says(self):
+        # (The chip shop is 8 m away, the sushi bar 35 m: the nearer one, before.)
+        self.assertEqual(self.nearest(PIER_HALL, LUNCH).name, "Pier Chips")
+        self.assertIsNone(self.find(PIER_HALL, LUNCH))
+        sushi = dict(LUNCH, food=["sushi", "pickled ginger"])
+        self.assertEqual(self.find(PIER_HALL, sushi), ("Pier Sushi", "restaurant", False))
+
+    def test_a_dish_of_another_cuisine_is_not_from_the_place_next_door(self):
+        burger = dict(LUNCH, food=["burger", "fries"])
+        self.assertIsNone(self.find(THAI, burger))
+        self.assertEqual(named_places.picture_facts(json.dumps(burger)).cuisines,
+                         frozenset(("burger",)))
+        # A drink fits any cuisine (a coffee with a curry).
+        coffee = dict(LUNCH, food=["coffee"])
+        self.assertEqual(self.find(THAI, coffee), ("Lotus Thai", "restaurant", False))
+
+    def test_a_kind_of_shop_is_named_only_for_a_picture_that_shows_one(self):
+        fitting = {"title": "Trying on a shirt", "setting": "indoor", "scene": "fitting room",
+                   "food": []}
+        self.assertIn("clothes", named_places.picture_facts(json.dumps(fitting)).shows)
+        self.assertEqual(self.find(OUTFITTERS, fitting), ("Example Outfitters", "clothes",
+                                                          False))
+        self.assertIsNone(self.find(OUTFITTERS, {"title": "A face", "setting": "indoor"}))
+
+    def test_a_picture_of_an_airport_near_the_edge_of_its_outline_names_it(self):
+        terminal = {"title": "Waiting", "setting": "indoor", "scene": "airport terminal",
+                    "subjects": ["baggage claim"]}
+        outside = offset(*FIELD, east_m=10)         # (20 m outside the outline)
+        self.assertIsNone(self.nearest(outside, terminal))
+        self.assertEqual(self.find(outside, terminal), ("Quay Field Airport", "aerodrome",
+                                                        True))
+        self.assertIsNone(self.find(outside, {"title": "A face", "setting": "indoor"}))
+        self.assertIsNone(self.find(offset(*FIELD, east_m=-60), terminal))
+        # A ferry's or a bus's terminal by the airport's outline is no airport's.
+        by_ferry = offset(*FIELD, north_m=150, east_m=10)     # (20 m outside the outline)
+        for scene in ("ferry terminal", "bus terminal"):
+            self.assertEqual(self.find(by_ferry, {"title": "Waiting", "setting": "indoor",
+                                                  "scene": scene}),
+                             ("Example Ferry Terminal", "ferry_terminal", False), scene)
+
+    def test_only_a_place_to_eat_that_fits_counts_from_beyond_its_reach(self):
+        # A scene word fits several kinds ("museum": a gallery too): the north gallery,
+        # 70 m away (beyond its reach of 60), is not named for it.
+        exhibits = {"title": "Old maps", "setting": "indoor", "scene": "museum"}
+        self.assertIsNone(self.find(offset(*GALLERIES, north_m=120), exhibits))
+        # A place to eat that fits the food shown, 45 m away (beyond its reach of 40):
+        # where it is sat in is often further from a fix indoors.
+        noodles = dict(LUNCH, food=["pad thai"])
+        self.assertEqual(self.find(offset(*THAI, north_m=55), noodles),
+                         ("Lotus Thai", "restaurant", False))
+
+    def test_a_sign_naming_a_venue_reaches_further_than_its_kind(self):
+        # A bookshop 40 m north of a position taken indoors: beyond its reach (15 m, and
+        # half of the 15 m of the 20 m it may be off that count: 22.5 m), outside any
+        # building outline. The sign in the picture names it: it is named from
+        # NAMED_EXTRA_M further.
+        shop = offset(*QUAY, east_m=-1200)
+        write_streets(FEATURES + INDOOR_FEATURES + [
+            poi(9961, "Example Page Books", "books", *offset(*shop, north_m=40),
+                min_zoom=17)])
+        sign = {"title": "Shelves of novels", "setting": "indoor", "scene": "shop",
+                "text": "EXAMPLE PAGE BOOKS - new and used", "food": []}
+        self.assertIsNone(self.nearest(shop, sign))
+        self.assertEqual(self.find(shop, sign), ("Example Page Books", "books", False))
+        with mock.patch.object(named_places, "NAMED_EXTRA_M", 0.0):
+            self.assertIsNone(self.find(shop, sign))
+        # Without the sign, nothing; with it but further than that, nothing either.
+        self.assertIsNone(self.find(shop, dict(sign, text="")))
+        self.assertIsNone(self.find(offset(*shop, north_m=-20), sign))
+
+    def test_no_named_place_where_there_is_none(self):
+        # A parking garage in the arts centre's building is not the arts centre.
+        garage = {"title": "Our car on level 2", "setting": "indoor",
+                  "scene": "parking garage", "food": []}
+        self.assertEqual(self.nearest(ARTS_HALL, garage).name, "Example Arts Hall")
+        self.assertTrue(named_places.picture_facts(json.dumps(garage)).nowhere)
+        self.assertIsNone(self.find(ARTS_HALL, garage))
+        # A plate on a picnic table by a mall was not eaten in the mall.
+        plate = {"title": "Shrimp salad", "setting": "outdoor", "scene": "picnic table",
+                 "food": ["shrimp", "salad"]}
+        self.assertEqual(self.nearest(MARKET, plate).name, "Quay Market Mall")
+        self.assertIsNone(self.find(MARKET, plate))
+        self.assertEqual(self.find(MARKET, {"title": "Shoppers", "setting": "outdoor",
+                                            "scene": "lawn"}),
+                         ("Quay Market Mall", "mall", False))
+
+    def test_two_galleries_side_by_side_name_neither(self):
+        art = {"title": "Old paintings", "setting": "indoor", "scene": "art gallery"}
+        # (The north one is 50 m away, the south one 72 m: beyond its reach, not by much.)
+        self.assertEqual(self.nearest(GALLERIES, art).name, "North Gallery")
+        self.assertIsNone(self.find(GALLERIES, art))
+        self.assertEqual(self.find(offset(*GALLERIES, north_m=40), art),
+                         ("North Gallery", "gallery", False))
+
+    def test_only_the_pictures_taken_inside_read_the_building_outlines(self):
+        reader = self.reader()
+        facts = named_places.picture_facts(json.dumps({"title": "Boats", "setting": "outdoor",
+                                                       "scene": "harbour"}))
+        named_places.find(QUAY[0], QUAY[1], 20.0, reader, facts)
+        self.assertEqual(len(reader.built), 0)
+        named_places.find(QUAY[0], QUAY[1], 20.0, reader,
+                          named_places.picture_facts(json.dumps(LUNCH)))
+        self.assertGreater(len(reader.built), 0)
+
+    def test_what_a_description_shows(self):
+        facts = named_places.picture_facts(json.dumps(
+            {"title": "Fish", "setting": "indoor", "scene": "public hall",
+             "subjects": ["jellyfish"], "tags": ["shark"]}))
+        self.assertIn("aquarium", facts.shows)
+        self.assertNotIn("aquarium", facts.hints)
+        view = named_places.picture_facts(json.dumps(
+            {"title": "The city from the observation deck", "setting": "indoor",
+             "subjects": ["museum"]}))
+        self.assertEqual(view.shows, named_places.VIEW_KINDS)
+        meal = named_places.picture_facts(json.dumps(
+            {"title": "Pad thai", "setting": "indoor", "food": ["pad thai", "coffee"]}))
+        self.assertEqual((meal.food, meal.cuisines), (True, frozenset(("thai", "coffee"))))
+        self.assertEqual(named_places._cuisine_fit(frozenset(("thai",)), {"burger"}), -1)
+        self.assertEqual(named_places._cuisine_fit(frozenset(("coffee",)), {"burger"}), 0)
+        self.assertEqual(named_places._cuisine_fit(frozenset(("burger",)), {"burger"}), 1)
+        self.assertEqual(named_places.cuisines_of({"kind_detail": "sushi;japanese"},
+                                                  "Example House"), {"sushi", "ramen"})
+        self.assertEqual(named_places.cuisines_of({}, "Example Pizza Corner"), {"pizza"})
+        # (Outdoors, no parking garage counts: a lot is where many places are.)
+        self.assertFalse(named_places.picture_facts(json.dumps(
+            {"title": "Car", "setting": "outdoor", "scene": "parking garage"})).nowhere)
+        # What it shows is part of the facts the rows are kept with: a new description
+        # that shows something else is looked up again.
+        plain = named_places.Position(1, 0.0, 0.0, 20.0, "gps", named_places.picture_facts(
+            json.dumps({"title": "Fish", "setting": "indoor"})))
+        shown = plain._replace(facts=facts._replace(words=plain.facts.words))
+        self.assertNotEqual(named_places._facts_text(plain), named_places._facts_text(shown))
+        # ... and so is the minute it was taken (its visit), when known.
+        taken = plain._replace(taken="2024-05-01T10:05:42")
+        self.assertEqual(named_places._facts_text(taken),
+                         named_places._facts_text(plain) + "@2024-05-01T10:05")
+        self.assertNotEqual(named_places._facts_text(taken._replace(taken="2024-05-01T13:05:42")),
+                            named_places._facts_text(taken))
+        self.assertTrue(named_places.approximate({"source": "owner",
+                                                  "facts": "pa@2024-05-01T10:05"}))
+        self.assertFalse(named_places.approximate({"source": "gps",
+                                                   "facts": "psi@2024-05-01T10:05"}))
+
+    def test_words_found_elsewhere_too_show_no_kind_of_place(self):
+        def shows(setting="indoor", **info):
+            return named_places.picture_facts(json.dumps(dict(info, setting=setting))).shows
+
+        hotels = {"hotel", "motel", "hostel", "resort"}
+        fairs = {"conference_centre", "exhibition_centre", "events_venue"}
+        self.assertFalse(shows(title="Salmon on a bed of rice", food=["salmon"]) & hotels)
+        self.assertFalse(shows(title="Pancakes", scene="diner booth", food=["pancakes"]) & fairs)
+        self.assertFalse(shows(title="Dessert", tags=["food presentation"]) & fairs)
+        self.assertNotIn("zoo", shows("outdoor", title="Sea lions on the dock"))
+        self.assertNotIn("station", shows(title="Kids at the model trains",
+                                          scene="living room"))
+        self.assertNotIn("winery", shows(title="Steak dinner", scene="restaurant",
+                                         subjects=["wine barrels"]))
+        self.assertNotIn("supermarket", shows(title="Unpacking groceries", scene="kitchen"))
+        self.assertFalse(shows(title="Flowers", scene="garden", subjects=["flower beds"]))
+        self.assertFalse(named_places._indoorish(named_places.picture_facts(json.dumps(
+            {"title": "Flowers", "setting": "outdoor", "scene": "garden",
+             "subjects": ["flower beds"]}))))
+        self.assertFalse(shows(title="Waiting", scene="ferry terminal") & {"aerodrome",
+                                                                           "airport"})
+        # What names the place still does.
+        self.assertIn("hotel", shows(title="A made hotel bed"))
+        self.assertIn("conference_centre", shows(title="Exhibitor booths"))
+        self.assertIn("zoo", shows("outdoor", title="Lions resting"))
+        self.assertIn("station", shows(title="Trains at the platform"))
+        self.assertIn("airport", shows(title="Planes", subjects=["airline counter"]))
+        self.assertIn("winery", shows(title="Casks", scene="barrel room"))
+
+
+class VisitTest(Fixture, unittest.TestCase):
+    """The pictures of one visit agree on its place."""
+
+    def setUp(self):
+        super().setUp()
+        write_streets(FEATURES + INDOOR_FEATURES)
+        self.inside = inside = offset(*AQUARIUM_HALL, north_m=10)
+        self.tanks = [self.picture("tank-%d.jpg" % number, *inside, info=TANK,
+                                   taken_at="2024-05-01T10:%02d:00" % number,
+                                   gps={"GPSHPositioningError": 15.0})
+                      for number in (1, 2)]
+        # A close-up of a fish, its fix 200 m off (more than MAX_ACCURACY_M): areas only.
+        far = offset(*AQUARIUM_HALL, north_m=150)
+        self.fish = self.picture("fish-close.jpg", *far,
+                                 info={"title": "A fish", "setting": "indoor",
+                                       "scene": "close-up"},
+                                 taken_at="2024-05-01T10:05:00",
+                                 gps={"GPSHPositioningError": 200.0})
+        # The same an hour later: another visit.
+        self.later = self.picture("fish-later.jpg", *far,
+                                  info={"title": "A fish", "setting": "indoor",
+                                        "scene": "close-up"},
+                                  taken_at="2024-05-01T11:30:00",
+                                  gps={"GPSHPositioningError": 200.0})
+
+    def test_a_picture_of_a_visit_takes_the_place_the_others_agree_on(self):
+        summary = named_places.update(self.conn, self.config)
+        rows = named_places.stored(self.conn)
+        for tank in self.tanks:
+            self.assertEqual((rows[tank]["name"], rows[tank]["inside"]), ("Reef Aquarium", 1))
+        self.assertEqual(rows[self.fish]["name"], "Reef Aquarium")
+        self.assertEqual(rows[self.later]["name"], "")
+        self.assertEqual(summary["agreed"], 1)
+        # (Its distance is the fix's: 150 m, and the fix may be 200 m off: "nearby".)
+        keys = named_places.record_keys(rows[self.fish])
+        self.assertEqual((keys["np"], keys.get("na"), keys.get("nd")), ("Reef Aquarium", 1, None))
+        found = [position.image_id for members in named_places.visits(
+            named_places.positions(self.conn, self.config)) for _seconds, position in members]
+        self.assertEqual(sorted(found), sorted(self.tanks + [self.fish]))
+
+    def test_a_visit_is_looked_up_whole(self):
+        named_places.update(self.conn, self.config)
+        self.conn.execute("UPDATE images SET info = ? WHERE id = ?",
+                          (json.dumps(dict(TANK, title="Fish in a big tank")), self.tanks[0]))
+        self.conn.commit()
+        summary = named_places.update(self.conn, self.config)
+        self.assertEqual(summary["looked_up"], 3)
+        self.assertEqual(named_places.stored(self.conn)[self.fish]["name"], "Reef Aquarium")
+
+    def set(self, image_id, **values):
+        self.conn.execute("UPDATE images SET %s WHERE id = ?" % ", ".join(
+            "%s = ?" % name for name in values), list(values.values()) + [image_id])
+        self.conn.commit()
+
+    def names(self, *ids):
+        rows = named_places.stored(self.conn)
+        return tuple(rows[image_id]["name"] for image_id in ids)
+
+    def test_a_picture_whose_time_changed_is_in_another_visit(self):
+        named_places.update(self.conn, self.config)
+        self.assertEqual(self.names(self.fish, self.later), ("Reef Aquarium", ""))
+        # (Their times set right: the close-up was taken later, the other one then.)
+        self.set(self.fish, taken_at="2024-05-01T11:35:00")
+        self.set(self.later, taken_at="2024-05-01T10:05:00")
+        summary = named_places.update(self.conn, self.config)
+        self.assertEqual(summary["looked_up"], 4)
+        self.assertEqual(self.names(self.fish, self.later), ("", "Reef Aquarium"))
+
+    def test_the_visit_of_a_picture_that_lost_its_position_is_looked_up_again(self):
+        named_places.update(self.conn, self.config)
+        self.assertEqual(self.names(self.fish), ("Reef Aquarium",))
+        # (One tank picture's position set aside: one shot of the tanks is left, too few
+        # for the close-up that shows nothing of them.)
+        self.set(self.tanks[0], lat=None, lon=None)
+        summary = named_places.update(self.conn, self.config)
+        self.assertEqual((summary["removed"], summary["looked_up"]), (1, 2))
+        self.assertEqual(self.names(self.tanks[1], self.fish), ("Reef Aquarium", ""))
+
+    def test_copies_of_one_shot_vote_once(self):
+        # (The second tank picture a copy of the first: the same time and position.)
+        self.set(self.tanks[1], taken_at="2024-05-01T10:01:00")
+        named_places.update(self.conn, self.config)
+        self.assertEqual(self.names(self.fish), ("",))
+        self.picture("tank-3.jpg", *self.inside, info=TANK, taken_at="2024-05-01T10:03:00",
+                     gps={"GPSHPositioningError": 15.0})
+        named_places.update(self.conn, self.config)
+        self.assertEqual(self.names(self.fish), ("Reef Aquarium",))
+
+    def test_a_visit_more_than_the_quick_limit_looks_up_the_changed_picture_at_once(self):
+        named_places.update(self.conn, self.config)
+        moved = offset(*self.inside, north_m=2)
+        self.set(self.tanks[0], lat=moved[0], lon=moved[1])
+        # (Its visit has three pictures: the moved one now, the others with it next time.)
+        summary = named_places.update(self.conn, self.config, limit=2)
+        self.assertEqual(summary["looked_up"], 1)
+        rows = named_places.stored(self.conn)
+        self.assertTrue(named_places.applies(rows[self.tanks[0]], moved[0], moved[1], ("gps",)))
+        self.assertEqual(rows[self.tanks[0]]["name"], "Reef Aquarium")
+        self.assertEqual((rows[self.tanks[1]]["maps"], rows[self.fish]["maps"]), ("", ""))
+        self.assertEqual(rows[self.later]["maps"], named_places.maps_key())
+        self.assertEqual(named_places.update(self.conn, self.config)["looked_up"], 3)
+        rows = named_places.stored(self.conn)
+        self.assertEqual({rows[image_id]["maps"] for image_id in self.tanks + [self.fish]},
+                         {named_places.maps_key()})
+        self.assertEqual(self.names(self.fish), ("Reef Aquarium",))
+
+    def test_a_visits_area_is_taken_inside_it_only_from_inside(self):
+        # Two pictures of the giraffes inside the zoo; a room 110 m north of its outline
+        # (nothing of it shown, near enough: the zoo, "nearby"), and a corridor inside it
+        # whose position may be too far off to tell (the zoo, taken inside it).
+        house = {"title": "Giraffes", "setting": "indoor", "scene": "giraffe house"}
+        for minute in (0, 2):
+            self.picture("giraffes-%d.jpg" % minute, *offset(*ZOO, north_m=200), info=house,
+                         taken_at="2024-05-02T14:%02d:00" % minute,
+                         gps={"GPSHPositioningError": 20.0})
+        room = self.picture("room.jpg", *offset(*ZOO, north_m=360),
+                            info={"title": "Us", "setting": "indoor", "scene": "room"},
+                            taken_at="2024-05-02T14:04:00", gps={"GPSHPositioningError": 20.0})
+        corridor = self.picture("corridor.jpg", *offset(*ZOO, north_m=220),
+                                info={"title": "Us", "setting": "indoor", "scene": "corridor"},
+                                taken_at="2024-05-02T14:06:00",
+                                gps={"GPSHPositioningError": 150.0})
+        named_places.update(self.conn, self.config)
+        rows = named_places.stored(self.conn)
+        self.assertEqual(named_places.record_keys(rows[room]),
+                         {"np": "City Zoo", "nk": "zoo", "na": 1})
+        self.assertEqual(named_places.record_keys(rows[corridor]),
+                         {"np": "City Zoo", "nk": "zoo", "ni": 1})
+
+    def test_a_visit_is_written_as_it_goes(self):
+        # (Other writers get in between the visits and the other pictures: see
+        # test_other_writers_get_in_while_places_are_looked_up.)
+        other = db.connect()
+        self.addCleanup(other.close)
+        seen = []
+        real = named_places.find
+
+        def counting(*args, **kwargs):
+            seen.append(other.execute("SELECT COUNT(*) FROM named_places").fetchone()[0])
+            return real(*args, **kwargs)
+
+        with mock.patch.object(named_places, "find", counting), \
+                mock.patch.object(named_places, "COMMIT_SECONDS", 0.0):
+            named_places.update(self.conn, self.config)
+        # (The visit of three first or last: the other picture's row is written before
+        # or after it, never in its middle.)
+        self.assertIn(seen, ([0, 0, 0, 3], [0, 1, 1, 1]))
 
 
 class FakeIndex:
@@ -663,17 +1190,32 @@ class UpdateTest(Fixture, unittest.TestCase):
 class ReachTest(unittest.TestCase):
 
     def test_the_map_page_knows_how_far_each_kind_reaches(self):
-        # static/streets.js PLACE_REACH (the circle a picked place searches) is KINDS'.
+        # static/streets.js PLACE_REACH (the circle a picked place searches) is KINDS' and
+        # SHOWN_SHOPS' (a clothes shop is named for a picture that shows one).
         with open(os.path.join(support.REPO, "static", "streets.js"), encoding="utf-8") as handle:
             text = handle.read()
         table = text[text.index("var PLACE_REACH = {"):]
-        table = table[table.index("{") + 1:table.index("}")]
+        table = re.sub(r"//[^\n]*", "", table[table.index("{") + 1:table.index("}")])
         reach = {name.strip().strip('"'): int(value) for name, value in
                  (pair.split(":") for pair in table.split(",") if pair.strip())}
-        self.assertEqual(reach, {kind: metres for kind, (_group, metres)
-                                 in named_places.KINDS.items()})
+        wanted = {kind: metres for kind, (_group, metres) in named_places.KINDS.items()}
+        wanted.update(named_places.SHOWN_SHOPS)
+        self.assertEqual(reach, wanted)
         indoor = re.search(r"var PLACE_INDOOR_M = (\d+);", text).group(1)
         self.assertEqual(float(indoor), named_places.INDOOR_ACCURACY_M)
+
+    def test_the_viewer_says_what_a_shop_named_only_when_shown_sells(self):
+        # static/viewer.js KIND_WORDS: a kind of SHOWN_SHOPS whose name alone says little
+        # ("car", "outdoor") reads as the shop it is ("car dealer").
+        with open(os.path.join(support.REPO, "static", "viewer.js"), encoding="utf-8") as handle:
+            text = handle.read()
+        table = text[text.index("var KIND_WORDS = {"):]
+        table = table[table.index("{") + 1:table.index("}")]
+        words = dict(re.findall(r'(\w+): "([^"]+)"', table))
+        self.assertEqual(words["car"], "car dealer")
+        for kind in named_places.SHOWN_SHOPS:
+            self.assertTrue(kind in words or kind in ("supermarket", "florist", "variety_store"),
+                            kind)
 
 
 class RecordTest(Fixture, unittest.TestCase):
@@ -852,6 +1394,17 @@ class CommandLineTest(Fixture, unittest.TestCase):
         self.assertIn("Named places: 1 of 1 picture(s)", printed)
         code, printed = self.run_main()
         self.assertIn("1 of 1 picture(s) with a position have a named place (1 gps)", printed)
+        self.assertNotIn("older rules", printed)
+        self.assertEqual(named_places.status(self.conn, self.config)["older"], 0)
+        # Rows of older rules (a new version of them): the status says so, until an
+        # update looks them up again.
+        with mock.patch.object(named_places, "RULES_VERSION", named_places.RULES_VERSION + 1):
+            self.assertEqual(named_places.status(self.conn, self.config)["older"], 1)
+            code, printed = self.run_main()
+            self.assertIn("1 of them was looked up with older rules or street maps: "
+                          "python named_places.py --update", printed)
+            self.run_main("--update")
+            self.assertEqual(named_places.status(self.conn, self.config)["older"], 0)
         code, printed = self.run_main("--redo")
         self.assertIn("1 looked up", printed)
         code, printed = self.run_main("--lookup", str(BASE[0]), str(BASE[1]))
@@ -1111,6 +1664,43 @@ class TripTest(test_trip_export.TripExportTest):
         self.assertNotIn("np", records["Drive 1"])
         self.assertEqual(records["Picture 10-0"]["np"], "Lake Museum")
 
+    def test_no_named_place_found_in_the_home_area_for_a_picture_out_of_it(self):
+        # A picture of a visit 1 km out of the home area (not in home's town) with the
+        # place the visit agreed on, found for the positions of its pictures in the home
+        # area (named_places.agree: up to a few km from its own): it does not go.
+        home_area = trip_export.HomeArea(test_trip_export.HOME, trip_export.HOME_KM)
+        east = home_area.west + home_area.width
+        lat = test_trip_export.HOME[0]
+        cursor = self.conn.execute(
+            "INSERT INTO images (library_id, path, name, size, mtime, ctime, width, height, "
+            "added, updated, taken_at, taken_source, content_hash, lat, lon, has_preview, "
+            "info, described, prompt_ver, place_city, place_region, place_country, place_cc, "
+            "place_km) VALUES (?, 'out.jpg', 'out.jpg', 1000, 1, 1, 160, 120, 1, 1, "
+            "'2024-05-10T06:05:00', 'exif', 'out', ?, ?, 1, ?, 1, 5, 'Edgeton', "
+            "'Region One', 'Countryland', 'CL', 1.0)",
+            (test_trip_export.LAKES, lat, east + 0.012,
+             json.dumps(test_trip_export.info("Picture out", ["view"]))))
+        out_id = cursor.lastrowid
+        import cache
+        import imagegen
+        thumb = imagegen.jpeg_bytes(imagegen.textured_image((160, 120)))
+        with cache.ThumbStore() as thumbs:
+            thumbs.put(out_id, thumb)
+        cache.PreviewStore().write(test_trip_export.LAKES, out_id, thumb)
+        self.conn.commit()
+        self.assertFalse(home_area.contains(lat, east + 0.012))
+        named_places.update(self.conn, common.load_config())
+        self.conn.execute("UPDATE named_places SET name = 'Homeside Park', kind = 'park', "
+                          "metres = 0, inside = 0 WHERE image_id = ?", (out_id,))
+        self.conn.commit()
+        out, _summary = self.export("named-visit", {"location": True, "story": True})
+        records = self.records(out)
+        self.assertEqual(records["Picture out"].get("ci"), "Edgeton")
+        for key in named_places.RECORD_KEYS:
+            self.assertNotIn(key, records["Picture out"])
+        self.assertEqual(records["Picture 10-0"]["np"], "Lake Museum")
+        self.assertNotIn("Homeside", "\n".join(self.texts(out).values()))
+
     def test_a_smart_album_that_names_a_place_at_home_is_left_out(self):
         import albums
         for name, query in (("Park at home", 'place:"homeside park"'),
@@ -1209,6 +1799,32 @@ class AdminTest(Fixture, unittest.TestCase):
         self.assertEqual((row["name"], row["source"]), ("City Zoo", "owner"))
         self.assertEqual(named_places.RECORD_KEYS, ("np", "nk", "nd", "ni", "na"))
 
+    def test_choosing_a_place_answers_the_other_pictures_of_its_visit(self):
+        # A visit at the made-up quay's aquarium: a picture of its tanks, a close-up whose
+        # fix is 200 m off (one shot of the tanks is too few for it to take their place)
+        # and a picture of the tanks without a position. Its place set in the aquarium,
+        # it is a second shot of the tanks: the close-up is the aquarium's too.
+        write_streets(FEATURES + INDOOR_FEATURES)
+        place_estimates.ensure_tables(self.conn)
+        inside = offset(*AQUARIUM_HALL, north_m=10)
+        self.picture("tank.jpg", *inside, info=TANK, taken_at="2024-05-01T10:01:00",
+                     gps={"GPSHPositioningError": 15.0})
+        fish = self.picture("fish.jpg", *offset(*AQUARIUM_HALL, north_m=150),
+                            info={"title": "A fish", "setting": "indoor", "scene": "close-up"},
+                            taken_at="2024-05-01T10:05:00", gps={"GPSHPositioningError": 200.0})
+        tank = self.picture("tank-2.jpg", info=TANK, taken_at="2024-05-01T10:03:00")
+        named_places.update(self.conn, self.config)
+        self.assertEqual(named_places.stored(self.conn)[fish]["name"], "")
+        with mock.patch("places.shared", lambda: None):
+            reply = self.post("/images/%d/place" % tank,
+                              {"choice": "set", "lat": inside[0], "lon": inside[1]})
+        self.assertEqual(reply.status_code, 200, reply.get_data(as_text=True))
+        answer = reply.get_json()
+        # (Its own record has it when its place has names: none here.)
+        self.assertEqual(named_places.stored(self.conn)[tank]["name"], "Reef Aquarium")
+        self.assertEqual((answer["others"][str(fish)]["np"], answer["more"]),
+                         ("Reef Aquarium", 0))
+
 
 @unittest.skipIf(NODE is None, "Node.js is not installed")
 class KindsTest(unittest.TestCase):
@@ -1229,8 +1845,19 @@ class KindsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = json.loads(result.stdout)
         found = {kind for line in lines for kind in line["kinds"]}
-        self.assertEqual(found - set(named_places.KINDS), set())
+        # (And shops named only for a picture that shows one, by what the viewer calls
+        # them: "car dealers".)
+        self.assertEqual(found - set(named_places.KINDS) - set(named_places.SHOWN_SHOPS),
+                         set())
         self.assertEqual(set(named_places.KINDS) - found, self.BY_NAME_ONLY)
+        with open(os.path.join(support.REPO, "static", "viewer.js"), encoding="utf-8") as handle:
+            text = handle.read()
+        table = text[text.index("var KIND_WORDS = {"):]
+        words = dict(re.findall(r'(\w+): "([^"]+)"', table[:table.index("}")]))
+        keys = {line["key"]: line for line in lines}
+        for kind in named_places.SHOWN_SHOPS:
+            self.assertIn(words.get(kind, kind.replace("_", " ")).lower(), keys[kind]["words"],
+                          kind)
         # (An airport's kinds, as kind_words shows them.)
         self.assertIn({"key": "airport", "label": "airports",
                        "words": ["airport", "aerodrome", "airfield"],

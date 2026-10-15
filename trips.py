@@ -1397,7 +1397,7 @@ class TripsService:
         """(status, body bytes, headers) for the trips of libraries ({id: name})."""
         key = [FORMAT, sorted(settings(config).items()), sorted(libraries.items()),
                trip_libraries(config, set(libraries)), bool(admin),
-               state_key(conn, list(libraries))]
+               state_key(conn, list(libraries)), place_estimates.FILE_PLACE_RULES]
         etag = hashlib.sha1(json.dumps(key, sort_keys=True, default=str).encode("utf-8")
                             ).hexdigest()[:32]
         headers = {"ETag": '"%s"' % etag, "Cache-Control": "private, no-cache",

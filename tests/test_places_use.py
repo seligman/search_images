@@ -287,7 +287,8 @@ class ExportTest(support.TempBaseMixin, unittest.TestCase):
         self.assertIn('href="https://www.geonames.org/"', page)
         self.assertIn('rel="license"', page)
         self.assertTrue(support.page_config(page)["capabilities"]["places"])
-        footers = re.findall(r'<footer class="export-credits">(.*?)</footer>', page)
+        footers = re.findall(r'<footer id="credits" class="export-credits">(.*?)</footer>',
+                             page)
         self.assertEqual(footers, [export.PLACES_CREDIT])
 
     def test_the_credit_follows_the_owners_credits(self):
@@ -295,16 +296,19 @@ class ExportTest(support.TempBaseMixin, unittest.TestCase):
         library["export"] = {"credits": "Photos by me & mine"}
         page = export.render_page("page.html", "Trips", "Trips", {"places": True}, "x",
                                   export.library_options(library, {"location": True}))
-        footer = re.search(r'<footer class="export-credits">(.*?)</footer>', page).group(1)
+        footer = re.search(r'<footer id="credits" class="export-credits">(.*?)</footer>',
+                           page).group(1)
         self.assertEqual(footer, "Photos by me &amp; mine<br>" + export.PLACES_CREDIT)
-        # The map page has no foot: only the GeoNames credit, in a corner.
+        # The map page has no foot: the GeoNames credit in a corner, and a link to the
+        # owner's credits line (not the line itself).
         page = export.render_page("map.html", "Trips", "Trips", {"places": True}, "x",
                                   export.library_options(library, {"location": True}))
         self.assertNotIn("<footer", page)
         self.assertNotIn("Photos by me", page)
         credit = re.search(r'<p id="map-credit" class="export-credits map-credit">(.*?)</p>',
                            page).group(1)
-        self.assertEqual(credit, export.PLACES_CREDIT)
+        self.assertEqual(credit, export.PLACES_CREDIT + " &middot; " +
+                         export.PHOTO_CREDITS_LINK % "index.html")
         self.assertIn('href="https://www.geonames.org/"', credit)
         page = export.render_page("map.html", "Trips", "Trips", {"places": False}, "x",
                                   export.library_options(library, {"location": True}))

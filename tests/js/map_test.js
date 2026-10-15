@@ -563,16 +563,17 @@ function mapResponse(body) {
 }
 
 /* The admin's map page at an address (searchText: its ?... part; records:
-   the search records, MAP_RECORDS by default). page.urls: the addresses it
-   wrote; page.views() their views ([lat, lon, zoom]). */
-function mapPage(searchText, records) {
+   the search records, MAP_RECORDS by default; html: the page, MAP_PAGE by
+   default; setup(document): called before the scripts run). page.urls: the
+   addresses it wrote; page.views() their views ([lat, lon, zoom]). */
+function mapPage(searchText, records, html, setup) {
     var urls = [];
     var document = FAKE.makeDocument();
     var config = {mode: "server", page: "map", api: "/api", tiles: "/tile", tilesMax: 8,
                   adminApi: "/api/admin", libraries: ["Example"],
                   libraryList: [{id: "lib", name: "Example"}],
                   capabilities: {admin: true, static: false, people: true}};
-    FAKE.parseBody(document, MAP_PAGE, config);
+    FAKE.parseBody(document, html || MAP_PAGE, config);
     var canvas = document.getElementById("map-canvas");
     canvas.getContext = function () {
         // (A context that draws nothing.)
@@ -593,6 +594,9 @@ function mapPage(searchText, records) {
     canvas.getBoundingClientRect = function () {
         return {top: 0, left: 0, right: 1000, bottom: 700, width: 1000, height: 700};
     };
+    if (setup) {
+        setup(document);
+    }
     function storage() {
         var items = {};
         return {
@@ -752,6 +756,54 @@ test("a search whose picture has a place but no position says it has no position
         assert.ok(/a place named without a position has no pin/.test(box.textContent),
                   box.textContent);
         assert.ok(!/no location/.test(box.textContent), box.textContent);
+    });
+});
+
+test("an export's corner credit of several lines has the other credits above it",
+     function () {
+    // (export.py render_page puts it in the map's corner: GeoNames, named places and the
+    // link to the photo credits, which on a narrow phone take three lines; style.css
+    // places the street maps' credit and the note above a corner of one line.)
+    var corner = '<p id="map-credit" class="export-credits map-credit">Places: GeoNames' +
+        '<br>Named places: OpenStreetMap contributors (ODbL) <a href="index.html#credits">' +
+        'Photo credits</a></p>\n';
+    var EXPORT_MAP = MAP_PAGE.replace('<div id="map-message"', corner + '<div id="map-message"');
+    assert.notStrictEqual(EXPORT_MAP, MAP_PAGE);
+    // The map is 700 px tall (mapPage); the corner sits 8 px above its foot.
+    function stacked(cornerHeight) {
+        return mapPage("", null, EXPORT_MAP, function (document) {
+            document.getElementById("map-credit").getBoundingClientRect = function () {
+                return {top: 692 - cornerHeight, bottom: 692, left: 640, right: 992,
+                        width: 352, height: cornerHeight};
+            };
+            document.getElementById("map-streets-credit").getBoundingClientRect = function () {
+                return {top: 600, bottom: 621, left: 842, right: 992, width: 150, height: 21};
+            };
+        });
+    }
+    function settled(page) {
+        var streets = page.document.getElementById("map-streets-credit");
+        var note = page.document.getElementById("map-note");
+        return FAKE.waitFor(function () {
+            return streets.style.bottom && note.style.bottom;
+        }).then(function () {
+            return new Promise(function (resolve) {
+                setTimeout(resolve, 100);
+            });
+        }).then(function () {
+            return [streets.hidden, streets.style.bottom, note.style.bottom];
+        });
+    }
+    var plain = mapPage("");
+    return Promise.all([settled(stacked(54)), settled(stacked(21))]).then(function (found) {
+        // Three lines (54 px): the street maps' credit 5 px above it, the note 11 px
+        // above that.
+        assert.deepStrictEqual(found[0], [false, "67px", "99px"]);
+        // One line: where style.css has them (34 px; 66 px).
+        assert.deepStrictEqual(found[1], [false, "34px", "66px"]);
+        // The server's map page has no such corner: style.css alone places them.
+        assert.ok(!plain.document.getElementById("map-streets-credit").style.bottom);
+        assert.ok(!plain.document.getElementById("map-note").style.bottom);
     });
 });
 
