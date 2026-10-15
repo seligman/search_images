@@ -786,8 +786,11 @@ var SHELL = (function () {
         return region;
     }
 
-    // kind: "error" (default), "warn", "ok" or "info".
-    function toast(message, kind, seconds) {
+    // kind: "error" (default), "warn", "ok" or "info". action: {text, title,
+    // run, keys}: a button (such as Undo) that runs it, and the message goes;
+    // keys {label, aria} (optional): its keyboard shortcut, shown by the button
+    // where there is a keyboard (style.css) and told to screen readers.
+    function toast(message, kind, seconds, action) {
         kind = kind || "error";
         var region = toastRegion();
         var box = el("div", {className: "toast toast-" + kind,
@@ -795,12 +798,24 @@ var SHELL = (function () {
         var close = el("button", {type: "button", className: "toast-close", text: "\u00d7",
                                   attrs: {"aria-label": "Dismiss"}});
         box.appendChild(el("span", {className: "toast-text", text: message}));
-        box.appendChild(close);
         function remove() {
             if (box.parentNode) {
                 box.parentNode.removeChild(box);
             }
         }
+        if (action && action.text && typeof action.run === "function") {
+            var keys = action.keys && action.keys.label ? action.keys : null;
+            box.appendChild(el("button", {type: "button", className: "toast-action",
+                                          text: action.text, title: action.title || "",
+                                          attrs: keys ? {"data-keys": keys.label,
+                                                         "aria-keyshortcuts": keys.aria || null}
+                                              : {},
+                                          on: {click: function () {
+                                              remove();
+                                              action.run();
+                                          }}}));
+        }
+        box.appendChild(close);
         close.addEventListener("click", remove);
         region.appendChild(box);
         while (region.children.length > 4) {

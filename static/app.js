@@ -69,7 +69,9 @@
    "plain_language": false, capabilities.plain): what is typed is searched
    as interpreted -- a person's name as person: (or, in an export that
    publishes names, as those words only), a town, region or country of the
-   pictures as place:, years, months and seasons ("last summer", "November
+   pictures as place:, a kind of place pictures were taken at ("beaches",
+   "at the zoo": the kinds of their named places on the street maps) as
+   kind:, years, months and seasons ("last summer", "November
    2024") as date: -- and the chips above the results (#plain-chips) say
    so: each with an x that leaves that part as typed (state.typed, kept in
    the address), the words left over with how they are searched (and the
@@ -604,16 +606,24 @@
     /* What plain-language search understands on this page, in words: the
        names of people (the server's when it shows them People; an export's
        when it publishes names) and of places (when the pictures have
-       places), and always years, months and seasons. */
+       places), kinds of place (when some have a named place of the street
+       maps), and always years, months and seasons. */
     function plainKinds() {
         var caps = SITE.capabilities || {};
         var people = SITE.isStatic ? Boolean(data && data.personNames && data.personNames.length)
             : caps.people === true;
         var places = data ? Object.keys(data.index.placeLookup()).length > 0
             : !SITE.isStatic || caps.places === true;
+        var kinds = data ? data.index.kindCounts().total > 0
+            : SITE.isStatic && caps.named_places === true;
         var names = people && places ? "names of people and places, "
             : people ? "names of people, " : places ? "names of places, " : "";
-        return names + "years, months and seasons";
+        // (Examples: the kinds the most pictures were taken at.)
+        var examples = data ? data.index.commonKinds(2).map(function (line) {
+            return line.label.split(" and ")[0];
+        }) : [];
+        return names + (kinds ? "kinds of place (" + (examples.length ? examples.join(", ")
+            : "beaches, museums") + "), " : "") + "years, months and seasons";
     }
 
     // The search "Search the words as typed" was chosen for (state.typed
@@ -2084,7 +2094,8 @@
             var field = row.example.split(":")[0];
             // (No person: in an export: site.js never loads people there.)
             if (field === "lib" || field === "person" ||
-                    (field === "place" && caps.places !== true)) {
+                    (field === "place" && caps.places !== true) ||
+                    (field === "kind" && caps.named_places !== true)) {
                 return;
             }
             if (!marked && (field === "rating" || field === "album" ||
@@ -2874,8 +2885,10 @@
         var named = (kinds.indexOf("person") >= 0 ? " Visitors who cannot see People get " +
                      "it with the words typed for the person; an export publishes it only " +
                      "with the names of people." : "") +
-            (kinds.indexOf("place") >= 0 ? " An export without places gets it with the " +
-             "words typed for the place." : "");
+            (kinds.indexOf("place") >= 0 ? " An export without places gets it with the words " +
+             "typed for the place." : "") +
+            (kinds.indexOf("kind") >= 0 ? " An export without named places gets it with the " +
+             "words typed for the kind of place." : "");
         var filters = savedFilterCount();
         if (filters > 0) {
             parts.push(fmt.plural(filters, "filter"));
@@ -3218,9 +3231,10 @@
             var again = interpretQuery([]);
             if (again.parts.length || again.choices.length) {
                 items.push(plainButton(chipButton("Words as typed", function () {},
-                                                  "Understand names, places and dates in the " +
-                                                  "search again", "Words as typed \u2013 " +
-                                                  "understand names, places and dates again"),
+                                                  "Understand names, places, kinds of place " +
+                                                  "and dates in the search again",
+                                                  "Words as typed \u2013 understand names, " +
+                                                  "places, kinds of place and dates again"),
                                        function () {
                                            keepTyped("", false);
                                        }));

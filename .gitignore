@@ -15,6 +15,10 @@
 /*_helper.py
 !/example_helper.py
 
+# ---- The demo set's downloads (sample/demo-set/fetch_demo_set.py) ----
+/sample/demo-set/files/
+/sample/demo-set/originals/
+
 # ---- API key files: keep them outside the program folder ----
 *.key
 /keys/

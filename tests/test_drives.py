@@ -1015,12 +1015,13 @@ class ExportTest(DriveLibraryCase):
         self.assertEqual([record for record in records if "dvt" in record or "dvd" in record],
                          [])
         self.assertEqual(len([record for record in records if "dv" in record]), 7)
-        # Options that publish them: with their flags (the page filters by them).
+        # Options that publish them: with their sensitive level (the page
+        # filters by it), never the private flag (export.PRIVATE_FLAG_KEYS).
         library = common.get_library(common.load_config(), "lib_trip1")
         options = export.library_options(library, {"exclude_private": False,
                                                    "exclude_sensitive": False})
         texts = {record["dvt"]: record for record in self.exported(options) if "dvt" in record}
-        self.assertEqual(texts["Past 12 Elm Street"]["dvp"], 1)
+        self.assertNotIn("dvp", texts["Past 12 Elm Street"])
         self.assertEqual(texts["The crash"]["dvs"], "graphic")
 
 

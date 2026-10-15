@@ -89,8 +89,10 @@ ni, na in its record; nd rounded to named_places.EXPORT_METRES) is
 location data too: it goes with the location option (an estimated
 place's also with estimated_places), and only when the position it was
 found for goes (_Export.named_published: a track's with the routes, none
-in a trip's home area). The named places are looked up first (as the GPS
-check runs: named_places.run_safely), and they are OpenStreetMap data: an
+in a trip's home area); with it, kind: and plain language's "beaches" find
+the pictures taken at a kind of place in the published site. The named
+places are looked up first (as the GPS check runs:
+named_places.run_safely), and they are OpenStreetMap data: an
 export that holds some carries the OpenStreetMap credit and licence
 (NAMED_CREDIT, maps/LICENSE.txt) also without the street maps.
 
@@ -132,7 +134,8 @@ is:favorite and rating: work in the published site too. A smart album
 whose search cannot be published is left out: one limited to another
 library, or going by what the export leaves out (folder:, file:,
 place:, has:gps, the Place filter or an area of the map while the
-matching option is off; lib:), naming a picture or an album that is not
+matching option is off; kind: without published named places; lib:),
+naming a picture or an album that is not
 published, or a person (person:, whose name it would publish). An area of
 the map (map_areas.py) is location data: it goes only with location (and
 never one near home in a trip's export, see trip_export.py).
@@ -281,7 +284,8 @@ IMAGE_MODES = ("web", "original", "none")
 VIDEO_MODES = ("skip", "include")
 MAX_VIDEO_MB = (1, 100000)
 MAX_TITLE = 200
-MAX_CREDITS = 2000
+# (A credits line naming every creator of a mixed set of pictures gets long.)
+MAX_CREDITS = 4000
 # The credit an export with place names carries (CC BY 4.0, see places.py).
 PLACES_CREDIT = ('Place names: <a href="%s">GeoNames</a> (<a href="%s" rel="license">'
                  'CC BY 4.0</a>)' % (html.escape(places.ATTRIBUTION_URL),
@@ -656,7 +660,8 @@ def validate_options(options, base=None):
 
 
 def _saved_options(saved):
-    """The valid options of a saved dict; anything wrong in it is left at its default."""
+    """The valid options of a saved dict; anything wrong in it is left at its default
+    (saved_option_problems says what)."""
     if not isinstance(saved, dict):
         return {}
     result = {}
@@ -668,8 +673,75 @@ def _saved_options(saved):
     return result
 
 
+def saved_option_problems(saved, skip=()):
+    """[(key, why)] of the saved options an export leaves at their defaults (_saved_options),
+    in their order: unknown names and values validate_options refuses (text that is too long
+    says how long it is); [(None, why)] when saved is not an object at all. saved is a
+    library's config "export" (None: none saved); keys in skip (those a run sets itself)
+    are not looked at."""
+    if saved is None:
+        return []
+    if not isinstance(saved, dict):
+        return [(None, "must be an object of export options")]
+    problems = []
+    for key, value in saved.items():
+        if key in skip:
+            continue
+        try:
+            validate_options({key: value})
+        except OptionsError as error:
+            why = error.errors.get(key) or "; ".join(str(text) for text in error.errors.values())
+            if key in ("title", "credits") and isinstance(value, str):
+                why += " (this one has %d)" % len(" ".join(value.split()))
+            problems.append((str(key), why))
+    return problems
+
+
+def saved_option_warnings(saved, skip=()):
+    """One line per saved option an export leaves out (saved_option_problems), for a log or
+    the Export dialog."""
+    lines = []
+    for key, why in saved_option_problems(saved, skip):
+        if key is None:
+            lines.append("The saved export options are ignored (left at their defaults): they %s."
+                         % why)
+        elif why == "is not an export option":
+            lines.append('The saved export option "%s" is ignored: it is not an export option.'
+                         % key)
+        else:
+            lines.append('The saved export option "%s" is ignored (left at its default): it %s.'
+                         % (key, why))
+    return lines
+
+
+# Saved options of text the Export dialog shows as saved even when an export refuses them.
+TEXT_OPTIONS = ("title", "credits")
+
+
+def saved_text_options(saved):
+    """{key: text} of the saved title and credits (TEXT_OPTIONS) an export leaves at their
+    defaults though they are text (too long: saved_option_problems): the Export dialog
+    fills its fields with them, so they can be shortened there instead of being replaced
+    by the default when it saves its options."""
+    if not isinstance(saved, dict):
+        return {}
+    refused = {key for key, _why in saved_option_problems(saved)}
+    return {key: saved[key] for key in TEXT_OPTIONS
+            if key in refused and isinstance(saved.get(key), str)}
+
+
+def library_option_warnings(library, overrides=None):
+    """saved_option_warnings of a library's saved export options, but those overrides set."""
+    saved = library.get("export") if isinstance(library, dict) else None
+    return saved_option_warnings(saved, skip=tuple(overrides) if isinstance(overrides, dict)
+                                 else ())
+
+
 def library_options(library, overrides=None):
-    """The export options of a library: its saved ones (config "export"), then overrides."""
+    """The export options of a library: its saved ones (config "export"), then overrides.
+
+    A saved option that is wrong is left at its default (library_option_warnings says
+    which); a wrong override raises OptionsError."""
     saved = library.get("export") if isinstance(library, dict) else None
     return validate_options(overrides, base=saved)
 
@@ -2350,17 +2422,21 @@ def preview_export(conn, config, library_id, options=None, reachable=None):
     file stays home: it holds a GPS position and the location option is
     off)},
     "size_estimate": bytes, "size_parts": {thumbs, images, panos, data, videos,
-    vectors, meaning, looks, raws}, "options": the options used}. Reasons: hidden,
-    excluded (by id), undescribed, unchecked, a picture type (screenshot,
-    document, ...), private, sensitive. reachable says whether the
+    vectors, meaning, looks, raws}, "options": the options used, "option_warnings": a
+    line for each saved option the export leaves out (library_option_warnings)}.
+    Reasons: hidden, excluded (by id), undescribed, unchecked, a picture type
+    (screenshot, document, ...), private, sensitive. reachable says whether the
     library's folder can be read (None: look now; it may take long for a
     share that does not answer).
     """
     library = common.get_library(config, library_id)
     if library is None or not library.get("id"):
         raise ExportError("There is no library %r in the settings." % (library_id,))
+    overrides = options
     options = library_options(library, options)
-    return preview_pictures(conn, config, [library], options, reachable=reachable)
+    result = preview_pictures(conn, config, [library], options, reachable=reachable)
+    result["option_warnings"] = library_option_warnings(library, overrides)
+    return result
 
 
 class _AllSizes:
@@ -2711,6 +2787,10 @@ def _estimated_location(row, record, estimate):
 
 # The record keys of a picture's own text (search_index's _TEXT_FIELDS).
 RECORD_TEXT_KEYS = (("t", "title"), ("d", "description"), ("o", "text"), ("sc", "scene"))
+
+# The record keys that say a picture (pr) or a drive's words (dvp) show private
+# information: a site never carries them (see _Export.records).
+PRIVATE_FLAG_KEYS = ("pr", "dvp")
 
 
 def published_places(conn, library_ids, pairs, routes):
@@ -3343,6 +3423,9 @@ class _Export:
         self.meaning_status = None
         # The albums the manifest lists (the marks option, see album_numbers).
         self.published_albums = []
+        # Some published picture has a named place, and with it its kind (see
+        # album_numbers; smart_search keeps kind: only then).
+        self.kinds_published = False
         # What goes out of the videos' GPS tracks (see _Routes; made with the records).
         self.track_routes = None
 
@@ -3834,6 +3917,14 @@ class _Export:
         exported pictures of its day (1, 2, ...; only on days with more
         than one), so pictures of one day sort as they were taken while
         their times stay out of the export.
+
+        No record says it shows private information (PRIVATE_FLAG_KEYS): a
+        picture flagged so is published only when the owner chose to (the
+        exclude_private option off, or Publish ticked in the review), and
+        on a public site the flag would only point visitors at it (is:private).
+        The sensitive level (se, dvs) stays: the site's "Hide sensitive
+        pictures" and its trip pages go by it (the pages show no badge for
+        either, see viewer.js).
         """
         records = [picture.record for picture in pictures]
         # Duplicate groups over the exported pictures only: a group's
@@ -3896,6 +3987,8 @@ class _Export:
             record = picture.record
             record["i"] = picture.xid
             record["l"] = self.export_id
+            for key in PRIVATE_FLAG_KEYS:
+                record.pop(key, None)
             if record.get("dg") is not None:
                 record["dg"] = xids[record["dg"]]
             if "al" in record:
@@ -3938,6 +4031,8 @@ class _Export:
         self.published_albums = []
         if not self.options["marks"] or not pictures:
             return {}
+        self.kinds_published = bool(self.options["location"]) and any(
+            self.kind_published(picture) for picture in pictures)
         xids = {picture.row["id"]: picture.xid for picture in pictures}
         every = sorted(albums.list_albums(self.conn), key=lambda item: item["id"])
         manual = {}
@@ -3992,14 +4087,23 @@ class _Export:
             self.published_albums.append(entry)
         return numbers
 
+    def kind_published(self, picture):
+        """True when a published picture's record keeps the kind of its named place (nk):
+        records() has left out the named places that do not go before album_numbers (a
+        trip's export leaves out more after it: see trip_export)."""
+        value = picture.record.get("nk")
+        return isinstance(value, str) and bool(value)
+
     def smart_search(self, album, xids):
         """What of a smart album's saved search can be published, or None when it cannot.
 
         Not when it is limited to another library (its library choice or
         Library filter; this library's choice is dropped); nor when its
         search (query terms or filters) goes by what the export leaves out:
-        folder: (the folders option), file: (file_names), place:, has:gps
-        and the Place filter (location), lib: (the libraries' own names);
+        folder: (the folders option), file: (file_names), place:, has:gps and
+        the Place filter (location), kind: (the kinds of the named places:
+        location, and a published picture with one, kinds_published), lib:
+        (the libraries' own names);
         nor when its area of the map may not be published (area_published);
         nor when it looks for pictures like one that is not published
         (similar:, look:); nor when it looks for a person (person:: an
@@ -4007,7 +4111,8 @@ class _Export:
         people_names on (the names are tags of their pictures then), a person:
         term that plain-language search wrote as an alternative to the words
         typed ('person:"Anna Lopez" OR anna', albums.alternative_spans) goes
-        and the words stay; so does such a place: term without location.
+        and the words stay; so does such a place: term without location, and
+        such a kind: term ("kind:zoo OR zoos") without named places.
         Returns
         {"options", "changes": {(start, stop):
         new value} (similar: and look: name the picture by its export id; ""
@@ -4031,11 +4136,12 @@ class _Export:
         else:
             options.pop("filters", None)
         needs = {"folder": "folders", "file": "file_names", "place": "location"}
+        kinds = bool(self.options["location"]) and self.kinds_published
         query = album.get("query") or ""
         # (Without people_names a name never goes out, not even as a word.)
         dropped = albums.alternative_spans(query, [field for field, drop in (
-            ("person", self.options["people_names"]), ("place", not self.options["location"]))
-            if drop])
+            ("person", self.options["people_names"]), ("place", not self.options["location"]),
+            ("kind", not kinds)) if drop])
         changes = {span: "" for span in dropped}
         named = []
         for term in albums.query_terms(query):
@@ -4043,7 +4149,8 @@ class _Export:
                 continue        # (an alternative that goes: the words stay)
             field = term["field"]
             value = term["value"].strip()
-            if field in ("lib", "person") or (field in needs and not self.options[needs[field]]):
+            if (field in ("lib", "person") or (field in needs and not self.options[needs[field]])
+                    or (field == "kind" and not kinds)):
                 return None
             if (field == "has" and not self.options["location"]
                     and value.lower().startswith(_LOCATION_WORDS)):
@@ -4780,7 +4887,11 @@ def export_library(ctx, conn, config, library_id, out_dir=None, options=None, he
         raise ExportError("There is no library %r in the settings." % (library_id,))
     if not library.get("id"):
         raise ExportError("The library %s has no id yet." % common.library_label(library))
+    overrides = options
     options = library_options(library, options)
+    # (A saved option that is wrong is left at its default: never silently.)
+    for line in library_option_warnings(library, overrides):
+        ctx.log(line, "warn")
     out_dir = os.path.abspath(out_dir) if out_dir else default_output_dir(config, library)
     job = _Export(ctx, conn, config, library, out_dir, options, helper)
     lock = jobs.WorkerLock(os.path.join(common.data_dir(), LOCK_FILE))

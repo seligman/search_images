@@ -116,7 +116,11 @@
                                    their way. hidden (the admin's): hidden
                                    people too (person: names them, but
                                    never by a part of a name, nor with
-                                   person:any).
+                                   person:any). After
+                                   SITE.peopleChanged() (the admin named a
+                                   face in the viewer) they are asked for
+                                   again the next time want needs them,
+                                   and onLoaded is told again.
      SITE.faceUrl(id)              a square picture of one face (/face/<id>),
                                    null in an export
      SITE.lookQuery(blob, callback)  the look vector of an example picture
@@ -1449,19 +1453,32 @@ var SITE = (function () {
     }
 
     var PERSON_TERM = /(^|\s)-?person:/i;
+    var peopleEpoch = 0;        // raised by peopleChanged: the people loaded before are old
+
+    function peopleChanged() {
+        peopleEpoch += 1;
+    }
 
     function peopleForSearch(onLoaded, hidden) {
         var list = null;
         var asked = false;
         var settled = false;
+        var epoch = peopleEpoch;
         return {
             // (words: plain-language search may find a person's name in any word.)
             want: function (text, words) {
                 text = String(text || "");
+                if (asked && settled && epoch !== peopleEpoch) {
+                    // (A face was named since: asked for again when needed.)
+                    asked = false;
+                    settled = false;
+                    list = null;
+                }
                 if (asked || !(PERSON_TERM.test(text) || (words === true && /\S/.test(text)))) {
                     return false;
                 }
                 asked = true;
+                epoch = peopleEpoch;
                 var waiting = true;
                 loadPeople(function (answer) {
                     settled = true;
@@ -2156,6 +2173,7 @@ var SITE = (function () {
         lookQuery: lookQuery,
         loadPeople: loadPeople,
         peopleForSearch: peopleForSearch,
+        peopleChanged: peopleChanged,
         faceUrl: function (id) {
             return isStatic ? null : "/face/" + encodeURIComponent(id);
         },

@@ -1,0 +1,858 @@
+{
+ "about": "The demo set of Search Images: 39 pictures and 5 short videos under Creative Commons licenses or in the public domain, which the published demo shows besides the 19 bundled sample pictures. CREDITS.md next to this file credits them; fetch_demo_set.py downloads each original (file_url), checks its size (bytes) and SHA-256 (sha256), and makes its library copy (file) as its copy instructions say.",
+ "licences_checked": "2026-10-14",
+ "groups": {
+  "trip": "Trip: Porto",
+  "videos": "Videos",
+  "bursts": "Bursts and near-duplicates",
+  "text": "Text in pictures",
+  "varied": "Varied scenes"
+ },
+ "copy_instructions": {
+  "max_edge": "resize to this many pixels on the long edge (JPEG quality 92), keeping the metadata",
+  "exif_date": "write as EXIF DateTimeOriginal (the source page's date)",
+  "exif_offset": "write as EXIF OffsetTimeOriginal",
+  "gps": "write as EXIF GPS: lat, lon (WGS-84) and accuracy_m as GPSHPositioningError",
+  "remove_gps_void": "remove EXIF GPSStatus (V, void: the camera had no position)",
+  "xmp_place": "write these names in the XMP location fields (photoshop:City, photoshop:State, photoshop:Country, Iptc4xmpCore:CountryCode), in place of what those fields held; no position is added",
+  "transcode": "make a 720p H.264 / AAC MP4 copy of the video with ffmpeg",
+  "video_date": "write as the copy's QuickTime creation date",
+  "video_location": "write as the copy's QuickTime location (ISO 6709)"
+ },
+ "originals_total_bytes": 564069909,
+ "copies_total_bytes": 465041527,
+ "items": [
+  {
+   "file": "trip-01-douro-buoy-freixo.jpg",
+   "group": "trip",
+   "title": "The River Douro at Palácio do Freixo (55245790392)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:The_River_Douro_at_Pal%C3%A1cio_do_Freixo_%2855245790392%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/6/6b/The_River_Douro_at_Pal%C3%A1cio_do_Freixo_%2855245790392%29.jpg",
+   "sha256": "a1adc3b0c1358cc8dbd8bfc414064a685e29d1954c1fd7d21e12884f8a345db9",
+   "bytes": 19086306,
+   "copy": {},
+   "copy_sha256": "a1adc3b0c1358cc8dbd8bfc414064a685e29d1954c1fd7d21e12884f8a345db9",
+   "copy_bytes": 19086306
+  },
+  {
+   "file": "trip-02-palacio-do-freixo.jpg",
+   "group": "trip",
+   "title": "Palácio do Freixo (55245766332)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Pal%C3%A1cio_do_Freixo_%2855245766332%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/1/1d/Pal%C3%A1cio_do_Freixo_%2855245766332%29.jpg",
+   "sha256": "b910580cd14b7f2f48fc93067b69f37ee6d686720b8fe16e6e5ec2bc814690b8",
+   "bytes": 14972669,
+   "copy": {},
+   "copy_sha256": "b910580cd14b7f2f48fc93067b69f37ee6d686720b8fe16e6e5ec2bc814690b8",
+   "copy_bytes": 14972669
+  },
+  {
+   "file": "trip-03-funicular-dos-guindais.jpg",
+   "group": "trip",
+   "title": "Funicular dos Guindais (55247069635)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Funicular_dos_Guindais_%2855247069635%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/c/c9/Funicular_dos_Guindais_%2855247069635%29.jpg",
+   "sha256": "cb597761fffd52f7a55a847cae2781cf5ae6367b5c1c0eea3edf0ce284518c94",
+   "bytes": 24777432,
+   "copy": {},
+   "copy_sha256": "cb597761fffd52f7a55a847cae2781cf5ae6367b5c1c0eea3edf0ce284518c94",
+   "copy_bytes": 24777432
+  },
+  {
+   "file": "trip-04-rua-miradouro-rooftops.jpg",
+   "group": "trip",
+   "title": "Rua Miradouro (55246930474)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Rua_Miradouro_%2855246930474%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/c/c2/Rua_Miradouro_%2855246930474%29.jpg",
+   "sha256": "8c6d0a4101a19ebd68585b5b1a758bdf80c34ca3eeaf8d71e29815ea81eb706b",
+   "bytes": 29462782,
+   "copy": {},
+   "copy_sha256": "8c6d0a4101a19ebd68585b5b1a758bdf80c34ca3eeaf8d71e29815ea81eb706b",
+   "copy_bytes": 29462782
+  },
+  {
+   "file": "trip-05-ponte-maria-pia.jpg",
+   "group": "trip",
+   "title": "Ponte Maria Pia (55245774217)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Ponte_Maria_Pia_%2855245774217%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/d/d7/Ponte_Maria_Pia_%2855245774217%29.jpg",
+   "sha256": "27adff78cd2e7cf55be4da5a64f2d9d7e10876dedcf56cd6c2e6429245e893cb",
+   "bytes": 16022579,
+   "copy": {},
+   "copy_sha256": "27adff78cd2e7cf55be4da5a64f2d9d7e10876dedcf56cd6c2e6429245e893cb",
+   "copy_bytes": 16022579
+  },
+  {
+   "file": "trip-06-dom-luis-bridge-panorama.jpg",
+   "group": "trip",
+   "title": "A panoramic view of the Dom Luís I Bridge spanning the Douro River in Porto, Portugal, with a yellow tram crossing and the historic city skyline in the background. (55246746406)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:A_panoramic_view_of_the_Dom_Lu%C3%ADs_I_Bridge_spanning_the_Douro_River_in_Porto%2C_Portugal%2C_with_a_yellow_tram_crossing_and_the_historic_city_skyline_in_the_background._%2855246746406%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/3/38/A_panoramic_view_of_the_Dom_Lu%C3%ADs_I_Bridge_spanning_the_Douro_River_in_Porto%2C_Portugal%2C_with_a_yellow_tram_crossing_and_the_historic_city_skyline_in_the_background._%2855246746406%29.jpg",
+   "sha256": "2d9753d8cc643109cc590c117bb6ed90e7b8cb7fcdc2e6815a9d93097a65a81b",
+   "bytes": 25237508,
+   "copy": {},
+   "copy_sha256": "2d9753d8cc643109cc590c117bb6ed90e7b8cb7fcdc2e6815a9d93097a65a81b",
+   "copy_bytes": 25237508
+  },
+  {
+   "file": "trip-07-praca-gomes-teixeira.jpg",
+   "group": "trip",
+   "title": "Praça de Gomes Teixeira (55246830238)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Pra%C3%A7a_de_Gomes_Teixeira_%2855246830238%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/d/da/Pra%C3%A7a_de_Gomes_Teixeira_%2855246830238%29.jpg",
+   "sha256": "7812831194320e4ad40011c9a342282e11ccb6ce3053f8b246d5e96c95265563",
+   "bytes": 18040357,
+   "copy": {
+    "max_edge": 1600
+   },
+   "copy_bytes": 818820
+  },
+  {
+   "file": "trip-08-riverside-market.jpg",
+   "group": "trip",
+   "title": "Porto Riverside Market and Douro River Boats (55246688641)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Porto_Riverside_Market_and_Douro_River_Boats_%2855246688641%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/7/70/Porto_Riverside_Market_and_Douro_River_Boats_%2855246688641%29.jpg",
+   "sha256": "1d459657d292eedfbe015b288de9808ee17c6930b2252230d57cf8a80325c3e5",
+   "bytes": 17064571,
+   "copy": {},
+   "copy_sha256": "1d459657d292eedfbe015b288de9808ee17c6930b2252230d57cf8a80325c3e5",
+   "copy_bytes": 17064571
+  },
+  {
+   "file": "trip-09-rabelo-boat.jpg",
+   "group": "trip",
+   "title": "A Lively Riverboat Cruises Past the Colourful Buildings of Porto (55245785232)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:A_Lively_Riverboat_Cruises_Past_the_Colourful_Buildings_of_Porto_%2855245785232%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/8/81/A_Lively_Riverboat_Cruises_Past_the_Colourful_Buildings_of_Porto_%2855245785232%29.jpg",
+   "sha256": "512fe3b7d12e18316f066b5ac750f9b849f5a28f7d2962fbd033961e096c10ed",
+   "bytes": 16959256,
+   "copy": {},
+   "copy_sha256": "512fe3b7d12e18316f066b5ac750f9b849f5a28f7d2962fbd033961e096c10ed",
+   "copy_bytes": 16959256
+  },
+  {
+   "file": "trip-10-stone-steps-alley.jpg",
+   "group": "trip",
+   "title": "Weathered Stone Steps in a Narrow Alley (55247094930)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Weathered_Stone_Steps_in_a_Narrow_Alley_%2855247094930%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/4/4f/Weathered_Stone_Steps_in_a_Narrow_Alley_%2855247094930%29.jpg",
+   "sha256": "ca324022e08247ba9bafa0f3498cf696e6dcd345471fdbaa2daf32d94b577b69",
+   "bytes": 16525576,
+   "copy": {},
+   "copy_sha256": "ca324022e08247ba9bafa0f3498cf696e6dcd345471fdbaa2daf32d94b577b69",
+   "copy_bytes": 16525576
+  },
+  {
+   "file": "trip-11-colourful-corner.jpg",
+   "group": "trip",
+   "title": "A Colourful Corner in Porto's Historic District (55245786552)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:A_Colourful_Corner_in_Porto%27s_Historic_District_%2855245786552%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/7/7e/A_Colourful_Corner_in_Porto%27s_Historic_District_%2855245786552%29.jpg",
+   "sha256": "8d3503a13e838b16c2806e66f730b5ce5ff4ed3c1f5c7f095dba210ff7403d03",
+   "bytes": 19528421,
+   "copy": {},
+   "copy_sha256": "8d3503a13e838b16c2806e66f730b5ce5ff4ed3c1f5c7f095dba210ff7403d03",
+   "copy_bytes": 19528421
+  },
+  {
+   "file": "trip-12-palacio-da-bolsa-arab-room.jpg",
+   "group": "trip",
+   "title": "The Stunningly Ornate Mudejar Hall at the Palácio da Bolsa, Porto (55245889290)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:The_Stunningly_Ornate_Mudejar_Hall_at_the_Pal%C3%A1cio_da_Bolsa%2C_Porto_%2855245889290%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/7/7a/The_Stunningly_Ornate_Mudejar_Hall_at_the_Pal%C3%A1cio_da_Bolsa%2C_Porto_%2855245889290%29.jpg",
+   "sha256": "c9a64691dc77eb45f80778fa9283fea5b11e17b829b70acfef4c89880416cb76",
+   "bytes": 28805171,
+   "copy": {
+    "gps": {
+     "lat": 41.141371,
+     "lon": -8.615879,
+     "accuracy_m": 100
+    }
+   },
+   "copy_bytes": 28784142
+  },
+  {
+   "file": "trip-13-ribeira-riverfront.jpg",
+   "group": "trip",
+   "title": "Ribeira do Porto (55246830698)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Ribeira_do_Porto_%2855246830698%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/9/90/Ribeira_do_Porto_%2855246830698%29.jpg",
+   "sha256": "55fc681ce7efc3cf09b9e154fac43529ab8f74c0e59ea5a99e5ad0a944319924",
+   "bytes": 22377887,
+   "copy": {
+    "max_edge": 1600,
+    "xmp_place": {
+     "State": "Norte Region"
+    }
+   },
+   "copy_bytes": 917643
+  },
+  {
+   "file": "trip-14-riverfront-at-night.jpg",
+   "group": "trip",
+   "title": "Porto's Illuminated Riverfront and Historic Architecture at Night (55245778362)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Porto%27s_Illuminated_Riverfront_and_Historic_Architecture_at_Night_%2855245778362%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/a/af/Porto%27s_Illuminated_Riverfront_and_Historic_Architecture_at_Night_%2855245778362%29.jpg",
+   "sha256": "12b6fb5dfe607dfd9ad04867767ab5ce0f78df7434ad39056f77aeb483e9ea8d",
+   "bytes": 21266179,
+   "copy": {
+    "xmp_place": {
+     "State": "Norte Region"
+    }
+   },
+   "copy_bytes": 21266341
+  },
+  {
+   "file": "videos-01-baltic-beach-waves.mp4",
+   "group": "videos",
+   "title": "Kühlungsborn Strand lub 2025-02-14",
+   "creator": "Lukas Beck",
+   "credit": "Lukas Beck",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:K%C3%BChlungsborn_Strand_lub_2025-02-14.webm",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/c/c0/K%C3%BChlungsborn_Strand_lub_2025-02-14.webm",
+   "sha256": "d72f2087467081b250c917d648d69bd279dc52142ddede015014b28e58583a8e",
+   "bytes": 45966750,
+   "copy": {
+    "transcode": true,
+    "video_date": "2025-02-14T16:17:07+0100",
+    "video_location": "+54.1538+011.6986-002.676/"
+   },
+   "copy_bytes": 2461533
+  },
+  {
+   "file": "videos-02-dublin-snow-tram.mp4",
+   "group": "videos",
+   "title": "Dublin snow benburb st",
+   "creator": "MdeVicente",
+   "credit": "MdeVicente",
+   "licence": "CC0 1.0",
+   "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Dublin_snow_benburb_st.webm",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/9/93/Dublin_snow_benburb_st.webm",
+   "sha256": "fcabe73695c188164e7efcdf71cfc64d1f773e2c87ab8b3c139b5a6afb04315e",
+   "bytes": 17808925,
+   "copy": {
+    "transcode": true,
+    "video_date": "2024-03-01T12:00:00+0000"
+   },
+   "copy_bytes": 5946589
+  },
+  {
+   "file": "videos-03-sika-deer-kushiro.mp4",
+   "group": "videos",
+   "title": "Yezo sika deer - kushiro hokkaido - 2021 Dec 9",
+   "creator": "Nesnad",
+   "credit": "Nesnad",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Yezo_sika_deer_-_kushiro_hokkaido_-_2021_Dec_9.webm",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/6/66/Yezo_sika_deer_-_kushiro_hokkaido_-_2021_Dec_9.webm",
+   "sha256": "1b4e5a84a24bbe8030a6f9b2e46624449e199a16d9ccab2b3cfd1aed665db1f9",
+   "bytes": 6235712,
+   "copy": {
+    "transcode": true,
+    "video_date": "2021-12-09T12:00:00+0900"
+   },
+   "copy_bytes": 3484534
+  },
+  {
+   "file": "videos-04-train-shin-fuji-station.mp4",
+   "group": "videos",
+   "title": "Nemuro Main Line local train - shinfuji station 2021 12 10",
+   "creator": "Nesnad",
+   "credit": "Nesnad",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Nemuro_Main_Line_local_train_-_shinfuji_station_2021_12_10.webm",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/a/af/Nemuro_Main_Line_local_train_-_shinfuji_station_2021_12_10.webm",
+   "sha256": "1498a6198ffb54bddc9b8adcb18d9a6013c30caf70955d55f503886b74c63ffc",
+   "bytes": 4005113,
+   "copy": {
+    "transcode": true,
+    "video_date": "2021-12-10T12:00:00+0900",
+    "video_location": "+43.0018+144.3500/"
+   },
+   "copy_bytes": 1256416
+  },
+  {
+   "file": "videos-05-maruia-falls.mp4",
+   "group": "videos",
+   "title": "Maruia Falls, Tasman, New Zealand",
+   "creator": "Mike Dickison",
+   "credit": "Mike Dickison",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Maruia_Falls%2C_Tasman%2C_New_Zealand.ogv",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/9/9f/Maruia_Falls%2C_Tasman%2C_New_Zealand.ogv",
+   "sha256": "e40acc10be8789d32890fef0e69464c3815bb01302e7ac5ea1ccd8822bf0b910",
+   "bytes": 2129006,
+   "copy": {
+    "transcode": true,
+    "video_date": "2019-06-09T12:00:00+1200"
+   },
+   "copy_bytes": 2764019
+  },
+  {
+   "file": "bursts-01-strokkur-bubble.jpg",
+   "group": "bursts",
+   "title": "Strokkur Geyser - Bubble (34418280801)",
+   "creator": "Theo Crazzolara",
+   "credit": "Theo Crazzolara",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Strokkur_Geyser_-_Bubble_%2834418280801%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/b/b4/Strokkur_Geyser_-_Bubble_%2834418280801%29.jpg",
+   "sha256": "a7d17e1fd1e0ece1273dda031547405407358843fd651b88d84f328cef696836",
+   "bytes": 17628609,
+   "copy": {
+    "xmp_place": {
+     "Country": "Iceland",
+     "CountryCode": "IS"
+    }
+   },
+   "copy_bytes": 17628834
+  },
+  {
+   "file": "bursts-02-strokkur-eruption.jpg",
+   "group": "bursts",
+   "title": "Strokkur Geyser (34461551446)",
+   "creator": "Theo Crazzolara",
+   "credit": "Theo Crazzolara",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Strokkur_Geyser_%2834461551446%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/9/93/Strokkur_Geyser_%2834461551446%29.jpg",
+   "sha256": "c79f6a2deafe3ef8724faff95261807d11db65cb08934672c1302f4c11aab792",
+   "bytes": 20239114,
+   "copy": {
+    "xmp_place": {
+     "Country": "Iceland",
+     "CountryCode": "IS"
+    }
+   },
+   "copy_bytes": 20239339
+  },
+  {
+   "file": "bursts-03-night-heron-a.jpg",
+   "group": "bursts",
+   "title": "Yellow-crowned Night-Heron (cropping-lightening) (31692581383)",
+   "creator": "Andy Reago & Chrissy McClarren",
+   "credit": "Andy Reago & Chrissy McClarren",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Yellow-crowned_Night-Heron_%28cropping-lightening%29_%2831692581383%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/e/ed/Yellow-crowned_Night-Heron_%28cropping-lightening%29_%2831692581383%29.jpg",
+   "sha256": "b86769a95768ce4c8c8401f528fa6734b16bcb418152e4a51160881889970181",
+   "bytes": 3461080,
+   "copy": {
+    "xmp_place": {
+     "City": "St. Louis",
+     "State": "Missouri",
+     "Country": "United States",
+     "CountryCode": "US"
+    }
+   },
+   "copy_bytes": 3461373
+  },
+  {
+   "file": "bursts-04-night-heron-b.jpg",
+   "group": "bursts",
+   "title": "Yellow-crowned Night-Heron (cropping-lightening) (31692578673)",
+   "creator": "Andy Reago & Chrissy McClarren",
+   "credit": "Andy Reago & Chrissy McClarren",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Yellow-crowned_Night-Heron_%28cropping-lightening%29_%2831692578673%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/d/de/Yellow-crowned_Night-Heron_%28cropping-lightening%29_%2831692578673%29.jpg",
+   "sha256": "4c74e98d11014c209760d9a83dfe68f85dc7c60fc7867d147134ee21bde77bce",
+   "bytes": 3103457,
+   "copy": {
+    "xmp_place": {
+     "City": "St. Louis",
+     "State": "Missouri",
+     "Country": "United States",
+     "CountryCode": "US"
+    }
+   },
+   "copy_bytes": 3103750
+  },
+  {
+   "file": "bursts-05-little-blue-heron-crop-a.jpg",
+   "group": "bursts",
+   "title": "Little Blue Heron (crop experimentation) (32333250002)",
+   "creator": "Andy Reago & Chrissy McClarren",
+   "credit": "Andy Reago & Chrissy McClarren",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Little_Blue_Heron_(crop_experimentation)_(32333250002).jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/b/bb/Little_Blue_Heron_%28crop_experimentation%29_%2832333250002%29.jpg",
+   "sha256": "cc44e2d6fea0a5f2a92f912f471c542ad1399afd77a7fd7c82d37c4b6172688b",
+   "bytes": 549342,
+   "copy": {
+    "xmp_place": {
+     "City": "St. Louis",
+     "State": "Missouri",
+     "Country": "United States",
+     "CountryCode": "US"
+    }
+   },
+   "copy_bytes": 549635
+  },
+  {
+   "file": "bursts-06-little-blue-heron-crop-b.jpg",
+   "group": "bursts",
+   "title": "Little Blue Heron (crop experimentation) (32363256441)",
+   "creator": "Andy Reago & Chrissy McClarren",
+   "credit": "Andy Reago & Chrissy McClarren",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Little_Blue_Heron_(crop_experimentation)_(32363256441).jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/e/eb/Little_Blue_Heron_%28crop_experimentation%29_%2832363256441%29.jpg",
+   "sha256": "946d167ba2632d74c63f65d9b3b2be6f52005a5126fb6545d17929667661b277",
+   "bytes": 1005303,
+   "copy": {
+    "xmp_place": {
+     "City": "St. Louis",
+     "State": "Missouri",
+     "Country": "United States",
+     "CountryCode": "US"
+    }
+   },
+   "copy_bytes": 1005596
+  },
+  {
+   "file": "bursts-07-ponte-maria-pia-twin.jpg",
+   "group": "bursts",
+   "title": "Ponte Maria Pia (55246730866)",
+   "creator": "Michael Gaylard",
+   "credit": "Michael Gaylard",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Ponte_Maria_Pia_%2855246730866%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/8/8b/Ponte_Maria_Pia_%2855246730866%29.jpg",
+   "sha256": "f7bda4d4af7708995f32a99f70080e573696ec7791bbbde0743a0e9c7b3809bc",
+   "bytes": 15959802,
+   "copy": {},
+   "copy_sha256": "f7bda4d4af7708995f32a99f70080e573696ec7791bbbde0743a0e9c7b3809bc",
+   "copy_bytes": 15959802
+  },
+  {
+   "file": "text-01-board-of-works-receipt.jpg",
+   "group": "text",
+   "title": "Board of Works receipt",
+   "creator": "Laineys Repertoire",
+   "credit": "Laineys Repertoire",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://www.flickr.com/photos/76283671@N00/157827178/",
+   "file_url": "https://live.staticflickr.com/72/157827178_487cfc2bb1_o.jpg",
+   "sha256": "b6e80fc955197db158689d6ccf2365bd4d24271e84aa26922175fab0dcaf1d1e",
+   "bytes": 266495,
+   "copy": {
+    "exif_date": "2007:05:01 00:00:00"
+   },
+   "copy_bytes": 266581
+  },
+  {
+   "file": "text-02-vr-train-ticket.jpg",
+   "group": "text",
+   "title": "Train Ticket",
+   "creator": "Ananta Bhadra Lamichhane",
+   "credit": "Ananta Bhadra Lamichhane",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://www.flickr.com/photos/33088287@N00/2556077982/",
+   "file_url": "https://live.staticflickr.com/3120/2556077982_6f999b99c7_o.jpg",
+   "sha256": "c6844636444a62a5493c878b82555485aa0207b2ec6d6bcced95221cb72ae59b",
+   "bytes": 287742,
+   "copy": {
+    "gps": {
+     "lat": 60.866019,
+     "lon": 26.698837,
+     "accuracy_m": 800
+    }
+   },
+   "copy_bytes": 284319
+  },
+  {
+   "file": "text-03-italian-specialities-sign.jpg",
+   "group": "text",
+   "title": "Hand Painted Sign, Copenhagen",
+   "creator": "Peter Lindberg",
+   "credit": "Peter Lindberg",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://www.flickr.com/photos/35237094214@N01/189887777/",
+   "file_url": "https://live.staticflickr.com/64/189887777_b7eaeeb669_o.jpg",
+   "sha256": "3c851aacc2c0d1e0b6ec20be9a7bcad1da1ff5fe617f22c11891618a5fc88cc5",
+   "bytes": 2206315,
+   "copy": {
+    "xmp_place": {
+     "City": "Copenhagen",
+     "State": "Capital Region",
+     "Country": "Denmark",
+     "CountryCode": "DK"
+    }
+   },
+   "copy_bytes": 2206845
+  },
+  {
+   "file": "text-04-hiking-signpost-goschenen.jpg",
+   "group": "text",
+   "title": "Uri - Göschenen",
+   "creator": "Kecko",
+   "credit": "Kecko",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://www.flickr.com/photos/70981241@N00/35412066873/",
+   "file_url": "https://live.staticflickr.com/4316/35412066873_314ace74b2_o.jpg",
+   "sha256": "4f07ac251d676bdfc916af0c496bc9e97a265a229120d797bfe6222393abb8ac",
+   "bytes": 8736145,
+   "copy": {
+    "exif_date": "2017:07:23 13:46:23",
+    "gps": {
+     "lat": 46.66595,
+     "lon": 8.58808,
+     "accuracy_m": 100
+    }
+   },
+   "copy_bytes": 8736397
+  },
+  {
+   "file": "text-05-danger-deep-water-sign.jpg",
+   "group": "text",
+   "title": "Danger: deep water - hand painted sign",
+   "creator": "Futurilla",
+   "credit": "Futurilla",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://www.flickr.com/photos/52067454@N00/28498200495/",
+   "file_url": "https://live.staticflickr.com/7793/28498200495_93311c205a_o.jpg",
+   "sha256": "4fd4c665b3c5b6f8b94db35ee0fba411f73cf1c2418c79fce48ba7fd57977916",
+   "bytes": 4005128,
+   "copy": {
+    "xmp_place": {
+     "City": "Stoke-on-Trent",
+     "State": "England",
+     "Country": "United Kingdom",
+     "CountryCode": "GB"
+    }
+   },
+   "copy_bytes": 4005426
+  },
+  {
+   "file": "text-06-circus-poster.jpg",
+   "group": "text",
+   "title": "Walter L. Main Circus Poster",
+   "creator": "Ashtabula Archive",
+   "credit": "Ashtabula Archive",
+   "licence": "Public Domain Mark 1.0",
+   "licence_url": "https://creativecommons.org/publicdomain/mark/1.0/",
+   "source_page": "https://www.flickr.com/photos/115892967@N03/51762276826/",
+   "file_url": "https://live.staticflickr.com/65535/51762276826_7dabd19b5d_o.jpg",
+   "sha256": "98a5b41a0d55955740f78a16571f78b0de6a25770ae9e3178e83baedde933fc4",
+   "bytes": 2133338,
+   "copy": {},
+   "copy_sha256": "98a5b41a0d55955740f78a16571f78b0de6a25770ae9e3178e83baedde933fc4",
+   "copy_bytes": 2133338
+  },
+  {
+   "file": "text-07-militia-return.jpg",
+   "group": "text",
+   "title": "1843 Boxborough Militia",
+   "creator": "liz west",
+   "credit": "liz west",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://www.flickr.com/photos/53133240@N00/101952116/",
+   "file_url": "https://live.staticflickr.com/26/101952116_7e5b45ff2e_o.jpg",
+   "sha256": "f741ba03bfbd6a9e8a2137e68c52fdb4cdcce3fb4bcee62904cce05969d3d3f6",
+   "bytes": 1643294,
+   "copy": {},
+   "copy_sha256": "f741ba03bfbd6a9e8a2137e68c52fdb4cdcce3fb4bcee62904cce05969d3d3f6",
+   "copy_bytes": 1643294
+  },
+  {
+   "file": "text-08-trees-poem-book.jpg",
+   "group": "text",
+   "title": "Open book with “Trees,” Joyce Kilmer memorial, South Park, 2025-06-19",
+   "creator": "Cbaile19",
+   "credit": "Cbaile19",
+   "licence": "CC0 1.0",
+   "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Open_book_with_%E2%80%9CTrees%2C%E2%80%9D_Joyce_Kilmer_memorial%2C_South_Park%2C_2025-06-19.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/0/00/Open_book_with_%E2%80%9CTrees%2C%E2%80%9D_Joyce_Kilmer_memorial%2C_South_Park%2C_2025-06-19.jpg",
+   "sha256": "6149a5bb6decaf3e069854ee93090d4a27f37b8cbcb1167182db2d3602d48f55",
+   "bytes": 4912615,
+   "copy": {
+    "xmp_place": {
+     "City": "South Park",
+     "State": "Pennsylvania",
+     "Country": "United States",
+     "CountryCode": "US"
+    }
+   },
+   "copy_bytes": 4912760
+  },
+  {
+   "file": "varied-01-aurora-comet-church.jpg",
+   "group": "varied",
+   "title": "Comet C 2025 A6 Lemmon and Northen lights in Maarja-Magdaleena",
+   "creator": "FoxBill",
+   "credit": "FoxBill (Viljam Takis)",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Comet_C_2025_A6_Lemmon_and_Northen_lights_in_Maarja-Magdaleena.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/e/e0/Comet_C_2025_A6_Lemmon_and_Northen_lights_in_Maarja-Magdaleena.jpg",
+   "sha256": "12b9f8fb9e0eae2efffd05ecfbc8d934cd13bac45902f08572035cf1d5907939",
+   "bytes": 4427807,
+   "copy": {
+    "exif_date": "2025:10:18 20:00:00",
+    "exif_offset": "+03:00",
+    "gps": {
+     "lat": 58.60882,
+     "lon": 26.74238
+    }
+   },
+   "copy_bytes": 4424876
+  },
+  {
+   "file": "varied-02-jamaa-el-fna-dusk.jpg",
+   "group": "varied",
+   "title": "Jamaa el Fna (7346063132)",
+   "creator": "Jorge Láscar",
+   "credit": "Jorge Láscar",
+   "licence": "CC BY 2.0",
+   "licence_url": "https://creativecommons.org/licenses/by/2.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Jamaa_el_Fna_%287346063132%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/8/84/Jamaa_el_Fna_%287346063132%29.jpg",
+   "sha256": "bfe683bba377e4961240f5f85bd8c08152e9a3ca8e31d97cada80c0504da931e",
+   "bytes": 2988924,
+   "copy": {
+    "gps": {
+     "lat": 31.625833,
+     "lon": -7.989444,
+     "accuracy_m": 100
+    }
+   },
+   "copy_bytes": 2989090
+  },
+  {
+   "file": "varied-03-lightning-storm-belfort.jpg",
+   "group": "varied",
+   "title": "2019-07-26 21-46-13 orage-Belfort",
+   "creator": "Thomas Bresson",
+   "credit": "Thomas Bresson",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:2019-07-26_21-46-13_orage-Belfort.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/f/f7/2019-07-26_21-46-13_orage-Belfort.jpg",
+   "sha256": "3661fa121808132e90894a9b7294b174b669ccc580a0a087469a203121b49f1e",
+   "bytes": 16516823,
+   "copy": {},
+   "copy_sha256": "3661fa121808132e90894a9b7294b174b669ccc580a0a087469a203121b49f1e",
+   "copy_bytes": 16516823
+  },
+  {
+   "file": "varied-04-foggy-valley-witow.jpg",
+   "group": "varied",
+   "title": "Zamglona dolina w Witowie w powiecie proszowickim, 20241020 0808 6322",
+   "creator": "Jakub Hałun",
+   "credit": "Jakub Hałun",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Zamglona_dolina_w_Witowie_w_powiecie_proszowickim%2C_20241020_0808_6322.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/1/1a/Zamglona_dolina_w_Witowie_w_powiecie_proszowickim%2C_20241020_0808_6322.jpg",
+   "sha256": "a64f8262dcbd52815feef7f51d888cbb5d07305c1551312848fc423c069caafe",
+   "bytes": 12497245,
+   "copy": {
+    "gps": {
+     "lat": 50.1495,
+     "lon": 20.57623906
+    }
+   },
+   "copy_bytes": 12497361
+  },
+  {
+   "file": "varied-05-kirkjufell-rainbow.jpg",
+   "group": "varied",
+   "title": "Kirkjufell, Iceland, 20240714 1631 0713",
+   "creator": "Jakub Hałun",
+   "credit": "Jakub Hałun",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Kirkjufell%2C_Iceland%2C_20240714_1631_0713.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/e/ea/Kirkjufell%2C_Iceland%2C_20240714_1631_0713.jpg",
+   "sha256": "b2618deacef2a56ecbde8d16376e21aba0a7534292548017f8b50e140c3d78b7",
+   "bytes": 17008251,
+   "copy": {
+    "gps": {
+     "lat": 64.92596171,
+     "lon": -23.31226149
+    }
+   },
+   "copy_bytes": 17008367
+  },
+  {
+   "file": "varied-06-angkor-wat-reflection.jpg",
+   "group": "varied",
+   "title": "Angkor (I)",
+   "creator": "Supanut Arunoprayote",
+   "credit": "Supanut Arunoprayote",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Angkor_%28I%29.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/e/e0/Angkor_%28I%29.jpg",
+   "sha256": "0007895bba0d1970e0c2f93702e21ab7d5d75a4f3c5b04b7cbbbf16a3af9df1a",
+   "bytes": 12398060,
+   "copy": {
+    "gps": {
+     "lat": 13.411947,
+     "lon": 103.864062
+    }
+   },
+   "copy_bytes": 12393089
+  },
+  {
+   "file": "varied-07-camels-gobi-dunes.jpg",
+   "group": "varied",
+   "title": "Camels at Khongoryn Els 01",
+   "creator": "Bernard Gagnon",
+   "credit": "Bernard Gagnon",
+   "licence": "CC0 1.0",
+   "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Camels_at_Khongoryn_Els_01.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/3/3f/Camels_at_Khongoryn_Els_01.jpg",
+   "sha256": "fb5ab721b6fcab8e6987e7e10940b6734d180cbfef0b4dc8df770e33776550c9",
+   "bytes": 7916252,
+   "copy": {
+    "gps": {
+     "lat": 43.795278,
+     "lon": 102.198944
+    }
+   },
+   "copy_bytes": 7903326
+  },
+  {
+   "file": "varied-08-red-fox-drinking.jpg",
+   "group": "varied",
+   "title": "Red Fox drinking from a lake in Gennevilliers, France",
+   "creator": "Alexis Lours",
+   "credit": "Alexis Lours",
+   "licence": "CC BY 4.0",
+   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Red_Fox_drinking_from_a_lake_in_Gennevilliers%2C_France.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/c/c4/Red_Fox_drinking_from_a_lake_in_Gennevilliers%2C_France.jpg",
+   "sha256": "3afea7f228eaa7fcdf0eb3d2754040a2993ae14b94f800642c24975d7aac28e6",
+   "bytes": 16912954,
+   "copy": {
+    "gps": {
+     "lat": 48.935269,
+     "lon": 2.314757,
+     "accuracy_m": 100
+    },
+    "remove_gps_void": true
+   },
+   "copy_bytes": 16894592
+  },
+  {
+   "file": "varied-09-elephant-masai-mara.jpg",
+   "group": "varied",
+   "title": "African bush elephant (Loxodonta africana), Masai Mara",
+   "creator": "Hobbyfotowiki",
+   "credit": "Hobbyfotowiki",
+   "licence": "CC0 1.0",
+   "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:African_bush_elephant_%28Loxodonta_africana%29%2C_Masai_Mara.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/6/64/African_bush_elephant_%28Loxodonta_africana%29%2C_Masai_Mara.jpg",
+   "sha256": "668ad88b8033178ffd0f66f666f324f559d9c9335467fd91dfebac404dfd0b00",
+   "bytes": 12714626,
+   "copy": {
+    "xmp_place": {
+     "Country": "Kenya",
+     "CountryCode": "KE"
+    }
+   },
+   "copy_bytes": 12714849
+  },
+  {
+   "file": "varied-10-tekkadon-tuna-bowl.jpg",
+   "group": "varied",
+   "title": "Tekkadon 001",
+   "creator": "Ocdp",
+   "credit": "Ocdp",
+   "licence": "CC0 1.0",
+   "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+   "source_page": "https://commons.wikimedia.org/wiki/File:Tekkadon_001.jpg",
+   "file_url": "https://upload.wikimedia.org/wikipedia/commons/6/6d/Tekkadon_001.jpg",
+   "sha256": "b4d721aced5a4aa7756fa609dddb50d5f31134c1ad965b99ffb936ae578182c2",
+   "bytes": 8278988,
+   "copy": {
+    "gps": {
+     "lat": 34.850992,
+     "lon": 138.326097
+    }
+   },
+   "copy_bytes": 8224728
+  }
+ ]
+}

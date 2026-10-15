@@ -265,6 +265,34 @@ test("the viewer names the named place before the town", function () {
     });
 });
 
+test("the viewer marks a named place found by its kind", function () {
+    var page = searchPage();
+    var falls = {i: 6, l: "lib", t: "Mist over the rocks", g: ["mist"], ds: 1,
+                 dk: "2021-03-08", gp: 1, np: "High Falls", nk: "waterfall", nd: 30};
+    function marked(rec, query) {
+        var place = placeOf(page, rec, query);
+        var marks = place.node.querySelectorAll("mark");
+        return [place.node.querySelectorAll("a")[0].classList.contains("is-match"),
+                marks.length ? marks[0].textContent : "", place.node.textContent];
+    }
+    return FAKE.waitFor(function () {
+        return /\d+ pictures?/.test(FAKE.byId(page, "result-count").textContent);
+    }).then(function () {
+        // "High Falls" never says waterfall: the chip and the kind under it are marked.
+        assert.deepStrictEqual(marked(falls, "kind:waterfall OR waterfalls"),
+                               [true, "waterfall", "High Fallswaterfall, 30 m away"]);
+        assert.deepStrictEqual(marked(falls, SearchCore.parse("kind:waterfalls")).slice(0, 2),
+                               [true, "waterfall"]);
+        // Another kind, a left-out kind, or only words: not marked.
+        ["kind:zoo", "mist -kind:waterfall", "mist"].forEach(function (query) {
+            assert.deepStrictEqual(marked(falls, query).slice(0, 2), [false, ""], query);
+        });
+        // The maps' kind in words: an aerodrome is an airport.
+        assert.deepStrictEqual(marked(records()[4], "kind:airport OR airports").slice(0, 2),
+                               [true, "airport"]);
+    });
+});
+
 /* ---------- The map ----------------------------------------------------------- */
 
 var MAP_PAGE = fs.readFileSync(path.join(ROOT, "templates", "map.html"), "utf8");

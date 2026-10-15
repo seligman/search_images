@@ -781,6 +781,33 @@ class ExportTest(ExportFixture):
             self.assertIn(title, titles)
         self.assertNotIn("Tax letter", titles)
 
+    def test_a_site_never_says_a_picture_shows_private_information(self):
+        # A picture flagged as showing private information is published only
+        # when the owner chose to (Publish ticked in the review, or the option
+        # off): its record does not carry the flag, so the site shows no badge
+        # and is:private finds nothing there. The sensitive level stays: the
+        # site's "Hide sensitive pictures" goes by it.
+        out = self.out("flags")
+        self.export(out, {"include_ids": [self.ids["private.jpg"], self.ids["sensitive.jpg"]]})
+        records = self.by_title(out)
+        self.assertNotIn("pr", records["Bank card"])
+        self.assertEqual(records["Beach outfit"]["se"], "suggestive")
+        self.assertEqual([title for title, record in records.items()
+                          if set(record) & set(export.PRIVATE_FLAG_KEYS)], [])
+        if NODE is not None:
+            self.run_node(out, {"page": "index.html", "queries": [
+                {"query": "is:private", "titles": []},
+                {"query": "card", "titles": ["Bank card"]},
+                {"query": "is:sensitive", "titles": ["Beach outfit"]},
+                {"query": "beach", "options": {"sensitive": "strict"}, "titles": []}]})
+        self.export(out, {"exclude_private": False})
+        self.assertNotIn("pr", self.by_title(out)["Bank card"])
+        # The owner's own pages keep the flag.
+        import search_index
+        own = [record for record in search_index.build_records(
+            self.conn, common.load_config(), [self.library_id]) if record.get("t") == "Bank card"]
+        self.assertEqual([record.get("pr") for record in own], [1])
+
     def test_preview_counts_flags_and_size(self):
         config = common.load_config()
         preview = export.preview_export(self.conn, config, self.library_id)
@@ -1262,6 +1289,39 @@ class ExportTest(ExportFixture):
         # The library's own name is not used when a title is given.
         self.assertNotIn("Family", html)
 
+    def test_saved_options_it_cannot_use_are_logged(self):
+        # The export goes on with them at their defaults, and its log says so
+        # (once each); an option the run sets itself is not warned about.
+        out = self.out("warned")
+        config = common.load_config()
+        library = common.get_library(config, self.library_id)
+        too_long = "Photos: " + "A. Creator, " * 400
+        library["export"] = {"credits": too_long, "colour": True, "images": "huge",
+                             "title": "Kept title"}
+
+        def warnings(options=None):
+            lines = []
+            export.export_library(export.LogContext(lines.append), self.conn, config,
+                                  self.library_id, out, options)
+            return [line for line in lines if line.startswith("Warning: The saved export")]
+        said = warnings()
+        self.assertEqual(len(said), 3, said)
+        self.assertIn('"credits" is ignored (left at its default): it must be at most 4000 '
+                      'characters (this one has %d)' % len(" ".join(too_long.split())), said[0])
+        self.assertIn('"colour" is ignored: it is not an export option', said[1])
+        self.assertIn('"images" is ignored (left at its default): it must be one of', said[2])
+        with open(os.path.join(out, "index.html"), encoding="utf-8") as handle:
+            html = handle.read()
+        self.assertIn("<title>Kept title</title>", html)
+        self.assertNotIn("A. Creator", html)
+        self.assertEqual(read_manifest(out)["options"]["images"], "web")
+        # Set for the run: no warning about it, and it is used.
+        said = warnings({"credits": "Photos: A. Creator", "images": "none"})
+        self.assertEqual(len(said), 1, said)
+        self.assertIn('"colour"', said[0])
+        with open(os.path.join(out, "index.html"), encoding="utf-8") as handle:
+            self.assertIn("Photos: A. Creator", handle.read())
+
     def test_a_stop_keeps_track_of_what_was_written(self):
         out = self.out("stopped")
         ctx = jobs.JobContext("test")
@@ -1607,6 +1667,44 @@ class OptionsTest(unittest.TestCase):
             export.validate_options(["images"])
         with self.assertRaises(export.OptionsError):
             export.validate_options({"exclude_ids": [True]})
+
+    def test_saved_options_that_cannot_be_used_are_named(self):
+        # A saved option an export cannot use is left at its default
+        # (library_options), never silently: an unknown name, a wrong value, a
+        # text too long (with its length). Options a run sets itself are not
+        # looked at.
+        long_credits = "Photos: " + "A. Creator (CC BY 4.0), " * 200
+        length = len(" ".join(long_credits.split()))
+        self.assertGreater(length, export.MAX_CREDITS)
+        library = {"export": {"images": "original", "location": "bad", "colour": 1,
+                              "credits": long_credits}}
+        options = export.library_options(library)
+        self.assertEqual((options["images"], options["location"], options["credits"]),
+                         ("original", False, ""))
+        self.assertEqual(export.saved_option_problems(library["export"]), [
+            ("location", "must be true or false"), ("colour", "is not an export option"),
+            ("credits", "must be at most 4000 characters (this one has %d)" % length)])
+        self.assertEqual(export.library_option_warnings(library), [
+            'The saved export option "location" is ignored (left at its default): it must '
+            'be true or false.',
+            'The saved export option "colour" is ignored: it is not an export option.',
+            'The saved export option "credits" is ignored (left at its default): it must be '
+            'at most 4000 characters (this one has %d).' % length])
+        self.assertEqual(export.library_option_warnings(library, {"credits": "Short",
+                                                                  "location": True}),
+                         ['The saved export option "colour" is ignored: it is not an '
+                          'export option.'])
+        for good in ({}, {"export": None}, {"export": {"zip": True}}, None):
+            self.assertEqual(export.library_option_warnings(good), [], good)
+        self.assertEqual(export.saved_option_warnings(["images"]),
+                         ["The saved export options are ignored (left at their defaults): "
+                          "they must be an object of export options."])
+        # A credits line of 4,000 characters is fine (one naming every
+        # creator of a mixed set of pictures gets long).
+        self.assertEqual(export.MAX_CREDITS, 4000)
+        self.assertEqual(len(export.validate_options({"credits": "x" * 4000})["credits"]), 4000)
+        self.assertEqual(export.library_option_warnings({"export": {"credits": "x" * 4000}}),
+                         [])
 
     def test_values_are_cleaned(self):
         options = export.validate_options({"include_ids": [5, 3, 5], "title": "  A \n B ",

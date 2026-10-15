@@ -709,6 +709,33 @@ body.map-page #shell-header {
     padding: 0 2px;
 }
 
+/* (A message's action, such as Undo: SHELL.toast.) */
+.toast-action {
+    flex: none;
+    padding: 2px 10px;
+    border: 1px solid currentColor;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.toast-action:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+}
+
+/* (Its keyboard shortcut, where there is a keyboard: "Undo Ctrl+Z".) */
+@media (hover: hover) and (pointer: fine) {
+    .toast-action[data-keys]::after {
+        content: " " attr(data-keys);
+        font-weight: 400;
+        opacity: 0.8;
+    }
+}
+
 /* Admin pages (Manage, Settings): buttons, forms, cards, dialogs */
 
 body.admin-page {
@@ -1972,6 +1999,15 @@ dialog.export-dialog {
 .export-dialog .export-home-km {
     width: auto;
     max-width: 100%;
+}
+
+/* Saved options an export cannot use (left at their defaults). */
+.export-option-warnings p {
+    margin: 0 0 6px;
+}
+
+.export-option-warnings .warning-list {
+    margin-bottom: 6px;
 }
 
 .export-summary {
@@ -4354,6 +4390,26 @@ html.viewer-open body {
     border: 2px solid #ffd54a;
     border-radius: 4px;
     box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+    /* (A button: a click, a tap or Enter says who it is, see viewer.js openNaming.) */
+    pointer-events: auto;
+    cursor: pointer;
+}
+
+.face-box:hover,
+.face-box.is-naming {
+    border-color: #ffffff;
+    border-style: solid;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 0 0 4px rgba(255, 213, 74, 0.45);
+}
+
+.face-box:focus {
+    outline: none;
+}
+
+.face-box:focus-visible {
+    border-color: #ffffff;
+    border-style: solid;
+    box-shadow: 0 0 0 2px #000000, 0 0 0 5px #ffffff;
 }
 
 .face-box.is-unknown,
@@ -4405,10 +4461,315 @@ html.viewer-open body {
     pointer-events: auto;
 }
 
-a.face-name:hover,
-a.face-name:focus-visible {
+.face-box:hover .face-name,
+.face-box:focus-visible .face-name,
+.face-box.is-naming .face-name {
     background: #000000;
-    text-decoration: underline;
+}
+
+/* A face in a crowd, whose name would cover its neighbour's face or name
+   (viewer.js markTight): the name shows on hover, on focus and while the
+   face is being named, over the others. */
+.face-box.is-tight .face-name {
+    display: none;
+}
+
+.face-box.is-tight:hover .face-name,
+.face-box.is-tight:focus-visible .face-name,
+.face-box.is-tight.is-naming .face-name {
+    display: block;
+    z-index: 1;
+}
+
+/* (To a finger, a small face takes a tap a little around it too: 44 px, but
+   under every box, so a tap on a face is always that face's.) */
+@media (pointer: coarse) {
+    .face-box::before {
+        content: "";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        z-index: -1;
+        width: 100%;
+        height: 100%;
+        min-width: 44px;
+        min-height: 44px;
+        transform: translate(-50%, -50%);
+    }
+}
+
+/* The popover that says who a face is (viewer.js openNaming): by its box (or
+   its face in the pane's strip), a sheet at the foot of a phone's screen. */
+.face-popover {
+    position: fixed;
+    inset: auto;
+    z-index: 950;
+    box-sizing: border-box;
+    width: 340px;
+    max-width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+    margin: 0;
+    padding: 12px;
+    overflow: auto;
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow-lg);
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.face-popover.is-busy {
+    cursor: progress;
+}
+
+.face-popover.is-sheet {
+    right: 0;
+    width: auto;
+    max-width: none;
+    padding: 14px 16px calc(14px + env(safe-area-inset-bottom, 0px));
+    border-width: 1px 0 0;
+    border-radius: 14px 14px 0 0;
+}
+
+.face-pop-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.face-pop-face {
+    flex: none;
+    width: 56px;
+    height: 56px;
+    border-radius: 8px;
+    background: var(--surface-3);
+    object-fit: cover;
+}
+
+.face-pop-who {
+    flex: 1;
+    min-width: 0;
+}
+
+.face-pop-title {
+    margin: 0;
+    font-size: 15px;
+}
+
+.face-pop-now {
+    margin: 2px 0 0;
+    color: var(--text-muted);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.face-pop-now a {
+    color: var(--link);
+}
+
+.face-pop-x {
+    flex: none;
+    align-self: flex-start;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.face-pop-x:hover {
+    background: var(--surface-2);
+    color: var(--text);
+}
+
+.face-pop-x:focus-visible {
+    outline: 2px solid var(--accent);
+}
+
+.face-pop-input {
+    display: block;
+}
+
+.face-pop-list {
+    max-height: 264px;
+    margin: 8px 0 0;
+    padding: 0;
+    overflow-y: auto;
+    list-style: none;
+}
+
+.face-pop-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 40px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.face-pop-option:hover {
+    background: var(--surface-2);
+}
+
+.face-pop-option.is-active {
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.face-pop-option img,
+.face-pop-plus {
+    flex: none;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--surface-3);
+    object-fit: cover;
+}
+
+.face-pop-plus {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    font-weight: 700;
+}
+
+.face-pop-name {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.face-pop-option small {
+    flex: none;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.face-pop-hint {
+    margin: 8px 2px 0;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+.face-pop-error {
+    margin: 8px 2px 0;
+    color: var(--danger-fg);
+    font-size: 13px;
+}
+
+.face-pop-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+
+/* A video's (or a 360 picture's) faces in the pane, "Show faces" on: each
+   says who it is when pressed (viewer.js faceStrip). */
+.info-face-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    width: 100%;
+    margin-top: 4px;
+}
+
+.info-face {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    width: 64px;
+    padding: 4px 3px 3px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    line-height: 1.3;
+    cursor: pointer;
+}
+
+.info-face:hover,
+.info-face:focus-visible,
+.info-face.is-naming {
+    border-color: var(--accent);
+}
+
+.info-face:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.info-face img {
+    width: 52px;
+    height: 52px;
+    border-radius: 6px;
+    background: var(--surface-3);
+    object-fit: cover;
+}
+
+.info-face.is-unknown img {
+    outline: 2px dashed var(--border-strong);
+    outline-offset: -2px;
+}
+
+.info-face-name,
+.info-face-at {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.info-face-at {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
+/* (Fingers: large choices and buttons; a field that phones do not zoom into.) */
+@media (pointer: coarse) {
+    .face-pop-input {
+        font-size: 16px;
+        min-height: 44px;
+    }
+
+    .face-pop-option {
+        min-height: 48px;
+    }
+
+    .face-pop-option img,
+    .face-pop-plus {
+        width: 40px;
+        height: 40px;
+    }
+
+    .face-pop-actions .button {
+        min-height: 44px;
+    }
+
+    .face-pop-x {
+        min-width: 44px;
+        min-height: 44px;
+    }
+
+    .info-face {
+        width: 72px;
+    }
 }
 
 .info-people .info-chip.is-unnamed {
@@ -6268,6 +6629,11 @@ body.map-panel-open #map-area-tools {
         min-width: 40px;
         min-height: 40px;
         margin: -10px -10px -10px 0;
+    }
+
+    .toast-action {
+        min-height: 40px;
+        margin: -8px 0;
     }
 
     .drive-track {

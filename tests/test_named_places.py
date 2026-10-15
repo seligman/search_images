@@ -219,6 +219,30 @@ class FindTest(Fixture, unittest.TestCase):
         self.assertEqual(self.find(TOWER), ("Harbour Tower", "attraction", False))
         self.assertEqual(named_places.display_name({"name": "Caf\u00e9 Nord"}), "Caf\u00e9 Nord")
 
+    def test_a_place_with_several_names_is_shown_by_the_first(self):
+        # OpenStreetMap keeps the several names of one place in one ("A;B"): the
+        # first, trimmed, is the name shown, searched and published.
+        first = named_places.first_name
+        self.assertEqual(first(" Southern Hall ; Hall Two "), "Southern Hall")
+        self.assertEqual(first(";;Hall Two;"), "Hall Two")
+        self.assertEqual([first(" ; "), first(""), first(None)], ["", "", ""])
+        self.assertEqual(named_places.display_name({"name": "\u5357;\u5317",
+                                                    "name:en": "South Hall;North Hall"}),
+                         "South Hall")
+        self.assertEqual(named_places.all_names({"name": "Southern Hall; Hall Two",
+                                                 "name:en": "Hall Two;Hall 2"}),
+                         ["Southern Hall", "Hall Two", "Hall 2"])
+        write_streets([poi(8701, "Southern Hall;Hall Two", "attraction", *BASE, min_zoom=13),
+                       poi(8702, "Gull Gifts", "gift", *offset(*BASE, north_m=300),
+                           min_zoom=16)])
+        self.assertEqual(self.find(offset(*BASE, north_m=20)),
+                         ("Southern Hall", "attraction", False))
+        # A description that says its other name names it too.
+        said = named_places.plain_words("A visit to Hall Two")
+        found = named_places.candidates(BASE[0], BASE[1], 10.0, self.reader(),
+                                        facts(words=said))
+        self.assertEqual((found[0].name, found[0].named), ("Southern Hall", True))
+
     def test_tiles_are_read_back_as_written(self):
         archive = street_maps.open_local(street_maps.archive_path())
         self.addCleanup(archive.read.close)
@@ -697,6 +721,18 @@ class RecordTest(Fixture, unittest.TestCase):
         self.assertNotIn("nd", guess)
         self.assertEqual(search_index.picture_record(self.conn, self.zoo)["np"], "City Zoo")
 
+    def test_a_row_found_with_several_names_shows_one(self):
+        # (A row found before the rules said so, until the next update finds it
+        # again: RULES_VERSION.)
+        self.conn.execute("UPDATE named_places SET name = ? WHERE image_id = ?",
+                          ("City Zoo ; Zoo of the City", self.zoo))
+        self.conn.commit()
+        record = search_index.picture_record(self.conn, self.zoo)
+        self.assertEqual(record["np"], "City Zoo")
+        self.assertEqual(named_places.record_keys(
+            {"name": "City Zoo;Zoo of the City", "kind": "zoo", "inside": 1}, True),
+            {"np": "City Zoo", "nk": "zoo", "ni": 1})
+
     def test_the_keys_of_a_named_place(self):
         def keys(for_export=False, **row):
             named = dict({"name": "Toy Museum", "kind": "museum", "metres": 57, "inside": 0,
@@ -942,6 +978,60 @@ class ExportTest(Fixture, unittest.TestCase):
         self.config = common.load_config()
         self.assertFalse(any("np" in record for record in self.records(location=True)))
 
+    def test_a_smart_album_of_a_kind_of_place_goes_with_the_location(self):
+        import albums
+        from test_export import read_manifest
+        searches = {"Zoos": "kind:zoo OR zoos", "At a zoo": "kind:zoo",
+                    "Fish, no zoo": "fish -kind:zoo", "Zoos 2019": "zoos date:2019 OR 2019"}
+        for name, query in searches.items():
+            albums.create_album(self.conn, name, kind="smart", query=query)
+        self.conn.commit()
+
+        def published(location):
+            out = self.site(location=location, marks=True)
+            return out, {album["name"]: album["query"] for album in read_manifest(out)["albums"]}
+
+        out, found = published(True)
+        self.assertEqual(found, searches)
+        # The published site finds the picture taken at the zoo by its kind
+        # (search-core.js, as its page runs it).
+        if NODE is not None:
+            self.assertEqual(self.search_site(out, ["kind:zoo", "zoos", "kind:aquarium"]),
+                             {"kind:zoo": ["City Zoo"], "zoos": ["City Zoo"],
+                              "kind:aquarium": ["Harbour Aquarium"]})
+        # Without location: no named place, no kind; the words typed stay.
+        out, found = published(False)
+        self.assertEqual(found, {"Zoos": "zoos", "Zoos 2019": "zoos date:2019 OR 2019"})
+        # With location but no named place published (named places off): the
+        # same -- kind: alone would find nothing there.
+        self.base.write_config([support.library("Family", self.family, id="lib_family1")],
+                               named_places={"enabled": False})
+        self.config = common.load_config()
+        out, found = published(True)
+        self.assertFalse(any("nk" in record for record in self.records(location=True)))
+        self.assertEqual(found, {"Zoos": "zoos", "Zoos 2019": "zoos date:2019 OR 2019"})
+
+    def search_site(self, out, queries):
+        """{query: [named places]} of the published site's records, searched (and
+        understood: plain language) by its search-core.js under Node."""
+        from test_export import read_records
+        path = self.base.join("records.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(read_records(out), handle)
+        script = ("var S = require(process.argv[1]); var r = require(process.argv[2]);"
+                  "var x = S.prepare(r); var out = {};"
+                  "JSON.parse(process.argv[3]).forEach(function (q) {"
+                  "  var said = x.interpret(q, {});"
+                  "  out[q] = x.search(said.query, {}).items.map(function (i) {"
+                  "    return x.get(i).np; }); });"
+                  "console.log(JSON.stringify(out));")
+        result = subprocess.run([NODE, "-e", script, os.path.join(out, "assets",
+                                                                  "search-core.js"),
+                                 path, json.dumps(queries)],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
 
 @unittest.skipUnless(support.pillow_available(), "Pillow is not installed")
 class TripTest(test_trip_export.TripExportTest):
@@ -1039,6 +1129,29 @@ class TripTest(test_trip_export.TripExportTest):
         self.assertNotIn("Homeside", text)
         self.assertNotIn("hometown museum", text.lower())
 
+    def test_no_kind_of_place_when_only_home_has_named_places(self):
+        # Only the picture in home's town (out of the home area) keeps a named place:
+        # the trip leaves it out (after the albums are chosen), so no kind of place is
+        # published, and a smart album of a kind goes as a library's export without
+        # named places does: left out, or with the words typed only.
+        import albums
+        from test_export import read_manifest
+        self.conn.execute("UPDATE named_places SET name = '', kind = '' WHERE image_id <> ?",
+                          (self.edge_id,))
+        for name, query in (("Museums", "kind:museum"),
+                            ("Museums, or the word", "kind:museum OR museums")):
+            albums.create_album(self.conn, name, kind="smart", query=query)
+        self.conn.commit()
+        out, _summary = self.export("home-kinds", {"location": True, "marks": True})
+        records = self.records(out)
+        self.assertIn("Picture edge", records)
+        self.assertFalse(any(key in record for record in records.values()
+                             for key in named_places.RECORD_KEYS))
+        manifest = read_manifest(out)
+        self.assertFalse(manifest["capabilities"].get("named_places"))
+        self.assertEqual({album["name"]: album["query"] for album in manifest["albums"]},
+                         {"Museums, or the word": "museums"})
+
 
 # (TripTest runs its own tests only, not again those of the trip export's.)
 for _name in dir(test_trip_export.TripExportTest):
@@ -1095,6 +1208,33 @@ class AdminTest(Fixture, unittest.TestCase):
         row = named_places.stored(self.conn)[image_id]
         self.assertEqual((row["name"], row["source"]), ("City Zoo", "owner"))
         self.assertEqual(named_places.RECORD_KEYS, ("np", "nk", "nd", "ni", "na"))
+
+
+@unittest.skipIf(NODE is None, "Node.js is not installed")
+class KindsTest(unittest.TestCase):
+    """The kinds of place the search knows (search-core.js PLACE_KIND_LIST, kind:) are
+    kinds of named places (KINDS); the kinds it leaves to kind: by their own name
+    are these."""
+
+    # Shops of one thing, land cover, and areas with a name that is no place to go.
+    BY_NAME_ONLY = {"antiques", "art", "cheese", "chocolate", "confectionery", "deli", "wine",
+                    "bare_rock", "grass", "heath", "meadow", "sand", "scrub", "wetland", "cape",
+                    "commercial", "pedestrian", "railway"}
+
+    def test_the_kinds_of_the_search_are_those_of_the_named_places(self):
+        result = subprocess.run(
+            [NODE, "-e", "console.log(JSON.stringify(require(process.argv[1]).placeKinds()))",
+             os.path.join(support.REPO, "static", "search-core.js")],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = json.loads(result.stdout)
+        found = {kind for line in lines for kind in line["kinds"]}
+        self.assertEqual(found - set(named_places.KINDS), set())
+        self.assertEqual(set(named_places.KINDS) - found, self.BY_NAME_ONLY)
+        # (An airport's kinds, as kind_words shows them.)
+        self.assertIn({"key": "airport", "label": "airports",
+                       "words": ["airport", "aerodrome", "airfield"],
+                       "kinds": ["airport", "aerodrome"]}, lines)
 
 
 @unittest.skipIf(NODE is None, "Node.js is not installed")

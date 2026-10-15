@@ -30,7 +30,8 @@ its value is empty, zero, or the "nothing" value noted below:
          (landmarks and location guess in an export only with location)
     q    aesthetic score 1-5              sh   sharpness score 1-5
     qf   quality flags []                 se   sensitive (not "none")
-    pr   1 when the picture shows private information
+    pr   1 when the picture shows private information (server; an export
+         never carries it, nor dvp below: see export.PRIVATE_FLAG_KEYS)
     dk   date taken "YYYY-MM-DD" (an export: only from the camera or the
          file name, never from the file's time)
     ts   date and time taken (server)

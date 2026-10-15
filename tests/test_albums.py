@@ -553,6 +553,15 @@ class AlternativesTest(unittest.TestCase):
                                                      ("person",)), "place:lisbon OR lisbon tram")
         self.assertEqual(albums.without_alternatives('person:"Anna Lopez" | "anna lopez"',
                                                      ("person",)), '"anna lopez"')
+        # A kind of place ("zoos", "golf courses"), as plain language writes it.
+        self.assertEqual(albums.without_alternatives(
+            'lions at the kind:zoo OR zoo kind:golf_course OR "golf courses"', ("kind",)),
+            'lions at the zoo "golf courses"')
+        # (A kind of several words, word by word.)
+        self.assertEqual(albums.without_alternatives(
+            "kind:place_of_worship OR house of kind:place_of_worship OR worship", ("kind",)),
+            "house of worship")
+        self.assertEqual(albums.query_terms("placekind:beach")[0]["field"], "kind")
         # A person: of its own, negated, or with another field term after the OR: none.
         for query in ("person:Anna beach", "-person:Anna OR anna", "person:Anna OR place:x",
                       "person:Anna OR", 'beach person:"Anna"'):

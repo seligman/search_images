@@ -17,7 +17,9 @@ pictures: its title, dates (the first and last day of the published
 pictures), kind, the export ids of its pictures by day in the order taken,
 how far apart one after the other were taken (trips.gap_classes: "within
 20 s", "within two minutes" or "further" -- never a time), the look units of
-each day (trips.look_units, of the published pictures), and with the location
+each day (trips.look_units, of the published pictures), the published
+pictures its page never features (unfeatured: never among a day's best, as
+a day's only picture or on its cover; see below), and with the location
 option the places of the trip and of each day, from the published pictures'
 place names. Its title is the export's title option, else the owner's or the
 library's name for the trip, else one made from the places of the published
@@ -51,6 +53,15 @@ area has: the town or named place (named_places.py) withheld from a
 picture there, or a named place found in the home area (_TripExport.
 smart_search; a word some published picture's place also has is no secret). Titles and descriptions
 are published as written (the review step lists the pictures).
+
+The records of an export never say a picture shows private information
+(export.PRIVATE_FLAG_KEYS), so the trip's page could not tell such a picture
+the owner chose to publish (the exclude_private option off, or Publish ticked
+in the review) from the others, and would feature it where the owner's own
+page does not: the trip lists, by their export ids, the published pictures
+the owner's page never features (presentable: the private ones, and the
+sensitive ones -- whose records say so too -- with them), and static/trips.js
+leaves them out of the best, the cover and a day's only picture.
 
 The trip's story (trip_stories.py) goes only with the "story" option (off
 by default; never a hidden story) and the location option (it names the
@@ -217,24 +228,16 @@ def trip_options(saved=None, overrides=None):
     if overrides is not None and not isinstance(overrides, dict):
         raise export.OptionsError({"options": "must be an object"})
     overrides = dict(overrides or {})
+    # (A kept one that is wrong is left at its default: option_warnings says so.)
+    values = {key: value for key, value in _trip_only(saved).items()
+              if _trip_option_problem(key, value) is None}
     errors = {}
-    home_km = saved.pop("home_km", HOME_KM)
-    if not _good_km(home_km):
-        home_km = HOME_KM
-    if "home_km" in overrides:
-        value = overrides.pop("home_km")
-        if _good_km(value):
-            home_km = value
+    for key, value in _trip_only(overrides).items():
+        problem = _trip_option_problem(key, value)
+        if problem is None:
+            values[key] = value
         else:
-            errors["home_km"] = ("must be one of %s kilometres, or 0 (home is not kept out)"
-                                 % ", ".join(str(step) for step in HOME_KM_STEPS))
-    story = saved.pop("story", False) is True
-    if "story" in overrides:
-        value = overrides.pop("story")
-        if isinstance(value, bool):
-            story = value
-        else:
-            errors["story"] = "must be true or false"
+            errors[key] = problem
     if overrides.get("album") is not None:
         errors["album"] = "cannot be chosen for a trip: the trip's pictures go"
     overrides.pop("album", None)
@@ -247,14 +250,48 @@ def trip_options(saved=None, overrides=None):
     if errors:
         raise export.OptionsError(errors)
     options["album"] = None
-    options["home_km"] = home_km
-    options["story"] = story
+    options.update(TRIP_DEFAULTS)
+    options.update(values)
     return options
+
+
+def _trip_only(options):
+    """{key: value} of the options of trip exports only (TRIP_DEFAULTS) that options sets,
+    taken out of it."""
+    return {key: options.pop(key) for key in TRIP_DEFAULTS if key in options}
+
+
+def _trip_option_problem(key, value):
+    """What is wrong with a value of an option of trip exports only (TRIP_DEFAULTS), as
+    export.validate_options words its problems, or None."""
+    if key == "home_km" and not _good_km(value):
+        return ("must be one of %s kilometres, or 0 (home is not kept out)"
+                % ", ".join(str(step) for step in HOME_KM_STEPS))
+    if key == "story" and not isinstance(value, bool):
+        return "must be true or false"
+    return None
 
 
 def _good_km(value):
     return (isinstance(value, int) and not isinstance(value, bool)
             and (value == 0 or value in HOME_KM_STEPS))
+
+
+def option_warnings(saved, overrides=None):
+    """A line for each option kept with a trip's last export that an export of the trip
+    leaves at its default (export.saved_option_warnings; home_km and story as trip_options
+    reads them; album is never kept for a trip), but those overrides set."""
+    skip = tuple(overrides) if isinstance(overrides, dict) else ()
+    lines = []
+    if isinstance(saved, dict):
+        saved = dict(saved)
+        for key, value in _trip_only(saved).items():
+            problem = _trip_option_problem(key, value)
+            if problem is not None and key not in skip:
+                lines.append('The saved export option "%s" is ignored (left at its default): '
+                             'it %s.' % (key, problem))
+        saved.pop("album", None)
+    return lines + export.saved_option_warnings(saved, skip)
 
 
 def options_to_save(options):
@@ -290,6 +327,15 @@ def load(conn, config, trip_id):
     libraries = [common.get_library(config, library_id) for library_id in order
                  if library_id in wanted]
     return built, trip, [library for library in libraries if library is not None]
+
+
+def presentable(record):
+    """True when the trip's page may show a picture as a day's picture or on its cover, by
+    the owner's search record (static/trips.js presentable): not hidden, private or
+    sensitive."""
+    level = record.get("se")
+    return not (record.get("h") or record.get("pr")
+                or (isinstance(level, str) and level not in ("", "none")))
 
 
 def candidates(trip):
@@ -509,6 +555,8 @@ class _TripExport(export._Export):
         # (Positions, routes and town names: only with the location.)
         self.home = self.area if options["location"] else None
         self.at_home_ids = set()        # pictures whose town is not named (see records)
+        self.home_pictures = set()      # the same, known before (names_at_home)
+        self.unfeatured = set()         # pictures the trip's page never features (records)
         # (The town and named place names withheld near home, and those published: see
         # smart_search; plain_words each.)
         self.home_names = set()
@@ -586,6 +634,10 @@ class _TripExport(export._Export):
         return done, False
 
     def records(self, pictures):
+        # (The pictures the trip's page never features, while their records still say why:
+        # the export's leave out the private flag, see trip_view.)
+        self.unfeatured = {picture.row["id"] for picture in pictures
+                           if not presentable(picture.record)}
         records = export._Export.records(self, pictures)
         # (The words of the drives of the near-home clips left out: see the module notes.)
         export.drop_drive_words(records, {picture.xid for picture in pictures
@@ -617,14 +669,24 @@ class _TripExport(export._Export):
             self.home_names, self.published_names = self.names_at_home(pictures)
         return export._Export.album_numbers(self, pictures)
 
+    def kind_published(self, picture):
+        """As a library's export, but not a picture at home: records() leaves out its named
+        place after album_numbers (names_at_home finds those pictures)."""
+        return (export._Export.kind_published(self, picture)
+                and picture.row["id"] not in self.home_pictures)
+
     def names_at_home(self, pictures):
         """(the town and named place names withheld near home -- of the published pictures
         at home (at_home), and every named place found in the home area -- and the place
-        names published), plain_words each."""
+        names published), plain_words each; the ids of the pictures at home go in
+        home_pictures."""
         estimates = place_estimates.for_libraries(self.conn, self.library_ids)
         home, published = set(), set()
+        self.home_pictures = set()
         for picture in pictures:
             at_home = self.at_home(picture, estimates.get(picture.row["id"]), self.towns)
+            if at_home:
+                self.home_pictures.add(picture.row["id"])
             for key in ("ci", "rg", "co", "np"):
                 value = picture.record.get(key)
                 if isinstance(value, str) and value:
@@ -728,6 +790,10 @@ class _TripExport(export._Export):
                     [picture for shown in days.values() for picture in shown]))
                 if location else [],
                 "days": day_list, "other": [picture.xid for picture in other]}
+        unfeatured = [picture.xid for picture in published
+                      if picture.row["id"] in self.unfeatured]
+        if unfeatured:
+            view["unfeatured"] = unfeatured
         if units and units[-1]:
             view["other_looks"] = unit_xids(units[-1])
         if self.options.get("story"):
@@ -813,6 +879,8 @@ def export_trip(ctx, conn, config, trip_id, out_dir=None, options=None, helper=N
     try:
         built, trip, libraries = load(conn, config, trip_id)
         checked = trip_options(built.export_options(trip), options)
+        for line in option_warnings(built.export_options(trip), options):
+            ctx.log(line, "warn")
         if checked["location"]:
             # (As a library export: positions the GPS check sets aside never go, and
             # the local times follow it.)
@@ -858,6 +926,7 @@ def preview_trip(conn, config, trip_id, options=None, reachable=None):
     result["counts"]["trip"] = {"title": export_title(trip, checked, published, area,
                                                       home_towns(conn, area))}
     result["home"] = built.home is not None
+    result["option_warnings"] = option_warnings(built.export_options(trip), options)
     return result
 
 
@@ -872,7 +941,9 @@ def export_info(conn, config, trip_id):
     export's, every default filled in), "default_output", "last" (export.last_export, or
     None), "meaning" {available, reason}, "home" (whether home was found), "libraries"
     (the names of the libraries its pictures are in), "story" (trip_stories.export_status:
-    {available, hidden, days})}."""
+    {available, hidden, days}), "option_warnings" (option_warnings: a line for each kept
+    option an export leaves out), "saved_text" (the kept title and credits among them, as
+    kept, for the dialog's fields: export.saved_text_options)}."""
     import trip_stories
     built, trip, libraries = load(conn, config, trip_id)
     options = trip_options(built.export_options(trip))
@@ -883,7 +954,9 @@ def export_info(conn, config, trip_id):
             "meaning": {"available": status["available"], "reason": status["reason"]},
             "home": built.home is not None,
             "libraries": [common.library_label(library) for library in libraries],
-            "story": trip_stories.export_status(conn, config, built, trip)}
+            "story": trip_stories.export_status(conn, config, built, trip),
+            "option_warnings": option_warnings(built.export_options(trip)),
+            "saved_text": export.saved_text_options(built.export_options(trip))}
 
 
 def save_options(conn, config, trip_id, options):

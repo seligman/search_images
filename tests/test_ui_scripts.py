@@ -152,8 +152,8 @@ class PageScriptSourceTest(unittest.TestCase):
     def test_admin_actions_name_pictures_by_id_only(self):
         # Copy path, open folder, hide, describe, the tags of many pictures,
         # the albums and the GPS check's choice send picture ids (and tags,
-        # an album's name, or use: true or false); no path from the page
-        # ever goes to the server.
+        # an album's name, or use: true or false; the undo of a face named in
+        # the viewer, its token); no path from the page ever goes to the server.
         bodies = []
         for name in ("viewer.js", "app.js"):
             code = read(STATIC, name)
@@ -161,7 +161,7 @@ class PageScriptSourceTest(unittest.TestCase):
                 bodies.append(body)
                 keys = set(re.findall(r"([A-Za-z_]+):", body))
                 self.assertLessEqual(keys, {"ids", "hidden", "kind", "library_id", "params",
-                                            "add", "remove", "name", "use"},
+                                            "add", "remove", "name", "use", "undo"},
                                      "%s: %s %s" % (name, url, body))
         self.assertGreaterEqual(len(bodies), 5)
         viewer = read(STATIC, "viewer.js")

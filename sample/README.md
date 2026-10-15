@@ -3,6 +3,23 @@
 The `images/` folder holds 19 freely licensed images for trying out the
 project. See `images/CREDITS.md` for licenses and attribution.
 
+The published demo also uses a larger demo set: 39 more pictures and 5
+short videos under Creative Commons licenses or in the public domain,
+listed with their sources in `demo-set/CREDITS.md`. They are not in the
+repository; from the program folder,
+
+    python sample/demo-set/fetch_demo_set.py --out ~/Pictures/demo-set
+
+(or `--out C:\Photos\DemoSet` on Windows) downloads them (about 564 MB
+of originals; the copies need about 465 MB more), checks each against
+`demo-set/manifest.json`, and makes the copies the demo uses in that
+folder (`--list` lists them first, `--only GROUP` fetches one group).
+Add the folder as a library as below. The originals stay in
+`demo-set/originals` (or `--originals DIR`, a folder of its own) so
+that a second run downloads only what is missing; delete that folder
+when you are done. The videos need ffmpeg (see
+"Videos" in the main README); without it they are skipped.
+
 Three images contain text for testing the LLM's OCR ability:
 
 - `17-stop-sign.jpg` - a stop sign

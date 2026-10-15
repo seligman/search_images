@@ -566,14 +566,19 @@ def export_view(config, library):
     chosen, "last": export.last_export() (None before the first export),
     "meaning": {"available", "reason"}: whether search by meaning in the
     browser can go with it (export.meaning_status; the review step says it
-    for the pictures chosen)}.
+    for the pictures chosen), "option_warnings": a line for each saved
+    option an export leaves at its default (export.library_option_warnings),
+    "saved_text": the saved title and credits among them, as saved, for the
+    dialog's fields (export.saved_text_options)}.
     """
     options = export.library_options(library)
     status = export.meaning_status(config, options)
     return {"options": options,
             "default_output": export.default_output_dir(config, library),
             "last": export.last_export(library.get("id")) if library.get("id") else None,
-            "meaning": {"available": status["available"], "reason": status["reason"]}}
+            "meaning": {"available": status["available"], "reason": status["reason"]},
+            "option_warnings": export.library_option_warnings(library),
+            "saved_text": export.saved_text_options(library.get("export"))}
 
 
 def options_error(error):
@@ -1679,6 +1684,8 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                     return fresh
                 config, answer["config_token"] = write_config(mutate, token_of(data))
         job, added = manager.enqueue(kind, library_id, params)
+        if kind == "delete_faces":
+            forget_undo()       # (the names an undo kept go with the face data)
         answer.update(job=job, added=added, jobs=snapshot(config))
         return jsonify(answer), 202
 
@@ -1768,14 +1775,60 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         return jsonify(with_people(lambda store: people_groups.person_view(
             store, get_conn(), config, person_id, people_libraries(config)), write=True))
 
+    # The last change made with "undo": true (the viewer's, when a face is named there):
+    # {"token", "snap"} (people_groups.snapshot), until it is undone, another replaces it,
+    # an undo of it is refused, or the face data is deleted. Kept in memory only: a
+    # server started again has none.
+    undo_lock = threading.Lock()
+    last_undo = {}
+
+    def undo_token(store, snap, made=()):
+        """The token that undoes the change snap was taken before (POST /people/undo), or
+        None when it cannot be undone (another change came in between, too many faces)."""
+        if not people_groups.settle_snapshot(store, snap, made):
+            return None
+        token = os.urandom(12).hex()
+        with undo_lock:
+            last_undo.clear()
+            last_undo.update({"token": token, "snap": snap})
+        return token
+
+    def forget_undo(token=None):
+        """No undo any more (of token's change only, when given): its snapshot -- names
+        among it -- is let go."""
+        with undo_lock:
+            if token is None or last_undo.get("token") == token:
+                last_undo.clear()
+
     @bp.route("/people/<int:person_id>", methods=["POST"])
     def person_change(person_id):
-        """{name?, hidden?, cover?}: name a person ("" takes its name away), hide it, or
-        choose the face that stands for it (null: the best one)."""
+        """{name?, hidden?, cover?, face?, undo?}: name a person ("" takes its name away),
+        hide it, or choose the face that stands for it (null: the best one). face (the
+        viewer's, naming a person by one of its faces): refused (409) when that face is
+        not in this person (any more). With "undo": true the answer's "undo" is a token
+        that undoes it (POST /people/undo)."""
         changes = body()
-        return jsonify({"person": with_people(lambda store: people_groups.update_person(
-            store, person_id, {key: changes[key] for key in ("name", "hidden", "cover")
-                               if key in changes}), write=True)})
+        face = changes.get("face")
+        if face is not None and (isinstance(face, bool) or not isinstance(face, int)
+                                 or not 0 < face <= IMAGE_ID_MAX):
+            raise AdminError(400, "face is a face's id (a number).", {"face": "A face's id."})
+
+        def change(store):
+            if face is not None and people_groups.face_person(store, face) != person_id:
+                raise AdminError(409, "That face is not in this person any more (a grouping "
+                                      "or another change moved it): look at it again.")
+            return {"person": people_groups.update_person(
+                store, person_id, {key: changes[key] for key in ("name", "hidden", "cover")
+                                   if key in changes})}
+
+        def work(store):
+            if changes.get("undo") is not True:
+                return change(store)
+            reply, snap = people_groups.undoable(store, (), [person_id],
+                                                 lambda: change(store))
+            reply["undo"] = undo_token(store, snap)
+            return reply
+        return jsonify(with_people(work, write=True))
 
     @bp.route("/people/<int:person_id>/merge", methods=["POST"])
     def person_merge(person_id):
@@ -1788,11 +1841,12 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
 
     @bp.route("/people/faces", methods=["POST"])
     def people_faces():
-        """{action, faces (face ids, or "all" with person), person?, to?, name?}:
+        """{action, faces (face ids, or "all" with person), person?, to?, name?, undo?}:
         "move" the faces to person "to" (null: a new person called name), "reject" them
         from person ("not this person"), "not_face" ("not a face") or "is_face" (a face
         after all). With person, the answer's "source" is that person now (null when it
-        went: its last faces left)."""
+        went: its last faces left). With "undo": true (the viewer's) the answer's "undo"
+        is a token that undoes it (POST /people/undo; null when it cannot be)."""
         data = body()
         action = data.get("action")
         if action not in ("move", "reject", "not_face", "is_face"):
@@ -1811,20 +1865,31 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                 faces = people_groups.person_faces(store, person)
                 if not faces:
                     raise AdminError(404, "That person has no faces (any more).")
-            if action == "move":
-                to = data.get("to")
-                if to is not None:
-                    to = person_id_of(to, "to")
-                reply = {"person": people_groups.move_faces(store, faces, to,
-                                                            data.get("name") or "")}
-            elif action == "reject":
-                if person is None:
-                    raise AdminError(400, "Say which person they are not (person).",
-                                     {"person": "Needed."})
-                reply = people_groups.reject_faces(store, faces, person)
+            to = data.get("to") if action == "move" else None
+            if to is not None:
+                to = person_id_of(to, "to")
+            if action == "reject" and person is None:
+                raise AdminError(400, "Say which person they are not (person).",
+                                 {"person": "Needed."})
+
+            def change():
+                if action == "move":
+                    return {"person": people_groups.move_faces(store, faces, to,
+                                                               data.get("name") or "")}
+                if action == "reject":
+                    return people_groups.reject_faces(store, faces, person)
+                return {"changed": people_groups.mark_not_face(store, faces,
+                                                               action == "not_face")}
+
+            if data.get("undo") is True:
+                # (The snapshot and the change in one write: see people_groups.undoable.)
+                reply, snap = people_groups.undoable(
+                    store, faces if isinstance(faces, list) else (),
+                    [value for value in (person, to) if value is not None], change)
+                made = [reply["person"]["id"]] if action == "move" and to is None else []
+                reply["undo"] = undo_token(store, snap, made) if snap is not None else None
             else:
-                reply = {"changed": people_groups.mark_not_face(store, faces,
-                                                                action == "not_face")}
+                reply = change()
             if person is not None:
                 # (The person the faces came from, or null when it went with them.)
                 try:
@@ -1832,6 +1897,31 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                 except people_groups.GroupError:
                     reply["source"] = None
             return reply
+        return jsonify(with_people(work, write=True))
+
+    @bp.route("/people/undo", methods=["POST"])
+    def people_undo():
+        """{undo: the token of the last change made with "undo": true}: the people as
+        they were before it (people_groups.restore). Only that change, once, only while
+        nothing else changed the people since, and not after the server was started
+        again (it keeps the change in memory): 409 else."""
+        token = body().get("undo")
+        with undo_lock:
+            entry = dict(last_undo)
+        if not isinstance(token, str) or not entry or token != entry["token"]:
+            raise AdminError(409, "That change cannot be undone here any more (only the last "
+                                  "change made in the viewer can be, once, and not after the "
+                                  "server was started again). Put it right on the People "
+                                  "page.")
+
+        def work(store):
+            try:
+                people_groups.restore(store, entry["snap"])
+            except people_groups.GroupError:
+                forget_undo(token)      # (refused once, it is refused for good)
+                raise
+            forget_undo(token)
+            return {"undone": True}
         return jsonify(with_people(work, write=True))
 
     @bp.route("/people/other", methods=["GET"])

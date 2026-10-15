@@ -2064,12 +2064,14 @@ function closeTo(cos, axis) {
 
 var QUERY = closeTo(1);
 
-// An index of records with vectors ({id: Int8Array}), among 200 (or
+// An index of records with vectors ({id: Int8Array}), among 3000 (or
 // fillers) pictures that are not what is looked for: their cosines with
 // the query (axis 0) spread from 0.05 to 0.45, as most of a real index's
-// are. (Cosines are judged against those of the whole index.)
+// are. (Cosines are judged against those of the whole index; with 3000
+// pictures, as in a library of thousands, no rule of a small set applies:
+// SearchCore.meaningCuts.)
 function meaningIndex(records, vectors, fillers) {
-    fillers = fillers || 200;
+    fillers = fillers || 3000;
     for (var k = 0; k < fillers; k++) {
         var id = 10000 + k;
         records.push({i: id, t: "Filler picture " + k, dk: "2010-01-01", ds: 1});
@@ -2143,7 +2145,7 @@ test("words and meaning: word matches first, then pictures that mean the same", 
     ];
     var index = meaningIndex(records, {1: closeTo(0.9), 2: closeTo(0.85, 2), 3: closeTo(0.55),
                                        4: closeTo(0.2, 3), 5: closeTo(0.4, 4),
-                                       6: closeTo(0.65, 5)});
+                                       6: closeTo(0.65, 5)}, 200);
     var result = index.search("zebra quilt", {vector: QUERY});
     // Both word matches (the closer one first), then the striped animal by
     // meaning; the zebra in the savanna lacks a word and is too far below
@@ -2436,7 +2438,9 @@ test("a typed search in a small set: the closest few when none stands out", func
     // others no picture is far above them, and a query that means two of
     // them puts both a little above the rest (z 2.3 and 2.2): they are found,
     // by words and meaning and by meaning only. An unrelated query (z 2.0 at
-    // best) finds nothing, and neither does the same in a set of 62 pictures.
+    // best) finds nothing. The same two among 62 pictures (z 2.46 and 2.3;
+    // the cut of a one-word search there is 2.34) are found too: no step at
+    // 50 pictures.
     function set(cosines) {
         var records = [];
         var ids = [];
@@ -2466,7 +2470,7 @@ test("a typed search in a small set: the closest few when none stands out", func
     }
     assert.deepStrictEqual(found([0.45, 0.43].concat(rest)), [[1, 2], [1, 2], [1, 2]]);
     assert.deepStrictEqual(found([0.36, 0.33].concat(rest)), [[], [], []]);
-    assert.deepStrictEqual(found([0.45, 0.43].concat(wide)), [[], [], []]);
+    assert.deepStrictEqual(found([0.45, 0.43].concat(wide)), [[1, 2], [1, 2], [1, 2]]);
     // Only those near the closest one (z 2.7 and 1.5 here).
     assert.deepStrictEqual(found([0.47, 0.36].concat(rest)), [[1], [1], [1]]);
     // Five as close as each other do not stand out (z 1.6).
@@ -3095,14 +3099,15 @@ test("per-term coverage: a word whose pictures stand far out needs more than z 2
     assert.deepStrictEqual(result.items, []);
 });
 
-test("per-term coverage: not in a small set, where the whole query decides", function () {
+test("per-term coverage: in a small set, the whole query decides", function () {
     // Nineteen pictures, as an export of a small library has. The coffee
     // cups have neither "warm" nor "drink" in their words, and stand a
     // little above the rest for the whole query (z 2.7), as the closest few
     // of a small set do; on its own, "warm" (a word of another picture)
-    // puts them below the mean. In a library of hundreds of pictures cups
-    // even far above the rest for the whole query need each word's own
-    // meaning, and "warm" lacks.
+    // puts them below the mean. Among so few pictures that is close enough
+    // to the whole query (z 1.1 is: MEANING_TERM_RESCUE). In a library of
+    // thousands, cups even far above the rest for the whole query need each
+    // word's own meaning, and "warm" lacks.
     function cups(fillers) {
         var records = [
             {i: 1, t: "Coffee cups on a cafe table", g: ["coffee", "cups", "table"],
@@ -3139,14 +3144,303 @@ test("per-term coverage: not in a small set, where the whole query decides", fun
     var result = small.search("warm drink", {vector: QUERY, termVectors: words});
     assert.deepStrictEqual(result.items, [1]);
     assert.deepStrictEqual(result.byMeaning, [1]);
-    // (No term was judged on its own.)
-    assert.deepStrictEqual(result.meaning.terms, []);
-    // A library of hundreds: "warm" is not covered.
-    var large = cups(400);
+    // (Each word was looked at; neither is a name.)
+    assert.deepStrictEqual(result.meaning.terms.map(function (term) {
+        return [term.text, term.name];
+    }), [["warm", false], ["drink", false]]);
+    // A library of thousands: "warm" is not covered.
+    var large = cups(3000);
     assert.deepStrictEqual(large.search("warm drink", {vector: QUERY, termVectors: words}).items,
                            []);
     assert.deepStrictEqual(large.search("warm drink", {vector: QUERY}).items, [1]);
 });
+
+test("meaning in a small set: the cuts grow with the set, without a step", function () {
+    // The few-cut: 2.2 in a set of up to 50 pictures with a vector (as below
+    // 50 before), more in a larger one, until it is the usual cut (3) at
+    // about 1,230 pictures; for a search of one free clause faster, until
+    // about 170.
+    function near(a, b) {
+        return Math.abs(a - b) < 0.01;
+    }
+    var cuts = SearchCore.meaningCuts;
+    [2, 18, 30, 35, 40, 45, 49, 50].forEach(function (n) {
+        assert.ok(near(cuts(n).few, 2.2) && near(cuts(n).one, 2.2), n + " " + cuts(n).few);
+    });
+    assert.ok(near(cuts(63).few, 2.258), String(cuts(63).few));
+    assert.ok(near(cuts(100).few, 2.373), String(cuts(100).few));
+    assert.ok(near(cuts(200).few, 2.547), String(cuts(200).few));
+    assert.ok(cuts(1200).few < 3 && cuts(1250).few > 3);
+    assert.ok(near(cuts(63).one, 2.350) && near(cuts(100).one, 2.651), String(cuts(63).one));
+    assert.ok(cuts(165).one < 3 && cuts(175).one > 3);
+    // The z of the whole query that keeps a picture per-term coverage
+    // would leave out: a quarter of the highest z a set allows.
+    assert.ok(near(cuts(19).rescue, 1.06) && near(cuts(63).rescue, 1.97) &&
+              near(cuts(200).rescue, 3.53) && cuts(1000).rescue > 7.8,
+              JSON.stringify(cuts(1000)));
+    // Both grow a little from one size to the next: no step anywhere.
+    for (var n = 2; n < 20000; n += 1) {
+        var step = [cuts(n + 1).few - cuts(n).few, cuts(n + 1).rescue - cuts(n).rescue,
+                    cuts(n + 1).one - cuts(n).one];
+        assert.ok(step[0] >= 0 && step[0] < 0.1 && step[1] > 0 && step[1] < 0.13 &&
+                  step[2] >= 0 && step[2] < 0.1, n + " " + step);
+    }
+});
+
+/* An index of n pictures with a vector: the first targets.length records
+   (ids 1, 2, ... unless records says) close to the query at about the z
+   given (worked out from the cosines of the whole set), the rest spread
+   from 0.05 to 0.35. */
+function zSet(n, targets, records) {
+    var fill = [];
+    for (var k = 0; k < n - targets.length; k++) {
+        fill.push(0.05 + 0.3 * k / Math.max(1, n - targets.length - 1));
+    }
+    var cos = targets.map(function () {
+        return 0.5;
+    });
+    for (var round = 0; round < 40; round++) {
+        var all = cos.concat(fill);
+        var mean = all.reduce(function (a, b) {
+            return a + b;
+        }, 0) / all.length;
+        var spread = Math.sqrt(all.reduce(function (a, b) {
+            return a + (b - mean) * (b - mean);
+        }, 0) / all.length);
+        cos = targets.map(function (z) {
+            return Math.min(0.99, mean + z * spread);
+        });
+    }
+    records = (records || []).slice();
+    var ids = [];
+    var data = new Int8Array(n * MEANING_DIMS);
+    cos.concat(fill).forEach(function (value, k) {
+        if (!records[k]) {
+            records[k] = {i: 100 + k, t: "Picture " + (k + 1), dk: "2020-01-01", ds: 1};
+        }
+        ids.push(records[k].i);
+        data.set(closeTo(value, k < targets.length ? 2 : 6 + (k % 2)), k * MEANING_DIMS);
+    });
+    var index = SearchCore.prepare(records);
+    assert.strictEqual(index.setVectors({dims: MEANING_DIMS, ids: ids, data: data}), n);
+    return index;
+}
+
+test("meaning in a small set: the closest few, from 18 pictures to thousands", function () {
+    // Two pictures a little above the rest (z 2.7 and 2.6) are the closest
+    // few in a set of 18 and in every larger one up to a hundred or so; among
+    // thousands, z 3 is needed (MEANING_MIN_Z). One at z 2.33 is enough among
+    // 18 (the few-cut 2.2) but not among 100 (2.44).
+    function found(n, targets) {
+        var index = zSet(n, targets);
+        var stats = index.cosineStats(QUERY);
+        var zs = targets.map(function (z, k) {
+            return (stats.values[k] - stats.mean) / stats.std;
+        });
+        zs.forEach(function (z, k) {
+            assert.ok(Math.abs(z - targets[k]) < 0.08, n + ": " + zs);
+        });
+        return index.search("zebra", {vector: QUERY}).items;
+    }
+    [18, 30, 45, 50, 55, 63, 100].forEach(function (n) {
+        assert.deepStrictEqual(found(n, [2.7, 2.6]), [100, 101], String(n));
+    });
+    assert.deepStrictEqual(found(3000, [2.7, 2.6]), []);
+    assert.deepStrictEqual(found(3000, [3.2, 2.6]), [100]);
+    assert.deepStrictEqual(found(18, [2.33]), [100]);
+    assert.deepStrictEqual(found(100, [2.33]), []);
+});
+
+test("meaning in a small set: a set of 35 to 49 pictures keeps the cut of a smaller one",
+     function () {
+         // The closest picture a little above 2.2 (the few-cut up to 50
+         // pictures) is found in every set below 50, as it was, by a search
+         // of one word and of several, in both modes (a cut that grew from
+         // fewer pictures on left these with nothing).
+         [[40, 2.2], [41, 2.24], [48, 2.2], [49, 2.2]].forEach(function (pair) {
+             var n = pair[0];
+             var index = zSet(n, [pair[1]]);
+             var stats = index.cosineStats(QUERY);
+             var z = (stats.values[0] - stats.mean) / stats.std;
+             // (Below what a cut growing 0.2 from 30 pictures on asks.)
+             assert.ok(z >= 2.21 && z < 2.19 + 0.2 * Math.log(n / 30), n + ": " + z);
+             var words = {zebra: QUERY, stripes: QUERY};
+             // (First: the next one may be within MEANING_FEW_MARGIN_Z of it.)
+             ["hybrid", "meaning"].forEach(function (mode) {
+                 assert.strictEqual(index.search("zebra", {vector: QUERY, meaning: mode})
+                                    .items[0], 100, n + " " + mode);
+                 assert.strictEqual(index.search("zebra stripes", {
+                     vector: QUERY, termVectors: words, meaning: mode}).items[0], 100,
+                                    n + " " + mode);
+             });
+         });
+     });
+
+test("meaning in a small set: \"meaning\" only shows what words and meaning find by meaning",
+     function () {
+         // Among 63 pictures: the grilled fish has both words (z 3.9); a
+         // plate of sushi without them is the closest of the others (z 2.3,
+         // the few-cut 2.26). By words and meaning it comes after the fish;
+         // "meaning" only, a wider net, shows it too, though the fish is
+         // above z 3. And three pictures close to a query no picture has the
+         // words of (z 2.8, 2.4, 2.35): the same three in both.
+         var fish = zSet(63, [3.9, 2.3], [
+             {i: 1, t: "Grilled fish for dinner", g: ["fish", "dinner"], dk: "2020-01-01", ds: 1},
+             {i: 2, t: "Plate of sushi", g: ["sushi", "plate"], dk: "2020-01-02", ds: 1}]);
+         var stats = fish.cosineStats(QUERY);
+         var z = (stats.values[1] - stats.mean) / stats.std;
+         assert.ok(z > 2.26 && z < 2.5, String(z));
+         var words = {fish: QUERY, dinner: QUERY};
+         function both(index, query) {
+             return ["hybrid", "meaning"].map(function (mode) {
+                 return index.search(query, {vector: QUERY, termVectors: words,
+                                             meaning: mode}).items;
+             });
+         }
+         assert.deepStrictEqual(both(fish, "fish dinner"), [[1, 2], [1, 2]]);
+         var near = zSet(63, [2.8, 2.4, 2.35]);
+         assert.deepStrictEqual(both(near, "fish dinner"), [[100, 101, 102], [100, 101, 102]]);
+     });
+
+test("meaning in a small set: one word needs more than several among a hundred pictures",
+     function () {
+         // A picture at z 2.5 among a hundred: the closest few of a search of
+         // several words (few-cut 2.37), whose words are each checked; not of
+         // one word (2.65), which nothing checks. Among 50 both find it.
+         function found(n, query) {
+             var index = zSet(n, [2.5]);
+             return index.search(query, {vector: QUERY,
+                                         termVectors: {zebra: QUERY, stripes: QUERY}}).items;
+         }
+         assert.deepStrictEqual(found(100, "zebra stripes"), [100]);
+         assert.deepStrictEqual(found(100, "zebra"), []);
+         assert.deepStrictEqual(found(50, "zebra"), [100]);
+         // "meaning" only, a wider net, shows what the other does.
+         assert.deepStrictEqual(zSet(100, [2.5]).search("zebra stripes", {
+             vector: QUERY, meaning: "meaning"}).items, [100]);
+     });
+
+test("per-term coverage in a small set: close to the whole query is enough", function () {
+    // "motel highway": the motel sign lacks "highway" and is far from that
+    // word on its own, but close to the whole query (z 3.8). Among up to a
+    // few hundred pictures that keeps it (no step at 50 pictures); in a
+    // library of thousands each word must be covered (MEANING_TERM_RESCUE).
+    // "anna" is in folder names only (a name). With four pictures in her
+    // folder it is covered by its words only at every size: no motel, and
+    // the chip says so. In one picture's folder only, too rare to tell, it
+    // is let go in a small set like any word: the motel shows, and "anna"
+    // is not said to be searched by its words only; so it is when one of
+    // three pictures with it has it in its description (a word pictures
+    // show too, though a name by the others).
+    function index(n, folders, described) {
+        var records = [
+            {i: 1, t: "Motel sign by the road", g: ["motel", "sign"], dk: "2020-01-01", ds: 1},
+            {i: 2, t: "Highway at night", g: ["highway", "night"], dk: "2020-01-02", ds: 1}
+        ];
+        for (var k = 0; k < folders; k++) {
+            records.push({i: 3 + k, t: "Picture " + k, f: "Anna", dk: "2020-01-03", ds: 1,
+                          d: k < described ? "A sign that says anna." : "A picture."});
+        }
+        return zSet(n, [3.8, 0.5], records);
+    }
+    var words = {motel: QUERY, highway: axisVector(4), anna: axisVector(5)};
+    function shown(n, query, how) {
+        how = how || {};
+        var opts = {vector: QUERY, termVectors: words};
+        if (how.filters) {
+            opts.filters = how.filters;
+        }
+        var result = index(n, how.folders === undefined ? 4 : how.folders,
+                           how.described || 0).search(query, opts);
+        return [result.items, result.meaning.terms.filter(function (term) {
+            return term.name;
+        }).map(function (term) {
+            return term.text;
+        })];
+    }
+    [19, 40, 50, 63, 100, 200].forEach(function (n) {
+        assert.deepStrictEqual(shown(n, "motel highway"), [[1], []], String(n));
+        assert.deepStrictEqual(shown(n, "motel anna"), [[], ["anna"]], String(n));
+        assert.deepStrictEqual(shown(n, "motel anna", {folders: 1}), [[1], []], String(n));
+        assert.deepStrictEqual(shown(n, "motel anna", {folders: 3, described: 1}), [[1], []],
+                               String(n));
+        // (Kept, but left out by a filter: then nothing shown lacks the name.)
+        assert.deepStrictEqual(shown(n, "motel anna", {folders: 1,
+                                                       filters: {year: ["2019"]}}),
+                               [[], ["anna"]], String(n));
+    });
+    assert.deepStrictEqual(shown(3000, "motel highway"), [[], []]);
+    assert.deepStrictEqual(shown(3000, "motel anna"), [[], ["anna"]]);
+    assert.deepStrictEqual(shown(3000, "motel anna", {folders: 1}), [[], ["anna"]]);
+    assert.deepStrictEqual(shown(3000, "motel anna", {folders: 3, described: 1}),
+                           [[], ["anna"]]);
+});
+
+test("per-term coverage in a small set: the name chip goes only with a picture shown",
+     function () {
+         // "zebra anna" among 63 pictures, "anna" in one picture's folder (a
+         // name too rare to tell): the zebra lacks it and is close enough to
+         // the whole query to stay (z 2.1, MEANING_TERM_RESCUE 1.97), but not
+         // to be among the closest few (2.26). Nothing without "anna" is
+         // shown, so it was searched by its words only, and the chip says so.
+         var records = [{i: 1, t: "Zebra at a water hole", g: ["zebra", "water"],
+                         dk: "2020-01-01", ds: 1},
+                        {i: 2, t: "Picture", f: "Anna", dk: "2020-01-02", ds: 1}];
+         var index = zSet(63, [2.13], records);
+         var stats = index.cosineStats(QUERY);
+         var z = (stats.values[0] - stats.mean) / stats.std;
+         var cuts = SearchCore.meaningCuts(63);
+         assert.ok(z >= cuts.rescue && z < cuts.few, String(z));
+         var result = index.search("zebra anna", {vector: QUERY,
+                                                  termVectors: {zebra: QUERY,
+                                                                anna: axisVector(5)}});
+         assert.deepStrictEqual(result.items, []);
+         assert.deepStrictEqual(result.meaning.terms.map(function (term) {
+             return [term.text, term.name];
+         }), [["zebra", false], ["anna", true]]);
+     });
+
+/* Per-term coverage among a few hundred pictures: an index of 200 (n)
+   pictures, the records given at their cosines with the query (vectors
+   {id: Int8Array}), the rest spread from 0.05 to 0.45 as meaningIndex's. */
+function midIndex(records, vectors, n) {
+    return meaningIndex(records, vectors, (n || 200) - records.length);
+}
+
+test("per-term coverage among a few hundred pictures: a word lacking still lacks",
+     function () {
+         // Among 200 pictures the snowman of "dog playing in snow" and the
+         // blue car of "red car" come out at z 3 to 3.4 for the whole query,
+         // below what keeps a picture whole (MEANING_TERM_RESCUE: 3.53), and
+         // lack a word they do not mean on its own: they stay out, as in a
+         // library of thousands; the crimson sedan means "red" and stays.
+         function z(index, id) {
+             var stats = index.cosineStats(QUERY);
+             var r = index.position[String(id)];
+             return (stats.values[r] - stats.mean) / stats.std;
+         }
+         var snowy = midIndex([
+             {i: 1, t: "Dog playing in the snow", g: ["dog", "playing", "snow"],
+              dk: "2020-01-01", ds: 1},
+             {i: 2, t: "Snowman in a yard", g: ["snowman", "snow", "yard"], dk: "2020-01-02",
+              ds: 1}
+         ], {1: closeTo(0.85, 2), 2: closeTo(0.66, 3)});
+         assert.strictEqual(snowy.vecCount, 200);
+         assert.ok(z(snowy, 2) > 3 && z(snowy, 2) < 3.4, String(z(snowy, 2)));
+         assert.deepStrictEqual(snowy.search("dog playing in snow", {
+             vector: QUERY, termVectors: {dog: axisVector(2), playing: axisVector(2),
+                                          snow: QUERY}}).items, [1]);
+         var cars = midIndex([
+             {i: 3, t: "Red car", g: ["red", "car"], dk: "2020-01-03", ds: 1},
+             {i: 4, t: "Blue car", g: ["blue", "car"], dk: "2020-01-04", ds: 1},
+             {i: 5, t: "Crimson sedan", g: ["crimson", "sedan"], dk: "2020-01-05", ds: 1}
+         ], {3: closeTo(0.85, 4), 4: closeTo(0.66, 2), 5: closeTo(0.72, 4)});
+         assert.ok(z(cars, 4) > 3 && z(cars, 4) < 3.4, String(z(cars, 4)));
+         var result = cars.search("red car", {vector: QUERY, termVectors: {
+             red: axisVector(4), car: QUERY}});
+         assert.deepStrictEqual(result.items, [3, 5]);
+         assert.deepStrictEqual(result.byMeaning, [5]);
+     });
 
 test("per-term coverage: a folder's word that pictures show is no name", function () {
     // Ten pictures in "Wood Carving" (one says "carving"), all much like
@@ -3381,6 +3675,475 @@ test("the dates pictures were taken on: first and last", function () {
     var index = SearchCore.prepare(plainRecords());
     assert.deepStrictEqual(index.takenSpan(), {from: "2015-12-24", to: "2026-07-14"});
     assert.strictEqual(SearchCore.prepare([{i: 1, t: "x"}]).takenSpan(), null);
+});
+
+/* ---------- Kinds of place (kind:) ---------------------------------------- */
+
+// Pictures with a named place of the street maps (np, nk) and without one.
+function kindRecords() {
+    return [
+        {i: 1, t: "Lion resting", g: ["lion"], np: "City Zoo", nk: "zoo", dk: "2019-05-01",
+         ds: 1},
+        {i: 2, t: "Zoo gate", g: ["zoo", "gate"], np: "City Zoo", nk: "zoo", dk: "2019-05-01",
+         ds: 1},
+        {i: 3, t: "A visit to the zoo", g: ["zoo"], dk: "2018-03-01", ds: 1},
+        {i: 4, t: "Fish in a tank", g: ["fish"], np: "Harbour Aquarium", nk: "aquarium",
+         dk: "2019-06-01", ds: 1, ci: "Seaport", rg: "North Coast", co: "Examplia", cc: "XA"},
+        {i: 5, t: "Paintings on a wall", g: ["painting"], np: "Old Gallery", nk: "gallery",
+         dk: "2020-01-01", ds: 1},
+        {i: 6, t: "Museum hall", g: ["museum"], np: "Town Museum", nk: "museum",
+         dk: "2020-01-02", ds: 1},
+        {i: 7, t: "Bench under a tree", g: ["bench", "tree"], np: "Elm Park", nk: "park",
+         dk: "2024-04-01", ds: 1, ci: "Seaport", rg: "North Coast", co: "Examplia", cc: "XA"},
+        {i: 8, t: "Car in a car park", g: ["car", "park"], dk: "2024-04-02", ds: 1},
+        {i: 9, t: "Rocky point", g: ["rock"], np: "Gull Point", nk: "cape", dk: "2021-01-01",
+         ds: 1},
+        {i: 10, t: "Departure board", g: ["board"], np: "Field Airport", nk: "aerodrome",
+         dk: "2022-01-01", ds: 1},
+        {i: 11, t: "Tin toys", g: ["toy"], np: "Museum of Tin Toys", nk: "museum",
+         dk: "2022-02-01", ds: 1},
+        {i: 12, t: "Golf ball", g: ["golf"], np: "Links Course", nk: "golf_course",
+         dk: "2023-01-01", ds: 1}
+    ];
+}
+
+test("kind: finds the pictures taken at a kind of place", function () {
+    var records = kindRecords();
+    function found(query) {
+        var result = search(records, query);
+        return {items: result.items.slice().sort(function (a, b) {
+            return a - b;
+        }), warnings: result.warnings};
+    }
+    // The words for it, singular or plural, a phrase, the maps' own name;
+    // placekind: and kinds: too.
+    ["kind:zoo", "kind:zoos", "placekind:zoo", "kinds:\"wildlife park\"", "kind:Zoo"].forEach(
+        function (query) {
+            assert.deepStrictEqual(found(query), {items: [1, 2], warnings: []}, query);
+        });
+    // A line broader than the word: museums and galleries.
+    assert.deepStrictEqual(found("kind:museum").items, [5, 6, 11]);
+    assert.deepStrictEqual(found("kind:gallery").items, [5]);
+    assert.deepStrictEqual(found("kind:airport").items, [10]);
+    // The maps' name of a kind a line holds finds that kind alone.
+    assert.deepStrictEqual(found("kind:aerodrome").items, [10]);
+    assert.deepStrictEqual(found("kind:\"golf courses\"").items, [12]);
+    assert.deepStrictEqual(found("kind:golf_course").items, [12]);
+    // A kind no line names, by the maps' name.
+    assert.deepStrictEqual(found("kind:cape"), {items: [9], warnings: []});
+    // Left out, with other words and filters.
+    assert.deepStrictEqual(found("-kind:zoo year:2019").items, [4]);
+    assert.deepStrictEqual(found("gate kind:zoo").items, [2]);
+    // A kind no picture was taken at, or none is called: nothing, said --
+    // with the kinds the pictures were taken at most.
+    var tries = " (try kind:museum, kind:zoo, kind:aquarium, kind:airport).";
+    assert.deepStrictEqual(found("kind:volcanoes"), {items: [], warnings: [
+        "No picture was taken at volcanoes" + tries]});
+    assert.deepStrictEqual(found("kind:spaceport"), {items: [], warnings: [
+        "No picture was taken at a kind of place called \u201cspaceport\u201d" + tries]});
+    // A kind of picture, or the name of a place: what to try instead.
+    assert.deepStrictEqual(found("kind:screenshot").warnings, [
+        "kind: is the kind of place a picture was taken at; for a kind of picture try " +
+        "type:screenshot."]);
+    assert.ok(/try type:videos[.]$/.test(found("kind:videos").warnings[0]));
+    assert.deepStrictEqual(found("kind:\"city zoo\"").warnings, [
+        "\u201cCity Zoo\u201d is the name of a place, not a kind of place: try " +
+        "place:\"city zoo\"."]);
+    // Pictures without named places: kind: finds nothing, and says why --
+    // but not as the alternative to words plain language writes, which
+    // still find what they find (as place: does).
+    var bare = search([{i: 1, t: "Zoo gate"}], "kind:zoo");
+    assert.deepStrictEqual(bare.items, []);
+    assert.ok(/no picture has a named place/.test(bare.warnings[0]), bare.warnings);
+    var alternative = search([{i: 1, t: "Zoo gate"}], "kind:zoo OR zoos");
+    assert.deepStrictEqual([alternative.items, alternative.warnings], [[1], []]);
+    assert.deepStrictEqual(search([{i: 1, t: "Zoo gate", np: "Gull Point", nk: "cape"}],
+                                  "kind:volcano OR volcano").warnings, []);
+    assert.strictEqual(SearchCore.parse("kind:").clauses.length, 0);
+});
+
+test("kind: and the words: taken there and saying it, then taken there, then saying it",
+     function () {
+         var records = kindRecords();
+         // By words: 2 is at a zoo and says so, 1 is at one, 3 says it only.
+         assert.deepStrictEqual(items(records, "kind:zoo OR zoo"), [2, 1, 3]);
+         // Several kinds in one clause (1 has the word in its place's name: a
+         // little more).
+         assert.deepStrictEqual(items(records, "kind:zoo OR kind:aquarium").sort(), [1, 2, 4]);
+         assert.deepStrictEqual(items(records, "kind:zoo OR kind:aquarium OR zoo"), [2, 1, 4, 3]);
+     });
+
+test("kind: and meaning: the words of a kind's clause are searched by meaning too", function () {
+    var records = [
+        {i: 1, t: "Lion resting", g: ["lion"], np: "City Zoo", nk: "zoo", dk: "2019-05-01",
+         ds: 1},
+        {i: 2, t: "Zoo gate", g: ["zoo", "gate"], dk: "2019-05-01", ds: 1},
+        {i: 3, t: "Giraffes behind a fence", g: ["giraffe"], dk: "2019-05-02", ds: 1}
+    ];
+    // 3 says nothing of a zoo, but means one; 1 is at one, though its words do not say it.
+    var index = meaningIndex(records, {1: closeTo(0.6, 2), 2: closeTo(0.9, 3),
+                                       3: closeTo(0.95, 4)});
+    var result = index.search("kind:zoo OR zoos", {vector: QUERY});
+    assert.deepStrictEqual(result.items.slice().sort(), [1, 2, 3]);
+    assert.deepStrictEqual(result.byMeaning, [3]);
+    assert.strictEqual(result.meaning.mode, "hybrid");
+    // A kind alone is a filter: nothing for meaning to rank.
+    assert.strictEqual(index.search("kind:zoo", {vector: QUERY}).meaning, null);
+    // The words of the kind's clause are embedded as the others are.
+    assert.strictEqual(SearchCore.meaningText("kids at the kind:zoo OR zoo"), "kids at the zoo");
+    assert.deepStrictEqual(SearchCore.meaningTexts("kids kind:zoo OR zoo"),
+                           ["kids zoo", "kids", "zoo"]);
+});
+
+test("plain language: a kind of place pictures were taken at", function () {
+    var index = SearchCore.prepare(kindRecords());
+    function said(text) {
+        var answer = understood(index, text);
+        return [answer.query, answer.parts.map(function (part) {
+            return [part.kind, part.label, part.text, part.key];
+        })];
+    }
+    assert.deepStrictEqual(said("zoos"), ["kind:zoo OR zoos",
+        [["kind", "Kind of place: zoos and wildlife parks", "zoos", "zoos"]]]);
+    // After "at the": kept in the query (meaning reads it), in the chip's text.
+    assert.deepStrictEqual(said("lions at the zoo"), ["lions at the kind:zoo OR zoo",
+        [["kind", "Kind of place: zoos and wildlife parks", "at the zoo", "zoo"]]]);
+    assert.deepStrictEqual(said("museums in 2019")[0], "kind:museum OR museums date:2019 OR 2019");
+    assert.deepStrictEqual(said("parks in seaport")[0],
+                           "kind:park OR parks place:seaport OR seaport");
+    assert.deepStrictEqual(said("at the airport")[0], "at the kind:airport OR airport");
+    // A kind of several words, word by word (each found by its words or
+    // by meaning, as without the kind; a quoted phrase would be neither).
+    assert.deepStrictEqual(said("golf courses")[0],
+                           "kind:golf_course OR golf kind:golf_course OR courses");
+    assert.deepStrictEqual(said("galleries")[1][0][1], "Kind of place: art galleries");
+    // A kind no picture was taken at, or a word for none: words.
+    assert.deepStrictEqual(said("churches"), ["churches", []]);
+    assert.deepStrictEqual(said("shore"), ["shore", []]);
+    // A longer name is the name ("Museum of Tin Toys"); words about taking it go.
+    assert.deepStrictEqual(said("museum of tin toys")[1][0][0], "place");
+    assert.deepStrictEqual(said("pictures taken at the zoo")[0], "pictures at the kind:zoo OR zoo");
+    // Left as typed (the chip's x).
+    var kept = understood(index, "zoos 2019", {typed: ["zoos"]});
+    assert.deepStrictEqual([kept.query, kept.kept], ["zoos date:2019 OR 2019", ["zoos"]]);
+    // What a search finds with it: the pictures at a zoo, and those that say zoo.
+    assert.deepStrictEqual(index.search(understood(index, "zoos").query, {}).items, [2, 1, 3]);
+});
+
+test("plain language: a word with another meaning is a kind of place only on its own",
+     function () {
+         var index = SearchCore.prepare(kindRecords());
+         function query(text) {
+             return understood(index, text).query;
+         }
+         assert.strictEqual(query("parks"), "kind:park OR parks");
+         assert.strictEqual(query("at the park"), "at the kind:park OR park");
+         assert.strictEqual(query("benches in a park"), "benches in a kind:park OR park");
+         // A date, a place, a kind or a small word next to it is fine.
+         assert.strictEqual(query("parks 2024"), "kind:park OR parks date:2024 OR 2024");
+         assert.strictEqual(query("parks seaport"), "kind:park OR parks place:seaport OR seaport");
+         assert.strictEqual(query("2024 parks"), "date:2024 OR 2024 kind:park OR parks");
+         assert.strictEqual(query("parks and zoos"), "kind:park OR parks and kind:zoo OR zoos");
+         // Another word right before or after it: words.
+         ["car park", "park bench", "a car park", "old park bench"].forEach(function (text) {
+             assert.strictEqual(query(text), text);
+         });
+         // A kind of park the maps have no kind for: words ("state parks"
+         // would find a city's every park).
+         ["city parks", "state parks", "county park"].forEach(function (text) {
+             assert.strictEqual(query(text), text);
+         });
+         // Someone called so: asked about -- but "at the park" is the kind.
+         var people = [{id: 9, name: "Jo Park", label: "Jo Park", ids: [7]}];
+         var answer = understood(index, "park", {people: people});
+         assert.deepStrictEqual([answer.query, answer.parts], ["park", []]);
+         assert.deepStrictEqual(answer.choices.map(function (choice) {
+             return [choice.text, choice.options.map(function (option) {
+                 return [option.label, option.query];
+             })];
+         }), [["park", [["Kind of place: parks", "kind:park OR park"],
+                        ["Person: Jo Park", "person:\"Jo Park\" OR park"],
+                        ["the word \u201cpark\u201d", null]]]]);
+         assert.strictEqual(understood(index, "kids at the park", {people: people}).query,
+                            "kids at the kind:park OR park");
+     });
+
+test("the kinds of place: every word names one line, every kind a known one", function () {
+    var lines = SearchCore.placeKinds();
+    var keys = {};
+    var kinds = {};
+    var words = {};
+    lines.forEach(function (line) {
+        assert.ok(/^[a-z_]+$/.test(line.key), line.key);
+        assert.ok(!keys[line.key], line.key);
+        keys[line.key] = line;
+        assert.ok(line.label && line.kinds.length && line.words.length, line.key);
+        line.kinds.forEach(function (kind) {
+            kinds[kind] = true;
+        });
+    });
+    lines.forEach(function (line) {
+        line.words.forEach(function (word) {
+            assert.ok(!words[word], word + ": " + words[word] + " and " + line.key);
+            words[word] = line.key;
+            // kind: finds the line by each of its words (and their plurals) --
+            // but a line's key is that line, and the maps' name of a kind that
+            // kind alone ("aerodrome").
+            [word, word + "s"].forEach(function (typed) {
+                var name = typed.replace(/ /g, "_");
+                if (typed !== word && (kinds[name] ||
+                                       SearchCore.forms(typed).indexOf(word) < 0)) {
+                    return;         // (no plural of it: "glass" + "s")
+                }
+                var expected = keys[name] ? keys[name].kinds : kinds[name] ? [name] : line.kinds;
+                var filter = SearchCore.parse("kind:\"" + typed + "\"").terms[0].filter;
+                assert.deepStrictEqual(filter.kinds, expected, typed);
+            });
+        });
+    });
+    // (A copy: changing it changes nothing.)
+    lines[0].kinds.push("nowhere");
+    assert.ok(SearchCore.placeKinds()[0].kinds.indexOf("nowhere") < 0);
+    assert.ok(SearchCore.SYNTAX.some(function (row) {
+        return /^kind:/.test(row.example);
+    }));
+});
+
+test("plain language: a kind of several words, word by word, by words and meaning",
+     function () {
+         var records = [
+             {i: 1, t: "Espresso and a croissant on a cafe table", g: ["espresso", "cafe"],
+              dk: "2019-05-01", ds: 1},
+             {i: 2, t: "Barista pouring latte art", g: ["latte", "barista"], dk: "2019-05-01",
+              ds: 1, np: "Bean Co", nk: "cafe"},
+             {i: 3, t: "A coffee shop on the corner", g: ["coffee shop"], dk: "2019-05-01",
+              ds: 1},
+             {i: 4, t: "Coffee beans for sale in a shop", g: ["coffee", "shop"],
+              dk: "2019-05-01", ds: 1},
+             {i: 5, t: "Roller coaster", g: ["ride"], dk: "2019-05-01", ds: 1, np: "Funland",
+              nk: "theme_park"},
+             {i: 6, t: "Carousel horses at an amusement park", g: ["carousel"],
+              dk: "2019-05-01", ds: 1},
+             {i: 7, t: "Golf ball on the green", g: ["golf", "course", "green"],
+              dk: "2019-05-01", ds: 1},
+             {i: 8, t: "Putting green", g: ["golf"], dk: "2019-05-01", ds: 1, np: "Links",
+              nk: "golf_course"}
+         ];
+         var vectors = {1: closeTo(0.9, 2), 2: closeTo(0.85, 3), 3: closeTo(0.95, 4),
+                        4: closeTo(0.6, 5), 5: closeTo(0.7, 2), 6: closeTo(0.9, 3),
+                        7: closeTo(0.3, 4), 8: closeTo(0.3, 5)};
+         var index = meaningIndex(records.slice(), vectors);
+         function found(text) {
+             var query = understood(index, text).query;
+             var result = index.search(query, {vector: QUERY});
+             return {query: query, mode: result.meaning && result.meaning.mode,
+                     items: result.items.filter(function (id) {
+                         return id < 100;
+                     }).sort(), byMeaning: result.byMeaning.slice().sort()};
+         }
+         // The cafe, the shop that says both words apart, the espresso at a
+         // cafe table found by meaning: none lost to the kind.
+         assert.deepStrictEqual(found("coffee shop"), {
+             query: "kind:cafe OR coffee kind:cafe OR shop", mode: "hybrid",
+             items: [1, 2, 3, 4, 6], byMeaning: [1, 6]});
+         assert.deepStrictEqual(SearchCore.meaningTexts("kind:cafe OR coffee kind:cafe OR shop"),
+                                ["coffee shop", "coffee", "shop"]);
+         var parks = found("theme parks");
+         assert.strictEqual(parks.query, "kind:theme_park OR theme kind:theme_park OR parks");
+         assert.strictEqual(parks.mode, "hybrid");
+         assert.ok(parks.items.indexOf(5) >= 0 && parks.items.indexOf(6) >= 0, parks.items);
+         // By words alone: "golf" and "course" apart still count.
+         var golf = understood(index, "golf courses").query;
+         assert.deepStrictEqual(index.search(golf, {meaning: "words"}).items.slice().sort(),
+                                [7, 8]);
+         // Its small words stay as they are ("of": skipped as ever).
+         assert.strictEqual(understood(SearchCore.prepare([
+             {i: 1, t: "x", np: "Saint Example", nk: "place_of_worship"}]), "house of worship")
+             .query, "kind:place_of_worship OR house of kind:place_of_worship OR worship");
+     });
+
+test("kind: and meaning: the pictures taken there without the words do not turn it off",
+     function () {
+         var records = [];
+         var vectors = {};
+         // Thirty views and meals at a hotel, nothing like the query ...
+         for (var k = 1; k <= 30; k++) {
+             records.push({i: k, t: "View from a balcony " + k, g: ["view"], dk: "2020-01-01",
+                           ds: 1, np: "The Grand", nk: "hotel"});
+             vectors[k] = closeTo(0.1, 2 + (k % 4));
+         }
+         // ... three pictures that say it, and one that only means it.
+         [41, 42, 43].forEach(function (id) {
+             records.push({i: id, t: "Hotel front " + id, g: ["hotel"], dk: "2020-01-02",
+                           ds: 1});
+             vectors[id] = closeTo(0.9, 3);
+         });
+         records.push({i: 50, t: "Lobby with a reception desk", g: ["lobby"],
+                       dk: "2020-01-03", ds: 1});
+         vectors[50] = closeTo(0.95, 4);
+         var index = meaningIndex(records, vectors);
+         var result = index.search("kind:hotel OR hotels", {vector: QUERY});
+         assert.strictEqual(result.meaning && result.meaning.mode, "hybrid");
+         assert.deepStrictEqual(result.byMeaning, [50]);
+         // The pictures that say it first; those taken there are all still found.
+         assert.deepStrictEqual(result.items.slice(0, 3).sort(), [41, 42, 43]);
+         assert.strictEqual(result.total, 34);
+     });
+
+test("kinds of place: a word finds what it names, no more", function () {
+    var index = SearchCore.prepare([
+        {i: 1, t: "Pasta", g: ["pasta"], np: "Luigi", nk: "restaurant", ds: 1},
+        {i: 2, t: "Room", g: ["bed"], np: "Grand", nk: "hotel", ds: 1},
+        {i: 3, t: "Sign", g: ["sign"], np: "Roadside", nk: "motel", ds: 1},
+        {i: 4, t: "Bunks", g: ["bunk"], np: "Backpack", nk: "hostel", ds: 1},
+        {i: 5, t: "Pool", g: ["pool"], np: "Palm Bay", nk: "resort", ds: 1},
+        {i: 6, t: "Game", g: ["baseball"], np: "Ballfield", nk: "stadium", ds: 1},
+        {i: 7, t: "Trees", g: ["tree"], np: "Elm Park", nk: "park", ds: 1},
+        {i: 8, t: "Canyon", g: ["canyon"], np: "Red Rock", nk: "national_park", ds: 1},
+        {i: 9, t: "Tide pools", g: ["tide pool"], np: "Gardens", nk: "nature_reserve", ds: 1},
+        {i: 10, t: "Lion", g: ["lion"], np: "Wilds", nk: "zoo", ds: 1},
+        {i: 11, t: "Nave", g: ["nave"], np: "Saint Example", nk: "place_of_worship", ds: 1},
+        {i: 12, t: "Walls", g: ["wall"], np: "Old Keep", nk: "castle", ds: 1},
+        {i: 13, t: "Cannon", g: ["cannon"], np: "Point Fort", nk: "fort", ds: 1},
+        {i: 14, t: "Pint", g: ["beer"], np: "The Anchor", nk: "pub", ds: 1},
+        {i: 15, t: "Wine", g: ["wine"], np: "Cork", nk: "bar", ds: 1}
+    ]);
+    function query(text) {
+        return understood(index, text).query;
+    }
+    function found(text) {
+        return index.search(text, {}).items.slice().sort(function (a, b) {
+            return a - b;
+        });
+    }
+    // Sorts of place the maps have no kind for: words.
+    ["pizzeria", "diners", "bistro", "lodge", "inn", "arena", "ballpark", "cathedral",
+     "state parks", "county park", "petting"].forEach(function (text) {
+        assert.strictEqual(query(text), text);
+    });
+    // A narrower word: its own kind only.
+    assert.strictEqual(query("motels"), "kind:motel OR motels");
+    assert.deepStrictEqual(found("kind:motel"), [3]);
+    assert.strictEqual(query("resorts"), "kind:resort OR resorts");
+    assert.deepStrictEqual(found("kind:resort"), [5]);
+    assert.deepStrictEqual(found("kind:hostels"), [4]);
+    assert.deepStrictEqual(found("kind:pubs"), [14]);
+    assert.deepStrictEqual(found("kind:forts"), [13]);
+    assert.deepStrictEqual(found("kind:castle"), [12]);
+    // A broad one: the narrower kinds the maps have too.
+    assert.deepStrictEqual(found("kind:hotels"), [2, 3]);
+    assert.deepStrictEqual(found("kind:bars"), [14, 15]);
+    // Parks are not national parks, nor these nature reserves.
+    assert.deepStrictEqual(found("kind:parks"), [7]);
+    assert.strictEqual(query("national parks"),
+                       "kind:national_park OR national kind:national_park OR parks");
+    assert.deepStrictEqual(found("kind:\"national parks\""), [8]);
+    assert.deepStrictEqual(found("kind:\"nature reserves\""), [9]);
+    // A narrower word of a phrase stays a word of its own.
+    assert.strictEqual(query("petting zoo"), "petting kind:zoo OR zoo");
+    // Where the maps make no difference: a church is a place of worship.
+    assert.strictEqual(query("churches"), "kind:place_of_worship OR churches");
+    assert.deepStrictEqual(found("kind:church"), [11]);
+});
+
+test("plain language: a kind of place next to names, kinds and words", function () {
+    var records = kindRecords().concat([
+        {i: 20, t: "Boats", g: ["boat"], np: "Bay Marina", nk: "marina", ds: 1},
+        {i: 21, t: "Harbour wall", g: ["harbour"], ci: "Marina", rg: "South Coast",
+         co: "Examplia", cc: "XA", ds: 1},
+        {i: 22, t: "Lobby", g: ["lobby"], np: "Grand", nk: "hotel", ds: 1},
+        {i: 23, t: "Drinks", g: ["drink"], np: "Bar One", nk: "bar", ds: 1},
+        {i: 24, t: "Latte", g: ["latte"], np: "Bean Co", nk: "cafe", ds: 1},
+        {i: 25, t: "Desks", g: ["desk"], np: "Elm School", nk: "school", ds: 1},
+        {i: 26, t: "Shelves", g: ["book"], np: "Town Library", nk: "library", ds: 1},
+        {i: 27, t: "Spire", g: ["spire"], np: "Clock Tower", nk: "tower", ds: 1},
+        {i: 28, t: "Span", g: ["span"], np: "Red Bridge", nk: "bridge", ds: 1},
+        {i: 29, t: "Cannon", g: ["cannon"], np: "Point Fort", nk: "fort", ds: 1},
+        {i: 30, t: "Plaque", g: ["plaque"], np: "War Memorial", nk: "memorial", ds: 1},
+        {i: 31, t: "Pool", g: ["pool"], np: "Palm Bay", nk: "resort", ds: 1},
+        {i: 32, t: "Valley", g: ["valley"], np: "High Point", nk: "viewpoint", ds: 1},
+        {i: 33, t: "Sand", g: ["sand"], np: "Gull Beach", nk: "beach", ds: 1}
+    ]);
+    var index = SearchCore.prepare(records);
+    var people = [{id: 9, name: "Art Smith", label: "Art Smith", ids: [5]}];
+    function said(text) {
+        var answer = understood(index, text, {people: people});
+        return {query: answer.query, parts: answer.parts.map(function (part) {
+            return [part.kind, part.text];
+        }), choices: answer.choices.map(function (choice) {
+            return [choice.text, choice.options.map(function (option) {
+                return option.kind;
+            })];
+        }), rest: answer.rest};
+    }
+    function query(text) {
+        return said(text).query;
+    }
+    // A kind the query names with kind: already: the word stays a word.
+    ["kind:viewpoint lookout", "kind:zoo zoos", "kind:aquarium aquariums"].forEach(
+        function (text) {
+            assert.deepStrictEqual([query(text), said(text).parts], [text, []]);
+        });
+    // A town named like a kind: "in" makes it the town, "at the" the kind,
+    // alone it is asked about.
+    assert.deepStrictEqual(said("boats in marina").parts, [["place", "in marina"]]);
+    assert.strictEqual(query("boats in marina"), "boats place:marina OR marina");
+    assert.strictEqual(query("boats at the marina"), "boats at the kind:marina OR marina");
+    assert.deepStrictEqual(said("marina"), {query: "marina", parts: [],
+                                            choices: [["marina", ["kind", "place", "words"]]],
+                                            rest: "marina"});
+    // A longer kind than a person's name is the kind.
+    assert.strictEqual(query("art galleries"),
+                       "kind:gallery OR art kind:gallery OR galleries");
+    // Two kinds of place in a row: the last says what it is.
+    ["hotel bar", "beach bar", "school library", "tower bridge", "park fountain"].forEach(
+        function (text) {
+            assert.strictEqual(query(text), text);
+        });
+    assert.deepStrictEqual(said("museum cafe").parts, [["kind", "cafe"]]);
+    assert.strictEqual(query("museum cafe"), "museum kind:cafe OR cafe");
+    assert.strictEqual(query("parks, zoos"), "kind:park OR parks kind:zoo OR zoos");
+    // Words with another everyday meaning.
+    ["pillow fort", "last resort", "memorial day", "memorial service", "seaside town"].forEach(
+        function (text) {
+            assert.strictEqual(query(text), text);
+        });
+    assert.strictEqual(query("forts"), "kind:fort OR forts");
+    assert.strictEqual(query("at the memorial"), "at the kind:memorial OR memorial");
+    // "the" before it goes with it.
+    assert.deepStrictEqual(said("the beach at sunset"), {
+        query: "the kind:beach OR beach at sunset", parts: [["kind", "the beach"]], choices: [],
+        rest: "at sunset"});
+});
+
+test("the words' order still counts with a kind of place as their alternative", function () {
+    assert.deepStrictEqual(SearchCore.parse("kids at the kind:zoo OR zoo").sequence,
+                           ["kids", "at", "the", "zoo"]);
+    assert.deepStrictEqual(SearchCore.parse("kind:cafe OR coffee kind:cafe OR shop").sequence,
+                           ["coffee", "shop"]);
+    assert.strictEqual(SearchCore.parse("cat OR dog bowl").sequence, null);
+    var records = [
+        {i: 1, t: "Coffee shop", g: ["window"], dk: "2019-01-01", ds: 1},
+        {i: 2, t: "Shop selling coffee", g: ["window"], dk: "2020-01-01", ds: 1}
+    ];
+    assert.deepStrictEqual(items(records, "kind:cafe OR coffee kind:cafe OR shop"), [1, 2]);
+});
+
+test("a query finds a kind of place: what the viewer marks", function () {
+    assert.strictEqual(SearchCore.kindMatches("kind:place_of_worship OR churches",
+                                              "place_of_worship"), true);
+    assert.strictEqual(SearchCore.kindMatches(SearchCore.parse("kind:waterfalls"),
+                                              "waterfall"), true);
+    assert.strictEqual(SearchCore.kindMatches("kind:zoo", "aquarium"), false);
+    assert.strictEqual(SearchCore.kindMatches("fish -kind:zoo", "zoo"), false);
+    assert.strictEqual(SearchCore.kindMatches("zoos", "zoo"), false);
+    assert.strictEqual(SearchCore.kindMatches("kind:zoo", undefined), false);
+    // The kinds a library's pictures were taken at most (pubs with bars).
+    var index = SearchCore.prepare([{i: 1, nk: "pub", np: "A"}, {i: 2, nk: "bar", np: "B"},
+                                    {i: 3, nk: "zoo", np: "C"}, {i: 4, t: "x"}]);
+    assert.deepStrictEqual(index.commonKinds(3), [
+        {key: "bar", label: "bars and pubs", count: 2},
+        {key: "zoo", label: "zoos and wildlife parks", count: 1}]);
 });
 
 /* ---------- Run ------------------------------------------------------------ */

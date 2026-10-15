@@ -126,8 +126,15 @@
        the names of the people in it, each searching person:"Name"; the
        admin's pane also has "Show faces", which draws the boxes of its
        faces over the picture (a layer of its own over context.stage's
-       picture, following its place and zoom; each box names its person and
-       opens it on the People page), kept on for the next pictures. Of a
+       picture, following its place and zoom; each box names its person),
+       kept on for the next pictures -- of a video or a 360 picture, which
+       get no boxes, a strip of its faces in the pane instead. A box (or a
+       face of the strip; Tab reaches them, Enter opens) opens a small
+       popover by it, a sheet at the foot of a phone's screen, to say who
+       the face is: type a few letters of a name and Enter (see
+       format.faceChoices and openNaming), "Not <name>" or "Not a face";
+       each change can be undone (Undo in its message, or Ctrl+Z while it
+       shows), and the pane and the boxes follow it. Of a
        video, each name is followed by the moments that person was seen at
        (its frames looked at), which move the video there (stage.seekTo);
        a video opened by a search that names one of its people (person:,
@@ -466,6 +473,104 @@ var VIEWER = (function () {
         } catch (error) {
             return text;
         }
+    }
+
+    /* What the popover that names a face (openNaming) offers for the text
+       typed: people is /api/people's list (the admin's: hidden people too),
+       face {person (its person's id, or null), named (that person has a
+       name)}. Returns [{kind: "person", person}, ..., {kind: "name", person:
+       the face's person's id, name}, {kind: "new", name}]: the people (but
+       the face's own) whose name, or a word of it, starts with the text
+       (nameKey: any case, accents and punctuation aside; "lee" finds "Ann
+       Lee"; a person without a name only by its number: "12", "person 12"),
+       those called so first, then those whose name starts so, then the
+       others, each as people lists them; with nothing typed, the named
+       people. Then, when nobody (the face's own person neither) has that
+       name as the server compares names (serverNameKey: accents count there,
+       so "Jose" can be a new name beside the accented one, while "STRASSE"
+       is the name spelled with a sharp s): the text as a new name -- of the
+       face's person when it has none ("name": all its faces), and of a new
+       person of this face alone ("new"). Once something is typed, the first
+       one is what Enter takes. */
+    function faceChoices(people, face, text) {
+        var typed = String(text === null || text === undefined ? "" : text)
+            .replace(/\s+/g, " ").replace(/^ | $/g, "");
+        var key = nameKey(typed);
+        var server = serverNameKey(typed);
+        var own = face && typeof face.person === "number" ? face.person : null;
+        var numbered = /[0-9]/.test(key);
+        var exact = false;
+        var found = [];
+        (Array.isArray(people) ? people : []).forEach(function (person, order) {
+            if (!person || typeof person.id !== "number") {
+                return;
+            }
+            var label = nameKey(person.label || person.name || "");
+            if (key && serverNameKey(person.label || person.name || "") === server) {
+                exact = true;
+            }
+            if (person.id === own || (!person.name && (!key || !numbered))) {
+                return;
+            }
+            var rank = !key ? 3 : label === key ? 0 : label.indexOf(key) === 0 ? 1
+                : (" " + label).indexOf(" " + key) >= 0 ? 2 : -1;
+            if (rank >= 0) {
+                found.push({rank: rank, order: order, person: person});
+            }
+        });
+        found.sort(function (a, b) {
+            return a.rank - b.rank || a.order - b.order;
+        });
+        var choices = found.map(function (item) {
+            return {kind: "person", person: item.person};
+        });
+        // ("Person 12" is how people without a name are shown: no name.)
+        if (key && !exact && !/^person [0-9]+$/.test(key)) {
+            if (own !== null && !face.named) {
+                choices.push({kind: "name", person: own, name: typed});
+            }
+            choices.push({kind: "new", name: typed});
+        }
+        return choices;
+    }
+
+    // A name as the server tells names apart (people_groups.name_key: NFKC and
+    // case folding, accents kept), as near as a page can: one person per key.
+    function serverNameKey(text) {
+        text = String(text === null || text === undefined ? "" : text)
+            .replace(/\s+/g, " ").replace(/^ | $/g, "");
+        if (text.normalize) {
+            text = text.normalize("NFKC");
+        }
+        // (Case folding, where it is more than lower case: sharp s, final sigma.)
+        return text.toLowerCase().replace(/\u00df/g, "ss").replace(/\u03c2/g, "\u03c3");
+    }
+
+    /* The faces of a picture in reading order (for Tab): rows from the top --
+       a face whose middle is within the height of a row's first face is in
+       that row -- each from the left. faces: [{x, y, w, h}] (fractions). */
+    function readingOrder(faces) {
+        var rows = [];
+        (Array.isArray(faces) ? faces.slice() : []).sort(function (a, b) {
+            return a.y - b.y || a.x - b.x;
+        }).forEach(function (face) {
+            var middle = face.y + face.h / 2;
+            var row = rows.length ? rows[rows.length - 1] : null;
+            if (row && middle >= row.top && middle <= row.bottom) {
+                row.faces.push(face);
+            } else {
+                rows.push({top: face.y, bottom: face.y + face.h, faces: [face]});
+            }
+        });
+        var out = [];
+        rows.forEach(function (row) {
+            row.faces.sort(function (a, b) {
+                return a.x - b.x;
+            }).forEach(function (face) {
+                out.push(face);
+            });
+        });
+        return out;
     }
 
     // A moment of a video: "0:07", "1:02:03" -- whole seconds rounded down,
@@ -1260,13 +1365,18 @@ var VIEWER = (function () {
         if (!namedPlace(rec)) {
             return "";
         }
-        var kind = typeof rec.nk === "string" && rec.nk
-            ? KIND_WORDS[rec.nk] || rec.nk.replace(/_/g, " ") : "";
+        var kind = namedPlaceKind(rec);
         var where = rec.ni ? (rec.na ? "probably taken inside it" : "taken inside it")
             : typeof rec.nd === "number" && isFinite(rec.nd)
                 ? (rec.nd < 1 ? "right there" : Math.round(rec.nd) + " m away")
                 : rec.na ? "nearby" : "";
         return [kind, where].filter(Boolean).join(", ");
+    }
+
+    // What a named place is, in words ("aquarium", "place of worship"), or "".
+    function namedPlaceKind(rec) {
+        return namedPlace(rec) && typeof rec.nk === "string" && rec.nk
+            ? KIND_WORDS[rec.nk] || rec.nk.replace(/_/g, " ") : "";
     }
 
     var ESTIMATED_PLACE = "(estimated from pictures taken around the same time)";
@@ -1314,6 +1424,8 @@ var VIEWER = (function () {
         rawUrl: rawUrl,
         durationText: durationText,
         personMoment: personMoment,
+        faceChoices: faceChoices,
+        readingOrder: readingOrder,
         searchedQuery: searchedQuery,
         momentText: momentText,
         codecName: codecName,
@@ -3204,6 +3316,23 @@ var VIEWER = (function () {
         this.state();
     };
 
+    /* A 360-degree view turned to look at the point (u, v) of its panorama (0..1
+       across from the left, down from the top: a face's middle), its zoom kept.
+       False when the stage shows no 360-degree view. */
+    Stage.prototype.lookAt = function (u, v) {
+        if (this.mode !== "pano" || !isFinite(u) || !isFinite(v)) {
+            return false;
+        }
+        var view = this.view || openingView(null);
+        var yaw = -(u - 0.5) * 2 * Math.PI;
+        yaw = ((yaw + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+        this.view = {yaw: yaw, pitch: clamp((0.5 - v) * Math.PI, -MAX_PITCH, MAX_PITCH),
+                     fov: view.fov};
+        this.redraw();
+        this.state();
+        return true;
+    };
+
     Stage.prototype.isZoomed = function () {
         return this.mode === "image" && this.zoom > 1.01;
     };
@@ -4345,7 +4474,10 @@ var VIEWER = (function () {
                                   " (on the street maps). " : "") +
                                  "Show all pictures taken at " + name)
             : el("span", {text: name});
-        if (matches(name, context.query, "np")) {
+        // (Found by its kind -- kind:, or "churches" in plain language --
+        // the kind is marked too: "High Falls" never says waterfall.)
+        var byKind = kindMatches(rec, context.query);
+        if (byKind || matches(name, context.query, "np")) {
             named.classList.add("is-match");
         }
         var box = el("span", {className: "info-place info-named-place"});
@@ -4359,10 +4491,25 @@ var VIEWER = (function () {
             box.appendChild(named);
         }
         if (note) {
-            box.appendChild(el("span", {className: "info-place-note info-named-note",
-                                        text: note}));
+            var kind = namedPlaceKind(rec);
+            box.appendChild(byKind && kind && note.indexOf(kind) === 0
+                ? el("span", {className: "info-place-note info-named-note"}, [
+                    el("mark", {text: kind}), el("span", {text: note.slice(kind.length)})])
+                : el("span", {className: "info-place-note info-named-note", text: note}));
         }
         return box;
+    }
+
+    // True when the search finds the picture by the kind of its named place.
+    function kindMatches(rec, query) {
+        if (!query || !window.SearchCore || !SearchCore.kindMatches) {
+            return false;
+        }
+        try {
+            return SearchCore.kindMatches(query, rec.nk);
+        } catch (error) {
+            return false;
+        }
     }
 
     // The town of a picture, as a chip that finds the pictures taken there.
@@ -5997,10 +6144,14 @@ var VIEWER = (function () {
         }
         clear(box);
         box.infoId = rec ? rec.i : null;    // (whose information the box shows)
+        if (naming && (!rec || naming.rec.i !== rec.i)) {
+            closeNaming(false);             // (another picture: its popover goes)
+        }
         if (!rec) {
             box.appendChild(el("p", {className: "muted", text: "This picture is not available."}));
             return;
         }
+        peoplePane = {box: box, rec: rec, detail: detail, context: context};
         var head = el("div", {className: "info-head"});
         head.appendChild(el("h2", {className: "info-title"},
                             [highlighted(rec.t || rec.n || "Untitled picture", context.query, "t")]));
@@ -6018,10 +6169,15 @@ var VIEWER = (function () {
         if (rec.h) {
             badges.appendChild(badge("Hidden", "is-hidden"));
         }
-        if (rec.se && SENSITIVE[rec.se]) {
+        // A published site marks no picture as sensitive or private: each one
+        // there is one the owner chose to publish (export.py: its records never
+        // carry pr; se stays for "Hide sensitive pictures").
+        var site = typeof window !== "undefined" ? window.SITE : null;
+        var flagBadges = !(site && site.isStatic);
+        if (flagBadges && rec.se && SENSITIVE[rec.se]) {
             badges.appendChild(badge("Sensitive: " + SENSITIVE[rec.se], "is-warn"));
         }
-        if (rec.pr) {
+        if (flagBadges && rec.pr) {
             badges.appendChild(badge("Private information", "is-warn"));
         }
         if (rec.ed && admin()) {
@@ -6352,22 +6508,99 @@ var VIEWER = (function () {
             row.appendChild(el("span", {className: "muted", text: faces.length === 1
                 ? "A face of nobody known" : faces.length + " faces of nobody known"}));
         }
-        if (faces.length && context.stage && !rec.mv && rec.p !== "360") {
+        // (No boxes over a video or a 360 picture: a strip of its faces in the pane.)
+        var strip = faces.length && (rec.mv || rec.p === "360");
+        if (faces.length && context.stage) {
             var toggle = el("button", {type: "button", className: "button small info-faces",
                                        text: facesWanted() ? "Hide faces" : "Show faces",
-                                       title: "Draw the boxes of the faces found in the picture " +
-                                           "(on for the next pictures too)",
+                                       title: (strip ? "Show the faces found in it, to say who " +
+                                                   "they are" : "Draw the boxes of the faces " +
+                                                   "found in the picture, to say who they are") +
+                                           " (on for the next pictures too)",
                                        attrs: {"aria-pressed": facesWanted() ? "true" : "false"}});
             toggle.addEventListener("click", function () {
                 var on = !facesWanted();
                 storage(FACES_KEY, on ? "1" : "0");
                 toggle.setAttribute("aria-pressed", on ? "true" : "false");
                 toggle.textContent = on ? "Hide faces" : "Show faces";
+                var pane = peoplePane && peoplePane.rec.i === rec.i ? peoplePane.box : null;
+                if (strip && pane) {
+                    // (The strip is part of this line: drawn again.)
+                    redrawPeople({box: pane, rec: rec, detail: detail, context: context});
+                    var again = pane.querySelector(".info-faces");
+                    if (again && again.focus) {
+                        again.focus();
+                    }
+                    return;
+                }
                 faceBoxesFor(rec, detail, context);
             });
             row.appendChild(toggle);
+            if (strip && facesWanted()) {
+                row.appendChild(faceStrip(faces, rec, detail, context));
+            }
         }
         return row;
+    }
+
+    /* The faces of a video or a 360 picture (the admin's, "Show faces" on): a
+       button for each, its face's picture and its person's name ("?": nobody;
+       of a video, the moment it was seen at), that opens the popover to say
+       who it is (openNaming) -- and moves a video to that moment. */
+    function faceStrip(faces, rec, detail, context) {
+        var strip = el("div", {className: "info-face-strip",
+                               attrs: {role: "group", "aria-label": "Faces"}});
+        var seek = rec.mv && !context.drive && context.stage && context.stage.seekTo;
+        faces.forEach(function (face) {
+            var moment = rec.mv && typeof face.at === "number" ? momentText(face.at) : "";
+            var url = window.SITE && SITE.faceUrl ? SITE.faceUrl(face.id) : null;
+            var button = el("button", {type: "button",
+                                       className: "info-face" + (face.person ? "" : " is-unknown") +
+                                           (face.hidden ? " is-hidden" : ""),
+                                       title: faceTitle(face) + (moment ? " (at " + moment + ")"
+                                                                 : ""),
+                                       attrs: {"aria-haspopup": "dialog",
+                                               "data-face": String(face.id),
+                                               "aria-label": faceTitle(face) +
+                                                   (moment ? ", at " + moment : "")}});
+            if (url) {
+                button.appendChild(el("img", {src: url, alt: "", loading: "lazy",
+                                              decoding: "async"}));
+            }
+            button.appendChild(el("span", {className: "info-face-name", text: faceText(face)}));
+            if (moment) {
+                button.appendChild(el("span", {className: "info-face-at", text: moment}));
+            }
+            button.addEventListener("click", function () {
+                if (seek && typeof face.at === "number") {
+                    context.stage.seekTo(face.at);
+                } else if (!rec.mv && rec.p === "360" && context.stage &&
+                           context.stage.rec === rec && context.stage.lookAt) {
+                    // (A 360 photo turns to the face: seen where it is while it is named.)
+                    context.stage.lookAt(face.x + face.w / 2, face.y + face.h / 2);
+                }
+                openNaming({face: face, rec: rec, detail: detail, context: context, gap: 6,
+                            anchor: function () {
+                                var pane = peoplePane && peoplePane.rec.i === rec.i
+                                    ? peoplePane.box : null;
+                                return pane ? pane.querySelector(".info-face[data-face=\"" +
+                                                                 face.id + "\"]") : null;
+                            }});
+            });
+            strip.appendChild(button);
+        });
+        return strip;
+    }
+
+    // What a face box (or a face of the strip) says: its person's name, "?" for nobody.
+    function faceText(face) {
+        return face.person ? face.label + (face.hidden ? " (hidden)" : "") : "?";
+    }
+
+    // What a face box is to a screen reader (and its tooltip).
+    function faceTitle(face) {
+        return face.person ? "Face of " + face.label + (face.hidden ? " (hidden)" : "") +
+            ": say who it is" : "A face of nobody known: say who it is";
     }
 
     // The moments of a video a person was seen at, each a button that moves the
@@ -6418,28 +6651,167 @@ var VIEWER = (function () {
         return storage(FACES_KEY) === "1";
     }
 
-    function dropFaceBoxes() {
-        if (!faceLayer) {
+    // Give node the keyboard without scrolling anything to it.
+    function focusQuietly(node) {
+        try {
+            node.focus({preventScroll: true});
+        } catch (problem) {
+            node.focus();
+        }
+    }
+
+    // The keyboard was on what is gone (a redrawn box, a popover): nowhere now.
+    function focusGone() {
+        var active = hasDocument ? document.activeElement : null;
+        return !active || active === document.body || !document.documentElement.contains(active);
+    }
+
+    // The keyboard was on a face box that went (another picture's): to the viewer
+    // (keepFocus), or the nearest holder of the stage that takes it.
+    function focusLost(stage) {
+        if (!hasDocument || !focusGone()) {
             return;
         }
-        if (faceLayer.observer) {
-            faceLayer.observer.disconnect();
+        keepFocus();
+        var holder = stage && stage.box && stage.box.closest ? stage.box.closest("[tabindex]")
+            : null;
+        if (focusGone() && holder && holder.focus) {
+            focusQuietly(holder);
         }
-        window.removeEventListener("resize", faceLayer.place);
-        faceLayer.stage.img.removeEventListener("load", faceLayer.place);
-        if (faceLayer.layer.parentNode) {
-            faceLayer.layer.parentNode.removeChild(faceLayer.layer);
+    }
+
+    /* keep: the layer is drawn again for the same picture (its popover stays).
+       Returns the face whose box had the keyboard ({rec, face}: faceBoxesFor
+       gives it to its new box), or null; without keep the keyboard goes to the
+       viewer (focusLost). */
+    function dropFaceBoxes(keep) {
+        if (!faceLayer) {
+            return null;
         }
+        var gone = faceLayer;
         faceLayer = null;
+        if (gone.observer) {
+            gone.observer.disconnect();
+        }
+        cancelOpen(gone);
+        window.removeEventListener("resize", gone.place);
+        gone.stage.img.removeEventListener("load", gone.place);
+        gone.listening.forEach(function (pair) {
+            gone.stage.box.removeEventListener(pair[0], pair[1]);
+        });
+        var active = hasDocument ? document.activeElement : null;
+        var focused = active && active !== gone.layer && gone.layer.contains(active)
+            ? {rec: gone.rec, face: Number(active.getAttribute("data-face"))} : null;
+        if (gone.layer.parentNode) {
+            gone.layer.parentNode.removeChild(gone.layer);
+        }
+        if (!keep && naming && naming.onBox) {
+            closeNaming(false);
+        }
+        if (focused && !keep) {
+            focusLost(gone.stage);
+        }
+        return focused;
+    }
+
+    // A tap's popover that waits (a second tap would make it a double tap) opens not.
+    function cancelOpen(current) {
+        if (current && current.pending) {
+            clearTimeout(current.pending.timer);
+            current.pending = null;
+        }
+    }
+
+    /* A face box that takes the keyboard (Tab) comes into sight: the picture,
+       zoomed in, moves by the stage's own place and zoom until the face -- and
+       its name under it -- is in the stage. (The browser would scroll the stage
+       instead, which the stage does not know of: see the "scroll" listener.) */
+    function revealFace(current, box) {
+        var stage = current.stage;
+        if (faceLayer !== current || !stage.base || typeof stage.tx !== "number" ||
+                typeof stage.place !== "function") {
+            return;
+        }
+        var outer = stage.box.getBoundingClientRect();
+        var rect = box.getBoundingClientRect();
+        var dx = revealShift(rect.left, rect.right, outer.left, outer.right);
+        var dy = revealShift(rect.top, rect.bottom + 24, outer.top, outer.bottom);
+        if (dx || dy) {
+            stage.tx += dx;
+            stage.ty += dy;
+            stage.place();
+            if (stage.followCentre) {
+                stage.followCentre();
+            }
+            if (stage.state) {
+                stage.state();
+            }
+        }
+    }
+
+    // How far a span (low..high) moves to be within min..max (8 px in): its middle to
+    // the middle when it is too long.
+    function revealShift(low, high, min, max) {
+        var margin = 8;
+        if (high - low > max - min - 2 * margin) {
+            return Math.round((min + max) / 2 - (low + high) / 2);
+        }
+        if (low < min + margin) {
+            return Math.round(min + margin - low);
+        }
+        if (high > max - margin) {
+            return Math.round(max - margin - high);
+        }
+        return 0;
+    }
+
+    /* Faces whose names would cover a neighbour (side by side and close, in a
+       crowd -- each name is under its box, about 7 px a letter): their names
+       show only on hover, on focus and while being named (style.css
+       .is-tight). Of two names that would cover each other, the one on the
+       left gives way. width, height: the picture's size as shown (px). */
+    function markTight(items, width, height) {
+        var rects = items.map(function (item) {
+            var left = item.face.x * width;
+            var top = item.face.y * height;
+            var right = left + item.face.w * width;
+            var bottom = top + item.face.h * height;
+            var room = 14 + 7 * item.label.length;
+            return {box: {left: left, top: top, right: right, bottom: bottom},
+                    label: {left: left, top: bottom, right: left + room, bottom: bottom + 22}};
+        });
+        function meet(a, b) {
+            return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+        }
+        items.forEach(function (item, at) {
+            var mine = rects[at];
+            var tight = rects.some(function (other, k) {
+                var after = other.box.left > mine.box.left ||
+                    (other.box.left === mine.box.left && k > at);
+                return k !== at && (meet(mine.label, other.box) ||
+                                    (after && meet(mine.label, other.label)));
+            });
+            item.box.classList.toggle("is-tight", tight);
+        });
     }
 
     /* The admin's boxes of the faces of rec over context.stage's picture
        (when "Show faces" is on and the stage shows that picture flat), or
        none. The layer is the stage's child, laid over the picture as it is
        shown (its place, size and zoom, read whenever the picture's style
-       changes), so the stage itself does not know about it. */
+       changes), so the stage itself does not know about it. Each box is a
+       button (Tab reaches them in reading order, readingOrder): Enter, a
+       click or a tap opens its popover -- a tap or a click after a short
+       wait (DOUBLE_TAP_MS), so that a double tap or a double click zooms in
+       as anywhere on the picture, and opens nothing. */
     function faceBoxesFor(rec, detail, context) {
         var stage = context.stage;
+        if (stage && stage.rec !== rec && faceLayer && faceLayer.stage === stage &&
+                faceLayer.rec === stage.rec) {
+            // (rec is not the picture shown -- a late answer, the Undo of a change made
+            // on an earlier picture: the boxes of the one shown stay as they are.)
+            return;
+        }
         var faces = admin() && detail && detail.people && Array.isArray(detail.people.faces)
             ? detail.people.faces : [];
         // (The face the address asks for -- the People page's link to a face, on the
@@ -6449,25 +6821,45 @@ var VIEWER = (function () {
         var shown = facesWanted() ? faces : faces.filter(function (face) {
             return face.id === chosen;
         });
+        // (Drawn again when a face's person changes: its name is on its box.)
         var key = chosen + ":" + shown.map(function (face) {
-            return face.id;
+            return face.id + "/" + face.person + "/" + face.label + (face.hidden ? "/h" : "");
         }).join(",");
         if (faceLayer && faceLayer.stage === stage && faceLayer.rec === rec && shown.length &&
                 faceLayer.key === key) {
             faceLayer.place();
             return;
         }
-        dropFaceBoxes();
+        var focused = dropFaceBoxes(true);
         if (!hasDocument || !stage || !stage.img || !shown.length ||
                 stage.rec !== rec || stage.mode !== "image" || rec.mv || rec.p === "360") {
+            if (naming && naming.onBox) {
+                closeNaming(false);
+            }
+            if (focused) {
+                focusLost(stage);
+            }
             return;
         }
         var layer = el("div", {className: "face-layer"});
         var marked = null;
-        shown.forEach(function (face) {
+        var current = {stage: stage, rec: rec, layer: layer, observer: null, key: key,
+                       panned: true, listening: [], tap: null, pending: null, items: [],
+                       pressed: 0};
+        readingOrder(shown).forEach(function (face) {
+            // (A box is a button: a click or a tap -- not a drag of the picture, which
+            // starts on it as anywhere -- or Enter opens the popover to say who it is.)
+            var asked = naming && naming.onBox && naming.rec.i === rec.i &&
+                naming.face.id === face.id;
             var box = el("div", {className: "face-box" + (face.person ? "" : " is-unknown") +
                                  (face.hidden ? " is-hidden" : "") +
-                                 (face.id === chosen ? " is-chosen" : "")});
+                                 (face.id === chosen ? " is-chosen" : "") +
+                                 (asked ? " is-naming" : ""),
+                                 title: faceTitle(face),
+                                 attrs: {role: "button", tabindex: "0", "aria-haspopup": "dialog",
+                                         "aria-expanded": asked ? "true" : "false",
+                                         "aria-label": faceTitle(face),
+                                         "data-face": String(face.id)}});
             if (face.id === chosen) {
                 marked = face;
             }
@@ -6475,23 +6867,118 @@ var VIEWER = (function () {
             box.style.top = (100 * face.y) + "%";
             box.style.width = (100 * face.w) + "%";
             box.style.height = (100 * face.h) + "%";
-            var name = face.person ? el("a", {className: "face-name",
-                                              text: face.label + (face.hidden ? " (hidden)" : ""),
-                                              href: "/people?person=" +
-                                                  encodeURIComponent(face.person),
-                                              title: "Open " + face.label + " on the People page"})
-                : el("span", {className: "face-name", text: "?",
-                              title: "A face in no person (see Other faces on the People page)"});
-            // (A press on a name is the link's, not the start of a drag of the picture.)
-            name.addEventListener("pointerdown", function (event) {
-                event.stopPropagation();
+            var label = faceText(face);
+            box.appendChild(el("span", {className: "face-name", text: label,
+                                        attrs: {"aria-hidden": "true"}}));
+            current.items.push({face: face, box: box, label: label});
+            var open = function () {
+                openNaming({face: face, rec: rec, detail: detail, context: context, gap: 28,
+                            onBox: true, anchor: function () {
+                                return faceLayer && faceLayer.rec === rec
+                                    ? faceLayer.layer.querySelector(".face-box[data-face=\"" +
+                                                                    face.id + "\"]") : null;
+                            }});
+            };
+            box.addEventListener("keydown", function (event) {
+                if ((event.key === "Enter" || event.key === " ") && !event.ctrlKey &&
+                        !event.altKey && !event.metaKey) {
+                    event.preventDefault();
+                    cancelOpen(current);
+                    open();
+                }
             });
-            box.appendChild(name);
+            box.addEventListener("pointerdown", function (event) {
+                if (event.pointerType === "mouse" && event.button !== undefined &&
+                        event.button !== 0) {
+                    return;
+                }
+                current.pressed = Date.now();
+                // A second press soon after a tap, near it: a double tap (or click), which
+                // zooms in -- the first one's popover opens not, nor does this one's.
+                var waiting = current.pending;
+                var second = Boolean(waiting && Math.abs(event.clientX - waiting.x) < 30 &&
+                                     Math.abs(event.clientY - waiting.y) < 30);
+                cancelOpen(current);
+                current.tap = {id: event.pointerId, x: event.clientX, y: event.clientY,
+                               time: Date.now(), open: open, moved: false, second: second};
+            });
+            box.addEventListener("click", function (event) {
+                var tap = current.tap;
+                current.tap = null;
+                if (event.detail > 1) {
+                    cancelOpen(current);        // (a double click: the stage zooms in)
+                } else if (!tap) {
+                    open();     // (a click without a press: a screen reader's, a script's)
+                }
+            });
+            box.addEventListener("dblclick", function () {
+                cancelOpen(current);
+            });
+            // (Tab to a box out of sight: the picture moves to show it. Not for a press,
+            // which is on a box in sight, and may be the start of a drag.)
+            box.addEventListener("focus", function () {
+                if (Date.now() - current.pressed > 600) {
+                    setTimeout(function () {
+                        revealFace(current, box);
+                    }, 0);
+                }
+            });
             layer.appendChild(box);
         });
+        current.panned = !marked;
         stage.box.appendChild(layer);
-        var current = {stage: stage, rec: rec, layer: layer, observer: null, key: key,
-                       panned: !marked};
+        // The stage takes the pointer (a drag of the picture): its moves and its end
+        // come to the stage, which says whether a press on a box was a tap.
+        var listen = function (name, handler) {
+            stage.box.addEventListener(name, handler);
+            current.listening.push([name, handler]);
+        };
+        listen("pointerdown", function (event) {
+            if (current.tap && event.pointerId !== current.tap.id) {
+                current.tap.many = true;
+            }
+            if (current.pending && !(event.target && event.target.closest &&
+                                     event.target.closest(".face-box"))) {
+                cancelOpen(current);    // (a press elsewhere on the picture)
+            }
+        });
+        listen("pointermove", function (event) {
+            var tap = current.tap;
+            if (tap && event.pointerId === tap.id &&
+                    Math.abs(event.clientX - tap.x) + Math.abs(event.clientY - tap.y) > 8) {
+                tap.moved = true;
+            }
+        });
+        listen("pointerup", function (event) {
+            var tap = current.tap;
+            if (tap && event.pointerId === tap.id && !tap.moved && !tap.many && !tap.second &&
+                    Date.now() - tap.time < 800) {
+                tap.opened = true;
+                cancelOpen(current);
+                current.pending = {x: tap.x, y: tap.y, timer: setTimeout(function () {
+                    current.pending = null;
+                    if (faceLayer === current) {
+                        tap.open();
+                    }
+                }, DOUBLE_TAP_MS)};
+            }
+        });
+        // (A tap that opens the popover: no mouse events and click after it, which
+        // could land on the popover where the finger was -- a phone's sheet.)
+        listen("touchend", function (event) {
+            if (current.tap && current.tap.opened && event.cancelable !== false) {
+                event.preventDefault();
+            }
+        });
+        // The browser scrolls the stage to show a box that takes the keyboard; the
+        // stage shows the picture by its own place and zoom, never scrolled.
+        listen("scroll", function () {
+            if (stage.box.scrollLeft || stage.box.scrollTop) {
+                stage.box.scrollLeft = 0;
+                stage.box.scrollTop = 0;
+                current.place();
+            }
+        });
         current.place = function () {
             if (faceLayer !== current) {
                 return;
@@ -6512,6 +6999,10 @@ var VIEWER = (function () {
             layer.style.top = (shown.top - outer.top) + "px";
             layer.style.width = shown.width + "px";
             layer.style.height = shown.height + "px";
+            markTight(current.items, shown.width, shown.height);
+            if (naming && naming.onBox) {
+                placeNaming(naming);        // (it follows its box: a zoom, a pan)
+            }
         };
         if (typeof MutationObserver === "function") {
             current.observer = new MutationObserver(current.place);
@@ -6522,6 +7013,756 @@ var VIEWER = (function () {
         stage.img.addEventListener("load", current.place);
         faceLayer = current;
         current.place();
+        if (naming && naming.onBox && naming.rec.i !== rec.i) {
+            closeNaming(false);
+        }
+        if (focused) {
+            // (The same face's new box takes the keyboard back; another picture's: none.)
+            var again = focused.rec === rec ? layer.querySelector(".face-box[data-face=\"" +
+                                                                  focused.face + "\"]") : null;
+            if (again) {
+                focusQuietly(again);
+            } else {
+                focusLost(stage);
+            }
+        }
+    }
+
+    /* ---------- People: who a face is, said where it is (the admin's) -------- */
+
+    var NAMING_SHEET_QUERY = "(max-width: 899px) and (orientation: portrait), (max-width: 599px)";
+    var UNDO_SECONDS = 12;      // how long a change's message (with Undo) shows
+    var naming = null;          // the open popover (openNaming)
+    var knownPeople = null;     // /api/people?hidden=1's people, the last that came
+    var peoplePane = null;      // {box, rec, detail, context}: the pane drawn last
+    var lastUndo = null;        // {token, until, run}: what Ctrl+Z undoes (its message shows)
+    var undoKeys = false;       // (Ctrl+Z is listened for)
+    var namingCount = 0;        // (ids of the popovers' parts)
+
+    // The people of the admin's /api/people (hidden ones too); done() when they came.
+    function loadKnownPeople(done) {
+        if (!window.SITE || !SITE.loadPeople) {
+            done();
+            return;
+        }
+        SITE.loadPeople(function (answer) {
+            if (answer && Array.isArray(answer.people)) {
+                knownPeople = answer.people;
+            }
+            done();
+        }, true);
+    }
+
+    function knownPerson(id) {
+        var list = Array.isArray(knownPeople) ? knownPeople : [];
+        for (var k = 0; k < list.length; k++) {
+            if (list[k] && list[k].id === id) {
+                return list[k];
+            }
+        }
+        return null;
+    }
+
+    function picturesOf(person) {
+        var count = Array.isArray(person.ids) ? person.ids.length : 0;
+        return plural(count, "picture");
+    }
+
+    /* The popover that says who a face is: spec {face (people.faces' box), rec,
+       detail, context, anchor() (the box or the strip's button it is by, now;
+       null when gone), gap (room under the anchor: its name), onBox (by a box
+       over the picture)}. It shows who the face is now, a field to type a name
+       in with the choices for it (format.faceChoices; the arrows move among
+       them, Enter or a click takes one), "Not <name>" and "Not a face"; Esc,
+       x or a press elsewhere closes it (Esc gives the keyboard back to the
+       box). On a narrow upright screen it is a sheet at the foot of the
+       screen (above the on-screen keyboard). */
+    function openNaming(spec) {
+        if (!admin() || !hasDocument || !spec || !spec.face) {
+            return;
+        }
+        if (naming && naming.face.id === spec.face.id && naming.rec.i === spec.rec.i) {
+            naming.input.focus();
+            return;
+        }
+        closeNaming(false);
+        var face = spec.face;
+        var anchor = spec.anchor();
+        var host = (anchor && anchor.closest && anchor.closest(".viewer")) || document.body;
+        namingCount += 1;
+        var ids = "face-pop-" + namingCount;
+        var node = el("dialog", {className: "face-popover", attrs: {"aria-labelledby":
+                                                                     ids + "-title"}});
+        var faceUrl = window.SITE && SITE.faceUrl ? SITE.faceUrl(face.id) : null;
+        var head = el("div", {className: "face-pop-head"});
+        if (faceUrl) {
+            head.appendChild(el("img", {className: "face-pop-face", src: faceUrl, alt: "",
+                                        decoding: "async"}));
+        }
+        var now = el("p", {className: "face-pop-now", id: ids + "-now"});
+        head.appendChild(el("div", {className: "face-pop-who"}, [
+            el("h3", {className: "face-pop-title", id: ids + "-title", text: "Who is this?"}),
+            now
+        ]));
+        var x = el("button", {type: "button", className: "face-pop-x", text: "\u00d7",
+                              title: "Close (Esc)", attrs: {"aria-label": "Close"}});
+        head.appendChild(x);
+        node.appendChild(head);
+        var input = el("input", {type: "text", className: "input face-pop-input",
+                                 placeholder: face.person ? "Another name" : "Type a name",
+                                 maxLength: 100, autocomplete: "off", spellcheck: false,
+                                 attrs: {role: "combobox", "aria-autocomplete": "list",
+                                         "aria-expanded": "true", "aria-controls": ids + "-list",
+                                         "aria-labelledby": ids + "-title",
+                                         "aria-describedby": ids + "-now",
+                                         autocapitalize: "words", enterkeyhint: "done"}});
+        node.appendChild(input);
+        var list = el("ul", {className: "face-pop-list", id: ids + "-list",
+                             attrs: {role: "listbox", "aria-label": "People"}});
+        node.appendChild(list);
+        var hint = el("p", {className: "face-pop-hint", hidden: true});
+        node.appendChild(hint);
+        var error = el("p", {className: "face-pop-error", hidden: true, attrs: {role: "alert"}});
+        node.appendChild(error);
+        var actions = el("div", {className: "face-pop-actions"});
+        node.appendChild(actions);
+        var current = {face: face, rec: spec.rec, detail: spec.detail, context: spec.context,
+                       node: node, input: input, list: list, hint: hint, error: error,
+                       now: now, actions: actions, ids: ids, choices: [], active: -1,
+                       busy: false, anchor: spec.anchor, gap: spec.gap || 6,
+                       onBox: Boolean(spec.onBox), cleanup: [],
+                       pane: peoplePane && peoplePane.rec.i === spec.rec.i ? peoplePane.box
+                           : null};
+        naming = current;
+        x.addEventListener("click", function () {
+            closeNaming(true);
+        });
+        input.addEventListener("input", function () {
+            error.hidden = true;
+            current.enterWaiting = false;
+            drawChoices(current);
+            placeNaming(current);       // (a shorter list: it stays by its face)
+        });
+        node.addEventListener("keydown", function (event) {
+            namingKey(current, event);
+        });
+        // Only a press that starts in the popover acts in it: the end of the tap that
+        // opened it (a phone's sheet comes where the finger was) neither takes a choice
+        // nor takes the keyboard from the field.
+        node.addEventListener("pointerdown", function () {
+            current.pressed = true;
+        }, true);
+        node.addEventListener("mousedown", function (event) {
+            if (!current.pressed) {
+                event.preventDefault();
+            }
+        }, true);
+        node.addEventListener("click", function (event) {
+            if (event.detail && !current.pressed) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        }, true);
+        drawNow(current);
+        drawChoices(current);
+        host.appendChild(node);
+        if (typeof node.show === "function") {
+            try {
+                node.show();
+            } catch (problem) {
+                node.setAttribute("open", "");
+            }
+        } else {
+            node.setAttribute("open", "");
+        }
+        var follow = function () {
+            placeNaming(current);
+        };
+        // A press anywhere else closes it (on its box: it stays).
+        var outside = function (event) {
+            var target = event.target;
+            var by = current.anchor();
+            if (naming === current && !node.contains(target) && !(by && by.contains(target))) {
+                closeNaming(false);
+            }
+        };
+        document.addEventListener("pointerdown", outside, true);
+        window.addEventListener("resize", follow);
+        document.addEventListener("scroll", follow, true);
+        current.cleanup.push(function () {
+            document.removeEventListener("pointerdown", outside, true);
+            window.removeEventListener("resize", follow);
+            document.removeEventListener("scroll", follow, true);
+        });
+        if (window.visualViewport && window.visualViewport.addEventListener) {
+            // (A phone's keyboard: the sheet stays above it.)
+            window.visualViewport.addEventListener("resize", follow);
+            window.visualViewport.addEventListener("scroll", follow);
+            current.cleanup.push(function () {
+                window.visualViewport.removeEventListener("resize", follow);
+                window.visualViewport.removeEventListener("scroll", follow);
+            });
+        }
+        if (anchor) {
+            anchor.classList.add("is-naming");
+            anchor.setAttribute("aria-expanded", "true");
+        }
+        placeNaming(current);
+        input.focus();
+        loadKnownPeople(function () {
+            if (naming !== current) {
+                return;
+            }
+            current.loaded = true;
+            drawNow(current);
+            drawChoices(current);
+            placeNaming(current);
+            // (Enter pressed while the people came: it takes a person the letters name,
+            // never a new name made of them -- that one is chosen by hand.)
+            var first = current.enterWaiting && current.active === 0 ? current.choices[0] : null;
+            current.enterWaiting = false;
+            if (first && first.kind === "person") {
+                take(current, first);
+            }
+        });
+    }
+
+    function closeNaming(focusBack) {
+        var current = naming;
+        if (!current) {
+            return;
+        }
+        naming = null;
+        current.cleanup.forEach(function (undo) {
+            undo();
+        });
+        if (current.node.parentNode) {
+            current.node.parentNode.removeChild(current.node);
+        }
+        var by = current.anchor();
+        if (by) {
+            by.classList.remove("is-naming");
+            by.setAttribute("aria-expanded", "false");
+            if (focusBack && by.focus) {
+                focusQuietly(by);
+            }
+        }
+    }
+
+    // Who the face is now: its person (a link to the People page) and how many faces
+    // that person has, or nobody; and the buttons "Not <name>" and "Not a face".
+    function drawNow(current) {
+        var face = current.face;
+        clear(current.now);
+        clear(current.actions);
+        var person = face.person ? knownPerson(face.person) : null;
+        if (face.person) {
+            var label = person ? person.label : face.label;
+            current.now.appendChild(document.createTextNode("Now: "));
+            current.now.appendChild(el("a", {href: "/people?person=" +
+                                                encodeURIComponent(face.person),
+                                            text: label + (face.hidden ? " (hidden)" : ""),
+                                            title: "Open " + label + " on the People page"}));
+            if (person && typeof person.faces === "number") {
+                current.now.appendChild(document.createTextNode(
+                    " \u00b7 " + plural(person.faces, "face")));
+            }
+            var leave = "Take this face out of " + label + " for good";
+            current.actions.appendChild(namingButton(current, "Not " + label, leave, function () {
+                send(current, "/people/faces", {action: "reject", faces: [face.id],
+                                                person: face.person, undo: true},
+                     function () {
+                         return "This face is not " + label + " any more.";
+                     });
+            }));
+        } else {
+            current.now.textContent = "In no person yet";
+        }
+        var none = "Something that is not a face: left out of People";
+        current.actions.appendChild(namingButton(current, "Not a face", none, function () {
+            var body = {action: "not_face", faces: [face.id], undo: true};
+            if (face.person) {
+                body.person = face.person;
+            }
+            send(current, "/people/faces", body, function () {
+                return "Marked as not a face.";
+            });
+        }));
+    }
+
+    function namingButton(current, text, title, onClick) {
+        var button = el("button", {type: "button", className: "button small", text: text,
+                                   title: title});
+        button.addEventListener("click", function (event) {
+            if (!ghost(current, event)) {
+                onClick();
+            }
+        });
+        return button;
+    }
+
+    // A click in the popover that did not start there (the end of the tap that opened it).
+    function ghost(current, event) {
+        return Boolean(event && event.detail) && !current.pressed;
+    }
+
+    // The choices for what was typed (format.faceChoices), the first one marked.
+    function drawChoices(current) {
+        var face = current.face;
+        var own = face.person ? knownPerson(face.person) : null;
+        var named = face.person ? (own ? Boolean(own.name) : !/^Person [0-9]+$/.test(face.label))
+            : false;
+        current.choices = faceChoices(knownPeople, {person: face.person || null, named: named},
+                                      current.input.value);
+        clear(current.list);
+        current.choices.forEach(function (choice, index) {
+            current.list.appendChild(choiceNode(current, choice, index, own));
+        });
+        current.list.hidden = !current.choices.length;
+        current.input.setAttribute("aria-expanded", current.choices.length ? "true" : "false");
+        var typed = current.input.value.replace(/^\s+|\s+$/g, "");
+        // (Until the people came, the letters typed name nobody yet: Enter waits for
+        // them, see openNaming, rather than take a new name made of those letters.)
+        var listed = knownPeople !== null;
+        var hint = "";
+        if (!listed) {
+            hint = current.loaded ? "The people could not be loaded: choose a line with the " +
+                "arrows or a click." : "Loading the people\u2026";
+        } else if (!current.choices.length) {
+            hint = !typed ? "Type a name." : face.person && own && nameKey(own.label) ===
+                nameKey(typed) ? "This face is " + own.label + " already."
+                : /^person [0-9]+$/.test(nameKey(typed))
+                    ? "\u201cPerson 12\u201d is how people without a name are shown."
+                    : "";
+        }
+        current.hint.textContent = hint;
+        current.hint.hidden = !hint;
+        // (Enter takes the first choice once something is typed and the people are
+        // there; before, none: the arrows choose.)
+        setActive(current, current.choices.length && typed && listed ? 0 : -1);
+    }
+
+    function choiceNode(current, choice, index, own) {
+        var node = el("li", {className: "face-pop-option" + (choice.kind === "person" ? ""
+                                                             : " is-new"),
+                             id: current.ids + "-option-" + index,
+                             attrs: {role: "option", "aria-selected": "false"}});
+        var small = "";
+        if (choice.kind === "person") {
+            var person = choice.person;
+            var url = person.cover !== null && person.cover !== undefined && window.SITE &&
+                SITE.faceUrl ? SITE.faceUrl(person.cover) : null;
+            node.appendChild(url ? el("img", {src: url, alt: "", loading: "lazy",
+                                              decoding: "async"})
+                : el("span", {className: "face-pop-plus", text: "?",
+                              attrs: {"aria-hidden": "true"}}));
+            node.appendChild(el("span", {className: "face-pop-name", text: person.label}));
+            // (Faces, as the popover's head and the messages count them.)
+            small = (typeof person.faces === "number" ? plural(person.faces, "face")
+                     : picturesOf(person)) + (person.hidden ? ", hidden" : "");
+        } else {
+            node.appendChild(el("span", {className: "face-pop-plus", text: "+",
+                                         attrs: {"aria-hidden": "true"}}));
+            var ownLabel = own ? own.label : current.face.label;
+            var text = choice.kind === "name"
+                ? "Name " + ownLabel + " \u201c" + choice.name + "\u201d"
+                : (current.face.person ? "Just this face: a new person \u201c"
+                   : "A new person \u201c") + choice.name + "\u201d";
+            node.appendChild(el("span", {className: "face-pop-name", text: text}));
+            if (choice.kind === "name") {
+                small = own && typeof own.faces === "number" ? "all " + plural(own.faces, "face")
+                    : "all its faces";
+            }
+        }
+        if (small) {
+            node.appendChild(el("small", {text: small}));
+        }
+        // (The field keeps the keyboard: a press on a choice takes it.)
+        node.addEventListener("pointerdown", function (event) {
+            event.preventDefault();
+        });
+        node.addEventListener("mousedown", function (event) {
+            event.preventDefault();
+        });
+        node.addEventListener("click", function (event) {
+            if (!ghost(current, event)) {
+                take(current, choice);
+            }
+        });
+        return node;
+    }
+
+    function setActive(current, index) {
+        current.active = index;
+        var nodes = current.list.querySelectorAll(".face-pop-option");
+        Array.prototype.forEach.call(nodes, function (node, at) {
+            node.classList.toggle("is-active", at === index);
+            node.setAttribute("aria-selected", at === index ? "true" : "false");
+        });
+        if (index >= 0 && nodes[index]) {
+            current.input.setAttribute("aria-activedescendant", nodes[index].id);
+            var list = current.list;
+            var item = nodes[index];
+            // (In sight in the list, which scrolls.)
+            if (typeof item.offsetTop === "number" && typeof list.scrollTop === "number") {
+                if (item.offsetTop < list.scrollTop) {
+                    list.scrollTop = item.offsetTop;
+                } else if (item.offsetTop + item.offsetHeight >
+                           list.scrollTop + list.clientHeight) {
+                    list.scrollTop = item.offsetTop + item.offsetHeight - list.clientHeight;
+                }
+            }
+        } else {
+            current.input.removeAttribute("aria-activedescendant");
+        }
+    }
+
+    // The popover's keys: the arrows and Enter in the field, Esc, Tab (kept inside).
+    function namingKey(current, event) {
+        var key = event.key;
+        if (event.ctrlKey || event.altKey || event.metaKey) {
+            return;
+        }
+        if (key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            closeNaming(true);
+            return;
+        }
+        if (key === "Tab") {
+            var focusable = Array.prototype.filter.call(
+                current.node.querySelectorAll("input, button, a[href]"), function (node) {
+                    return !node.disabled && !node.hidden;
+                });
+            if (focusable.length) {
+                var at = focusable.indexOf(document.activeElement);
+                var next = event.shiftKey ? (at <= 0 ? focusable.length - 1 : at - 1)
+                    : (at < 0 || at === focusable.length - 1 ? 0 : at + 1);
+                event.preventDefault();
+                focusable[next].focus();
+            }
+            event.stopPropagation();
+            return;
+        }
+        if (event.target === current.input) {
+            var count = current.choices.length;
+            if ((key === "ArrowDown" || key === "ArrowUp") && count) {
+                event.preventDefault();
+                var step = key === "ArrowDown" ? 1 : -1;
+                setActive(current, ((current.active < 0 ? (step > 0 ? -1 : 0) : current.active) +
+                                    step + count) % count);
+            } else if (key === "Enter" && !event.isComposing) {
+                event.preventDefault();
+                if (current.active >= 0 && current.choices[current.active]) {
+                    take(current, current.choices[current.active]);
+                } else if (knownPeople === null && !current.loaded &&
+                           /\S/.test(current.input.value)) {
+                    current.enterWaiting = true;     // (for the people: see openNaming)
+                }
+            }
+        }
+        event.stopPropagation();
+    }
+
+    // A choice taken: the face moves to that person, the face's person takes the
+    // name, or the face alone becomes a new person of that name.
+    function take(current, choice) {
+        var face = current.face;
+        var body;
+        var said;
+        if (choice.kind === "person") {
+            body = {action: "move", faces: [face.id], to: choice.person.id, undo: true};
+            said = function () {
+                return "This face is " + choice.person.label + " now.";
+            };
+        } else if (choice.kind === "name") {
+            var before = (knownPerson(choice.person) || {label: face.label}).label;
+            // (With the face: refused when a grouping moved it to another person since.)
+            send(current, "/people/" + encodeURIComponent(choice.person),
+                 {name: choice.name, face: face.id, undo: true}, function (reply) {
+                     var person = reply && reply.person ? reply.person : {label: choice.name};
+                     return before + " is " + person.label + " now" +
+                         (typeof person.faces === "number" ? " (" + plural(person.faces, "face") +
+                          ")" : "") + ".";
+                 });
+            return;
+        } else {
+            body = {action: "move", faces: [face.id], to: null, name: choice.name, undo: true};
+            said = function (reply) {
+                return "This face is " + (reply && reply.person ? reply.person.label
+                                          : choice.name) + " now (a new person).";
+            };
+        }
+        if (face.person) {
+            body.person = face.person;
+        }
+        send(current, "/people/faces", body, said);
+    }
+
+    // One change (SHELL.admin path, body); said(reply) is its message.
+    function send(current, path, body, said) {
+        if (current.busy || !window.SHELL || !SHELL.admin) {
+            return;
+        }
+        // (Busy, not disabled: a disabled field would lose the keyboard focus.)
+        current.busy = true;
+        current.error.hidden = true;
+        current.node.classList.add("is-busy");
+        current.node.setAttribute("aria-busy", "true");
+        var view = {box: current.pane, rec: current.rec, detail: current.detail,
+                    context: current.context};
+        var faceId = current.face.id;
+        var hadFocus = current.node.contains(document.activeElement);
+        SHELL.admin(path, body, {quiet: true}).then(function (reply) {
+            if (naming === current) {
+                closeNaming(false);
+            }
+            changed(said(reply), reply && typeof reply.undo === "string" ? reply.undo : null,
+                    view, faceId, hadFocus);
+        }, function (problem) {
+            var why = problem && problem.message ? problem.message : "That could not be saved.";
+            if (naming !== current) {
+                toast(why, "error");        // (the popover went meanwhile: said all the same)
+                return;
+            }
+            current.busy = false;
+            current.node.classList.remove("is-busy");
+            current.node.removeAttribute("aria-busy");
+            current.error.textContent = why;
+            current.error.hidden = false;
+            current.input.focus();
+        });
+    }
+
+    /* After a change (text: its message; token: what undoes it, or null): the
+       pane's People line and the boxes are drawn again with the picture's
+       people as they are now, the pages' people are asked for again
+       (SITE.peopleChanged: person:), and the message shows, with Undo. */
+    function changed(text, token, view, faceId, focusBack) {
+        peopleMoved(view, focusBack ? faceId : null);
+        // (Only the last change can be undone: the message of the one before goes.)
+        dropUndo();
+        var undo = null;
+        if (token) {
+            undo = function () {
+                undoChange(token, view);
+            };
+            lastUndo = {token: token, until: Date.now() + UNDO_SECONDS * 1000, run: undo,
+                        message: null, face: faceId};
+            listenForUndo();
+        }
+        if (window.SHELL && SHELL.toast) {
+            // (Its keys show by the button where there is a keyboard: style.css.)
+            var mac = /Mac|iPhone|iPad/.test((window.navigator && navigator.platform) || "");
+            var keys = mac ? {label: "\u2318Z", aria: "Meta+Z"} : {label: "Ctrl+Z",
+                                                                    aria: "Control+Z"};
+            var message = SHELL.toast(text, "ok", UNDO_SECONDS,
+                                      undo ? {text: "Undo", title: "Undo (" + keys.label + ")",
+                                              keys: keys, run: undo} : null);
+            if (lastUndo && lastUndo.token === token) {
+                lastUndo.message = message || null;
+            }
+        }
+    }
+
+    // The last change can be undone no more: its message (with Undo) goes.
+    function dropUndo() {
+        var pending = lastUndo;
+        lastUndo = null;
+        if (pending && pending.message && pending.message.parentNode) {
+            pending.message.parentNode.removeChild(pending.message);
+        }
+    }
+
+    // The Undo button of the last change's message, while it shows (trapFocus).
+    function undoButton() {
+        var message = lastUndo && Date.now() <= lastUndo.until ? lastUndo.message : null;
+        var button = message && message.parentNode ? message.querySelector(".toast-action")
+            : null;
+        return button && !button.disabled ? button : null;
+    }
+
+    // The face whose box (or face of the strip) has the keyboard, or null.
+    function focusedFace() {
+        var active = hasDocument ? document.activeElement : null;
+        var holder = active && active.closest ? active.closest(".face-box, .info-face") : null;
+        var id = holder ? Number(holder.getAttribute("data-face")) : NaN;
+        return isFinite(id) ? id : null;
+    }
+
+    function undoChange(token, view) {
+        var pending = lastUndo && lastUndo.token === token ? lastUndo : null;
+        // The keyboard goes back to the face: the one it was on, else -- from the
+        // message's Undo, gone with it, or from nowhere -- the face changed.
+        var active = hasDocument ? document.activeElement : null;
+        var fromMessage = Boolean(active && active.closest && active.closest(".toast"));
+        var face = focusedFace();
+        if (face === null && (fromMessage || focusGone()) && pending) {
+            face = pending.face;
+        }
+        if (pending) {
+            dropUndo();
+        }
+        if (!window.SHELL || !SHELL.admin) {
+            return;
+        }
+        // (SHELL.admin says why when it cannot be undone.)
+        SHELL.admin("/people/undo", {undo: token}).then(function () {
+            toast("Undone.", "ok");
+            peopleMoved(view, face);
+        }, function () {
+            return null;
+        });
+    }
+
+    // The people changed: the picture's people again, the pages', and the popover's.
+    function peopleMoved(view, focusFace) {
+        if (window.SITE && SITE.peopleChanged) {
+            SITE.peopleChanged();
+        }
+        loadKnownPeople(function () {
+            return null;
+        });
+        if (!window.SITE || !SITE.loadRecord || !view.rec) {
+            return;
+        }
+        SITE.loadRecord(view.rec.i, function (fresh) {
+            if (fresh && view.detail) {
+                if (fresh.people) {
+                    view.detail.people = fresh.people;
+                } else {
+                    delete view.detail.people;
+                }
+            }
+            redrawPeople(view);
+            if (focusFace !== null && focusFace !== undefined) {
+                var box = faceLayer && faceLayer.rec === view.rec
+                    ? faceLayer.layer.querySelector(".face-box[data-face=\"" + focusFace + "\"]")
+                    : null;
+                var pane = view.box && view.box.infoId === view.rec.i ? view.box : null;
+                var target = box || (pane && (pane.querySelector(".info-face[data-face=\"" +
+                                                                 focusFace + "\"]") ||
+                                              pane.querySelector(".info-faces")));
+                if (target && target.focus) {
+                    focusQuietly(target);
+                }
+            }
+            // (Another picture by now, or the face went: the keyboard stays in the viewer.)
+            focusLost(view.context && view.context.stage);
+        });
+    }
+
+    /* The pane's People line (and the face boxes) drawn again in place, from
+       view.detail (the picture's full record, changed in place). Nothing when the
+       pane shows another picture by now, nor boxes over another picture. */
+    function redrawPeople(view) {
+        var box = view.box;
+        if (box && box.infoId === view.rec.i) {
+            var row = box.querySelector(".info-people");
+            var fresh = peopleFact(view.rec, view.detail, view.context);
+            var value = row ? row.parentNode : null;
+            if (value && fresh) {
+                value.replaceChild(fresh, row);
+            } else if (value && value.parentNode) {
+                // (Nobody any more: the line goes, its name too.)
+                var list = value.parentNode;
+                var at = Array.prototype.indexOf.call(list.childNodes, value);
+                var name = at > 0 ? list.childNodes[at - 1] : null;
+                list.removeChild(value);
+                if (name && name.tagName === "DT") {
+                    list.removeChild(name);
+                }
+            }
+        }
+        var stage = view.context && view.context.stage;
+        if (!stage || stage.rec === view.rec) {
+            faceBoxesFor(view.rec, view.detail, view.context);
+        }
+    }
+
+    // Ctrl+Z (or Cmd+Z) undoes the last change while its message shows (but in a
+    // field, where it is the field's).
+    function listenForUndo() {
+        if (undoKeys) {
+            return;
+        }
+        undoKeys = true;
+        document.addEventListener("keydown", function (event) {
+            if (!lastUndo || !(event.ctrlKey || event.metaKey) || event.altKey ||
+                    event.shiftKey || (event.key !== "z" && event.key !== "Z")) {
+                return;
+            }
+            var target = event.target;
+            var tag = target && target.tagName;
+            if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" ||
+                    (target && target.isContentEditable)) {
+                return;
+            }
+            var pending = lastUndo;
+            if (Date.now() > pending.until) {
+                lastUndo = null;
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            pending.run();
+        }, true);
+    }
+
+    /* Where the popover goes: by its box (under it and its name, else above it,
+       within the window), or -- on a narrow upright screen -- a sheet at the
+       foot of the screen, above the on-screen keyboard. */
+    function placeNaming(current) {
+        if (naming !== current) {
+            return;
+        }
+        var node = current.node;
+        var sheet = Boolean(window.matchMedia && window.matchMedia(NAMING_SHEET_QUERY).matches);
+        node.classList.toggle("is-sheet", sheet);
+        var height = window.innerHeight || 800;
+        var width = window.innerWidth || 1200;
+        if (sheet) {
+            var view = window.visualViewport;
+            var covered = view ? Math.max(0, height - view.height - view.offsetTop) : 0;
+            node.style.left = "0px";
+            node.style.top = "auto";
+            node.style.width = "";
+            node.style.bottom = Math.round(covered) + "px";
+            node.style.maxHeight = Math.round(Math.max(200, (view ? view.height : height) * 0.85)) +
+                "px";
+            return;
+        }
+        var anchor = current.anchor();
+        if (!anchor) {
+            return;
+        }
+        var rect = anchor.getBoundingClientRect();
+        var wide = Math.min(340, width - 16);
+        node.style.width = wide + "px";
+        node.style.maxHeight = "";
+        var natural = node.getBoundingClientRect().height || 320;
+        var below = height - 8 - (rect.bottom + current.gap);
+        var above = rect.top - 6 - 8;
+        // (It stays on the side it opened on while it fits there: the list grows and
+        // shrinks as letters are typed.)
+        var side = current.side;
+        if (!(side === "below" && below >= natural) && !(side === "above" && above >= natural)) {
+            side = below >= natural || below >= above ? "below" : "above";
+        }
+        current.side = side;
+        if (side === "below") {
+            node.style.bottom = "auto";
+            node.style.top = Math.round(Math.min(rect.bottom + current.gap, height - 168)) + "px";
+            node.style.maxHeight = Math.max(160, below) + "px";
+        } else {
+            // (Above the face, held by its foot: a shorter list keeps it by the face.)
+            node.style.top = "auto";
+            node.style.bottom = Math.round(Math.max(8, height - (rect.top - 6))) + "px";
+            node.style.maxHeight = Math.max(160, above) + "px";
+        }
+        var left = rect.left + rect.width / 2 - wide / 2;
+        left = Math.max(8, Math.min(left, width - wide - 8));
+        node.style.left = Math.round(left) + "px";
     }
 
     // The "Looks like this" strip: thumbnails of pictures (ids) that open in the viewer
@@ -7110,18 +8351,31 @@ var VIEWER = (function () {
                 return !node.disabled && !node.hidden && node.offsetParent !== null &&
                     node.tabIndex >= 0;
             });
+        // (The Undo of the last change's message is in the round while it shows: it
+        // comes after the viewer's last control.)
+        var undo = undoButton();
+        if (undo) {
+            focusable.push(undo);
+        }
         if (!focusable.length) {
             return;
         }
         var first = focusable[0];
         var last = focusable[focusable.length - 1];
-        if (event.shiftKey && document.activeElement === first) {
+        var at = focusable.indexOf(document.activeElement);
+        if (event.shiftKey && at === 0) {
             event.preventDefault();
             last.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
+        } else if (!event.shiftKey && at === focusable.length - 1) {
             event.preventDefault();
             first.focus();
-        } else if (!lightbox.root.contains(document.activeElement)) {
+        } else if (undo && at === focusable.length - 2 && !event.shiftKey) {
+            event.preventDefault();
+            undo.focus();
+        } else if (undo && at === focusable.length - 1 && event.shiftKey) {
+            event.preventDefault();
+            focusable[at - 1].focus();
+        } else if (at < 0 && !lightbox.root.contains(document.activeElement)) {
             event.preventDefault();
             first.focus();
         }
@@ -7592,6 +8846,7 @@ var VIEWER = (function () {
             editing = null;                 // (not saved)
         }
         var id = lightbox.id;
+        closeNaming(false);
         lightbox.root.hidden = true;
         setSheetFull(false);
         lightbox.detailToken += 1;

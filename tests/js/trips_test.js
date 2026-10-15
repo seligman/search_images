@@ -374,6 +374,39 @@ test("an export's pictures have no times: their day's gaps spread them", functio
     TRIPS.useMoments([]);
 });
 
+test("an export's trip lists the pictures its page never features", function () {
+    // An export's records never say a picture is private (export.py's
+    // PRIVATE_FLAG_KEYS): its trip says which the owner's page leaves out.
+    var records = [
+        {i: "a", dk: "2024-05-11", ty: "photo", q: 5, fav: 1, ts: at(9, 0)},
+        {i: "b", dk: "2024-05-11", ty: "photo", q: 3, ts: at(11, 0)},
+        {i: "c", dk: "2024-05-12", ty: "photo", q: 5, rt: 4, ts: "2024-05-12T09:00:00"},
+        {i: "d", dk: "2024-05-12", ty: "document", q: 2, ts: "2024-05-12T10:00:00"}
+    ];
+    var get = lookup(records);
+    var trip = {days: [{date: "2024-05-11", ids: ["a", "b"]},
+                       {date: "2024-05-12", ids: ["c", "d"]}], other: [],
+                unfeatured: ["a", "c"]};
+    TRIPS.useUnfeatured([]);
+    assert.deepStrictEqual(TRIPS.bestOf(["a", "b"], get, 1), ["a"]);
+    assert.deepStrictEqual(TRIPS.bestOf(["c", "d"], get, 6), ["c"]);
+    assert.deepStrictEqual(TRIPS.bestOf(TRIPS.tripIds(trip), get, 4, {perDay: true}),
+                           ["a", "b", "c"]);
+    TRIPS.useUnfeatured([trip]);
+    assert.deepStrictEqual(TRIPS.bestOf(["a", "b"], get, 1), ["b"]);
+    // Not as a day's only picture either: its document is.
+    assert.deepStrictEqual(TRIPS.bestOf(["c", "d"], get, 6), []);
+    assert.strictEqual(TRIPS.fallback(["c", "d"], get), "d");
+    assert.strictEqual(TRIPS.fallback(["c"], get), null);
+    // (Nothing says why: no reason is named.)
+    assert.strictEqual(TRIPS.noneWords(["c"], get), "Nothing to show here.");
+    assert.deepStrictEqual(TRIPS.bestOf(TRIPS.tripIds(trip), get, 4, {perDay: true}), ["b"]);
+    // The page still shows them (in its counts, map and search): only not as its best.
+    assert.ok(TRIPS.shown(get("a"), false));
+    TRIPS.useUnfeatured([]);
+    assert.deepStrictEqual(TRIPS.bestOf(["a", "b"], get, 1), ["a"]);
+});
+
 test("a trip's export: its trip page first, its search page beside it", function () {
     var file = require.resolve(path.join(__dirname, "..", "..", "static", "site.js"));
     delete require.cache[file];

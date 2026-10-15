@@ -8,7 +8,8 @@
    a word that may be a person or a place, the words searched by their
    words only (a name); one /api/embed request for the query and its words;
    Save as album saving the search as understood; the switch that turns it
-   all off. The pictures and people are all made up here.
+   all off; a kind of place (a named place's kind: "zoos", kind:). The
+   pictures, places and people are all made up here.
 
    Run by tests/test_plain_language.py, or directly:
        node tests/js/app_plain_test.js
@@ -64,9 +65,10 @@ function records() {
          f: "Kowalski"},
         {i: 7, l: "lib", t: "Turtle painted on a wall", g: ["turtle", "wall"], dk: "2023-05-02", ds: 1}
     ];
-    // (Sixty more: a library, not a small set, where per-term coverage applies
-    // -- see search-core.js MEANING_SMALL.)
-    for (var k = 0; k < 60; k++) {
+    // (Three thousand more: a library, not a small set, where per-term
+    // coverage applies without exception -- see search-core.js
+    // MEANING_TERM_RESCUE.)
+    for (var k = 0; k < 3000; k++) {
         list.push({i: 100 + k, l: "lib", t: "Filler " + k, g: ["filler"], dk: "2010-01-01",
                    ds: 1});
     }
@@ -99,7 +101,8 @@ function response(status, body) {
 }
 
 /* The admin's search page; searchText: its address's ?... part; options:
-   plain (false: config.json turned plain-language search off), meaning
+   records (default records()), plain (false: config.json turned
+   plain-language search off), meaning
    (true: the server has meaning vectors and embeds queries), people (false:
    People is not shown to the requester: a visitor, unless admin is true:
    the admin with People off).
@@ -108,7 +111,7 @@ function response(status, body) {
 function serverPage(searchText, options) {
     options = options || {};
     var log = {requests: [], sent: [], embeds: [], urls: []};
-    var data = {records: records()};
+    var data = {records: options.records || records()};
     var document = FAKE.makeDocument();
     document.createElementNS = function (ns, tag) {
         var node = document.createElement(tag);
@@ -707,6 +710,109 @@ test("a word the server gives no vector for is searched by the whole query", fun
         });
     }).then(function () {
         assert.strictEqual(page.log.embeds[1].length, 9);
+    });
+});
+
+// The pictures with some taken at a zoo (its named place on the street maps).
+function zooRecords() {
+    return records().concat([
+        {i: 301, l: "lib", t: "Lion resting", g: ["lion"], np: "Ridgeway Wilds", nk: "zoo",
+         dk: "2019-05-01", ds: 1},
+        {i: 302, l: "lib", t: "Zoo gate", g: ["zoo", "gate"], dk: "2019-05-02", ds: 1},
+        {i: 303, l: "lib", t: "Elephant", g: ["elephant"], np: "City Zoo", nk: "zoo",
+         dk: "2018-05-01", ds: 1}
+    ]);
+}
+
+test("a kind of place: a chip, its x, and the words found as before", function () {
+    var page = serverPage("?q=zoos+2019", {records: zooRecords()});
+    return loaded(page).then(function () {
+        return waitFor(function () {
+            return chips(page).length > 2;
+        });
+    }).then(function () {
+        assert.deepStrictEqual(chips(page), ["Searching for",
+                                             "Kind of place: zoos and wildlife parks",
+                                             "Taken: 2019", "Search the words as typed"]);
+        // The lion taken at the zoo, and the gate that says zoo.
+        assert.strictEqual(count(page), "2 pictures");
+        var kind = chip(page, "Kind of place");
+        assert.strictEqual(kind.getAttribute("aria-label"), "Kind of place: zoos and wildlife " +
+                           "parks \u2013 search \u201czoos\u201d as typed words instead");
+        kind.click();
+        return waitFor(function () {
+            return chips(page).indexOf("As typed: zoos") >= 0;
+        });
+    }).then(function () {
+        assert.ok(/[?&]typed=zoos(&|$)/.test(lastUrl(page)), lastUrl(page));
+        assert.strictEqual(count(page), "1 picture");
+        // The tips say kinds of place are understood here, and list kind:.
+        byId(page, "syntax-button").click();
+        var tips = byId(page, "syntax-help").textContent;
+        // (Its example: the kind its pictures were taken at most.)
+        assert.ok(tips.indexOf("the names of people and places, kinds of place (zoos), " +
+                               "years, months and seasons become filters") >= 0, tips);
+        assert.ok(tipExamples(page).indexOf("kind:beach") >= 0);
+        // Save as album: an export without places gets the words typed.
+        page = serverPage("?q=zoos", {records: zooRecords()});
+        return loaded(page).then(function () {
+            return waitFor(function () {
+                return count(page) === "3 pictures";
+            });
+        });
+    }).then(function () {
+        byId(page, "save-search").click();
+        var hint = page.document.querySelector(".modal").querySelector(".field-hint").textContent;
+        assert.ok(hint.indexOf("\u201ckind:zoo OR zoos\u201d") >= 0, hint);
+        assert.ok(hint.indexOf("An export without named places gets it with the words typed " +
+                               "for the kind of place.") >= 0, hint);
+        assert.ok(hint.indexOf("An export without places") < 0, hint);
+    });
+});
+
+test("a kind of place that is also a town's name is asked about", function () {
+    var page = serverPage("?q=marina", {records: records().concat([
+        {i: 311, l: "lib", t: "Boats", g: ["boat"], np: "Bay Marina", nk: "marina",
+         dk: "2019-05-01", ds: 1},
+        {i: 312, l: "lib", t: "Harbour wall", g: ["wall"], ci: "Marina", rg: "South Coast",
+         co: "Examplia", cc: "XA", dk: "2019-05-02", ds: 1}])});
+    return loaded(page).then(function () {
+        return waitFor(function () {
+            return byId(page, "plain-chips").querySelector(".plain-choice");
+        });
+    }).then(function (choice) {
+        assert.deepStrictEqual(choice.querySelectorAll("button").map(function (button) {
+            return button.textContent;
+        }), ["Kind of place: marinas", "Place: Marina", "the word \u201cmarina\u201d"]);
+        assert.strictEqual(choice.getAttribute("aria-label"),
+                           "\u201cmarina\u201d: kind, place or words?");
+        buttonNamed(choice, "Kind of place: marinas").click();
+        return waitFor(function () {
+            return byId(page, "query").value !== "marina";
+        });
+    }).then(function () {
+        assert.strictEqual(byId(page, "query").value, "kind:marina OR marina");
+        // (The boats at the marina, and the wall with the word in its place.)
+        assert.strictEqual(count(page), "2 pictures");
+    });
+});
+
+test("a published site: kinds of place with its named places only", function () {
+    var named = exportPage("?q=zoos", {records: zooRecords(),
+                                       capabilities: {places: true, named_places: true}});
+    var bare = exportPage("", {capabilities: {places: true}});
+    return Promise.all([shown(named), shown(bare)]).then(function () {
+        return waitFor(function () {
+            return chips(named).length;
+        });
+    }).then(function () {
+        assert.deepStrictEqual(chips(named).slice(0, 2),
+                               ["Searching for", "Kind of place: zoos and wildlife parks"]);
+        assert.strictEqual(count(named), "3 pictures");
+        assert.ok(tipExamples(named).indexOf("kind:beach") >= 0);
+        // (No named places published: no kind: in the tips.)
+        assert.ok(tipExamples(bare).indexOf("kind:beach") < 0, tipExamples(bare).join(" | "));
+        assert.ok(byId(bare, "syntax-help").textContent.indexOf("kinds of place") < 0);
     });
 });
 

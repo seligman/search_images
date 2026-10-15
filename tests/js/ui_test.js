@@ -2589,9 +2589,11 @@ function lightboxPage(options) {
     return page;
 }
 
+// options.site: the SITE of the page (the server's search page by default).
 function onLightboxPage(options, body) {
+    var site = options && options.site || SITE;
     var savedSite = global.SITE;
-    global.SITE = SITE;
+    global.SITE = site;
     var page = lightboxPage(options);
     var real = fakePage;
     fakePage = function () {
@@ -2599,7 +2601,7 @@ function onLightboxPage(options, body) {
     };
     return onFakePage(options, function (viewer) {
         fakePage = real;
-        page.window.SITE = SITE;
+        page.window.SITE = site;
         return body(viewer, page);
     }).then(function (value) {
         global.SITE = savedSite;
@@ -3009,6 +3011,27 @@ function byClass(root, name) {
     })(root);
     return found;
 }
+
+test("a published site shows no private or sensitive badge; the server's pages do", function () {
+    // (An export's records never carry pr: this is the page's own rule too.)
+    var rec = {i: 10, w: 400, hgt: 300, t: "Ticket", ds: 1, pr: 1, se: "suggestive"};
+    function badges(site) {
+        return onLightboxPage({site: site}, function (viewer, page) {
+            assert.ok(viewer.open({ids: [10], index: 0, get: function (id) {
+                return id === 10 ? rec : null;
+            }}));
+            return byClass(page.document.body, "info-badge").map(textOf);
+        });
+    }
+    var exported = loadSite({mode: "static", data: "data/", page: "search",
+                             capabilities: {static: true, images: true}});
+    return badges(SITE).then(function (shown) {
+        assert.deepStrictEqual(shown, ["Sensitive: Suggestive", "Private information"]);
+        return badges(exported);
+    }).then(function (shown) {
+        assert.deepStrictEqual(shown, []);
+    });
+});
 
 test("in the viewer M is More like this, also with the focus on the player", function () {
     var records = {9: VIDEO_REC, 10: {i: 10, w: 400, hgt: 300, t: "Cat"}};

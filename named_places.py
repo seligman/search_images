@@ -147,8 +147,8 @@ import street_maps
 import world_map
 
 # Raise when the rules (KINDS, the scores, how areas are named) change: every
-# picture is looked up again.
-RULES_VERSION = 2
+# picture is looked up again. (3: one name per place, see first_name.)
+RULES_VERSION = 3
 # The tiles read: the most detailed zoom of the street maps (at most this),
 # and, for the names of areas whose label is elsewhere, the tiles at the
 # position down to LABEL_ZOOM_MIN.
@@ -646,14 +646,39 @@ def _latin(text):
     return all(ord(char) < 0x250 or not char.isalpha() for char in text)
 
 
+def first_name(text):
+    """The first of the names in a name, trimmed: OpenStreetMap keeps the several names of
+    one place in one, separated by ";" ("Harbour Hall;Hall of the Harbour"); ""
+    when there is none."""
+    if not isinstance(text, str):
+        return ""
+    for part in text.split(";"):
+        part = part.strip()
+        if part:
+            return part
+    return ""
+
+
+def all_names(props):
+    """Every name of a point of interest (its own and its English one, each of their
+    ";"-separated names, trimmed), display_name's first, each once."""
+    names = [display_name(props)] if display_name(props) else []
+    for key in ("name", "name:en"):
+        value = props.get(key)
+        for part in value.split(";") if isinstance(value, str) else ():
+            part = part.strip()
+            if part and part not in names:
+                names.append(part)
+    return names
+
+
 def display_name(props):
     """The name a point of interest is shown by: its own, or its English name when its own
-    is not in Latin letters and it has one."""
-    name = props.get("name")
-    name = name.strip() if isinstance(name, str) else ""
-    english = props.get("name:en")
-    if name and not _latin(name) and isinstance(english, str) and english.strip():
-        return english.strip()
+    is not in Latin letters and it has one -- the first of each (first_name)."""
+    name = first_name(props.get("name"))
+    english = first_name(props.get("name:en"))
+    if name and not _latin(name) and english:
+        return english
     return name
 
 
@@ -962,7 +987,7 @@ def candidates(lat, lon, accuracy_m, reader, facts=ANY):
             name = display_name(props)
             if not name or (kind == "attraction" and OPERATOR.search(name)):
                 continue
-            named = said is not None and said.names(name)
+            named = said is not None and any(said.names(each) for each in all_names(props))
             if group == VENUE and (facts.approximate or not named and (
                     not facts.eat if kind in EAT
                     else not facts.shops and kind not in LODGING)):
@@ -1384,7 +1409,8 @@ def record_keys(named, for_export=False):
     EXPORT_METRES, at least that). na 1 says the position is approximate: inside an
     area, probably; else nd is left out ("nearby") -- also when the position may be off
     by more than the distance."""
-    keys = {"np": named["name"], "nk": named["kind"] or ""}
+    # (first_name: a row found before RULES_VERSION 3 may hold several names.)
+    keys = {"np": first_name(named["name"]), "nk": named["kind"] or ""}
     rough = approximate(named)
     metres = int(named.get("metres") or 0)
     if named.get("inside"):

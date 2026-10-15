@@ -33,6 +33,10 @@
    its turn, and one taken within SAME_MOMENT_SECONDS of it is left out);
    in the order taken. A day with none of those shows its best picture
    that is not hidden, private or sensitive (a document, say: fallback).
+   An export's records never say a picture is private (export.py's
+   PRIVATE_FLAG_KEYS): its trip lists the pictures the owner's page never
+   features (unfeatured, see trip_export.py), and they are never chosen
+   either (useUnfeatured).
    A trip's cover takes one picture a day first, unless another day has
    only clearly worse ones (by more than half a point of the aesthetic
    score: COVER_SLACK), and leaves 360 photos and wide panoramas (cropped
@@ -168,6 +172,23 @@ var TRIPS = (function () {
 
     /* ---------- The best pictures ------------------------------------------ */
 
+    // {id: true} of the pictures an export's trip says its page never features (its
+    // unfeatured: those the owner's page leaves out, private ones among them, which the
+    // export's records do not say; see useUnfeatured).
+    var unfeatured = {};
+
+    // Use the lists of the pictures some trips' pages never feature (an export's trip:
+    // see trip_export.py; the server's trips have none, its records say why).
+    function useUnfeatured(trips) {
+        unfeatured = {};
+        (trips || []).forEach(function (trip) {
+            (trip && Array.isArray(trip.unfeatured) ? trip.unfeatured : []).forEach(
+                function (id) {
+                    unfeatured[id] = true;
+                });
+        });
+    }
+
     // True when the page shows a picture at all (its strips, map, viewer and
     // counts): as the search page does by default, never an explicit or graphic
     // one, and a hidden one only to the admin.
@@ -177,10 +198,10 @@ var TRIPS = (function () {
     }
 
     // True when a picture may be shown at all as a day's picture: not hidden,
-    // private or sensitive.
+    // private or sensitive (nor one its export's trip says is never featured).
     function presentable(rec) {
         return Boolean(rec) && typeof rec === "object" && !rec.h && !rec.pr &&
-            !(isText(rec.se) && rec.se !== "none");
+            !(isText(rec.se) && rec.se !== "none") && unfeatured[rec.i] !== true;
     }
 
     // True when a picture may be among the best: see the notes at the top.
@@ -2391,6 +2412,7 @@ var TRIPS = (function () {
             SITE.loadTrips(function (loaded) {
                 trips = loaded;
                 useMoments(loaded && loaded.trips);
+                useUnfeatured(loaded && loaded.trips);
                 done();
             });
             SITE.loadLocations(function (loaded) {
@@ -2457,6 +2479,7 @@ var TRIPS = (function () {
         moment: moment,
         dayMoments: dayMoments,
         useMoments: useMoments,
+        useUnfeatured: useUnfeatured,
         parseDay: parseDay,
         dayWords: dayWords,
         spanWords: spanWords,

@@ -881,7 +881,8 @@ FIELD_NAMES = {
     "is": "is", "place": "place", "places": "place", "on": "on", "similar": "similar",
     "like": "similar", "look": "look", "looks": "look", "rating": "rating",
     "rated": "rating", "stars": "rating", "album": "album", "albums": "album",
-    "person": "person", "date": "date", "taken": "date",
+    "person": "person", "date": "date", "taken": "date", "kind": "kind", "kinds": "kind",
+    "placekind": "kind",
 }
 QUOTE_CHARS = "\"\u201c\u201d\u201e"
 _FIELD_TERM_RE = re.compile(r"([A-Za-z]{1,12}):")

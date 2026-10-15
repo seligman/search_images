@@ -43,6 +43,13 @@ A face the owner put in a person (owner 1 in face_people) stays there
 whatever the vectors say, and no grouping puts the faces of two people the
 owner put faces in together.
 
+A change can be undone right after it (the viewer's Undo, when a face is
+named there): undoable() makes it with a snapshot() of what it will change
+-- the faces' people, "not this person" and "not a face", and the rows of
+the people concerned -- in the same write, and restore() puts that back, as
+long as nothing else changed the people in between (people_version, read
+again inside restore's own write).
+
     people        id, name ('' while unnamed), hidden, cover (a face id the
                   owner chose, or NULL: the best face), created, updated
     face_people   face_id, person_id, owner (1: the owner's choice), updated
@@ -643,6 +650,33 @@ def _drop_empty(store, keep=()):
 GROUP_TRIES = 3
 
 
+def _settled(store, faces, assign, new_ids, now):
+    """The face_people rows (face, person, now) a grouping writes for its plan's assign
+    {face id: person (an id, or a key of new_ids: the people it made)}, read against
+    the store as it is now (inside the grouping's write): a face the owner placed
+    (owner 1), said "not" of that person or marked as not a face -- also since the plan
+    was worked out -- keeps what the owner said, and a face or a person that went
+    meanwhile gets no row. faces: those the plan was worked out from."""
+    present = {face[0] for face in faces}
+    wanted = sorted(face_id for face_id in assign if face_id in present)
+    there = set(_existing_faces(store, wanted))
+    owned = {row[0] for row in store.execute("SELECT face_id FROM face_people WHERE owner = 1")}
+    marked = {row[0] for row in store.execute("SELECT face_id FROM face_marks WHERE not_face")}
+    rejected = collections.defaultdict(set)
+    for face_id, person_id in store.execute("SELECT face_id, person_id FROM face_rejects"):
+        rejected[face_id].add(person_id)
+    persons = {row[0] for row in store.execute("SELECT id FROM people")}
+    rows = []
+    for face_id in wanted:
+        person = assign[face_id]
+        target = new_ids.get(person, person)
+        if (face_id not in there or face_id in owned or face_id in marked
+                or target in rejected.get(face_id, ()) or target not in persons):
+            continue                    # (the owner's say, or gone: left as it is)
+        rows.append((face_id, target, now))
+    return rows
+
+
 def group(store, options, ctx=None, now=None, use_numpy=None, conn=None):
     """Group the faces into people again (see the module notes) and write it.
 
@@ -650,9 +684,11 @@ def group(store, options, ctx=None, now=None, use_numpy=None, conn=None):
     conn index.db, whose pictures tell the moments apart (picture_moments;
     without it, every picture is a moment of its own). A change the owner
     makes meanwhile is never lost: the grouping is made again when the
-    people changed while it was worked out. Returns {"faces" (that could be
-    grouped), "grouped" (in a person), "people", "new", "removed",
-    "seconds"}.
+    people changed while it was worked out, and what it writes leaves alone
+    every face the owner placed, said "not" of or marked as not a face by
+    then (_settled: so does its last try, written whatever changed).
+    Returns {"faces" (that could be grouped), "grouped" (in a person),
+    "people", "new", "removed", "seconds"}.
     """
     started = time.monotonic()
     now = time.time() if now is None else now
@@ -678,14 +714,7 @@ def group(store, options, ctx=None, now=None, use_numpy=None, conn=None):
                                        "updated) VALUES ('', 0, NULL, ?, ?)", (now, now))
                 new_ids[key] = cursor.lastrowid
             store.execute("DELETE FROM face_people WHERE owner = 0")
-            present = {face[0] for face in faces}
-            rows = []
-            for face_id, person in sorted(result["assign"].items()):
-                place = previous.get(face_id)
-                if place is not None and place[1]:
-                    continue            # (the owner's: left as it is)
-                if face_id in present:
-                    rows.append((face_id, new_ids.get(person, person), now))
+            rows = _settled(store, faces, result["assign"], new_ids, now)
             store.executemany("INSERT OR REPLACE INTO face_people (face_id, person_id, owner, "
                               "updated) VALUES (?, ?, 0, ?)", rows)
             removed = _drop_empty(store)
@@ -970,6 +999,177 @@ def mark_not_face(store, face_ids, not_face=True, now=None):
 
 
 # ---------------------------------------------------------------------------
+# Undo (the viewer's, for the last face named there)
+
+UNDO_FACES = 100            # faces a change may name and still be undone
+
+
+def snapshot(store, face_ids=(), person_ids=()):
+    """What undoing a change of faces face_ids and people person_ids needs (restore), as
+    it is now: each face's person (with owner), its "not this person" and "not a face",
+    and the rows of those people and of the faces' people (with the "not this person"
+    of every face they hold: deleting a person deletes those). Take it right before the
+    change, in the change's own write (undoable), and settle_snapshot() right after.
+    None for more than UNDO_FACES faces (or a list that is not one of face ids: the
+    change refuses it)."""
+    # (The counters first: a change another connection makes while the rest is read
+    # shows in them, and settle_snapshot then refuses to undo.)
+    epoch = _meta_value(store, "epoch")
+    before = people_version(store)
+    generation = _meta_number(store, "generation")
+    seen = _data_version(store)
+    if face_ids:
+        try:
+            face_ids = _face_ids(list(face_ids))
+        except GroupError:
+            return None
+    face_ids = list(face_ids or ())
+    if len(face_ids) > UNDO_FACES:
+        return None
+    faces = {face_id: {"person": None, "rejects": [], "mark": None} for face_id in face_ids}
+    persons = {value for value in person_ids
+               if isinstance(value, int) and not isinstance(value, bool)}
+    for start in range(0, len(face_ids), ID_CHUNK):
+        part = face_ids[start:start + ID_CHUNK]
+        marks = ",".join("?" * len(part))
+        for face_id, person_id, owner, updated in store.execute(
+                "SELECT face_id, person_id, owner, updated FROM face_people WHERE face_id IN "
+                "(%s)" % marks, part):
+            faces[face_id]["person"] = (person_id, owner, updated)
+            persons.add(person_id)
+        for face_id, person_id, updated in store.execute(
+                "SELECT face_id, person_id, updated FROM face_rejects WHERE face_id IN (%s)"
+                % marks, part):
+            faces[face_id]["rejects"].append((person_id, updated))
+        for face_id, not_face, updated in store.execute(
+                "SELECT face_id, not_face, updated FROM face_marks WHERE face_id IN (%s)"
+                % marks, part):
+            faces[face_id]["mark"] = (not_face, updated)
+    rows = {}
+    for person_id in sorted(persons):
+        row = store.execute("SELECT name, hidden, cover, created, updated FROM people WHERE "
+                            "id = ?", (person_id,)).fetchone()
+        if row is not None:
+            rejects = store.execute("SELECT face_id, updated FROM face_rejects WHERE "
+                                    "person_id = ?", (person_id,)).fetchall()
+            rows[person_id] = {"row": tuple(row), "rejects": [tuple(item) for item in rejects]}
+    return {"epoch": epoch, "before": before, "generation": generation, "seen": seen,
+            "faces": faces, "people": rows, "made": []}
+
+
+def _data_version(store):
+    """SQLite's data_version: it changes when another connection commits to the file."""
+    return store.execute("PRAGMA data_version").fetchone()[0]
+
+
+def undoable(store, face_ids, person_ids, change):
+    """change() -- a change of the people (move_faces, reject_faces, mark_not_face,
+    update_person: each commits) -- made so that it can be undone: (its answer, the
+    snapshot() of faces face_ids and people person_ids taken right before it, or None).
+    The snapshot and the change are one write (BEGIN IMMEDIATE): no change of another
+    connection comes between them. settle_snapshot() then says whether it can be
+    undone."""
+    store.execute("BEGIN IMMEDIATE")
+    try:
+        snap = snapshot(store, face_ids, person_ids)
+        answer = change()
+        if store.in_transaction:
+            store.commit()
+    except BaseException:
+        if store.in_transaction:
+            store.rollback()
+        raise
+    return answer, snap
+
+
+def settle_snapshot(store, snap, made=()):
+    """Right after the change snap was taken for (undoable): the people it made (made:
+    their ids; an undo deletes them again) and the state it left. False when another
+    change of the people came in between, or another connection wrote to the file since
+    the snapshot (it cannot be undone then)."""
+    if snap is None:
+        return False
+    snap["made"] = [person_id for person_id in made if person_id not in snap["people"]]
+    snap["after"] = people_version(store)
+    snap["generation_after"] = _meta_number(store, "generation")
+    return snap["after"] == snap["before"] + 1 and _data_version(store) == snap.get("seen")
+
+
+# (Why an undo is refused: restore, and the viewer's Undo when it cannot be done.)
+CANNOT_UNDO = ("The people changed since then (another change, a grouping, or the face data "
+               "was deleted): it cannot be undone here. Put it right on the People page.")
+
+
+def restore(store, snap):
+    """Undo the change snap was taken for (undoable, settle_snapshot): its faces are in
+    the people they were in again (the owner's or not, as before), with the "not this
+    person" and "not a face" they had; the people it changed have their names, hidden,
+    covers and times again (one it deleted comes back with its id; one it made goes);
+    and when the faces wait for a grouping only because of it, they do no more. Refused
+    (GroupError, 409) when anything changed the people since the change: that is read
+    inside the undo's own write (BEGIN IMMEDIATE), so nothing comes in between."""
+    store.execute("BEGIN IMMEDIATE")
+    try:
+        if (_meta_value(store, "epoch") != snap.get("epoch")
+                or people_version(store) != snap.get("after")):
+            raise GroupError(CANNOT_UNDO, status=409)
+        present = _put_back(store, snap)
+        _changed(store)
+        store.commit()
+    except BaseException:
+        store.rollback()
+        raise
+    return {"faces": len(present), "people": len(snap["people"])}
+
+
+def _put_back(store, snap):
+    """restore()'s writes (no commit); returns the snapshot's faces that are still there."""
+    for person_id, kept in sorted(snap["people"].items()):
+        name, hidden, cover, created, updated = kept["row"]
+        if store.execute("SELECT 1 FROM people WHERE id = ?", (person_id,)).fetchone():
+            store.execute("UPDATE people SET name = ?, hidden = ?, cover = ?, created = ?, "
+                          "updated = ? WHERE id = ?",
+                          (name, hidden, cover, created, updated, person_id))
+        else:
+            # (Deleted with its last face: back with its id and name.)
+            store.execute("INSERT INTO people (id, name, hidden, cover, created, updated) "
+                          "VALUES (?, ?, ?, ?, ?, ?)",
+                          (person_id, name, hidden, cover, created, updated))
+    persons = {row[0] for row in store.execute("SELECT id FROM people")}
+    present = set(_existing_faces(store, sorted(snap["faces"])))
+    for face_id in sorted(present):
+        entry = snap["faces"][face_id]
+        for table in ("face_people", "face_rejects", "face_marks"):
+            store.execute("DELETE FROM %s WHERE face_id = ?" % table, (face_id,))
+        if entry["person"] is not None and entry["person"][0] in persons:
+            store.execute("INSERT INTO face_people (face_id, person_id, owner, updated) "
+                          "VALUES (?, ?, ?, ?)", (face_id,) + tuple(entry["person"]))
+        store.executemany("INSERT OR IGNORE INTO face_rejects (face_id, person_id, updated) "
+                          "VALUES (?, ?, ?)", [(face_id, person_id, updated) for
+                                               person_id, updated in entry["rejects"]
+                                               if person_id in persons])
+        if entry["mark"] is not None:
+            store.execute("INSERT INTO face_marks (face_id, not_face, updated) VALUES "
+                          "(?, ?, ?)", (face_id,) + tuple(entry["mark"]))
+    others = set(_existing_faces(store, sorted({face_id for kept in snap["people"].values()
+                                                for face_id, _updated in kept["rejects"]})))
+    for person_id, kept in snap["people"].items():
+        # ("Not this person" of other faces, gone with a person the change deleted.)
+        store.executemany("INSERT OR IGNORE INTO face_rejects (face_id, person_id, updated) "
+                          "VALUES (?, ?, ?)", [(face_id, person_id, updated) for
+                                               face_id, updated in kept["rejects"]
+                                               if face_id in others])
+    for person_id in snap.get("made", ()):
+        store.execute("DELETE FROM people WHERE id = ? AND id NOT IN (SELECT person_id "
+                      "FROM face_people)", (person_id,))
+    if (snap.get("generation_after") != snap["generation"]
+            and _meta_number(store, "generation") == snap.get("generation_after")):
+        # (The faces wait for a grouping only because of the change: no more.)
+        _set_meta(store, "generation", snap["generation"])
+    return present
+
+
+# ---------------------------------------------------------------------------
 # Pictures of the faces (index.db)
 
 def _visible_pictures(conn, library_ids, include_hidden, videos=None):
@@ -1160,6 +1360,13 @@ def person_faces(store, person_id):
     """The ids of a person's faces."""
     return [row[0] for row in store.execute(
         "SELECT face_id FROM face_people WHERE person_id = ? ORDER BY face_id", (person_id,))]
+
+
+def face_person(store, face_id):
+    """The id of the person a face is in, or None."""
+    row = store.execute("SELECT person_id FROM face_people WHERE face_id = ?",
+                        (face_id,)).fetchone()
+    return row[0] if row is not None else None
 
 
 def person_view(store, conn, config, person_id, library_ids):

@@ -2546,6 +2546,12 @@
         options = options || {};
         var info = lib.export_info || {};
         var opts = copyOptions(info.options);
+        // (A saved title or footer line an export refuses, too long, shows as
+        // saved, to be shortened here rather than replaced: saved_text.)
+        var savedText = info.saved_text || {};
+        Object.keys(savedText).forEach(function (key) {
+            opts[key] = savedText[key];
+        });
         var last = info.last || null;
         var defaultFolder = info.default_output || "";
         var folderValue = last && last.output ? last.output : defaultFolder;
@@ -2629,6 +2635,36 @@
             footNote.textContent = R.headline(reply.counts) + " " + R.sizeText(reply);
         }
 
+        // The saved options an export leaves at their defaults, or null: of the
+        // options (the library's export_info) or, with reply, of the review (the
+        // preview's reply: those the options shown do not replace). An export
+        // from this dialog saves the options shown, so its log has no word of
+        // them; one from the command line has.
+        function optionWarnings(reply) {
+            var lines = ((reply ? reply : info).option_warnings || []).filter(
+                function (line, k, all) {
+                    return all.indexOf(line) === k;
+                });
+            if (!lines.length) {
+                return null;
+            }
+            var texts = reply ? [
+                "Some saved export options cannot be used: this export leaves them at " +
+                    "their defaults and saves the options shown in their place:"
+            ] : [
+                "Some saved export options cannot be used, so an export leaves them at " +
+                    "their defaults (an export from the command line says so in its log):",
+                "Exporting from this dialog saves the options it shows in their place." +
+                    (Object.keys(savedText).length ? " A title or footer line that is too " +
+                     "long is shown below as saved: shorten it there." : "")
+            ];
+            var box = notice("warn", [el("p", {text: texts[0]}), warningList(lines),
+                                      texts[1] ? el("p", {text: texts[1]}) : null]);
+            box.classList.add("export-option-warnings");
+            box.setAttribute("role", "status");
+            return box;
+        }
+
         /* -- the options -- */
 
         function optionsView() {
@@ -2645,6 +2681,10 @@
                 "server and nothing to install. Put it on any web host, or open it from the " +
                 "folder. Nothing is uploaded; the files are written to a folder on this " +
                 "computer."}));
+            var warned = optionWarnings(null);
+            if (warned) {
+                body.appendChild(warned);
+            }
 
             // Which pictures: the whole library, or the pictures of one album.
             var albumSelect = el("select", {className: "input export-album"});
@@ -3110,6 +3150,10 @@
 
         function renderSummary(holder, reply) {
             clear(holder);
+            var warned = optionWarnings(reply);
+            if (warned) {
+                holder.appendChild(warned);
+            }
             holder.appendChild(el("p", {className: "export-headline",
                                         text: R.headline(reply.counts)}));
             var size = R.sizeText(reply);

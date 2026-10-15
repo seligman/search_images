@@ -945,8 +945,9 @@ pictures); drives get routes on the map and in the viewer. Optional:
 ## plain_language
 
 Plain-language search (README, "Plain language"): the search box
-understands the names of people and places and dates in what is typed
-(`anna in lisbon last summer`) and shows how as chips over the results.
+understands the names of people and places, kinds of place and dates in
+what is typed (`anna at the zoo last summer`) and shows how as chips over
+the results.
 On by default:
 
 ```
@@ -1243,8 +1244,9 @@ changes them).
   use the search pages from another computer (`serve.py --host`): the
   People page (named people that are not hidden, and their faces), the
   names in the viewer, `person:` and the smart albums that search for a
-  person; never the boxes of the faces, unnamed or hidden people, or
-  anything of hidden pictures. Default `false`: people are this
+  person; never the boxes of the faces (nor naming a face in the viewer:
+  that is yours only), unnamed or hidden people, or anything of hidden
+  pictures. Default `false`: people are this
   computer's only (smart albums with `person:` are not listed for
   others).
 
@@ -1380,9 +1382,10 @@ optional:
 ```
 
 - `enabled` - `false` turns them off: the pages, searches and exports
-  leave the pictures' named places out at once, none are looked up, and
-  the next scan (or `python named_places.py --update`) deletes what was
-  kept of them.
+  leave the pictures' named places out at once (and with them what
+  `kind:` and the kinds of place of plain language find: README, "Kinds
+  of place"), none are looked up, and the next scan (or `python
+  named_places.py --update`) deletes what was kept of them.
 - `max_estimate_km` - an estimated place (see `place_estimates`) gets a
   named place only when it may be off by at most this much (0 to 2,
   default 0.3 km); estimates of more than 0.15 km get an area only (a
@@ -1476,7 +1479,13 @@ A list of folders to scan. Each library is one object:
   a switch for each that changes it for one run (`--file-names` for
   `file_names`, `--no-file-names` to turn it off; see `python export.py
   --help` and "Automating" in the README). Every option may be left out;
-  the defaults publish as little as possible:
+  the defaults publish as little as possible. A saved option an export
+  cannot use (an unknown name, a wrong value, a title or footer line that
+  is too long) is left at its default, never silently: the log of an
+  export that runs with it (from the command line, say) has a warning for
+  each, and the Export dialog shows them until the options are saved
+  again (a title or footer line that is too long in its field, as saved,
+  to be shortened):
   - `title` - the site's name; blank (the default) uses the library name.
   - `images` - `"web"` (the default: 2048 px pictures), `"original"` (the
     originals with their metadata removed; HEIC, HEIF, AVIF and TIFF become
@@ -1540,7 +1549,9 @@ A list of folders to scan. Each library is one object:
     `sensitive`, a picture type, `writing`, `unchecked`, `undescribed`.
   - `exclude_ids` - picture ids left out whatever the rules above say.
     Hidden pictures are never published.
-  - `credits` - a line of plain text shown at the foot of the pages.
+  - `credits` - a line of plain text shown at the foot of the pages (at
+    most 4,000 characters: enough to name every creator of a mixed set of
+    pictures).
   - `zip` - `true` also writes `<folder>.zip` next to the output folder.
     An existing file of that name is only replaced when an earlier export
     made it and it was not changed since; otherwise the export stops.
@@ -1620,9 +1631,13 @@ A list of folders to scan. Each library is one object:
     is left out: one limited to another library, one with `folder:`,
     `file:`, `place:` or `has:gps` (or the Place filter, or an area of
     the map) while `folders`, `file_names` or `location` is off, one with
-    `lib:`, and one that looks for pictures like one that is not
-    published. A trip's export also leaves out a smart album whose area
-    of the map comes into the area around home (`home_km`).
+    `kind:` while no named place is published (`location` off, or none of
+    the pictures at one), one with `lib:`, and one that looks for
+    pictures like one that is not published; a place or a kind of place
+    that plain language understood is published as the words typed for it
+    (a person too with `people_names`). A trip's export also leaves out a
+    smart album whose area of the map comes into the area around home
+    (`home_km`).
   - `people_names` - `true` also publishes the names of the people in the
     pictures (People: named people who are not hidden), as tags of the
     pictures they are in; default `false`. Faces, their boxes and

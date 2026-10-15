@@ -196,6 +196,31 @@ class OptionsTest(unittest.TestCase):
         for km in trip_export.HOME_KM_STEPS:
             self.assertEqual(trip_export.trip_options(None, {"home_km": km})["home_km"], km)
 
+    def test_kept_options_that_cannot_be_used_are_named(self):
+        # As a library's saved options: left at their defaults, never silently.
+        kept = {"location": True, "home_km": 25, "colour": "red", "album": 4, "story": True}
+        self.assertEqual(trip_export.option_warnings(kept), [
+            'The saved export option "home_km" is ignored (left at its default): it must be '
+            'one of 5, 10, 20, 40, 80, 160 kilometres, or 0 (home is not kept out).',
+            'The saved export option "colour" is ignored: it is not an export option.'])
+        # (In the words of the error an export given the same values gets.)
+        with self.assertRaises(export.OptionsError) as caught:
+            trip_export.trip_options(None, {"home_km": 25, "story": "yes"})
+        self.assertEqual(trip_export.option_warnings({"home_km": 25, "story": "yes"}), [
+            'The saved export option "%s" is ignored (left at its default): it %s.'
+            % (key, caught.exception.errors[key]) for key in ("home_km", "story")])
+        self.assertEqual(trip_export.option_warnings(kept, {"home_km": 10}),
+                         ['The saved export option "colour" is ignored: it is not an export '
+                          'option.'])
+        self.assertEqual(trip_export.option_warnings(None), [])
+        self.assertEqual(trip_export.option_warnings({"home_km": 0, "story": True}), [])
+        # A story that is not true or false is read as off: said too.
+        self.assertFalse(trip_export.trip_options({"story": "yes"})["story"])
+        self.assertEqual(trip_export.option_warnings({"story": "yes"}), [
+            'The saved export option "story" is ignored (left at its default): it must be '
+            'true or false.'])
+        self.assertEqual(trip_export.option_warnings({"story": "yes"}, {"story": True}), [])
+
     def test_the_dialog_offers_the_sizes(self):
         # The Export dialog asks for one of the sizes by name (no number field an empty
         # value would turn into 0, which is off).
@@ -418,22 +443,51 @@ class TripExportTest(support.TempBaseMixin, unittest.TestCase):
         self.assertEqual(edits["exports"][LAKES], {"options": {},
                                                    "span": ["2024-05-10", "2024-05-12"]})
 
+    def run_node(self, out, expected):
+        """tests/js/export_test.js on an export, with these expectations."""
+        folder = tempfile.mkdtemp(prefix="trip-export-node-")
+        self.addCleanup(support.remove_tree, folder)
+        path = os.path.join(folder, "expected.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(expected, handle)
+        result = subprocess.run([NODE, NODE_TESTS, out, path], cwd=support.REPO,
+                                capture_output=True, timeout=300)
+        output = (result.stdout + result.stderr).decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, "\n" + output)
+        self.assertRegex(output, r"(\d+) of \1 passed")
+
     @unittest.skipIf(NODE is None, "Node.js is not installed")
     def test_loaded_like_the_pages(self):
         out, summary = self.export(options={"location": True})
-        folder = tempfile.mkdtemp(prefix="trip-export-node-")
-        self.addCleanup(support.remove_tree, folder)
         for page in ("index.html", "search.html"):
-            path = os.path.join(folder, "expected.json")
-            with open(path, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump({"page": page, "count": summary["count"],
-                           "trip": {"title": "Lakes"},
-                           "queries": [{"query": "leaving", "count": 2}]}, handle)
-            result = subprocess.run([NODE, NODE_TESTS, out, path], cwd=support.REPO,
-                                    capture_output=True, timeout=300)
-            output = (result.stdout + result.stderr).decode("utf-8", "replace")
-            self.assertEqual(result.returncode, 0, "\n" + output)
-            self.assertRegex(output, r"(\d+) of \1 passed")
+            self.run_node(out, {"page": page, "count": summary["count"],
+                                "trip": {"title": "Lakes"},
+                                "queries": [{"query": "leaving", "count": 2}]})
+
+    def test_a_private_picture_published_by_choice_is_never_featured(self):
+        # The records of an export never say a picture shows private information
+        # (export.PRIVATE_FLAG_KEYS), so the trip lists the pictures the owner's page
+        # never features: the published page leaves out a private one the owner chose
+        # to publish as the owner's own does -- not among a day's best, nor as a day's
+        # only picture or on the cover (a favorite, it would be among the best of its day
+        # and of the trip without the list).
+        import albums
+        card = self.ids["card.jpg"]
+        albums.set_marks(self.conn, [card], favorite=True)
+        self.conn.commit()
+        out, summary = self.export("private", {"include_ids": [card], "marks": True})
+        self.assertNotIn("private", summary["excluded"])
+        records = {record.get("t"): record for record in read_records(out)}
+        self.assertNotIn("pr", records["Picture card"])
+        trip = trip_data(out)["trips"][0]
+        self.assertEqual(trip["unfeatured"], [records["Picture card"]["i"]])
+        if NODE is not None:
+            self.run_node(out, {"page": "index.html", "count": summary["count"],
+                                "trip": {"title": "Lakes", "unfeatured": ["Picture card"]},
+                                "queries": [{"query": "is:private", "count": 0}]})
+        # A trip without one has no list.
+        out, _summary = self.export("not-private")
+        self.assertNotIn("unfeatured", trip_data(out)["trips"][0])
 
     def test_choices_and_home_off(self):
         clip = self.ids["dash/20240510_070000.MP4"]

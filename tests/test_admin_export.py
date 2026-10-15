@@ -39,6 +39,7 @@ else:
 REMOTE = {"REMOTE_ADDR": "192.0.2.5"}
 NODE = shutil.which("node")
 NODE_TESTS = os.path.join(support.REPO, "tests", "js", "export_review_test.js")
+NODE_DIALOG_TESTS = os.path.join(support.REPO, "tests", "js", "manage_export_test.js")
 
 
 def info(title, photo_type="photo", **fields):
@@ -252,6 +253,63 @@ class OptionsTest(ExportFixture, unittest.TestCase):
         # A preview starts from the saved options.
         counts = self.ok(self.preview({"flagged": False}))["counts"]
         self.assertEqual(counts["exported"], 2)
+
+    def test_saved_options_that_cannot_be_used_are_shown(self):
+        # Written by hand (or by an older version with another limit): the
+        # library card's export_info and the preview name each one the export
+        # leaves at its default; options the dialog sends are not warned about.
+        config = self.config()
+        config["libraries"][0]["export"] = {"credits": "x" * (export.MAX_CREDITS + 5),
+                                            "colour": True, "zip": True}
+        common.save_config(config)
+        info_view = self.ok(self.get("/state"))["libraries"][0]["export_info"]
+        self.assertEqual(len(info_view["option_warnings"]), 2, info_view["option_warnings"])
+        self.assertIn('"credits" is ignored (left at its default): it must be at most 4000 '
+                      'characters (this one has 4005)', info_view["option_warnings"][0])
+        self.assertIn('"colour" is ignored', info_view["option_warnings"][1])
+        self.assertTrue(info_view["options"]["zip"])
+        self.assertEqual(info_view["options"]["credits"], "")
+        answer = self.ok(self.preview({"flagged": False}))
+        self.assertEqual(answer["option_warnings"], info_view["option_warnings"])
+        answer = self.ok(self.preview({"flagged": False, "options": {"credits": "Me"}}))
+        self.assertEqual(len(answer["option_warnings"]), 1)
+        self.assertIn('"colour"', answer["option_warnings"][0])
+        # Saved again (as the dialog does when an export starts): gone.
+        self.ok(self.post("/libraries/lib_family1/export/options",
+                          {"options": {"credits": "Me"}}))
+        self.assertEqual(self.saved(), {"credits": "Me", "zip": True})
+        info_view = self.ok(self.get("/state"))["libraries"][0]["export_info"]
+        self.assertEqual(info_view["option_warnings"], [])
+
+    def test_a_saved_footer_line_too_long_is_never_lost(self):
+        # The dialog gets it as saved (saved_text) to show in its field; an
+        # export from the dialog (which saves its options) is refused until it
+        # is shortened, and the saved line stays.
+        long_line = "Photos by " + ", ".join("Creator %d" % k for k in range(400))
+        self.assertGreater(len(long_line), export.MAX_CREDITS)
+        config = self.config()
+        config["libraries"][0]["export"] = {"credits": long_line, "colour": True,
+                                            "title": 7}
+        common.save_config(config)
+        info_view = self.ok(self.get("/state"))["libraries"][0]["export_info"]
+        self.assertEqual(info_view["saved_text"], {"credits": long_line})
+        self.assertEqual(info_view["options"]["credits"], "")
+        sent = dict(info_view["options"], credits=long_line)
+        response = self.export_job({"options": sent, "save_options": True})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["fields"],
+                         {"credits": "must be at most 4000 characters"})
+        self.assertEqual(self.saved()["credits"], long_line)
+        self.assertEqual(self.ok(self.get("/jobs"))["queue"], [])
+        # Shortened: saved in its place; the unknown option, shown in the
+        # dialog, goes with the save.
+        self.stub_file_manager()
+        self.ok(self.export_job({"options": dict(sent, credits="Photos by many"),
+                                 "save_options": True}), 202)
+        self.assertEqual(self.saved()["credits"], "Photos by many")
+        self.assertNotIn("colour", self.saved())
+        info_view = self.ok(self.get("/state"))["libraries"][0]["export_info"]
+        self.assertEqual((info_view["option_warnings"], info_view["saved_text"]), ([], {}))
 
     def test_bad_options_change_nothing(self):
         before = self.saved()
@@ -525,6 +583,34 @@ class DialogTest(ExportFixture, unittest.TestCase):
         text = test_ui_scripts.read(test_ui_scripts.STATIC, "export-review.js")
         self.assertIn("var EXPORT_REVIEW = (function () {", text)
         self.assertIn("module.exports = EXPORT_REVIEW;", text)
+
+    @unittest.skipIf(NODE is None, "Node.js is not installed")
+    def test_the_dialog_shows_the_saved_options_an_export_cannot_use(self):
+        # The Manage page's real scripts under Node (tests/js/manage_export_test.js),
+        # with this server's answers: GET /state, and the preview of the options the
+        # dialog sends with the saved footer line (refused: too long) and with a
+        # shorter one.
+        long_line = "x" * (export.MAX_CREDITS + 5)
+        config = self.config()
+        config["libraries"][0]["export"] = {"credits": long_line, "colour": True}
+        common.save_config(config)
+        state = self.ok(self.get("/state"))
+        options = dict(state["libraries"][0]["export_info"]["options"], credits=long_line)
+        refused = self.preview({"options": options, "flagged": False})
+        self.assertEqual(refused.status_code, 400)
+        shorter = self.ok(self.preview({"options": dict(options, credits="Me"),
+                                        "flagged": False}))
+        folder = tempfile.mkdtemp(prefix="manage-export-")
+        self.addCleanup(support.remove_tree, folder)
+        path = os.path.join(folder, "answers.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump({"state": state, "refused": refused.get_json(), "preview": shorter,
+                       "long": long_line}, handle)
+        result = subprocess.run([NODE, NODE_DIALOG_TESTS, path], cwd=support.REPO,
+                                capture_output=True, timeout=120)
+        output = (result.stdout + result.stderr).decode("utf-8", "replace")
+        self.assertEqual(result.returncode, 0, "\n" + output)
+        self.assertRegex(output, r"(\d+) of \1 passed")
 
     @unittest.skipIf(NODE is None, "Node.js is not installed")
     def test_words_and_rules_under_node(self):

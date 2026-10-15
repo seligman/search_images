@@ -24,7 +24,8 @@ face data on the Manage page) deletes as a whole. Every picture is looked at (hi
 anywhere).
 
     meta           key, value: version (FACES_VERSION), epoch (random, new for
-                   every file), generation (raised by every change)
+                   every file, and for one emptied by Delete face data),
+                   generation (raised by every change)
     face_pictures  content_hash, kind, recipe, width, height, faces, seconds,
                    frames, updated: the pictures looked at, with the size the
                    helper saw (pixels), how many faces it kept, and of a
@@ -1492,9 +1493,10 @@ WIPE_TIMEOUT = 30.0         # seconds a wipe waits for another program's write t
 
 
 def _wipe(path):
-    """Empty every table of the face data file at path (but meta) and overwrite what
-    they held (secure_delete, a checkpoint, VACUUM). Returns '' when it is empty and
-    wiped now, else why not."""
+    """Empty every table of the face data file at path (but meta, which gets a new
+    epoch and people version: it is another file now, for what remembered the old one
+    -- an ETag, the viewer's Undo) and overwrite what they held (secure_delete, a
+    checkpoint, VACUUM). Returns '' when it is empty and wiped now, else why not."""
     try:
         conn = sqlite3.connect(path, timeout=WIPE_TIMEOUT)
     except sqlite3.Error as error:
@@ -1507,6 +1509,15 @@ def _wipe(path):
         with conn:
             for name in tables:
                 conn.execute("DELETE FROM %s" % name)
+            if "meta" in present:
+                row = conn.execute("SELECT value FROM meta WHERE key = 'people_version'"
+                                   ).fetchone()
+                try:
+                    version = int(row[0]) if row is not None else 0
+                except (TypeError, ValueError):
+                    version = 0
+                conn.executemany("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (
+                    ("epoch", secrets.token_hex(8)), ("people_version", str(version + 1))))
         busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         conn.execute("VACUUM")
         left = sum(conn.execute("SELECT COUNT(*) FROM %s" % name).fetchone()[0]

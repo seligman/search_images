@@ -630,10 +630,11 @@ test("the face a link asks for is marked on its picture, and a pan view goes the
          // (Not again while it stays.)
          draw(301);
          assert.strictEqual(panned.length, 1);
-         // Without one: none, as before; "Show faces" on: all, the one asked for marked.
+         // Without one: none, as before; "Show faces" on: all, the one asked for marked
+         // (in reading order: 302, on the left, first).
          assert.deepStrictEqual(draw(undefined), []);
          page.context.localStorage.setItem("searchImages.faceBoxes", "1");
-         assert.deepStrictEqual(draw(301), [true, false]);
+         assert.deepStrictEqual(draw(301), [false, true]);
          assert.deepStrictEqual(draw(undefined), [false, false]);
      });
 

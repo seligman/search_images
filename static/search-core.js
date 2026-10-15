@@ -10,7 +10,9 @@
    c colors, ex extended words, q aesthetic, sh sharpness, qf quality
    flags, se sensitive, pr private, dk date taken, ts date and time taken,
    cm camera, gp has GPS, ci rg co cc km the place (town, region,
-   country, country code, km from the town), pe the place is only
+   country, country code, km from the town), np nk the named place of
+   the street maps where it was taken and its kind ("museum", see
+   PLACE_KINDS), pe the place is only
    estimated (is:place-estimated), ps where a place without the
    picture's own position comes from ("c" a copy, "t" the pictures taken
    around the same time, "a" the library's area, "o" the owner), gx the
@@ -197,7 +199,11 @@
      out; only dates taken, as the range option), on: (today: this day in
      earlier years; MM-DD: that day in any year; or YYYY-MM-DD), place:
      (words of the town, region or country, or of the named place on the
-     street maps: a park, a museum; record key np), lib: (library name or id),
+     street maps: a park, a museum; record key np), kind: (or placekind:;
+     taken at a kind of place: the kind of that named place, nk, by the
+     words for it, kind:beach, kind:museums, kind:"golf course", or by
+     its own name, kind:place_of_worship; see PLACE_KINDS), lib:
+     (library name or id),
      has: (text, gps, people, animals, food, vehicles, description) and
      is: (360, duplicate, hidden, undescribed, described, edited, private,
      sensitive, blurry, dark, overexposed, accidental, junk, v4, favorite,
@@ -276,10 +282,14 @@
      without it. Filters, quoted phrases, field words and -words stay
      strict.
      "meaning" ranks by the cosine alone (z at least MEANING_ONLY_Z, at
-     most MEANING_ONLY_MARGIN_Z below the best's). In a small set (fewer
-     than MEANING_SMALL pictures with a vector), where no z gets far, the
-     closest few (MEANING_FEW) count when none of these does and the
-     closest is at least MEANING_FEW_Z. similar: shows the
+     most MEANING_ONLY_MARGIN_Z below the best's). In a small set, where
+     no z gets far, the closest few (MEANING_FEW) of the pictures without
+     the words count when none of them reaches MEANING_MIN_Z and the
+     closest is at least the set's few-cut (MEANING_FEW_Z, which grows with
+     the number of pictures with a vector until it is the usual cut, faster
+     for a query of one free clause: SearchCore.meaningCuts(n)); "meaning"
+     takes them too, and the closest few of all pictures when none reaches
+     MEANING_MIN_Z. similar: shows the
      pictures at least SIMILAR_MIN_Z close to that picture, or when fewer
      than SIMILAR_FEW are, the closest SIMILAR_FEW if they are close in
      the model's own terms (Index.similarCut). No threshold is a cosine as
@@ -313,10 +323,15 @@
      word are (MEANING_TERM_FULL, MEANING_TERM_MARGIN_Z). Words of position
      ("over", "near": RELATION_WORDS) and words no picture has (a
      misspelling) need no covering. A term without a vector does as
-     before (the meaning of the whole query decides), and so does every
-     term in a small set (fewer than MEANING_SMALL pictures with a vector,
-     where no z gets far). The ranking of what is shown stays as it was. A
-     single free word, phrases, field words and filters are as before.
+     before (the meaning of the whole query decides). In a small set, where
+     no z gets far, a picture close enough to the whole query stays without
+     covering each term (MEANING_TERM_RESCUE: a share of the highest z the
+     set allows, out of reach from about a thousand pictures), unless it
+     lacks a name-like term NAME_SAMPLE or more pictures have (and fewer
+     than NAME_SHARE of them in what they show); a name-like term a
+     picture shown lacks is then not said to be searched by its words
+     only. The ranking of what is shown stays as it was. A single
+     free word, phrases, field words and filters are as before.
 
    SearchCore.interpret(records, query, options), index.interpret(query,
        options) -> {text, query, parts, choices, rest, others, kept,
@@ -341,18 +356,29 @@
      tags) the words alone, quoted; and the name of a town, region or
      country of the records (or another name of a country, COUNTRY_WORDS;
      a small word such as "us" only in capitals) -- place:name OR the
-     words, after an optional "in", "at", "near", ... . A name that is
-     both, several people's, a person's that is a month or season, or also
-     common words of what the pictures show (COMMON_SHOWN, commonWord,
-     commonPlace; a published name's own tags do not count), or a place
-     after "the" or a word such as "mount"
-     (FEATURE_WORDS), is not taken but asked about: choices [{text, key,
-     start, end (in text), options: [{kind ("date", "person", "place" or
-     "words"), label, query (what to put in its place; null for the words
-     as typed)}]}]; "in" makes it the place, "with" the person. query is
+     words, after an optional "in", "at", "near", ...; and a kind of place
+     that pictures were taken at (PLACE_KINDS: "beaches", "museums", "a
+     zoo"; a word with another everyday meaning, such as "park" or "bar",
+     only with no other plain word right before or after it; of two in a
+     row the last, "museum cafe"; not one the query names with kind:
+     already) -- kind:key OR each of its words (pictures at a named place
+     of that kind, and pictures whose words say it, by words or meaning:
+     "kind:cafe OR coffee kind:cafe OR shop"), after an optional "in",
+     "at", ... and "the", "a" ("at the airport", "the beach"). A name that
+     is both, several people's, a person's that is a month or season, or
+     also common words of what the pictures show (COMMON_SHOWN,
+     commonWord, commonPlace; a published name's own tags do not count), a
+     place after "the" or a word such as "mount" (FEATURE_WORDS), or a
+     kind of place that is also a person's or a place's name ("park" and
+     Jo Park; but "at the park" is the kind, "in marina" the town), is not
+     taken but asked about: choices [{text, key, start, end (in text),
+     options: [{kind ("date", "person", "place", "kind" or "words"),
+     label, query (what to put in its place; null for the words as
+     typed)}]}]; "in" makes it the place, "with" the person. query is
      the text with those parts replaced (the rest of it as typed); parts
-     [{kind ("person", "place" or "date"), label ("Person: Anna", "Place:
-     Lisbon", "Taken: June - August 2019"), key (its words, lower case),
+     [{kind ("person", "place", "kind" or "date"), label ("Person: Anna",
+     "Place: Lisbon", "Kind of place: beaches", "Taken: June - August
+     2019"), key (its words, lower case),
      text (as typed), start, end, query (what replaced it), from and to
      (a date's)}]; rest the plain words left (as typed, "" when only small
      words are left); others what is not plain words (field words,
@@ -410,7 +436,10 @@
    Also: prepare(records) -> index with the same search / similar /
    suggest / interpret methods and get(id); normalize(text);
    tokens(text); fold(word) (the singular a word is searched as);
-   forms(word); facetLabel(group,
+   forms(word); placeKinds() (the kinds of place of kind:, see
+   PLACE_KIND_LIST); kindMatches(query, nk) (a kind: term of the query
+   finds the kind nk; an index's kindCounts() and commonKinds(count) say
+   which kinds its pictures were taken at); facetLabel(group,
    value); placeLabel(value) ("Albufeira, Algarve, Portugal" for a
    value of the place facet), placeParent(value), placeOf(record) (its
    place as the place facet names it), PLACE_SEPARATOR;
@@ -921,7 +950,8 @@ var SearchCore = (function () {
         library: "lib", has: "has", is: "is", place: "place", places: "place", on: "on",
         similar: "similar", like: "similar", look: "look", looks: "look",
         rating: "rating", rated: "rating", stars: "rating", album: "album", albums: "album",
-        person: "person", date: "date", taken: "date"
+        person: "person", date: "date", taken: "date", kind: "kind", kinds: "kind",
+        placekind: "kind"
     });
     // Record keys (and field names) for highlights(text, query, field).
     var HIGHLIGHT_FIELDS = dict({
@@ -1057,6 +1087,244 @@ var SearchCore = (function () {
             }
         }
         return best + EXTRA_FIELD_FACTOR * (sum - best);
+    }
+
+    /* ---------- Kinds of place (kind:) ------------------------------------ */
+
+    /* The kinds of place where pictures were taken: the kind of a record's
+       named place on the street maps (nk: the kind of the point of interest
+       or area that carries the name, named_places.py KINDS), by the words
+       people use for them. One line per kind of place: "key: label | words
+       | kinds" -- key is what kind: writes for it (kind:beach), label what
+       the chip of plain-language search says ("Kind of place: beaches"),
+       words the words and phrases that name it, singular (a plural finds
+       it too: "beaches", "art galleries"), kinds the nk values it finds.
+       A word marked "~" has another everyday meaning too ("a car park", "a
+       candy bar", "a home theater", "a pillow fort", "Memorial Day"):
+       plain-language search takes it as the kind of place only with no
+       other plain word right before it (but "in", "at", "near", ... and
+       "the" or "a": "at the park") and none right after it (but a date, a
+       place or a person: "parks 2024"); kind: always.
+       A word finds what it names, no more: a broad word may hold the
+       narrower kinds the maps have ("bars" finds pubs, wine bars and
+       nightclubs too; "hotels" motels), a narrower word only its own kind
+       ("pubs", "motels", "resorts"), and a sort of place the maps have no
+       kind for stays a word -- "pizzeria", "diner", "inn", "lodge",
+       "arena", "cathedral", "state park", "botanical garden", "flea
+       market": most places of the broader kind are something else, and
+       they would push the pictures that say it down. (Measured on a
+       library of several thousand pictures: "motel" and "lodge" found
+       every hotel, "pizzeria" every restaurant, "arena" the baseball
+       stadiums, "state parks" a city's forest park.) Only where the maps
+       make no difference and the word names most of what the kind holds
+       does it find the kind: a church, a temple, a mosque and a synagogue
+       are all a place of worship, a wildlife park and a safari park a zoo.
+       A narrower word of a phrase stays a word of its own ("petting zoo":
+       the pictures with "petting" taken at a zoo or saying it). */
+    var PLACE_KIND_LIST = [
+        "beach: beaches | beach, ~seaside | beach",
+        "museum: museums and galleries | museum | museum gallery",
+        "gallery: art galleries | ~gallery, art gallery | gallery",
+        "zoo: zoos and wildlife parks | zoo, wildlife park, safari park, animal park | zoo",
+        "aquarium: aquariums | aquarium | aquarium",
+        "airport: airports | airport, aerodrome, airfield | airport aerodrome",
+        "park: parks | ~park | park dog_park recreation_ground village_green",
+        "national_park: national parks | national park | national_park",
+        "nature_reserve: nature reserves | nature reserve, nature preserve | nature_reserve",
+        "protected_area: protected areas | protected area | protected_area",
+        "dog_park: dog parks | dog park | dog_park",
+        "theme_park: theme parks | theme park, amusement park, funfair, fun fair | theme_park",
+        "water_park: water parks | water park, waterpark | water_park",
+        "garden: gardens | ~garden | garden",
+        "playground: playgrounds | playground | playground",
+        "pitch: sports fields | sports field, playing field, ~pitch | pitch",
+        "restaurant: restaurants | restaurant, eatery | restaurant fast_food food_court",
+        "cafe: cafes | cafe, coffee shop, coffeehouse, coffee house | cafe",
+        "bar: bars and pubs | ~bar | bar pub wine_bar biergarten nightclub",
+        "pub: pubs | pub, tavern | pub",
+        "wine_bar: wine bars | wine bar | wine_bar",
+        "biergarten: beer gardens | beer garden, biergarten | biergarten",
+        "nightclub: nightclubs | nightclub, night club | nightclub",
+        "bakery: bakeries | bakery | bakery",
+        "ice_cream: ice cream shops | ice cream shop, ice cream parlor, ice cream parlour, " +
+            "gelateria | ice_cream",
+        "brewery: breweries | brewery, brewpub, taproom | brewery",
+        "winery: wineries | winery, vineyard, wine estate | winery",
+        "hotel: hotels and motels | hotel | hotel motel",
+        "motel: motels | motel | motel",
+        "hostel: hostels | hostel | hostel",
+        "resort: resorts | ~resort | resort",
+        "alpine_hut: mountain huts | mountain hut, alpine hut | alpine_hut",
+        "camp_site: campsites | campsite, camp site, campground, camping ground | camp_site " +
+            "caravan_site",
+        "caravan_site: caravan parks | caravan park, caravan site, rv park | caravan_site",
+        "viewpoint: viewpoints | viewpoint, lookout, overlook, scenic overlook, scenic " +
+            "viewpoint, vista point | viewpoint",
+        "place_of_worship: places of worship | place of worship, house of worship, church, " +
+            "temple, mosque, synagogue | place_of_worship",
+        "stadium: stadiums | stadium | stadium",
+        "sports_centre: sports centres | sports centre, sports center, sports complex, " +
+            "recreation centre, recreation center | sports_centre",
+        "ice_rink: ice rinks | ice rink, skating rink | ice_rink",
+        "castle: castles | castle | castle",
+        "fort: forts | ~fort, fortress, citadel | fort",
+        "lighthouse: lighthouses | lighthouse | lighthouse",
+        "waterfall: waterfalls | waterfall | waterfall",
+        "monument: monuments and memorials | monument | monument memorial",
+        "memorial: memorials | ~memorial | memorial",
+        "ruins: ruins | ruin | ruins archaeological_site",
+        "archaeological_site: archaeological sites | archaeological site | archaeological_site",
+        "tower: towers | ~tower | tower",
+        "observatory: observatories | observatory | observatory",
+        "planetarium: planetariums | planetarium | planetarium",
+        "theatre: theatres | ~theater, ~theatre, playhouse | theatre",
+        "cinema: cinemas | cinema, movie theater, movie theatre, multiplex | cinema",
+        "arts_centre: arts centres | arts centre, arts center, art centre, art center, " +
+            "cultural centre, cultural center | arts_centre",
+        "library: libraries | ~library | library",
+        "casino: casinos | casino | casino",
+        "mall: shopping malls | mall, shopping mall, shopping centre, shopping center | mall",
+        "department_store: department stores | department store | department_store",
+        "market: markets | ~market, marketplace | marketplace",
+        "gift: gift shops | gift shop, souvenir shop | gift",
+        "books: bookshops | bookshop, bookstore, book shop, book store | books",
+        "marina: marinas | marina, yacht harbor, yacht harbour | marina",
+        "pier: piers | ~pier | pier",
+        "ferry_terminal: ferry terminals | ferry terminal, ferry port, ferry dock | " +
+            "ferry_terminal",
+        "station: train stations | ~station, train station, railway station, railroad station " +
+            "| station",
+        "bus_station: bus stations | bus station, bus terminal | bus_station",
+        "university: universities | university | university",
+        "college: colleges | ~college | college",
+        "campus: universities and colleges | ~campus | university college",
+        "school: schools | ~school | school",
+        "hospital: hospitals | hospital | hospital",
+        "cemetery: cemeteries | cemetery, graveyard, burial ground | cemetery",
+        "golf_course: golf courses | golf course, golf links | golf_course",
+        "ski: ski areas | ski area, ski resort, ski slope, ski hill, ski field | ski " +
+            "winter_sports",
+        "picnic_site: picnic areas | picnic area, picnic site, picnic spot | picnic_site",
+        "fountain: fountains | ~fountain | fountain",
+        "bridge: bridges | ~bridge | bridge",
+        "peak: mountain tops | ~peak, ~summit, mountain top, mountaintop | peak",
+        "volcano: volcanoes | volcano | volcano",
+        "hot_spring: hot springs | hot spring, thermal spring | hot_spring",
+        "geyser: geysers | geyser | geyser",
+        "cave: caves | ~cave, cavern | cave_entrance",
+        "glacier: glaciers | glacier | glacier",
+        "forest: forests | ~forest | forest wood",
+        "conference_centre: convention centres | convention center, convention centre, " +
+            "conference center, conference centre | conference_centre exhibition_centre",
+        "exhibition_centre: exhibition centres | exhibition center, exhibition centre, expo " +
+            "center, expo centre | exhibition_centre",
+        "events_venue: event venues | event venue, events venue | events_venue",
+        "townhall: town halls | town hall, city hall | townhall",
+        "amusement_arcade: arcades | ~arcade, amusement arcade, video arcade | amusement_arcade",
+        "attraction: tourist attractions | tourist attraction, ~attraction | attraction"
+    ];
+    // The most words of a phrase of PLACE_KIND_LIST.
+    var KIND_WORDS_MAX = 3;
+
+    /* PLACE_KIND_LIST read: {list: [{key, label, words: [phrases], kinds}],
+       byKey: {key: entry}, phrases: {first word: [{words, entry, loose}],
+       longest first}, kinds: {nk: true} (every kind a line names)}. */
+    var PLACE_KINDS = (function () {
+        var out = {list: [], byKey: Object.create(null), phrases: Object.create(null),
+                   kinds: Object.create(null)};
+        PLACE_KIND_LIST.forEach(function (line) {
+            var head = line.split(":");
+            var parts = line.slice(head[0].length + 1).split("|");
+            var entry = {key: head[0], label: parts[0].replace(/^\s+|\s+$/g, ""), words: [],
+                         kinds: parts[2].split(" ").filter(Boolean)};
+            parts[1].split(",").forEach(function (phrase) {
+                var text = phrase.replace(/^\s+|\s+$/g, "");
+                var loose = text.charAt(0) === "~";
+                var words = tokens(loose ? text.slice(1) : text);
+                entry.words.push(words.join(" "));
+                var list = out.phrases[words[0]] || (out.phrases[words[0]] = []);
+                list.push({words: words, entry: entry, loose: loose});
+            });
+            entry.kinds.forEach(function (kind) {
+                out.kinds[kind] = true;
+            });
+            out.list.push(entry);
+            out.byKey[entry.key] = entry;
+        });
+        Object.keys(out.phrases).forEach(function (first) {
+            out.phrases[first].sort(function (a, b) {
+                return b.words.length - a.words.length;
+            });
+        });
+        return out;
+    })();
+
+    // True when a normalized typed word is a word of PLACE_KIND_LIST (the
+    // same, or its plural: "beaches" for "beach").
+    function kindWordIs(typed, word) {
+        if (typed === word) {
+            return true;
+        }
+        var forms = wordForms(typed);
+        for (var k = 1; k < forms.length; k++) {
+            if (forms[k] === word) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* The phrase of PLACE_KIND_LIST that words (normalized) start with, the
+       longest: {words (how many), entry, loose}, or null. whole: only one
+       that is all of words. */
+    function kindPhrase(words, whole) {
+        var found = null;
+        (words.length ? wordForms(words[0]) : []).forEach(function (first) {
+            (PLACE_KINDS.phrases[first] || []).some(function (phrase) {
+                var size = phrase.words.length;
+                if (size > words.length || (whole && size !== words.length) ||
+                        (found && found.words >= size)) {
+                    return false;
+                }
+                for (var k = 1; k < size; k++) {
+                    if (!kindWordIs(words[k], phrase.words[k])) {
+                        return false;
+                    }
+                }
+                found = {words: size, entry: phrase.entry, loose: phrase.loose};
+                return true;
+            });
+        });
+        return found;
+    }
+
+    /* The kinds a kind: value finds: {kind "place_kind", value (what it
+       was read as: a key of PLACE_KIND_LIST or an nk), kinds, entry (its
+       line, or null)}, or null for a value of no word. A key of a line is
+       that line ("kind:museum", "kind:place_of_worship"); else an nk that a
+       line names, alone ("kind:aerodrome", "kind:fast_food"); else the line
+       its words name ("kind:beaches", "kind:church", kind:"golf course");
+       else the value as an nk of its own (named_places.py has more kinds
+       than the lines name: "kind:cape"). */
+    function placeKindFilter(value) {
+        var words = tokens(value);
+        if (!words.length) {
+            return null;
+        }
+        var key = words.join("_");
+        var entry = PLACE_KINDS.byKey[key];
+        if (entry) {
+            return {kind: "place_kind", value: key, kinds: entry.kinds, entry: entry};
+        }
+        if (PLACE_KINDS.kinds[key] === true) {
+            return {kind: "place_kind", value: key, kinds: [key], entry: null};
+        }
+        var phrase = kindPhrase(words, true);
+        if (phrase) {
+            return {kind: "place_kind", value: phrase.entry.key, kinds: phrase.entry.kinds,
+                    entry: phrase.entry};
+        }
+        return {kind: "place_kind", value: key, kinds: [key], entry: null};
     }
 
     /* ---------- Query parsing ---------------------------------------------- */
@@ -1335,6 +1603,9 @@ var SearchCore = (function () {
             filter = {kind: "lib", value: String(raw).replace(/^\s+|\s+$/g, "")};
         } else if (field === "album") {
             filter = {kind: "album", value: String(raw).replace(/^\s+|\s+$/g, "")};
+        } else if (field === "kind") {
+            filter = placeKindFilter(value);
+            hint = "try kind:beach, kind:museum, kind:park or kind:restaurant";
         } else if (field === "person") {
             filter = {kind: "person", value: String(raw).replace(/^\s+|\s+$/g, "")};
             hint = "try person:\"Name\", person:any or person:none";
@@ -1626,8 +1897,25 @@ var SearchCore = (function () {
             }
             return true;
         });
+        // (A kind of place as the alternative to a word, as plain language
+        // writes it -- "kind:cafe OR coffee kind:cafe OR shop" -- keeps the
+        // words' order counting: "coffee shop" together.)
         var hasOr = clauses.some(function (clause) {
-            return clause.terms.length > 1;
+            return clause.terms.filter(function (term) {
+                return !(term.filter && term.filter.kind === "place_kind");
+            }).length > 1;
+        });
+        // A kind of place as the alternative to words is no question of its
+        // own: it says nothing when no picture has a named place (filterTest).
+        clauses.forEach(function (clause) {
+            var worded = clause.terms.some(function (term) {
+                return term.kind !== "filter" && !term.neg;
+            });
+            clause.terms.forEach(function (term) {
+                if (worded && term.filter && term.filter.kind === "place_kind") {
+                    term.filter.alternative = true;
+                }
+            });
         });
         // The sequence: the plain words in order, without skipped words at
         // either end ("photo of a dog on the beach" -> "dog on the beach"),
@@ -4287,6 +4575,8 @@ var SearchCore = (function () {
     // to a place ("in Lisbon", "near Coimbra") or to a person ("with Anna").
     var PLACE_LEADS = wordSet("in at near around from to");
     var PERSON_LEADS = wordSet("with");
+    // Words between such a word and a kind of place ("at the zoo", "in a park").
+    var KIND_ARTICLES = wordSet("the a an");
     // Words about taking the picture, and words that say nothing of what it
     // shows: no description has them ("taken in Italy", "pictures shot at
     // the zoo", "something in Lisbon"). Left out of a query that names a
@@ -4648,6 +4938,94 @@ var SearchCore = (function () {
         return out;
     };
 
+    /* How many pictures were taken at a named place of each kind: {total,
+       kinds: {nk: count}} (kept per index: a record's nk does not change in
+       place). */
+    Index.prototype.kindCounts = function () {
+        if (!this.kindCache) {
+            var kinds = Object.create(null);
+            var total = 0;
+            this.records.forEach(function (rec) {
+                if (rec && typeof rec === "object" && isText(rec.nk)) {
+                    kinds[rec.nk] = (kinds[rec.nk] || 0) + 1;
+                    total += 1;
+                }
+            });
+            this.kindCache = {total: total, kinds: kinds};
+        }
+        return this.kindCache;
+    };
+
+    /* The kinds of place (lines of PLACE_KIND_LIST) the most pictures were
+       taken at, most first, at most count: [{key, label, count}] -- a line
+       whose kinds a line before it holds left out ("pubs" after "bars and
+       pubs"). */
+    Index.prototype.commonKinds = function (count) {
+        var counts = this.kindCounts().kinds;
+        var lines = PLACE_KINDS.list.map(function (entry, order) {
+            var sum = 0;
+            entry.kinds.forEach(function (kind) {
+                sum += counts[kind] || 0;
+            });
+            return {entry: entry, count: sum, order: order};
+        }).filter(function (line) {
+            return line.count > 0;
+        }).sort(function (a, b) {
+            return b.count - a.count || a.order - b.order;
+        });
+        var out = [];
+        var held = Object.create(null);
+        lines.forEach(function (line) {
+            if (out.length >= count || line.entry.kinds.every(function (kind) {
+                return held[kind] === true;
+            })) {
+                return;
+            }
+            line.entry.kinds.forEach(function (kind) {
+                held[kind] = true;
+            });
+            out.push({key: line.entry.key, label: line.entry.label, count: line.count});
+        });
+        return out;
+    };
+
+    /* What to say of a kind: term that finds nothing (filter: placeKindFilter's), or
+       "": no picture has a named place at all; or none was taken at a kind
+       the search knows; or the value is a kind of picture (type:) or the
+       name of a place (place:) rather than a kind of place; or no
+       kind is called so -- with the kinds the pictures were taken at most. */
+    function placeKindProblem(filter, index) {
+        var counts = index.kindCounts();
+        if (!counts.total) {
+            return "kind: finds nothing here: no picture has a named place of the street maps.";
+        }
+        if (filter.kinds.some(function (kind) {
+            return counts.kinds[kind] > 0;
+        })) {
+            return "";
+        }
+        var words = filter.value.replace(/_/g, " ");
+        var tries = index.commonKinds(4).map(function (line) {
+            return "kind:" + line.key;
+        });
+        var hint = tries.length ? " (try " + tries.join(", ") + ")" : "";
+        if (filter.entry || PLACE_KINDS.kinds[filter.value] === true) {
+            return "No picture was taken at " + (filter.entry ? filter.entry.label
+                : "a place of the kind \u201c" + words + "\u201d") + hint + ".";
+        }
+        if (typeFilter(words)) {
+            return "kind: is the kind of place a picture was taken at; for a kind of picture " +
+                "try type:" + filter.value + ".";
+        }
+        var place = index.placeLookup()[tokens(words).join(" ")];
+        if (place) {
+            return "\u201c" + place.label + "\u201d is the name of a place, not a kind of place: " +
+                "try place:" + (/\s/.test(words) ? "\"" + words + "\"" : words) + ".";
+        }
+        return "No picture was taken at a kind of place called \u201c" + words + "\u201d" + hint +
+            ".";
+    }
+
     // Per year ("YYYY"), how many pictures were taken in it (dates taken only).
     Index.prototype.yearCounts = function () {
         if (!this.years) {
@@ -4800,6 +5178,7 @@ var SearchCore = (function () {
         }
         var names = this.nameCache.lookup;
         var places = this.placeLookup();
+        var kinds = this.kindCounts();
         var self = this;
         var used = [];              // per unit: consumed
         var spans = [];             // {from, to (units), start, end, replace}
@@ -4883,6 +5262,118 @@ var SearchCore = (function () {
         function calendarName(word) {
             return MONTH_NUMBERS[word] !== undefined || SEASON_STARTS[word] !== undefined;
         }
+        // A plain word that says something of its own next to a kind of
+        // place ("car" in "car park", "bench" in "park bench"): not a small
+        // word, nor one that leads to a place, a date or a person.
+        function ownWord(u) {
+            var word = unitWord(units[u]);
+            if (!units[u] || (word && (PLACE_LEADS[word] === true || DATE_LEADS[word] === true ||
+                                        PERSON_LEADS[word] === true ||
+                                        TAKEN_WORDS[word] === true))) {
+                return false;
+            }
+            return skipLevel({kind: "word", words: units[u].words, value: units[u].raw}) === 0;
+        }
+        // The phrase of a kind of place that the plain units at u make
+        // (whole units): {end, phrase (kindPhrase's)} or null.
+        function kindWords(u) {
+            var ends = [];
+            var words = [];
+            for (var v = u; v < units.length && units[v] && words.length < KIND_WORDS_MAX; v++) {
+                words = words.concat(units[v].words);
+                ends.push({end: v + 1, words: words});
+            }
+            for (var e = ends.length - 1; e >= 0; e--) {
+                var phrase = kindPhrase(ends[e].words, true);
+                if (phrase) {
+                    return {end: ends[e].end, phrase: phrase};
+                }
+            }
+            return null;
+        }
+        // The kinds the query's own kind: terms name ("kind:viewpoint
+        // lookout": "lookout" stays a word there).
+        var asked = Object.create(null);
+        parse(text).terms.forEach(function (term) {
+            if (term.kind === "filter" && term.filter && term.filter.kind === "place_kind") {
+                term.filter.kinds.forEach(function (kind) {
+                    asked[kind] = true;
+                });
+            }
+        });
+        /* The kind of place at k (after an optional "in", "at", ... and
+           "the", "a"): {from (its first unit, the "at" or "the" too), at
+           (its words' first), end, entry, words, rival (a name of the same
+           words to ask about, or null)}, or null -- also when no picture
+           was taken at one, or the query names it with kind: already; for
+           the first of two kinds of place ("hotel bar", "museum cafe": the
+           last says what it is; "parks, zoos" are two); when a longer name
+           starts there ("Fort Example", "Museum of Tin Toys"), or a place of the
+           same words after "in", "near", ... ("in marina": the town); or
+           for a word with another everyday meaning (PLACE_KIND_LIST's "~")
+           that another plain word stands right before (without "at", ...
+           or "the") or after ("car park", "park bench"; a date, place or
+           person after it is fine: "parks 2024"). A person's or place's
+           name of the same words is asked about ("park": a kind of place,
+           Jo Park or the word?), but after "at the", "the", ... it is the
+           kind ("at the park"). */
+        function kindAt(k) {
+            var led = PLACE_LEADS[unitWord(units[k])] === true && Boolean(units[k + 1]);
+            var start = led ? k + 1 : k;
+            var articled = KIND_ARTICLES[unitWord(units[start])] === true &&
+                Boolean(units[start + 1]);
+            var at = articled ? start + 1 : start;
+            var found = kindWords(at);
+            if (!found) {
+                return null;
+            }
+            var entry = found.phrase.entry;
+            if (!entry.kinds.some(function (kind) {
+                return kinds.kinds[kind] > 0;
+            }) || entry.kinds.some(function (kind) {
+                return asked[kind] === true;
+            })) {
+                return null;
+            }
+            var after = found.end;
+            if (kindWords(after) && !/[,;]$/.test(units[after - 1].raw)) {
+                return null;
+            }
+            if (found.phrase.loose) {
+                var shielded = led || articled || at === 0 || !ownWord(at - 1) ||
+                    spans.some(function (span) {
+                        return span.to === at;
+                    });
+                if (!shielded || (ownWord(after) && !dateAt(units, after, today, years, text) &&
+                                  !nameAt(after) && !kindWords(after))) {
+                    return null;
+                }
+            }
+            var rival = nameAt(at);
+            if (rival && (rival.end > found.end || (rival.end === found.end && led && !articled &&
+                                                    rival.place))) {
+                return null;
+            }
+            return {from: led ? k : articled ? start : at, at: at, end: found.end, entry: entry,
+                    words: wordsOf(at, found.end),
+                    rival: rival && rival.end === found.end && !articled ? rival : null};
+        }
+        /* What a kind of place (kindAt) is searched as: kind:key OR each of
+           its words, its small words as they are ("kind:cafe OR coffee
+           kind:cafe OR shop", "kind:place_of_worship OR house of
+           kind:place_of_worship OR worship"): the pictures taken at one, and
+           those with the words -- each found by its words or by meaning, as
+           without the kind (a phrase in quotes would be neither). */
+        function kindQuery(kind) {
+            var parts = [];
+            for (var u = kind.at; u < kind.end; u++) {
+                var unit = units[u];
+                var word = unit.words.length === 1 ? unit.words[0] : unit.raw;
+                parts.push(skipLevel({kind: "word", words: unit.words, value: unit.raw}) === 0
+                    ? "kind:" + kind.entry.key + " OR " + word : word);
+            }
+            return parts.join(" ");
+        }
         for (var k = 0; k < units.length; k++) {
             if (!units[k]) {
                 continue;
@@ -4920,6 +5411,41 @@ var SearchCore = (function () {
                             part: {kind: "date", label: dateText, key: dateKeyText,
                                    from: date.from, to: date.to}});
                 k = date.end - 1;
+                continue;
+            }
+            // A kind of place: "beaches", "at the zoo".
+            var kind = kindAt(k);
+            if (kind) {
+                var kindKey = kind.words.join(" ");
+                var kindLabel = "Kind of place: " + kind.entry.label;
+                if (keep(kindKey)) {
+                    k = kind.end - 1;
+                    continue;
+                }
+                if (kind.rival) {
+                    // "park" with Jo Park in People, "marina" a town too: asked.
+                    var kindRaw = rawOf(kind.at, kind.end);
+                    var kindOptions = [{kind: "kind", label: kindLabel, query: kindQuery(kind)}];
+                    kind.rival.people.forEach(function (person) {
+                        kindOptions.push({kind: "person", label: personLabel(person),
+                                          query: personQuery(person, kind.rival.words)});
+                    });
+                    if (kind.rival.place) {
+                        kindOptions.push({kind: "place", label: "Place: " + kind.rival.place.label,
+                                          query: placeQuery(kind.rival.words)});
+                    }
+                    out.choices.push({text: kindRaw, key: kindKey, start: units[kind.at].start,
+                                      end: units[kind.end - 1].end,
+                                      options: kindOptions.concat([
+                                          wordsOption(kindRaw, kind.words.length)])});
+                } else {
+                    // (Its "at the" stays in the query, for meaning to read as typed.)
+                    spans.push({from: kind.at, to: kind.end, lead: kind.from,
+                                replace: kindQuery(kind),
+                                part: {kind: "kind", label: kindLabel, key: kindKey,
+                                       value: kind.entry.key}});
+                }
+                k = kind.end - 1;
                 continue;
             }
             var lead = unitWord(units[k]);
@@ -4981,13 +5507,14 @@ var SearchCore = (function () {
             k = name.end - 1;
         }
         spans.forEach(function (span) {
-            for (var u = span.from; u < span.to; u++) {
+            var first = span.lead === undefined ? span.from : span.lead;
+            for (var u = first; u < span.to; u++) {
                 used[u] = true;
             }
             span.start = units[span.from].start;
             span.end = units[span.to - 1].end;
-            span.part.text = text.slice(span.start, span.end);
-            span.part.start = span.start;
+            span.part.text = text.slice(units[first].start, span.end);
+            span.part.start = units[first].start;
             span.part.end = span.end;
             span.part.query = span.replace;
             out.parts.push(span.part);
@@ -5132,6 +5659,20 @@ var SearchCore = (function () {
             return function (rec) {
                 var at = index.position[String(rec.i)];
                 return at !== undefined && found.rank[at] >= 0;
+            };
+        case "place_kind":
+            // (Nothing is said of the alternative to words that plain
+            // language writes, "kind:zoo OR zoos": the words still count.)
+            var problem = filter.alternative ? "" : placeKindProblem(filter, index);
+            if (problem) {
+                context.warn(problem);
+            }
+            var wanted = Object.create(null);
+            filter.kinds.forEach(function (kind) {
+                wanted[kind] = true;
+            });
+            return function (rec) {
+                return isText(rec.nk) && wanted[rec.nk] === true;
             };
         case "person":
             var person = personSet(context, filter.value);
@@ -5290,23 +5831,61 @@ var SearchCore = (function () {
     // title -- a mug with "Anna" on it).
     var PERSON_SCORE = 20;
 
+    // Among alternatives, a picture taken at a named place of the kind a
+    // kind: term names scores this much more than its words do ("kind:zoo
+    // OR zoo", as plain-language search writes "zoos"; per word of a kind
+    // of several, "kind:cafe OR coffee kind:cafe OR shop"): a little more
+    // than the word in its title, so in a search by words the pictures
+    // taken at a zoo come first -- those that say it too before those that
+    // do not -- then those that only say it; by words and meaning, how
+    // close a picture is to what was asked counts as for any word (and the
+    // pictures taken at one that do not say it are not what tells whether
+    // the words found what the query means: kindOnly, wordsUnlikeQuery).
+    var KIND_SCORE = 12;
+
+    function kindTerm(term) {
+        return term.kind === "filter" && !term.neg && Boolean(term.filter) &&
+            term.filter.kind === "place_kind";
+    }
+
     // Scores of a clause of alternatives (a negated one matches where its
-    // term does not).
+    // term does not). With a kind of place among them, the scores carry
+    // kindOnly: per record 1 when only the kind matched (no other term).
     Index.prototype.clauseScores = function (clause, context) {
         if (clause.terms.length === 1 && !clause.terms[0].neg) {
             return this.termScores(clause.terms[0], context);
         }
         var out = filled(this.n, -1);
+        var at = null;
+        var r;
         for (var t = 0; t < clause.terms.length; t++) {
             var term = clause.terms[t];
             var scores = this.termScores(term, context);
+            if (kindTerm(term)) {
+                at = at || new Uint8Array(this.n);
+                for (r = 0; r < this.n; r++) {
+                    if (scores[r] >= 0) {
+                        at[r] = 1;
+                    }
+                }
+                continue;
+            }
             var person = term.kind === "filter" && Boolean(term.filter) &&
                 term.filter.kind === "person" ? PERSON_SCORE : 0;
-            for (var r = 0; r < this.n; r++) {
+            for (r = 0; r < this.n; r++) {
                 var score = term.neg ? (scores[r] < 0 ? 0 : -1)
                     : person && scores[r] >= 0 ? person : scores[r];
                 if (score > out[r]) {
                     out[r] = score;
+                }
+            }
+        }
+        if (at) {
+            out.kindOnly = new Uint8Array(this.n);
+            for (r = 0; r < this.n; r++) {
+                if (at[r] === 1) {
+                    out.kindOnly[r] = out[r] < 0 ? 1 : 0;
+                    out[r] = Math.max(out[r], 0) + KIND_SCORE;
                 }
             }
         }
@@ -5782,6 +6361,13 @@ var SearchCore = (function () {
             scores = driveScores && driveScores[c] ? driveScores[c]
                 : this.clauseScores(clause, context);
             var relaxed = missed !== null && plan.free[c] === true;
+            if (relaxed && scores.kindOnly) {
+                // (Taken at the kind of place, without its words: kindOnly.)
+                plan.byKind = plan.byKind || new Uint8Array(n);
+                for (r = 0; r < n; r++) {
+                    plan.byKind[r] |= scores.kindOnly[r];
+                }
+            }
             // (Per free clause, the pictures without its words: Per-term coverage.)
             var lacking = relaxed && plan.lacking ? (plan.lacking[c] = new Uint8Array(n)) : null;
             for (r = 0; r < n; r++) {
@@ -5821,6 +6407,23 @@ var SearchCore = (function () {
         var ranked = parsed.hasText || meaning !== null;
         var pass = this.facetPass(alive, opts);
         var final = pass.final;
+        if (meaning && meaning.rescued && meaning.rescued.length) {
+            // (A name a picture without it is shown for is not searched by
+            // its words only: termCoverage.)
+            var shown = new Uint8Array(n);
+            final.forEach(function (row) {
+                shown[row] = 1;
+            });
+            meaning.rescued.forEach(function (clause) {
+                if (clause.rows.some(function (row) {
+                    return shown[row] === 1;
+                })) {
+                    clause.items.forEach(function (item) {
+                        item.name = false;
+                    });
+                }
+            });
+        }
         var sort = SORTS.indexOf(opts.sort) >= 0 ? opts.sort
             : ranked ? "relevance" : "newest";
         // The order of the one album the query names: when asked for, and
@@ -6080,28 +6683,101 @@ var SearchCore = (function () {
     // "Meaning" only: a wider net.
     var MEANING_ONLY_Z = 2.5;
     var MEANING_ONLY_MARGIN_Z = 3.0;
-    // A small set (fewer than MEANING_SMALL pictures with a vector, such as
-    // an export of a small library) has few pictures that stand out: with
-    // n pictures no z can be above the square root of n - 1, and the few
-    // that are like a query share the top. When none of its pictures without
-    // the words reaches MEANING_MIN_Z (MEANING_ONLY_Z for "meaning" only),
-    // the closest one still counts when its z is at least MEANING_FEW_Z,
-    // with the next ones up to MEANING_FEW in all that are at most
-    // MEANING_FEW_MARGIN_Z below it. (In a set of 18 described pictures the
-    // closest picture to a query that means one of them comes out at z 2.2
-    // to 3, to an unrelated query at z 1.3 to 2.2.)
-    var MEANING_SMALL = 50;
+    /* A small set (an export of a small library, say) has few pictures that
+       stand out: with n pictures no z can be above the square root of n - 1,
+       and the few that are like a query share the top. When none of its
+       pictures without the words reaches MEANING_MIN_Z, the closest one
+       still counts when its z is at least the few-cut of the set
+       (meaningCuts), with the next ones up to MEANING_FEW in all that are
+       at most MEANING_FEW_MARGIN_Z below it ("meaning" only, a wider net,
+       does the same, and also of all pictures when none reaches
+       MEANING_MIN_Z). The few-cut is MEANING_FEW_Z in a set of up to
+       MEANING_FEW_SET pictures with a vector and MEANING_FEW_GROWTH more
+       each time the set is e (2.72) times as large: 2.26 in a set of 63,
+       2.37 of 100, 2.55 of 200, 2.95 of 1,000; it is MEANING_MIN_Z at
+       about 1,230 pictures, where the rule ends without a step. A search
+       of one free clause, which per-term coverage cannot check, has the
+       one-clause cut instead, growing MEANING_FEW_GROWTH_ONE: 2.35 of 63,
+       2.65 of 100, 2.91 of 150, MEANING_MIN_Z at about 170.
+       Measured on seeded random sets of a library of several thousand
+       pictures: the closest picture a query does not mean came out at a
+       median z of 2.0 (19 pictures), 2.2 (30), 2.5 (63), 2.6 (100), 2.9
+       (200), 3.2 (500) and 3.4 (1,000), at the 90th percentile 2.7, 2.9,
+       3.1, 3.4, 3.6, 3.8 and 4.0; the closest of three pictures that mean
+       it at a median z of 2.3 (19), 2.75 (30), 3.4 (63), 3.7 (100) and 4.0
+       (200). For 25 searches of several words with three right pictures
+       put in each set (6 sets per size), the right pictures found went
+       from 115 to 244 of 411 in sets of 63, 133 to 236 of 412 of 100, 138
+       to 226 of 420 of 150, 149 to 212 of 444 of 200 and 217 to 220 of
+       629 of 500 (the same from 1,000 on), and from 221-259 to 230-269 of
+       about 410 in sets of 35 to 49; the pictures shown that are not what
+       was asked for from 1 to 27 (63), 6 to 30 (100), 2 to 25 (150), 4 to
+       7 (200). Such near misses are this rule's price: in the same sets
+       without planted answers, 64 (63), 41 (100), 24 (150) and 19 (200)
+       pictures not asked for came up in 100 searches, against 3, 6, 1 and
+       5 before (and 46 to 69 in sets of 35 to 49, 38 to 56 before); in an
+       export of 63 pictures, 10 of 16 searches with no answer among them
+       show 1 to 3 of the closest pictures. For 24 searches of one word that
+       descriptions seldom use ("lodging", "canine", a misspelled animal),
+       the few-cut of several words found 22, 28, 25 and 15 more of the
+       right pictures in sets of 63, 100, 150 and 200, for 70, 62, 62 and
+       56 more not asked for (96 searches each); the one-clause cut 19, 18,
+       8 and none more for 52, 32, 5 and none, about as many near misses as
+       sets of 49 had before. The margin: in the set of 63 the coffee cups
+       "something warm to drink" means came out 0.64 below a fox drinking
+       from a pond; over random sets of 19, 30 and 63, 0.7 found a tenth
+       more of the right pictures than 0.5 (256 of 529, against 233), for
+       one more wrong one in about fifty searches (in the bundled sample of
+       19 the cups now come with a bowl of fruit salad 0.7 below them). */
     var MEANING_FEW_Z = 2.2;
-    var MEANING_FEW_MARGIN_Z = 0.5;
+    var MEANING_FEW_SET = 50;
+    var MEANING_FEW_GROWTH = 0.25;
+    var MEANING_FEW_GROWTH_ONE = 0.65;
+    var MEANING_FEW_MARGIN_Z = 0.7;
     var MEANING_FEW = 4;
-    /* Nor does per-term coverage (see MEANING_TERM_Z) apply in such a small
-       set: the meaning of the whole query decides, with the closest few as
-       above. A word's own z is held down as the query's is (in a set of 19
-       described pictures, the motel sign that "a place to stay along an old
-       highway" means had z 1.97 for "highway"; the coffee cups of "something
-       warm to drink" z 2.49 for "drink" but -1.25 for "warm"), and the cuts
-       measured on a library of thousands of pictures left such a set's
-       searches of several words with nothing. */
+    /* Nor does per-term coverage (see MEANING_TERM_Z) fit a small set: a
+       word's own z is held down as the query's is, and a word on its own
+       often means something else than next to the others ("warm" of
+       "something warm to drink", "old" of "an old highway", "standing" of "a
+       bird standing on a branch"). So a picture it would leave out still
+       stays when its z for the whole query is at least MEANING_TERM_RESCUE
+       times the highest z the set allows (the square root of n - 1): 1.06 in
+       a set of 19 pictures with a vector, 1.97 of 63, 2.49 of 100, 3.53 of
+       200, 5.58 of 500, 7.9 of 1,000 -- higher than any picture comes (in a
+       library of several thousand, the closest picture to each of 174 queries
+       came out at z 7.04 at most), so a large library is searched as by
+       per-term coverage alone. Never when it lacks a name-like word that
+       NAME_SAMPLE or more pictures have, fewer than NAME_SHARE of them in
+       what they show (a folder's, a file's, a person's or a place's name):
+       such a name is covered by its words only at every size (so "anna
+       turtle" is no turtle of anyone else's). A word too rare to tell is let
+       go, and so is one that descriptions use too (in a set of 63, "made",
+       which one description and the text in two pictures have: a bridge "made
+       of steel" lacks it). Measured on random sets of a library of several
+       thousand, of the pictures per-term coverage left out at z 2 or more for
+       the whole query: in sets of 30 and 63, nine in ten showed what was
+       asked for; in sets of 200, seven of eight above z 3.5 and two in three
+       below; in sets of 500 to 2,000, all but one in seventy above z 4, while
+       the snowmen and snowy streets of "dog playing in snow" came out at z 3
+       to 3.8. For 8 searches of a name-like word and a thing, the pictures
+       shown without the name were 13, 4, 7 and 6 in 32 searches in sets of
+       63, 100, 150 and 200 (30, 16, 14 and 9 when names were let go too; 8,
+       3, 2 and 5 keeping every name of three pictures or more, which left the
+       steel bridges out). (Per-term coverage used to start at 50 pictures: a
+       set of 63 found nothing for most searches of several words.) */
+    var MEANING_TERM_RESCUE = 0.25;
+
+    /* {few, one, rescue}: the few-cut of a set of count pictures with a
+       meaning vector (MEANING_FEW_Z), the one-clause cut, and the z of the
+       whole query that keeps a picture per-term coverage would leave out
+       (MEANING_TERM_RESCUE). */
+    function meaningCuts(count) {
+        var n = Math.max(1, count || 0);
+        var growth = Math.log(Math.max(1, n / MEANING_FEW_SET));
+        return {few: MEANING_FEW_Z + MEANING_FEW_GROWTH * growth,
+                one: MEANING_FEW_Z + MEANING_FEW_GROWTH_ONE * growth,
+                rescue: MEANING_TERM_RESCUE * Math.sqrt(n - 1)};
+    }
     // similar: and the "More like this" strip: pictures at least this z
     // (over the cosines of the other pictures to the picture), and at least
     // SIMILAR_MIN_SD standard deviations above the cosine of two pictures
@@ -6236,6 +6912,16 @@ var SearchCore = (function () {
         return term.kind !== "filter" && !term.field && !term.quoted && !term.neg;
     }
 
+    /* A clause meaning may stand in for: free terms, or free terms with a
+       kind of place as their alternative ("kind:zoo OR zoo": the words say
+       what pictures show, which meaning can find; the kind adds the
+       pictures taken at one, see KIND_SCORE). */
+    function freeClause(clause) {
+        return clause.terms.some(freeTerm) && clause.terms.every(function (term) {
+            return freeTerm(term) || kindTerm(term);
+        });
+    }
+
     function similarTerm(term) {
         return term.kind === "filter" && !term.neg && Boolean(term.filter) &&
             term.filter.kind === "similar";
@@ -6305,14 +6991,12 @@ var SearchCore = (function () {
             return [];
         }
         var out = [whole];
-        var free = parsed.clauses.filter(function (clause) {
-            return clause.terms.every(freeTerm);
-        });
+        var free = parsed.clauses.filter(freeClause);
         if (free.length < 2) {
             return out;
         }
         free.forEach(function (clause) {
-            clause.terms.forEach(function (term) {
+            clause.terms.filter(freeTerm).forEach(function (term) {
                 var text = termText(term);
                 if (text && out.indexOf(text) < 0 && out.length < MEANING_TEXTS &&
                         !(term.kind === "word" && term.words.length === 1 &&
@@ -6763,17 +7447,17 @@ var SearchCore = (function () {
         var free = [];
         var count = 0;
         parsed.clauses.forEach(function (clause, c) {
-            free[c] = clause.terms.every(freeTerm);
+            free[c] = freeClause(clause);
             count += free[c] ? 1 : 0;
         });
         if (!count) {
             return null;
         }
         var plan = {mode: mode, vector: vector, free: free, similar: null, lacking: null,
-                    clauses: parsed.clauses, termVector: null};
-        // (Per-term coverage: see MEANING_TERM_Z; not in a small set, see
-        // MEANING_SMALL.)
-        if (mode === "hybrid" && count >= 2 && this.vecCount >= MEANING_SMALL) {
+                    clauses: parsed.clauses, termVector: null, byKind: null};
+        // (Per-term coverage: see MEANING_TERM_Z, and MEANING_TERM_RESCUE for
+        // a small set.)
+        if (mode === "hybrid" && count >= 2) {
             plan.lacking = [];
             var dims = this.vectors.dims;
             var given = opts.termVectors;
@@ -6791,9 +7475,10 @@ var SearchCore = (function () {
        coverage): {text (what is embedded for it, see meaningTexts),
        relation (a word of RELATION_WORDS), name (name-like), unknown (no
        picture has its words), cut (the z its vector needs; Infinity for a
-       name), stats (cosineStats of its vector, or null without one)}.
-       Name-likeness is worked out from the words of the whole index (kept
-       per term), not the matches of this search. */
+       name), stats (cosineStats of its vector, or null without one),
+       matches (how many pictures have its words)}. Name-likeness is worked
+       out from the words of the whole index (kept per term), not the
+       matches of this search. */
     Index.prototype.termInfo = function (term, plan, context) {
         var text = termText(term);
         var vector = plan.termVector ? plan.termVector(text) : null;
@@ -6823,10 +7508,12 @@ var SearchCore = (function () {
         info.cut = known.name ? Infinity : known.cut;
         info.share = known.share;
         info.median = known.median;
+        info.matches = known.matches;
         return info;
     };
 
-    /* {name, unknown, cut, share, median} of a free term (see NAME_SHARE
+    /* {name, unknown, cut, share, median, matches (how many pictures have
+       its words)} of a free term (see NAME_SHARE
        and MEANING_TERM_Z): from the pictures its words match (not by the
        place words alone), how many have them in what they show (a name an
        export publishes, context.published, not by its tags: they are
@@ -6883,7 +7570,7 @@ var SearchCore = (function () {
                 zs.push((stats.values[r] - stats.mean) / stats.std);
             }
         }
-        var out = {name: false, unknown: anywhere === 0, cut: MEANING_TERM_Z,
+        var out = {name: false, unknown: anywhere === 0, cut: MEANING_TERM_Z, matches: anywhere,
                    share: matched ? seen / matched : anywhere ? 0 : 1, median: null};
         if (zs.length) {
             zs.sort(function (a, b) {
@@ -6912,9 +7599,16 @@ var SearchCore = (function () {
        how close that is (MEANING_TERM_FULL, MEANING_TERM_MARGIN_Z). A term
        without a vector (none was given) or with words no picture has does
        as before: the meaning of the whole query decides. A clause of
-       relation words needs no covering. Returns [{text, name, relation,
-       meaning, unknown}] for the free terms (meaning: it has a vector). */
-    Index.prototype.termCoverage = function (plan, alive, missed, context, stats) {
+       relation words needs no covering. In a small set a picture close
+       enough to the whole query stays without covering its clauses
+       (MEANING_TERM_RESCUE), unless it lacks a name NAME_SAMPLE or more
+       pictures have (and fewer than NAME_SHARE of them in what they
+       show); rescued gets {rows, items} for each clause such
+       pictures lack (the items of terms flip to name false when one of
+       its rows is shown: see Index.search). Returns [{text, name,
+       relation, meaning, unknown}] for the free terms (meaning: it has a
+       vector). */
+    Index.prototype.termCoverage = function (plan, alive, missed, context, stats, rescued) {
         var self = this;
         var entries = [];
         var listed = [];
@@ -6923,27 +7617,38 @@ var SearchCore = (function () {
             if (!plan.free[c] || !plan.lacking[c]) {
                 return;
             }
-            var infos = clause.terms.map(function (term) {
+            var infos = clause.terms.filter(freeTerm).map(function (term) {
                 return self.termInfo(term, plan, context);
             });
-            entries.push({lacking: plan.lacking[c], infos: infos,
-                          exempt: infos.some(function (info) {
-                              return info.relation || (!info.name && (info.unknown ||
-                                                                      !info.stats));
-                          })});
+            var entry = {lacking: plan.lacking[c], infos: infos, listed: [], rows: [],
+                         exempt: infos.some(function (info) {
+                             return info.relation || (!info.name && (info.unknown ||
+                                                                     !info.stats));
+                         })};
+            // (Names only, each on NAME_SAMPLE or more pictures and in what
+            // fewer than NAME_SHARE of them show: never rescued, see
+            // MEANING_TERM_RESCUE.)
+            entry.strict = !entry.exempt && infos.length > 0 && infos.every(function (info) {
+                return info.name && info.matches >= NAME_SAMPLE && info.share < NAME_SHARE;
+            });
+            entries.push(entry);
             infos.forEach(function (info) {
-                listed.push({text: info.text, name: info.name, relation: info.relation,
-                             meaning: info.stats !== null, unknown: info.unknown});
+                var item = {text: info.text, name: info.name, relation: info.relation,
+                            meaning: info.stats !== null, unknown: info.unknown};
+                listed.push(item);
+                entry.listed.push(item);
             });
         });
         function zOf(r) {
             var cos = stats.values[r];
             return cos > -2 ? (cos - stats.mean) / stats.std : -Infinity;
         }
-        // How close to the whole query the pictures with every free word are.
+        // How close to the whole query the pictures with every free word are
+        // (not those taken at a kind of place without its words: byKind).
         var full = [];
         for (r = 0; r < this.n; r++) {
-            if (alive[r] && !missed[r] && stats.values[r] > -2) {
+            if (alive[r] && !missed[r] && !(plan.byKind && plan.byKind[r]) &&
+                    stats.values[r] > -2) {
                 full.push(zOf(r));
             }
         }
@@ -6971,13 +7676,35 @@ var SearchCore = (function () {
             }
             return found;
         }
+        // (A small set: close enough to the whole query, see MEANING_TERM_RESCUE.)
+        var rescue = meaningCuts(stats.count).rescue;
+        var e;
+        function rescues(r) {
+            if (zOf(r) < rescue) {
+                return false;
+            }
+            for (var k = 0; k < entries.length; k++) {
+                if (entries[k].lacking[r] === 1 && entries[k].strict) {
+                    return false;
+                }
+            }
+            return true;
+        }
         for (r = 0; r < this.n; r++) {
             if (!alive[r] || !missed[r]) {
                 continue;
             }
+            if (rescues(r)) {
+                for (e = 0; e < entries.length; e++) {
+                    if (entries[e].lacking[r] === 1 && !entries[e].exempt) {
+                        entries[e].rows.push(r);
+                    }
+                }
+                continue;
+            }
             var lacks = 0;
             var maybe = false;
-            for (var e = 0; e < entries.length && alive[r]; e++) {
+            for (e = 0; e < entries.length && alive[r]; e++) {
                 if (entries[e].lacking[r] === 1 && !entries[e].exempt) {
                     lacks += 1;
                     var level = covers(entries[e], r);
@@ -6993,6 +7720,11 @@ var SearchCore = (function () {
                 alive[r] = 0;
             }
         }
+        entries.forEach(function (entry) {
+            if (entry.rows.length && rescued) {
+                rescued.push({rows: entry.rows, items: entry.listed});
+            }
+        });
         return listed;
     };
 
@@ -7030,12 +7762,16 @@ var SearchCore = (function () {
 
     /* True when the median z of the word matches (those with a vector) is
        below MEANING_WORDS_Z: what the words found is not what the model
-       makes of the query, so meaning has nothing to add (see there). */
-    Index.prototype.wordsUnlikeQuery = function (alive, missed, stats) {
+       makes of the query, so meaning has nothing to add (see there). The
+       pictures taken at a kind of place the query names that lack its
+       words (byKind) are not what the words found: the many pictures
+       taken at hotels that show the view or the breakfast would hold
+       "hotels" down. */
+    Index.prototype.wordsUnlikeQuery = function (alive, missed, stats, byKind) {
         var cos = stats.values;
         var zs = [];
         for (var r = 0; r < this.n; r++) {
-            if (alive[r] && !missed[r] && cos[r] > -2) {
+            if (alive[r] && !missed[r] && !(byKind && byKind[r]) && cos[r] > -2) {
                 zs.push((cos[r] - stats.mean) / stats.std);
             }
         }
@@ -7053,7 +7789,8 @@ var SearchCore = (function () {
        alone, closest first)}, or null when meaning had nothing to add (the
        word matches as without it, see MEANING_WORDS_Z). missed marks the
        pictures without the free words. With two or more free clauses, the
-       answer's terms say how each free term was searched (termCoverage). */
+       answer's terms say how each free term was searched, and its rescued
+       which pictures were kept without covering each term (termCoverage). */
     Index.prototype.applyMeaning = function (plan, alive, score, missed, context) {
         var n = this.n;
         var r;
@@ -7117,9 +7854,14 @@ var SearchCore = (function () {
             return {mode: "similar", best: best, only: only};
         }
         // A small set: the closest few when nothing else is close (see
-        // MEANING_SMALL), of the pictures wanted(r) allows; else Infinity.
+        // MEANING_FEW_Z), of the pictures wanted(r) allows; else Infinity
+        // (always once the few-cut is as high as the usual cut). A search
+        // of one free clause has the one-clause cut (MEANING_FEW_GROWTH_ONE).
+        var cuts = meaningCuts(stats.count);
+        var clauses = plan.free.filter(Boolean).length;
+        var least = clauses >= 2 ? cuts.few : cuts.one;
         function fewCut(wanted) {
-            if (stats.count >= MEANING_SMALL) {
+            if (least >= MEANING_MIN_Z) {
                 return Infinity;
             }
             var closest = [];
@@ -7131,7 +7873,7 @@ var SearchCore = (function () {
             closest.sort(function (a, b) {
                 return b - a;
             });
-            if (!closest.length || closest[0] < atZ(MEANING_FEW_Z)) {
+            if (!closest.length || closest[0] < atZ(least)) {
                 return Infinity;
             }
             return Math.max(closest[0] - MEANING_FEW_MARGIN_Z * stats.std,
@@ -7140,10 +7882,23 @@ var SearchCore = (function () {
         if (plan.mode === "meaning") {
             var lowest = Math.max(best - MEANING_ONLY_MARGIN_Z * stats.std,
                                   atZ(MEANING_ONLY_Z));
-            if (best < lowest) {
-                lowest = fewCut(function (row) {
+            // The closest few when nothing reaches MEANING_MIN_Z; and, as by
+            // words and meaning, of the pictures without the words when none
+            // of them does: this wider net never shows less.
+            var reach = atZ(MEANING_MIN_Z);
+            if (best < reach) {
+                lowest = Math.min(lowest, fewCut(function (row) {
                     return alive[row];
-                });
+                }));
+            }
+            var without = false;
+            for (r = 0; r < n && missed && !without; r++) {
+                without = Boolean(alive[r] && missed[r] && cos[r] >= reach);
+            }
+            if (missed && !without) {
+                lowest = Math.min(lowest, fewCut(function (row) {
+                    return alive[row] && missed[row];
+                }));
             }
             for (r = 0; r < n; r++) {
                 if (alive[r]) {
@@ -7160,7 +7915,8 @@ var SearchCore = (function () {
         plan.free.forEach(function (isFree) {
             free += isFree ? 1 : 0;
         });
-        if (free <= MEANING_NAME_WORDS && this.wordsUnlikeQuery(alive, missed, stats)) {
+        if (free <= MEANING_NAME_WORDS && this.wordsUnlikeQuery(alive, missed, stats,
+                                                                plan.byKind)) {
             for (r = 0; r < n; r++) {
                 if (alive[r] && missed[r]) {
                     alive[r] = 0;
@@ -7169,7 +7925,9 @@ var SearchCore = (function () {
             return null;
         }
         // (After best: the ranking of the word matches stays as it was.)
-        var terms = plan.lacking ? this.termCoverage(plan, alive, missed, context || {}, stats)
+        var rescued = [];
+        var terms = plan.lacking ? this.termCoverage(plan, alive, missed, context || {}, stats,
+                                                     rescued)
             : [];
         var floor = atZ(MEANING_FLOOR_Z);
         var span = best - floor;
@@ -7220,7 +7978,7 @@ var SearchCore = (function () {
                 alive[extra[k]] = 0;
             }
         }
-        return {mode: "hybrid", best: best, only: only, terms: terms};
+        return {mode: "hybrid", best: best, only: only, terms: terms, rescued: rescued};
     };
 
     /* Looks' part of a search (lookPlan): only the pictures that look like the
@@ -7761,8 +8519,9 @@ var SearchCore = (function () {
         {example: "red car", meaning: "pictures with all the words (cars, Red, ... too)"},
         {example: "anna in lisbon last summer", plain: true,
          meaning: "plain language: the " +
-            "names of people and places, years, months and seasons become filters (shown as " +
-            "chips over the results; \u00d7 searches that part as typed)"},
+            "names of people and places, kinds of place (beaches, museums), years, months and " +
+            "seasons become filters (shown as chips over the results; \u00d7 searches that " +
+            "part as typed)"},
         {example: "\"red car\"", meaning: "the words together, in this order"},
         {example: "beach -dog", meaning: "leave out pictures with a word"},
         {example: "cat OR dog", meaning: "either word (\"cat or dog\" too)"},
@@ -7783,6 +8542,9 @@ var SearchCore = (function () {
         {example: "place:portugal", meaning: "taken in a town, region or country, or at a " +
             "named place of the street maps (place:\"city zoo\"; pictures with a GPS " +
             "position, or an estimated place: is:place-estimated)"},
+        {example: "kind:beach", meaning: "taken at a kind of place: the kind of its named " +
+            "place on the street maps (kind:museums, kind:zoo, kind:airport, kind:\"golf " +
+            "course\")"},
         {example: "has:text", meaning: "with text, a location (has:gps), people, animals, ..."},
         {example: "is:360", meaning: "360\u00b0 photos and videos; also is:video, is:drive, " +
             "is:duplicate, is:undescribed, is:edited, is:hidden, is:gps-ignored"},
@@ -7829,6 +8591,26 @@ var SearchCore = (function () {
             var values = rec && typeof rec === "object" ? placeValues(rec) : [];
             return values.length ? values[values.length - 1] : "";
         },
+        // The kinds of place kind: knows (PLACE_KIND_LIST): [{key, label,
+        // words, kinds}], copies.
+        placeKinds: function () {
+            return PLACE_KINDS.list.map(function (entry) {
+                return {key: entry.key, label: entry.label, words: entry.words.slice(),
+                        kinds: entry.kinds.slice()};
+            });
+        },
+        // True when a query (text or parsed) finds pictures taken at a named
+        // place of kind nk by a kind: term (not a -kind: one): what the
+        // viewer marks as a match.
+        kindMatches: function (query, nk) {
+            if (!isText(nk)) {
+                return false;
+            }
+            return asQuery(query).terms.some(function (term) {
+                return kindTerm(term) && term.active !== false &&
+                    term.filter.kinds.indexOf(nk) >= 0;
+            });
+        },
         // The search for the pictures taken at a named place (a record's np):
         // place:"its words".
         namedPlaceQuery: function (name) {
@@ -7846,6 +8628,7 @@ var SearchCore = (function () {
         meaningText: meaningText,
         meaningTexts: meaningTexts,
         MEANING_TEXTS: MEANING_TEXTS,
+        meaningCuts: meaningCuts,
         decodeVectors: decodeVectors,
         joinVectors: joinVectors,
         queryVector: queryVector,

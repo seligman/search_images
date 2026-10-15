@@ -15,8 +15,11 @@
    id, dims} (the export ships its query model: the page embeds the query
    with it) or {query, state: "off"} (the page's self-check fails), "albums":
    the names of the albums the manifest lists (the marks option), in
-   order, "trip": {title} (a trip's export, trip_export.py: its trip, whose
-   days list every picture), "area": {text, query, titles} (an area of the
+   order, "trip": {title, "unfeatured": titles} (a trip's export,
+   trip_export.py: its trip, whose days list every picture; the pictures
+   its page never features, by its own trips.js: never among a day's best,
+   as a day's only picture or on the cover, though each would be without
+   the list), "area": {text, query, titles} (an area of the
    map, see search-core.js: with the site's own locations the search of
    query in it finds titles; without titles, the site has no areas)}. A
    query with "with_albums" searches with those albums.
@@ -464,7 +467,52 @@ if (expected.trip) {
                 assert.ok(ids[id], id);
             });
             assert.strictEqual(listed.length, data.records.length);
+            if (expected.trip.unfeatured) {
+                unfeaturedOf(found, trip);
+            }
         });
+    });
+}
+
+// The pictures of expected.trip.unfeatured: listed by the trip, without a private
+// flag in their records, and never featured by the export's own trips.js.
+function unfeaturedOf(found, trip) {
+    var TRIPS = require(path.resolve(folder, "assets", "trips.js"));
+    var byId = {};
+    data.records.forEach(function (rec) {
+        byId[rec.i] = rec;
+    });
+    function get(id) {
+        return byId[id] || null;
+    }
+    var never = expected.trip.unfeatured.map(function (title) {
+        assert.ok(byTitle[title], title);
+        assert.ok(!("pr" in byTitle[title]), title);
+        return byTitle[title].i;
+    });
+    assert.deepStrictEqual((trip.unfeatured || []).slice().sort(), never.slice().sort());
+    // What the page shows: each day's best (else its only picture), the other
+    // pictures' and the cover.
+    function featured() {
+        var shown = [];
+        trip.days.concat([{ids: trip.other, looks: trip.other_looks}]).forEach(function (day) {
+            var best = TRIPS.bestOf(day.ids, get, found.best_per_day, {looks: day.looks});
+            var only = TRIPS.fallback(day.ids, get);
+            shown = shown.concat(best.length ? best : only === null ? [] : [only]);
+        });
+        return shown.concat(TRIPS.bestOf(TRIPS.tripIds(trip), get, 4,
+                                         {perDay: true, looks: TRIPS.tripLooks(trip)}));
+    }
+    TRIPS.useMoments(found.trips);
+    TRIPS.useUnfeatured([]);
+    var without = featured();
+    never.forEach(function (id) {
+        assert.ok(without.indexOf(id) >= 0, "without the list " + id + " is featured");
+    });
+    TRIPS.useUnfeatured(found.trips);
+    var shown = featured();
+    never.forEach(function (id) {
+        assert.ok(shown.indexOf(id) < 0, id + " is never featured");
     });
 }
 

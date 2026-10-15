@@ -106,6 +106,19 @@ scan.py --settings-base "c:\path\to\data"`), as the command lines of jobs do
 To try it on the 19 bundled sample pictures first, see
 [sample/README.md](sample/README.md).
 
+The [demo](https://seligman.github.io/search_image_sample/index.html) also
+uses 44 more openly licensed pictures and videos (a trip, short videos,
+bursts and near-duplicates, text in pictures and varied scenes), listed
+with their creators, licenses and sources in
+[sample/demo-set/CREDITS.md](sample/demo-set/CREDITS.md). They are not in
+the repository: `python sample/demo-set/fetch_demo_set.py --out DIR`
+downloads them (about 564 MB of originals; the copies need about 465 MB
+more) and makes the copies the demo uses in DIR, a folder outside the
+program folder (`--list` lists them first; the videos need ffmpeg, see
+[Videos](#videos)). The originals stay in `sample/demo-set/originals`
+(or `--originals DIR`, a folder of its own) so that a second run
+downloads only what is missing; delete that folder when you are done.
+
 The same from the command line: `python settings.py` adds endpoints and
 libraries from a numbered menu (it takes no options), `python scan.py`
 scans and describes (see [Scanning](#scanning)), and `python serve.py`
@@ -984,6 +997,10 @@ about it.
 - `on:today` - taken on this day in earlier years; `on:05-14` - on May 14
   of any year; `on:2019-05-14` - on that day (dates from the camera or the
   file name only, not a file's time)
+- `kind:beach`, `kind:museums`, `kind:"golf course"` (or `placekind:`) -
+  taken at a kind of place: the kind of the picture's named place on the
+  street maps (see [Kinds of place](#kinds-of-place)); also by the maps'
+  own name for a kind (`kind:place_of_worship`, `kind:aerodrome`)
 - `place:portugal`, `place:"new york"` - taken in a town, region or country
   (see [Place names](#place-names)); place names are also found as ordinary
   words (`beach portugal`), and a few other names of countries too (`usa`,
@@ -1023,14 +1040,14 @@ about it.
 
 ### Plain language
 
-The search box also understands names and dates written as you would say
-them: `anna at the beach in lisbon last summer` searches for Anna's
-pictures, taken in Lisbon from June to August, that show a beach. Above
-the results, chips say how the search was understood -- `Searching for`
-**Person: Anna Lopez ×** **Place: Lisbon ×** **Taken: June – August 2026
-×** "at the beach" by words and meaning -- and the box keeps what you
-typed. What it understands, in the plain words of a search (not in quotes,
-fields, `-words` or next to `OR`):
+The search box also understands names, kinds of place and dates written
+as you would say them: `anna at the beach in lisbon last summer` searches
+for Anna's pictures, taken in Lisbon from June to August, at a beach or
+showing one. Above the results, chips say how the search was understood
+-- `Searching for` **Person: Anna Lopez ×** **Kind of place: beaches ×**
+**Place: Lisbon ×** **Taken: June – August 2026 ×** -- and the box keeps
+what you typed. What it understands, in the plain words of a search (not
+in quotes, fields, `-words` or next to `OR`):
 
 - **People**: the name of a person in [People](#people) (named, not
   hidden), or a whole word of it (`anna`, `lopez`, `anna's`; the first or
@@ -1045,6 +1062,22 @@ fields, `-words` or next to `OR`):
   and the other names of countries -- `US` only in capitals: `us` is a
   word), after `in`, `at`, `near`, ... or alone: the pictures taken there,
   and those with the name in their words: `place:lisbon OR lisbon`.
+- **Kinds of place**: `beaches`, `museums`, `a zoo`, `at the airport`,
+  `the beach`, `restaurants`, `churches`, `coffee shops`, ... -- a kind of
+  place some of the pictures were taken at (see [Kinds of
+  place](#kinds-of-place)): the pictures taken at one, and those whose
+  words say it, as before: `kind:beach OR beaches`; a kind of several
+  words word by word, `kind:cafe OR coffee kind:cafe OR shops`, so its
+  words are found by words and by meaning as without it. A word with
+  another everyday meaning (`park`, `bar`, `garden`, `station`, `theater`,
+  `library`, `tower`, `fort`, `resort`, `memorial`, ...) only on its own,
+  after `in`, `at`, `the`, ... or before a date, a place or a person
+  (`parks`, `at the park`, `parks 2024`; `car park`, `park bench`, `candy
+  bar`, `pillow fort` and `Memorial Day` stay words). Of two kinds of
+  place in a row the last one is meant (`museum cafe`: a cafe; `hotel
+  bar`, `beach bar` and `tower bridge` stay words; `parks, zoos` and
+  `parks and zoos` are two), and a kind the search names with `kind:`
+  already stays a word there (`kind:viewpoint lookout`).
 - **Dates**: a year pictures were taken in (`2019`; `1984` stays a word
   when no picture is from then), `2015-2019` (or `2015 - 2019`), `between
   2015 and 2019`, `from 2015 to 2019`, a month or season with its year
@@ -1080,19 +1113,25 @@ someone called June, or June 2019?), or also a common word of your
 pictures' descriptions (someone called Rose, and pictures of roses; a town
 called Atlantic, and pictures of the Atlantic Ocean; Red Hill, whose words
 pictures show) is not taken but asked about, and so is a place after `the`
-or after `mount`, `lake`, `river`, ... (`mount fuji`): the buttons
-write the choice into the search box (`in siena` is always the place,
-`with siena` the person). **Save as album** saves the search as
-understood (`person:"Anna Lopez" OR anna beach date:2026-06..2026-08`), so
-the album keeps finding the same pictures; where People is not shown (to
-visitors without it) the album searches the words typed for the person
-instead, an export publishes it only with the names of people (as words),
-and an export without places searches the words typed for a place. The
-map follows the search as understood too. A published site understands
+or after `mount`, `lake`, `river`, ... (`mount fuji`), and a kind of
+place that is also the name of a person or a town (`park` with someone
+called Jo Park, `marina` and a town called Marina): the buttons write
+the choice into the search box (`in siena` is always the place, `with
+siena` the person; `in marina` the town, `at the marina` the kind of
+place). **Save as album** saves the search as understood
+(`person:"Anna Lopez" OR anna at the kind:beach OR beach place:lisbon OR
+lisbon date:2026-06..2026-08`), so the album keeps finding the same
+pictures; where People is not shown (to visitors without it) the album
+searches the words typed for the person instead, an export publishes it
+only with the names of people (as words), an export without places
+searches the words typed for a place, and one without named places those
+typed for a kind of place. The map follows the search as understood
+too. A published site understands
 the places and dates of its pictures, and the names of people only when
-it publishes them (its `people_names` option); the search tips say what
-the page understands. To turn plain language off, set `"plain_language":
-false` in `config.json` (see [SETTINGS.md](SETTINGS.md)).
+it publishes them (its `people_names` option), and kinds of place with its
+named places; the search tips say what the page understands. To turn
+plain language off, set `"plain_language": false` in `config.json` (see
+[SETTINGS.md](SETTINGS.md)).
 
 ### Search by meaning
 
@@ -1167,12 +1206,29 @@ A switch next to the sort order chooses how a search goes:
   above the results says how many pictures have the words.
 
 Close in meaning means much closer than the other pictures are; in a
-small set of pictures (fewer than 50 with meaning vectors: a small
-published library, say), where none can stand out much, the closest few
-still show when they are a little closer than the rest -- and there the
-meaning of the whole search decides, not each word on its own (no word
-stands out among so few pictures either: `something warm to drink` finds
-the coffee cups of the sample pictures).
+small set of pictures (a small published library, say), where none can
+stand out much, the closest few still show when they are a little closer
+than the rest, and a picture close enough to the whole search shows
+without covering each word on its own (no word stands out among so few
+pictures either: `something warm to drink` finds the coffee cups of the
+sample pictures, `a place to stay along an old highway` the motel sign).
+A name is still matched only by having it, unless so few pictures (one
+or two) have the word that it cannot tell, or descriptions use the word
+too. Both give way gradually as
+the set grows: the closest few must stand out more among more pictures
+(for a search of one word, which nothing checks word by word, sooner:
+they are gone from about 170 pictures with meaning vectors on, for
+several words from about 1,200), and "close enough to the whole search"
+asks more than any picture comes from about a thousand pictures on. So a
+set of a few dozen, a few hundred or many thousands of pictures is
+searched without a step between sizes, and a large library as before.
+The price in a small set: a search none of its pictures answers often
+still shows the closest few, marked "≈" like every picture found by
+meaning (in a set of 63 pictures, 10 of 16 such searches showed one to
+three). **Meaning** shows these too (and the closest few of all pictures
+when none stands out), so it never shows fewer pictures by meaning than
+the default, apart from the rare one the default reaches because it
+left out closer ones that lack a word.
 - **Words**: the words alone, as without an embedding model. The page
   remembers this choice; the other two last until you leave the page.
 
@@ -1623,7 +1679,11 @@ since), and so do the places job and a download of the street maps (then
 every picture again: about half a minute for 2,500 positions, the first
 time); **Find named places** (Manage, under Street maps)
 does it at once, **Look up all again** for every picture, and the
-viewer's location choices for the pictures they change. Deleting the
+viewer's location choices for the pictures they change (and the first
+update after a new version changes how places are named does every
+picture again too). A place the street maps give several names
+(`Harbour Hall;Hall of the Harbour`) shows, searches and publishes
+the first. Deleting the
 street maps forgets them (street maps downloaded down to zoom 14 only,
 `"max_zoom": 14`, hold fewer of the small places: cafes, minor sights). From
 the command line:
@@ -1647,6 +1707,72 @@ the pages (and `maps/LICENSE.txt`) also without the street maps. Turned
 off (`"enabled": false`), or with the street maps deleted, none show at
 once, before the next scan forgets them; an export looks up the pictures
 whose position changed since the last scan first.
+
+#### Kinds of place
+
+What a named place is -- a beach, a museum, a zoo, an airport -- is
+searchable too: `kind:beach` finds the pictures taken at a beach, and
+plain language understands it as you would say it (`beaches`, `museums in
+2019`, `kids at the zoo`, `at the airport`), with a chip **Kind of place:
+beaches ×** over the results. Typed as a plain word, `beaches` searches
+`kind:beach OR beaches`: the pictures taken at a beach, and the pictures
+whose own words say beach (as before, by words and by meaning) -- a
+picture with no named place (no position, or none found) is found by its
+words, as always; `coffee shops` searches `kind:cafe OR coffee kind:cafe
+OR shops`, so its words count as they would without the kind. The
+pictures taken at one that also say it come first; in a search by words,
+then the others taken at one (they count a little more than the word in
+a title), then the pictures that only say it; by words and meaning, how
+close a picture is to what you typed counts as for any word, so a meal
+at an aquarium's restaurant comes after its fish (and the pictures taken
+at one that do not say it never turn meaning off: whether the words
+found what you meant is judged by the pictures that have them).
+
+`kind:` takes the words for a kind, singular or plural (`kind:museums`,
+`kind:"golf course"`, `kind:church`), or the name the street maps use for
+one (`kind:place_of_worship`, `kind:theme_park`, `kind:cape`). A word
+finds what it names, no more. A broad word holds the narrower kinds the
+maps have: museums art galleries; restaurants fast food places and food
+courts; bars pubs, wine bars, beer gardens and nightclubs; hotels motels;
+parks dog parks, recreation grounds and village greens; monuments
+memorials; campsites caravan parks. A narrower word finds its own kind
+only (`pubs`, `motels`, `hostels`, `resorts`, `national parks`, `nature
+reserves`, `memorials`, `forts`), and a sort of place the maps have no
+kind for stays a word: `pizzeria`, `diner`, `inn`, `lodge`, `arena`,
+`cathedral`, `state park`, `botanical garden`, `flea market` (most
+places of the broader kind are something else, and they would push the
+pictures that say it down). Only where the maps make no difference and
+the word names most of what the kind holds does it find the kind: a
+church, a temple, a mosque and a synagogue are all places of worship, a
+wildlife park and a safari park are zoos. A shore or a coast is no beach
+(most pictures of one were taken elsewhere), and an aquarium is no zoo.
+Plain language offers only the kinds some of your pictures were taken
+at, and a word with another everyday meaning (`park`, `bar`, `garden`,
+`station`, `theater`, `library`, `tower`, `fort`, `resort`, ...) only on
+its own, after `in`, `at`, `the`, ... or before a date, a place or a
+person (`parks 2024`, `at the bar`), never in `car park` or `park
+bench`. A search with `kind:` that finds nothing says why: no picture
+has a named place, none was taken at one of that kind (with the kinds
+your pictures were taken at most), or the word is a kind of picture
+(`kind:screenshot`: `type:screenshot`) or the name of a place
+(`place:"city zoo"`). In the viewer, a picture found by its kind marks
+its named place and the kind under it. The search tips list `kind:`; the
+map and smart albums follow it like any search, and an export without
+named places (without **Location**, which leaves them out, or with none
+of its pictures at one) publishes a smart album saved from plain
+language with the words typed for the kind, and leaves out one that
+searches `kind:` itself.
+
+Tried on a library of about 11,700 pictures (880 with a named place):
+`zoos` found 71 more pictures (animals at a wildlife park whose
+descriptions never say zoo), `viewpoints` 19, `aquariums` 37 (the
+aquarium's pools and its restaurant, ranked after the fish), `hotels in
+2020` 18, `museums in 2019` 4, `wildlife park` 73, `theme parks` 9;
+`beaches` none (every picture at a named beach already said beach), and
+`churches` and `lighthouses`, which none was taken at, stayed words. Of
+more than 200 searches tried, none lost a picture it found before: kinds
+of several words, such as `coffee shop` and `gift shop`, keep what their
+words and their meaning found.
 
 ### Searching an area of the map
 
@@ -2512,8 +2638,12 @@ counts the people the AI model saw in a picture, from its
 description.) The viewer's
 information pane names the people in the picture (each a link to their
 pictures); **Show faces** there draws the box of every face over the
-picture, with its person's name (a link to the People page), and stays
-on for the next pictures until you hide them. Of a video, each name is
+picture, with its person's name ("?" for a face of nobody), and stays on
+for the next pictures until you hide them -- a video or a 360-degree
+picture gets no boxes: its faces are shown in the pane instead, each
+with its name (and of a video, the moment it was seen at). A box (or a
+face in the pane) says who it is: see [Naming a face in the
+viewer](#naming-a-face-in-the-viewer). Of a video, each name is
 followed by the moments that person was seen at (`0:06 0:10 0:14`, and
 `+3` shows the others): a click moves the video there; and a video found
 by a search that names one of its people (`person:Ann`,
@@ -2533,6 +2663,61 @@ the smart albums that search for a person -- never the boxes, the
 unnamed or hidden people, or the faces of hidden pictures. Without it,
 those smart albums are not listed for them either (their searches name
 people).
+
+### Naming a face in the viewer
+
+You do not have to go to the People page to say who someone is. With
+**Show faces** on (in the viewer's pane, or on a picture's details page),
+click or tap a face's box -- or reach it with Tab and press Enter -- and
+a small box opens by it (on a phone, a sheet at the foot of the screen):
+the face, who it is now ("Person 12 - 37 faces", a named person with a
+link to the People page, or nobody), and a field to type a name in. A
+double click or a double tap on a face zooms in, as anywhere on the
+picture, and opens nothing (so one click or tap opens the box a moment
+later). Tab goes through the faces row by row; a face out of sight on a
+zoomed-in picture is brought into sight. In a crowd, where the names
+under the faces would cover each other, a face's name shows when you
+point at it, reach it with Tab or name it.
+
+- Type the first letters of a name and press Enter: the people whose
+  name (or a word of it: "lee" finds "Ann Lee") starts so are listed
+  with their faces, the first one marked, and Enter puts this face in
+  that person (as **Move to...** on the People page: it stays there,
+  and never goes back to the person it came from). The arrow keys
+  choose another; a click or a tap takes one. With nothing typed, the
+  named people are listed (hidden ones say so); a person without a name
+  is found by its number ("12"). Enter pressed before the people have
+  arrived waits for them, and then takes a person the letters name --
+  never a new name made of those letters, which you choose with the
+  arrows or a click. Letters that start an existing name take that
+  person: to give a new name that starts another one ("Dan" beside
+  "Daniel"), choose the new name's line.
+- A name nobody has yet: for a face of an unnamed person you are offered
+  **Name Person 12 "Name"** (the whole person, all its faces: usually
+  what you want when the grouping got it right) and **Just this face**
+  (a new person of that name, of this face alone); for a face of nobody,
+  a new person of that name; for a face of a named person, **Just this
+  face** too.
+- **Not Ann** takes the face out of its person for good (as **Not
+  <name>** on the People page); **Not a face** marks it as no face.
+
+Each change shows a message with **Undo** (or press Ctrl+Z while it
+shows; in the viewer, Tab reaches its Undo too): everything is as it was
+before, also a person that went with its last face. Only the last change
+can be undone, and only while nothing else changed the people since
+(another change, here or on the People page, a grouping, or Delete face
+data) and the server has not been started again since (it keeps the
+change in memory only); then put it right on the People page. **Name
+Person 12** is refused when a grouping has moved that face to another
+person meanwhile: look at it again. The names in the pane and on the
+boxes change at once; the People page and `person:` searches see the
+new names the next time they look (the search page's next search). Esc
+(or a click elsewhere) closes the box and gives the keyboard back to the
+face. For a video or a 360-degree picture, use its faces in the pane: a
+face of a video also moves the video to the moment it was seen at, and
+a face of a 360-degree photo turns the view to it. This is the admin's
+only, on this computer: never visitors (even with `"visitors": true`),
+never a published site.
 
 ### Deleting all face data
 
@@ -2574,7 +2759,14 @@ On the Manage page, **Export...** on a library opens a dialog:
    by meaning and "Looks like this" goes along (both on by default); and
    the site's title, a footer line, the
    output folder, a zip file and search-engine indexing. The line at the
-   bottom counts the pictures that would be published.
+   bottom counts the pictures that would be published. A saved option the
+   export cannot use (say a footer line over 4,000 characters, or one
+   written by hand into `config.json` with a typo) is named at the top
+   and left at its default (an export from the command line names it in
+   its log). A title or footer line that is too long shows in its field
+   as saved, so you can shorten it: the export waits until you do, as
+   exporting from the dialog saves the options it shows in place of the
+   saved ones.
 2. **Review what will be published**: how many pictures, the estimated
    size (and a warning when the folder's disk has less room, or when the
    library's folder is offline and pictures need it), how many are left
@@ -2583,7 +2775,13 @@ On the Manage page, **Export...** on a library opens a dialog:
    options leave out; a picture opens in a new tab to read its
    description. A picture you chose to publish is left out again when it
    gets a new flag later (say it is described again and shows private
-   information), and the review says so.
+   information), and the review says so. The published site shows no
+   "Private information" or "Sensitive" badge (your own pages still do),
+   and its pictures carry no private flag (`is:private` finds none there);
+   how sensitive a picture is goes along, for the site's "Hide sensitive
+   pictures". A published trip's page still never shows a private one
+   among a day's best or on its cover, as yours does not: the trip lists
+   the pictures it never features.
 3. **Export** saves the options with the library (`export` in
    `config.json`) and runs the export as a job: the dialog and the job
    panel show its progress (**Stop export** stops it). When it is done the
@@ -2721,10 +2919,13 @@ them all. `serve.py package` always uses the saved options.
   them. A smart album is left out when its search cannot be published: one
   limited to another library, one that searches by folder, file name or
   place (`folder:`, `file:`, `place:`, `has:gps`, the Place filter, an
-  area of the map) while those are not published, by library (`lib:`), for
-  pictures like one
-  that is not published, or for a person (`person:`: the site has no
-  people, and the search would publish a name). Without `--marks`, not
+  area of the map) while those are not published, by kind of place
+  (`kind:`) while no named place is, by library (`lib:`), for pictures
+  like one that is not published, or for a person (`person:`: the site has
+  no people, and the search would publish a name). A place or a kind of
+  place that plain language understood is published as the words typed
+  for it instead, and so is a person with `--people-names` (see [Plain
+  language](#plain-language)). Without `--marks`, not
   even the name of the album the export is limited to goes out.
 - The names of people (see [People](#people)) go only with
   `--people-names` (**People's names (as tags)** in the dialog,
@@ -3531,7 +3732,9 @@ one per line in `private-terms.txt` next to `config.json` (in the
 
 The code is released under the MIT License; see [LICENSE](LICENSE). The
 sample images are covered by their own licenses, listed in
-[sample/images/CREDITS.md](sample/images/CREDITS.md).
+[sample/images/CREDITS.md](sample/images/CREDITS.md), and so are the
+pictures and videos of the demo set (downloaded by you), listed in
+[sample/demo-set/CREDITS.md](sample/demo-set/CREDITS.md).
 
 ## Credits
 
