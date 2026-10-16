@@ -1,7 +1,9 @@
 /* Tests for People on the pages, under Node (no packages needed): the real page
    scripts on the made-up DOM of tests/js/app_meaning_test.js, with a fake fetch()
    for the server's answers. The Albums page counts smart albums that name a person
-   with the people (and lets them be copied only once the people have come); the
+   with the people (and lets them be copied only once the people have come), and
+   takes a word no picture has and no list of words has for a name, as the search
+   page does (with the word list its template loads); the
    People page's person picker chooses with Enter the person whose name was typed,
    else a new person of that name, else the only match; and a person whose last
    faces went leaves the list in its place; a face of a video says its moment and
@@ -325,6 +327,122 @@ test("the Albums page asks for its smart albums' meaning vectors together", func
         assert.ok(embeds.every(function (texts) {
             return texts.length <= 9;
         }));
+    });
+});
+
+// The scripts a template loads, in its order (in static/).
+function scriptsOf(template) {
+    var html = fs.readFileSync(path.join(ROOT, "templates", template), "utf8");
+    var found = [];
+    html.replace(/<script src="__ASSET_PREFIX__([a-z0-9-]+\.js)"/g, function (all, name) {
+        found.push(name);
+        return all;
+    });
+    return found;
+}
+
+test("the Albums page takes a word no picture has and no list of words has for a name",
+     function () {
+    // (As the search page does: in a small set a made-up name gets none of the
+    // pictures closest in meaning, so a smart album of it counts none and copies
+    // none; a word the rest of the word list has keeps them, once that is in.)
+    // Eighteen made-up pictures, two of them close to the query (z 2.3 and 2.2).
+    var dims = 8;
+    function vector(cos, axis) {
+        var values = [cos];
+        for (var k = 1; k < dims; k++) {
+            values.push(k === axis ? Math.sqrt(Math.max(0, 1 - cos * cos)) : 0);
+        }
+        var norm = Math.sqrt(values.reduce(function (sum, value) {
+            return sum + value * value;
+        }, 0));
+        return values.map(function (value) {
+            return Math.round(value / norm * 127);
+        });
+    }
+    var records = [];
+    var data = [];
+    for (var k = 0; k < 18; k++) {
+        records.push({i: k + 1, l: "lib", t: "Picture " + (k + 1), g: [], ds: 1,
+                      dk: "2020-01-01"});
+        data = data.concat(vector(k === 0 ? 0.45 : k === 1 ? 0.43 : 0.1 + 0.2 * (k - 2) / 15,
+                                  1 + (k % 5)));
+    }
+    function base64(numbers) {
+        return Buffer.from(Int8Array.from(numbers).buffer).toString("base64");
+    }
+    var albums = [
+        {id: 1, name: "Maplebrook", kind: "smart", cover: null, query: "maplebrook",
+         options: {}},
+        {id: 2, name: "Timepiece", kind: "smart", cover: null, query: "timepiece", options: {}}
+    ];
+    var page = serverPage("albums.html", scriptsOf("albums.html"), "", function (url) {
+        var plain = url.split("?")[0];
+        if (plain === "/api/index") {
+            return response(200, {version: 1, albums: albums, records: records,
+                                  libraries: [{id: "lib", name: "Example"}]});
+        }
+        if (plain === "/api/vectors") {
+            return response(200, {model: "m", dims: dims, query: true, count: records.length,
+                                  ids: records.map(function (rec) {
+                                      return rec.i;
+                                  }),
+                                  data: base64(data)});
+        }
+        if (plain === "/api/embed") {
+            var texts = new URLSearchParams(url.split("?")[1]).getAll("q");
+            return response(200, {model: "m", dims: dims, vec: base64(vector(1, 1)),
+                                  vecs: texts.map(function () {
+                                      return base64(vector(1, 1));
+                                  })});
+        }
+        return null;
+    });
+    // The rest of the word list: in when the test lets it in.
+    var added = [];
+    var pending = [];
+    page.document.onAppend = function (node) {
+        if (node.tagName === "SCRIPT") {
+            added.push(String(node.src).split("?")[0]);
+            pending.push(node);
+        }
+    };
+    function card(name) {
+        var found = cardOf(page, name);
+        return found ? found.textContent : "";
+    }
+    function copy(name) {
+        var found = cardOf(page, name);
+        return found ? found.querySelectorAll("button").filter(function (node) {
+            return node.textContent === "Copy to a new album";
+        })[0] : null;
+    }
+    return waitFor(function () {
+        // (Once the albums' meaning vectors are in.)
+        return added.length && page.log.requests.some(function (url) {
+            return /^\/api\/embed/.test(url);
+        }) && copy("Timepiece") && copy("Timepiece").disabled;
+    }).then(function () {
+        // While the rest is on its way, what meaning finds for a word only it can
+        // tell waits, and so does Copy.
+        assert.ok(/rest of the list of words/.test(copy("Timepiece").title),
+                  copy("Timepiece").title);
+        assert.ok(/[^0-9]0 pictures/.test(card("Timepiece")), card("Timepiece"));
+        pending.forEach(function (node) {
+            vm.runInContext(read("english-words-more.js"), page.context,
+                            {filename: "english-words-more.js"});
+            node.onload();
+        });
+        return waitFor(function () {
+            return /2 pictures/.test(card("Timepiece"));
+        });
+    }).then(function () {
+        assert.deepStrictEqual(added.map(function (src) {
+            return src.split("/").pop();
+        }), ["english-words-more.js"]);
+        assert.ok(/[^0-9]0 pictures/.test(card("Maplebrook")), card("Maplebrook"));
+        assert.ok(!copy("Timepiece").disabled);
+        assert.ok(!copy("Maplebrook").disabled);
     });
 });
 

@@ -445,7 +445,8 @@ class TripExportTest(support.TempBaseMixin, unittest.TestCase):
         # The pages: the trip's first.
         files = set(files_of(out))
         for name in ("index.html", "search.html", "detail.html", "map.html", "data/trips.js",
-                     "assets/trips.js", "assets/trips.css", "assets/map.js"):
+                     "assets/trips.js", "assets/trips.css", "assets/map.js",
+                     "assets/english-words.js", "assets/english-words-more.js"):
             self.assertIn(name, files)
         config = page_settings(out, "index.html")
         self.assertEqual((config["page"], config["trip"], config["tripsPage"],

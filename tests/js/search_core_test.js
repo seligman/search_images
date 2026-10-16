@@ -1290,25 +1290,112 @@ test("did you mean: never another word for a word of the language", function () 
         assert.strictEqual(SearchCore.suggest(records, "meadwo").text, "meadow");
         SearchCore.setWords("word meadows");
         assert.strictEqual(SearchCore.suggest(records, "words"), null);
-        // The page's list is a Bloom filter (static/english-words.js).
+        // The page's list is two Bloom filters (static/english-words.js, and
+        // english-words-more.js once the page has loaded it).
         var filter = require(path.join(__dirname, "..", "..", "static", "english-words.js"));
-        SearchCore.setWords(filter);
-        ["house", "water", "garden", "words", "cold", "sheep"].forEach(function (word) {
+        var more = require(path.join(__dirname, "..", "..", "static", "english-words-more.js"));
+        SearchCore.setWords([filter, more]);
+        ["house", "water", "garden", "words", "cold", "sheep", "cutlery", "felines",
+         "timepiece", "waterfowl", "eyewear", "cafe", "italian"].forEach(function (word) {
             assert.strictEqual(SearchCore.isWord(word), true, word);
         });
-        ["wodos", "meadwo", "qzxwvb", "trailz", "blorptif"].forEach(function (word) {
+        ["wodos", "meadwo", "qzxwvb", "trailz", "blorptif", "maplebrook"].forEach(function (word) {
             assert.strictEqual(SearchCore.isWord(word), false, word);
+            assert.strictEqual(SearchCore.isName(word), false, word);
+        });
+        // (Apostrophes go, as in a search: "o'clock" is "oclock".)
+        ["o'clock", "oclock", "don't", "isn\u2019t", "ma'am"].forEach(function (word) {
+            assert.strictEqual(SearchCore.isWord(word), true, word);
         });
         assert.strictEqual(SearchCore.suggest(records, "words"), null);
         assert.strictEqual(SearchCore.suggest(records, "wodos").text, "woods");
-        // Small: a sixth of the words as text, and quick to ask.
-        assert.ok(filter.size / 5 < 70000 && filter.count > 20000, filter.size);
+        // A well-known name is no word of the language, and meant as typed too:
+        // "rome" is not "rose", nor "greece" "green".
+        var named = records.concat([{i: 3, g: ["rose", "green", "seen"], d: "A rose",
+                                     dk: "2020-01-03"}]);
+        ["rome", "Greece", "norway", "Athens", "LISBON"].forEach(function (word) {
+            assert.strictEqual(SearchCore.isWord(word), false, word);
+            assert.strictEqual(SearchCore.isName(word), true, word);
+            assert.strictEqual(SearchCore.suggest(named, word), null, word);
+        });
+        assert.strictEqual(SearchCore.suggest(named, "rsoe").text, "rose");
+        SearchCore.setWords(filter);
+        assert.strictEqual(SearchCore.isName("rome"), false, "not before the rest is in");
+        // Small: a fifth of the words as text (the first part no larger than
+        // the list it replaced), and quick to ask.
+        assert.ok(filter.size / 5 < 70000 && filter.count + more.count > 40000, filter.size);
+        assert.strictEqual(filter.more.count, more.count);
         var started = Date.now();
         for (var k = 0; k < 20000; k++) {
             SearchCore.isWord("word" + String.fromCharCode(97 + k % 26));
         }
         assert.ok(Date.now() - started < 1000);
     } finally {
+        SearchCore.setWords(null);
+    }
+});
+
+test("the word list in two parts: the rest is asked for once, when a search first needs it",
+     function () {
+    var first = require(path.join(__dirname, "..", "..", "static", "english-words.js"));
+    var rest = require(path.join(__dirname, "..", "..", "static", "english-words-more.js"));
+    var records = [
+        {i: 1, g: ["woods", "trail"], d: "A trail through the woods", dk: "2020-01-01"},
+        {i: 2, g: ["meadow"], d: "Sheep in a meadow", dk: "2020-01-02"}
+    ];
+    var asked = [];
+    function loader(wanted) {
+        asked.push(wanted);
+    }
+    try {
+        SearchCore.setWords(first);
+        SearchCore.wantWords(loader);
+        assert.strictEqual(SearchCore.wordsState(), "");
+        // Words the pictures have, or the first part knows, need nothing more.
+        search(records, "meadow");
+        search(records, "kettle");
+        assert.strictEqual(SearchCore.suggest(records, "words"), null);
+        assert.deepStrictEqual(asked, []);
+        // A word of neither: the rest is asked for as it is searched, once.
+        search(records, "timepiece");
+        search(records, "waterfowl");
+        assert.deepStrictEqual(asked, [first.more]);
+        assert.deepStrictEqual(Object.keys(first.more).sort(), ["count", "file", "v"]);
+        assert.strictEqual(first.more.file, "english-words-more.js");
+        assert.strictEqual(SearchCore.wordsState(), "loading");
+        // While it is on its way, a word only it could tell gets no suggestion yet.
+        assert.strictEqual(SearchCore.isWord("timepiece"), false);
+        assert.strictEqual(SearchCore.suggest(records, "woodz"), null);
+        // Once it is in, the page searches again: something waited for it.
+        assert.strictEqual(SearchCore.addWords(rest), true);
+        assert.strictEqual(SearchCore.wordsState(), "ready");
+        assert.strictEqual(SearchCore.isWord("timepieces"), true);
+        assert.strictEqual(SearchCore.suggest(records, "woodz").text, "woods");
+        assert.strictEqual(SearchCore.suggest(records, "timepiece"), null);
+        assert.strictEqual(SearchCore.addWords(rest), false);
+        assert.strictEqual(asked.length, 1);
+        // It could not load: as with the first part alone, and never asked
+        // for again.
+        SearchCore.setWords(first);
+        search(records, "timepiece");
+        assert.strictEqual(asked.length, 2);
+        assert.strictEqual(SearchCore.addWords(null), false);
+        assert.strictEqual(SearchCore.wordsState(), "failed");
+        assert.strictEqual(SearchCore.suggest(records, "woodz").text, "woods");
+        assert.strictEqual(SearchCore.isWord("timepiece"), false);
+        search(records, "waterfowl");
+        assert.strictEqual(asked.length, 2);
+        // No loader yet: as with the first part alone, until the page gives one.
+        SearchCore.wantWords(null);
+        SearchCore.setWords(first);
+        search(records, "timepiece");
+        assert.strictEqual(SearchCore.wordsState(), "wanted");
+        assert.strictEqual(SearchCore.suggest(records, "woodz").text, "woods");
+        SearchCore.wantWords(loader);
+        assert.strictEqual(asked.length, 3);
+        assert.strictEqual(SearchCore.wordsState(), "loading");
+    } finally {
+        SearchCore.wantWords(null);
         SearchCore.setWords(null);
     }
 });
@@ -2607,6 +2694,170 @@ test("a typed search in a small set: the closest few when none stands out", func
     assert.deepStrictEqual(found([0.47, 0.36].concat(rest)), [[1], [1], [1]]);
     // Five as close as each other do not stand out (z 1.6).
     assert.deepStrictEqual(found([0.45, 0.45, 0.45, 0.45, 0.45].concat(rest))[0], []);
+});
+
+test("a small set: a name no picture has gets none of the closest few, a word or a typo does",
+     function () {
+    // The eighteen pictures of the test above (two close to the query, z 2.3
+    // and 2.2), one of them a zebra by its words. A word that no picture has
+    // and that is no word of the language is a name ("Maplebrook"): the two
+    // closest pictures would only be unrelated ones. A word of the language
+    // that descriptions seldom use ("timepiece"), or a misspelling of one the
+    // pictures have ("zebrq", which "did you mean" corrects), keeps them.
+    var records = [];
+    var ids = [];
+    var data = new Int8Array(18 * MEANING_DIMS);
+    for (var k = 0; k < 18; k++) {
+        records.push({i: k + 1, t: "Picture " + (k + 1),
+                      g: k === 17 ? ["zebra"] : k === 16 ? ["rose"] : [],
+                      dk: "2020-01-01", ds: 1});
+        ids.push(k + 1);
+        data.set(closeTo(k === 0 ? 0.45 : k === 1 ? 0.43 : 0.1 + 0.2 * (k - 2) / 15,
+                         1 + (k % 5)), k * MEANING_DIMS);
+    }
+    var index = SearchCore.prepare(records);
+    index.setVectors({dims: MEANING_DIMS, ids: ids, data: data});
+    function found(query) {
+        return [index.search(query, {vector: QUERY}).items,
+                index.search(query, {vector: QUERY, meaning: "meaning"}).items];
+    }
+    var first = require(path.join(__dirname, "..", "..", "static", "english-words.js"));
+    var rest = require(path.join(__dirname, "..", "..", "static", "english-words-more.js"));
+    var asked = 0;
+    try {
+        // Without a list of the words of the language, every word gets them (as before).
+        SearchCore.setWords(null);
+        assert.deepStrictEqual(found("maplebrook"), [[1, 2], [1, 2]]);
+        SearchCore.setWords([first, rest]);
+        assert.deepStrictEqual(found("maplebrook"), [[], []]);
+        assert.deepStrictEqual(found("Maplebrook harbor"), [[], []]);
+        assert.deepStrictEqual(found("timepiece"), [[1, 2], [1, 2]]);
+        assert.deepStrictEqual(found("zebrq"), [[1, 2], [1, 2]]);
+        assert.strictEqual(index.suggest("zebrq").text, "zebra");
+        // A well-known name is a name too, though it is one edit off a word a
+        // picture has ("rome", "rose"): "did you mean" leaves it alone.
+        assert.strictEqual(SearchCore.isName("rome"), true);
+        assert.deepStrictEqual(found("rome"), [[], []]);
+        assert.strictEqual(index.suggest("rome"), null);
+        // A word some picture has is no name: its word match, as before.
+        assert.deepStrictEqual(found("zebra")[0].slice(0, 1), [18]);
+        // A list as words works the same.
+        SearchCore.setWords(["picture", "harbor"]);
+        assert.deepStrictEqual(found("maplebrook"), [[], []]);
+        assert.deepStrictEqual(found("harbor"), [[1, 2], [1, 2]]);
+        // While the rest of the list is on its way, a word the first part lacks
+        // is held back as a name, a misspelling too (only the rest can tell a
+        // well-known name from one): its near misses come once the rest is in
+        // (they never show and then vanish), and the page searches again.
+        SearchCore.setWords(first);
+        SearchCore.wantWords(function () {
+            asked += 1;
+        });
+        assert.deepStrictEqual(found("timepiece"), [[], []]);
+        assert.deepStrictEqual(found("zebrq"), [[], []]);
+        assert.deepStrictEqual(found("rome"), [[], []]);
+        assert.strictEqual(asked, 1);
+        assert.strictEqual(SearchCore.addWords(rest), true);
+        assert.deepStrictEqual(found("timepiece"), [[1, 2], [1, 2]]);
+        assert.deepStrictEqual(found("zebrq"), [[1, 2], [1, 2]]);
+        assert.deepStrictEqual(found("rome"), [[], []]);
+        assert.deepStrictEqual(found("maplebrook"), [[], []]);
+        // When it could not load: as without the list (no name is told).
+        SearchCore.setWords(first);
+        found("timepiece");
+        SearchCore.addWords(null);
+        assert.deepStrictEqual(found("timepiece"), [[1, 2], [1, 2]]);
+        assert.deepStrictEqual(found("maplebrook"), [[1, 2], [1, 2]]);
+        // "Meaning" casts a wider net (one picture well above the rest, z 2.7
+        // here): a search of names alone finds nothing by it in a small set
+        // either; next to a word of the language, a name leaves it as it was.
+        data.set(closeTo(0.47, 1), 0);
+        data.set(closeTo(0.36, 2), MEANING_DIMS);
+        index = SearchCore.prepare(records.slice());
+        index.setVectors({dims: MEANING_DIMS, ids: ids, data: data});
+        SearchCore.setWords(null);
+        assert.deepStrictEqual(found("maplebrook"), [[1], [1]]);
+        SearchCore.setWords([first, rest]);
+        assert.deepStrictEqual(found("maplebrook"), [[], []]);
+        assert.deepStrictEqual(found("maplebrook thornvale"), [[], []]);
+        assert.deepStrictEqual(found("maplebrook harbor"), [[], [1]]);
+        assert.deepStrictEqual(found("timepiece"), [[1], [1]]);
+        // What reaches the usual cut (z 3.3 here) stays, though, by "meaning"
+        // too: it never shows less than the default.
+        data.set(closeTo(0.6, 1), 0);
+        index = SearchCore.prepare(records.slice());
+        index.setVectors({dims: MEANING_DIMS, ids: ids, data: data});
+        assert.deepStrictEqual(found("maplebrook"), [[1], [1]]);
+        assert.deepStrictEqual(found("maplebrook thornvale"), [[1], [1]]);
+    } finally {
+        SearchCore.wantWords(null);
+        SearchCore.setWords(null);
+    }
+});
+
+test("a small set: the words taken for names come with the answer, when they are all", function () {
+    // (The page's empty search says what happened to them, not "check the
+    // spelling" alone.) The pictures of the test above.
+    var records = [];
+    var ids = [];
+    var data = new Int8Array(18 * MEANING_DIMS);
+    for (var k = 0; k < 18; k++) {
+        records.push({i: k + 1, t: "Picture " + (k + 1),
+                      g: k === 17 ? ["zebra"] : k === 16 ? ["rose"] : [],
+                      dk: "2020-01-01", ds: 1});
+        ids.push(k + 1);
+        data.set(closeTo(k === 0 ? 0.45 : k === 1 ? 0.43 : 0.1 + 0.2 * (k - 2) / 15,
+                         1 + (k % 5)), k * MEANING_DIMS);
+    }
+    var index = SearchCore.prepare(records);
+    index.setVectors({dims: MEANING_DIMS, ids: ids, data: data});
+    function names(query, mode) {
+        return index.search(query, {vector: QUERY, meaning: mode}).meaning.names;
+    }
+    var first = require(path.join(__dirname, "..", "..", "static", "english-words.js"));
+    var rest = require(path.join(__dirname, "..", "..", "static", "english-words-more.js"));
+    try {
+        SearchCore.setWords(null);
+        assert.deepStrictEqual(names("maplebrook"), []);
+        SearchCore.setWords([first, rest]);
+        assert.deepStrictEqual(names("maplebrook"), ["maplebrook"]);
+        // (As typed, for the page to quote: capitals and accents, not the marks around.)
+        assert.deepStrictEqual(names("Maplebrook Thornvale"), ["Maplebrook", "Thornvale"]);
+        assert.deepStrictEqual(names("Maplebrook, Thornvale."), ["Maplebrook", "Thornvale"]);
+        assert.deepStrictEqual(names("M\u00e4plebrook"), ["M\u00e4plebrook"]);
+        assert.deepStrictEqual(names("maplebrook", "meaning"), ["maplebrook"]);
+        assert.deepStrictEqual(names("rome"), ["rome"]);
+        // Not when a word is no name: a word of the language, one a picture has,
+        // a misspelling "did you mean" corrects.
+        assert.deepStrictEqual(names("maplebrook harbor"), []);
+        assert.deepStrictEqual(names("maplebrook zebra"), []);
+        assert.deepStrictEqual(names("timepiece"), []);
+        assert.deepStrictEqual(names("zebrq"), []);
+        // Nor while the rest of the list, which could tell, is on its way.
+        SearchCore.setWords(first);
+        SearchCore.wantWords(function () {});
+        assert.deepStrictEqual(names("maplebrook"), []);
+        SearchCore.addWords(rest);
+        assert.deepStrictEqual(names("maplebrook"), ["maplebrook"]);
+    } finally {
+        SearchCore.wantWords(null);
+        SearchCore.setWords(null);
+    }
+});
+
+test("closest word: asked again, the same answer, kept by the index", function () {
+    var records = [{i: 1, g: ["meadow", "bridge"], d: "A bridge over a meadow",
+                    dk: "2020-01-01"}];
+    var index = SearchCore.prepare(records);
+    assert.strictEqual(index.closestWord("meadwo"), "meadow");
+    assert.strictEqual(index.closestWord("meadwo"), "meadow");
+    assert.strictEqual(index.closestWord("qzxwvb"), null);
+    assert.strictEqual(index.closestWord("qzxwvb"), null);
+    for (var k = 0; k < 450; k++) {
+        index.closestWord("brigd" + String.fromCharCode(97 + k % 26) + k);
+    }
+    assert.ok(index.closestCount <= 200, index.closestCount);
+    assert.strictEqual(index.closestWord("bridgr"), "bridge");
 });
 
 test("the typical cosine of two pictures: worked out, or a default", function () {

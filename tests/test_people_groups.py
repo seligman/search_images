@@ -1064,8 +1064,9 @@ class PageScriptTest(unittest.TestCase):
         script = self.read("static", "people.js")
         present = set(re.findall(r'\sid="([^"]+)"', html))
         wanted = set(re.findall(r'(?:byId|getElementById)\("([A-Za-z0-9_-]+)"\)', script))
-        # (The grid of other faces and its "Show more" are made by the script.)
-        self.assertEqual(wanted - present, {"people-faces", "people-more"})
+        # (The grid of other faces, its "Show more" and the list's "Who's this?" are made
+        # by the script.)
+        self.assertEqual(wanted - present, {"people-faces", "people-more", "people-queue-entry"})
         self.assertIn("people.js", html)
         self.assertIn("people.css", html)
 

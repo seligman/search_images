@@ -63,9 +63,12 @@ function response(status, body) {
 }
 
 /* The search page on the server (admin: the admin's); page.log.sent: [[route,
-   body]] of the admin requests made (a GET's query in the route). */
+   body]] of the admin requests made (a GET's query in the route), but for the
+   header's job indicator's polls (GET /jobs?log=0, shell.js pollJobs: page.log.polls,
+   answered "no jobs"), which come on a timer of their own whenever a test runs long
+   enough. */
 function serverPage(admin) {
-    var log = {sent: []};
+    var log = {sent: [], polls: []};
     var data = {records: records()};
     var document = FAKE.makeDocument();
     document.createElementNS = function (ns, tag) {
@@ -102,6 +105,10 @@ function serverPage(admin) {
         var route = /^\/api\/admin(\/.*)$/.exec(plain);
         if (!route) {
             return response(404, {error: "not here"});
+        }
+        if (route[1] === "/jobs" && !body) {
+            log.polls.push(String(url).replace("/api/admin", ""));
+            return response(200, {current: null, queue: [], lock: null});
         }
         log.sent.push([route[1] === "/places/towns" ? String(url).replace("/api/admin", "")
             : route[1], body]);
@@ -386,6 +393,10 @@ test("the admin accepts an estimate", function () {
     }).then(function () {
         page.document.body.constructor.prototype.scrollIntoView = page.realScroll;
         assert.deepStrictEqual(page.log.sent, [["/images/2/place", {choice: "accept"}]]);
+        // (The job indicator's polls, if any came, ask for the jobs only.)
+        page.log.polls.forEach(function (poll) {
+            assert.strictEqual(poll, "/jobs?log=0");
+        });
         // The focus on the first choice now, in the middle of what scrolls:
         // not under the toast at the foot of the screen that says it is done.
         assert.strictEqual(page.document.activeElement.textContent, "Clear");

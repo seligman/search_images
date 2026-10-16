@@ -21,6 +21,10 @@ var PAGE = fs.readFileSync(path.join(ROOT, "templates", "page.html"), "utf8");
 var SCRIPTS = ["site.js", "shell.js", "search-core.js", "viewer.js", "app.js"].map(function (name) {
     return {name: name, code: fs.readFileSync(path.join(STATIC, name), "utf8")};
 });
+// The word list: the first part, which the page loads (templates/page.html), and the
+// rest, a script the page adds when a search first needs it.
+var WORDS = fs.readFileSync(path.join(STATIC, "english-words.js"), "utf8");
+var MORE_WORDS = fs.readFileSync(path.join(STATIC, "english-words-more.js"), "utf8");
 var MODEL_ID = "m-0123456789ab";
 var DIMS = 32;
 
@@ -470,6 +474,17 @@ function records() {
     return {records: list, vectors: vectors};
 }
 
+/* A query vector that only the closest few of these 60 pictures find: the
+   snow angel, a little above the rest (between the cut of a one-word search
+   and the usual one). */
+function nearQuery(vectors) {
+    var values = [];
+    for (var d = 0; d < DIMS; d++) {
+        values.push(0.45 * vectors[7][d] + 0.55 * (d === 0 ? -40 : (d % 3 === 0 ? 30 : -10)));
+    }
+    return unit(values);
+}
+
 function base64(numbers) {
     return Buffer.from(Int8Array.from(numbers).buffer).toString("base64");
 }
@@ -477,15 +492,30 @@ function base64(numbers) {
 /* A fresh exported search page. options: {meaning (false: an export without
    its model), saveData, check (the self-check's cosine), fail (the model
    cannot load), words (Words chosen on an earlier visit), hash (of the
-   address)}. page.log lists the scripts added. */
+   address), wordList (the page loads the word list), wordsDelay (ms before
+   the rest of the word list is in; else 5, as every script), near (the query
+   vector is nearQuery's), missing (a pattern of the scripts that are not
+   there), search (the address's ?query), capabilities (more of the page's
+   capabilities: folders, file_names, map), ordered (scripts added with
+   async false run in the order added), located (every picture has a
+   position)}.
+   page.log lists the scripts added (sources: with their versions; ran: as
+   they ran). */
 function exportPage(options) {
     options = options || {};
     var data = records();
-    var log = {scripts: [], progress: 0, loads: 0, queries: []};
+    if (options.located) {
+        data.records.forEach(function (rec) {
+            rec.gp = 1;
+        });
+    }
+    var log = {scripts: [], sources: [], ran: [], progress: 0, loads: 0, queries: []};
     var document = makeDocument();
     var config = {mode: "static", page: "search", data: "data/", libraries: ["Example"],
                   libraryList: [{id: "lib", name: "Example"}],
-                  capabilities: {admin: false, static: true, images: false}, title: "Example"};
+                  capabilities: Object.assign({admin: false, static: true, images: false},
+                                              options.capabilities || {}),
+                  title: "Example"};
     parseBody(document, PAGE, config);
     var storage = function () {
         var items = {};
@@ -506,7 +536,8 @@ function exportPage(options) {
         document: document,
         navigator: {userAgent: "test", connection: {saveData: Boolean(options.saveData)},
                     clipboard: null},
-        location: {search: "", hash: options.hash || "", pathname: "/x/index.html",
+        location: {search: options.search || "", hash: options.hash || "",
+                   pathname: "/x/index.html",
                    protocol: "file:",
                    href: "file:///x/index.html", origin: "null"},
         history: {state: null, scrollRestoration: "auto", pushState: function (state) {
@@ -592,8 +623,9 @@ function exportPage(options) {
                                 log.queries.push(text);
                                 log.query = log.queries[0];
                                 // (options.far: a query like none of the pictures.)
-                                return Int8Array.from(options.far ? unit([-1].concat(
-                                    new Array(DIMS - 1).fill(0))) : data.vectors[7]);
+                                return Int8Array.from(options.near ? nearQuery(data.vectors)
+                                    : options.far ? unit([-1].concat(new Array(DIMS - 1).fill(0)))
+                                        : data.vectors[7]);
                             }
                         });
                     }, 30);
@@ -601,14 +633,24 @@ function exportPage(options) {
             });
         }
     };
-    // Scripts added to the page run (as theirs would) a moment later.
+    // Scripts added to the page run (as theirs would) a moment later; with
+    // options.ordered, those added with async false only after each such
+    // script added before them has (as a browser runs them).
+    var inOrder = [];
     document.onAppend = function (node) {
         if (node.tagName !== "SCRIPT") {
             return;
         }
         var src = String(node.src || "");
         log.scripts.push(src.split("?")[0]);
-        setTimeout(function () {
+        log.sources.push(src);
+        var entry = {ready: false};
+        var ordered = Boolean(options.ordered) && node.async === false;
+        if (ordered) {
+            inOrder.push(entry);
+        }
+        entry.run = function () {
+            log.ran.push(src.split("?")[0]);
             // (options.missing: the scripts that are not there.)
             if (options.missing && options.missing.test(src)) {
                 if (node.onerror) {
@@ -626,15 +668,30 @@ function exportPage(options) {
                                              data: base64([].concat.apply([], data.vectors))});
             } else if (/embed-engine\.js/.test(src)) {
                 context.EMBED = engine;
+            } else if (/english-words-more\.js/.test(src)) {
+                vm.runInContext(MORE_WORDS, context, {filename: "english-words-more.js"});
             }
             if (node.onload) {
                 node.onload();
             }
-        }, 5);
+        };
+        setTimeout(function () {
+            if (!ordered) {
+                entry.run();
+                return;
+            }
+            entry.ready = true;
+            while (inOrder.length && inOrder[0].ready) {
+                inOrder.shift().run();
+            }
+        }, /english-words-more/.test(src) && options.wordsDelay ? options.wordsDelay : 5);
     };
     vm.createContext(context);
     SCRIPTS.forEach(function (script) {
         vm.runInContext(script.code, context, {filename: script.name});
+        if (script.name === "search-core.js" && options.wordList) {
+            vm.runInContext(WORDS, context, {filename: "english-words.js"});
+        }
     });
     return {context: context, document: document, log: log, data: data};
 }
@@ -947,6 +1004,304 @@ test("with Save-Data on, a button downloads the model", function () {
     }).then(function () {
         assert.strictEqual(page.context.localStorage.getItem("searchImages.meaningDownload"),
                            "1");
+    });
+});
+
+test("the rest of the word list loads from disk when a search first needs it", function () {
+    // A word no picture has: a name ("Maplebrook") finds nothing, a word of the
+    // language descriptions seldom use (in the rest of the list) the closest
+    // picture in meaning, once the rest is in; both as the page searches them.
+    var page = exportPage({wordList: true, near: true});
+    function more() {
+        return page.log.sources.filter(function (src) {
+            return /english-words-more/.test(src);
+        });
+    }
+    var version = /more: \{file: "english-words-more\.js", v: "([0-9a-f]+)"/.exec(WORDS)[1];
+    return loaded(page).then(function () {
+        search(page, "snow");
+        return settle(150);
+    }).then(function () {
+        // (Nothing of it for a word the pictures have.)
+        assert.deepStrictEqual(more(), []);
+        search(page, "timepiece");
+        return waitFor(function () {
+            return /found by meaning/.test(notes(page));
+        });
+    }).then(function () {
+        assert.deepStrictEqual(more(), ["assets/english-words-more.js?v=" + version]);
+        assert.deepStrictEqual(shown(page).filter(function (text) {
+            return /Snow angel/.test(text);
+        }).length, 1);
+        search(page, "maplebrook");
+        return waitFor(function () {
+            return !byId(page, "empty").hidden;
+        });
+    }).then(function () {
+        return settle(150);
+    }).then(function () {
+        assert.deepStrictEqual(shown(page), []);
+        // A misspelling of a word the pictures have keeps its closest picture,
+        // and is corrected.
+        search(page, "snwo");
+        return waitFor(function () {
+            return /Did you mean snow\?/.test(byId(page, "meaning-notes").textContent);
+        });
+    }).then(function () {
+        assert.strictEqual(shown(page).length, 1);
+        assert.strictEqual(more().length, 1, "loaded once");
+    });
+});
+
+test("the rest of the word list that cannot load: no name is told", function () {
+    var page = exportPage({wordList: true, near: true, missing: /english-words-more/});
+    return loaded(page).then(function () {
+        search(page, "maplebrook");
+        return waitFor(function () {
+            return /found by meaning/.test(notes(page));
+        });
+    }).then(function () {
+        assert.deepStrictEqual(shown(page).filter(function (text) {
+            return /Snow angel/.test(text);
+        }).length, 1);
+        assert.strictEqual(page.context.SearchCore.wordsState(), "failed");
+    });
+});
+
+test("a search that waited for the rest of the word list runs again once it is in",
+     function () {
+    // "timepiece" is in the rest only: while it loads, the word is held back
+    // (no near misses that could vanish), then its closest picture comes.
+    var page = exportPage({wordList: true, near: true, wordsDelay: 400});
+    return loaded(page).then(function () {
+        search(page, "timepiece");
+        return settle(200);
+    }).then(function () {
+        assert.strictEqual(page.context.SearchCore.wordsState(), "loading");
+        assert.deepStrictEqual(shown(page), []);
+        return waitFor(function () {
+            return shown(page).length;
+        });
+    }).then(function () {
+        assert.strictEqual(page.context.SearchCore.wordsState(), "ready");
+        assert.deepStrictEqual(shown(page).filter(function (text) {
+            return /Snow angel/.test(text);
+        }).length, 1);
+    });
+});
+
+test("the map link counts the pictures the map shows: not those found by meaning alone",
+     function () {
+    // (The map searches by the words: a picture found by meaning alone is not
+    // there, so a link to it would open an empty map.)
+    var page = exportPage({located: true, capabilities: {map: true}});
+    function link() {
+        var node = byId(page, "map-link");
+        return node.hidden ? "" : node.textContent;
+    }
+    return loaded(page).then(function () {
+        search(page, "snow");
+        return waitFor(function () {
+            return /Show 1 located picture on the map/.test(link());
+        });
+    }).then(function () {
+        search(page, "kids playing outside");
+        return waitFor(function () {
+            return /found by meaning/.test(notes(page));
+        });
+    }).then(function () {
+        assert.ok(shown(page).some(function (text) {
+            return /Snow angel/.test(text);
+        }));
+        assert.strictEqual(link(), "");
+    });
+});
+
+test("a slow rest of the word list holds back neither the model nor the page", function () {
+    // (A fresh page searching a word the first part lacks: the rest of the
+    // list is added first, then the model's scripts, which run in order. The
+    // rest is no part of that order, so the model loads meanwhile; what it
+    // finds for the word waits for the rest, and the page says it is
+    // looking, not to check the spelling.)
+    var page = exportPage({wordList: true, wordsDelay: 400, ordered: true, near: true,
+                           search: "?q=snwo"});
+    function ran(pattern) {
+        return page.log.ran.some(function (src) {
+            return pattern.test(src);
+        });
+    }
+    return waitFor(function () {
+        return ran(/embed-engine\.js$/) && page.log.loads > 0;
+    }, 300).then(function () {
+        assert.ok(!ran(/english-words-more\.js$/), page.log.ran.join(" "));
+        return waitFor(function () {
+            return !byId(page, "empty").hidden &&
+                /Looking for pictures by meaning/.test(byId(page, "empty").textContent);
+        }, 300);
+    }).then(function () {
+        var text = byId(page, "empty").textContent;
+        assert.ok(!/Check the spelling/.test(text), text);
+        assert.ok(!ran(/english-words-more\.js$/), page.log.ran.join(" "));
+        return waitFor(function () {
+            return /Did you mean snow\?/.test(byId(page, "meaning-notes").textContent);
+        });
+    }).then(function () {
+        var tiles = byId(page, "grid").querySelectorAll(".tile");
+        assert.strictEqual(tiles.length, 1);
+        assert.ok(/Snow angel/.test(tiles[0].textContent));
+    });
+});
+
+test("a search the rest of the word list leaves as it was: its note, the same grid",
+     function () {
+    // A misspelling whose picture stands out by meaning shows it while the rest
+    // loads; once the rest is in, "did you mean" offers the word, and the grid,
+    // whose pictures are the same, is not drawn again.
+    var page = exportPage({wordList: true, wordsDelay: 400});
+    var tiles;
+    function grid() {
+        return byId(page, "grid").querySelectorAll(".tile");
+    }
+    return loaded(page).then(function () {
+        search(page, "snwo");
+        return settle(200);
+    }).then(function () {
+        assert.strictEqual(page.context.SearchCore.wordsState(), "loading");
+        tiles = grid();
+        assert.strictEqual(tiles.length, 1);
+        assert.ok(/Snow angel/.test(tiles[0].textContent));
+        assert.ok(!/Did you mean/.test(byId(page, "meaning-notes").textContent));
+        return waitFor(function () {
+            return /Did you mean snow\?/.test(byId(page, "meaning-notes").textContent);
+        });
+    }).then(function () {
+        var now = grid();
+        assert.strictEqual(now.length, 1);
+        // (Compared as a yes or no: a node's own report would print the page.)
+        assert.ok(now[0] === tiles[0], "the same tile");
+    });
+});
+
+test("following \"Did you mean\" gives the search box the focus again", function () {
+    // (A click gives the focus to the link, which the results drawn anew take
+    // away: the box would lose its clear button. With a touch screen the
+    // keyboard would come up over the pictures, so the focus stays.)
+    function follow(page, box) {
+        var link = byId(page, box).querySelector(".did-you-mean a");
+        assert.ok(link, byId(page, box).textContent);
+        link.focus();
+        link.click();
+        assert.strictEqual(byId(page, "query").value, "snow");
+        return page.document.activeElement;
+    }
+    var note = exportPage();
+    var empty = exportPage({far: true});
+    var touch = exportPage({far: true});
+    touch.context.matchMedia = function (query) {
+        return {matches: query === "(pointer: coarse)", addEventListener: function () {},
+                addListener: function () {}};
+    };
+    return Promise.all([loaded(note), loaded(empty), loaded(touch)]).then(function () {
+        // A misspelling meaning finds a picture for: in the note above the pictures.
+        search(note, "snwo");
+        // Nothing close in meaning either: on the empty page.
+        search(empty, "snwo");
+        search(touch, "snwo");
+        return waitFor(function () {
+            return /Did you mean snow\?/.test(byId(note, "meaning-notes").textContent) &&
+                /Did you mean snow\?/.test(byId(empty, "empty").textContent) &&
+                /Did you mean snow\?/.test(byId(touch, "empty").textContent);
+        });
+    }).then(function () {
+        assert.ok(follow(note, "meaning-notes") === byId(note, "query"), "the note's link");
+        assert.ok(follow(empty, "empty") === byId(empty, "query"), "the empty page's link");
+        assert.ok(follow(touch, "empty") !== byId(touch, "query"), "a touch screen");
+    });
+});
+
+test("a search of names alone that finds nothing says so, not to check the spelling",
+     function () {
+    // ("maplebrook" and "thornvale": no picture has them, nor the language, and
+    // "did you mean" has nothing for them, so they get none of the closest few.)
+    var page = exportPage({wordList: true, near: true});
+    function emptyText() {
+        return byId(page, "empty").hidden ? "" : byId(page, "empty").textContent;
+    }
+    return loaded(page).then(function () {
+        search(page, "maplebrook");
+        return waitFor(function () {
+            return /looks like a name/.test(emptyText());
+        });
+    }).then(function () {
+        var text = emptyText();
+        assert.ok(/No pictures match \u201cmaplebrook\u201d/.test(text), text);
+        // (This export has neither folders nor file names: it says what it searched.)
+        var said = "\u201cmaplebrook\u201d looks like a name: no picture's words or " +
+            "places mention it, and it is not in this app's list of English words, so " +
+            "pictures that only come close in meaning are left out.";
+        assert.ok(text.indexOf(said) >= 0, text);
+        assert.ok(/If it is not a name, check the spelling or try another word\./.test(text),
+                  text);
+        assert.ok(!/Check the spelling, or describe it another way/.test(text), text);
+        search(page, "Maplebrook, Thornvale");
+        return waitFor(function () {
+            return /look like names/.test(emptyText());
+        });
+    }).then(function () {
+        var text = emptyText();
+        // (As typed.)
+        var said = "\u201cMaplebrook\u201d, \u201cThornvale\u201d look like names: no " +
+            "picture's words or places mention them, and they are not in this app's list " +
+            "of English words";
+        assert.ok(text.indexOf(said) >= 0, text);
+        assert.ok(/If they are not names, check the spelling or try other words\./.test(text),
+                  text);
+    });
+});
+
+test("Meaning alone says so too, and what an export with file names searched", function () {
+    // (Not "Nothing is close enough in meaning" and "Search by words": no
+    // picture has the words either.)
+    var page = exportPage({wordList: true, near: true, search: "?by=meaning",
+                           capabilities: {folders: true, file_names: true}});
+    // (And a search Meaning finds nothing for that is no name: as before.)
+    var words = exportPage({wordList: true, far: true, search: "?by=meaning"});
+    function emptyText(which) {
+        return byId(which, "empty").hidden ? "" : byId(which, "empty").textContent;
+    }
+    return Promise.all([loaded(page), loaded(words)]).then(function () {
+        search(page, "Maplebrook");
+        search(words, "kids playing outside today");
+        return waitFor(function () {
+            return /looks like a name/.test(emptyText(page)) &&
+                /Nothing is close enough in meaning/.test(emptyText(words));
+        });
+    }).then(function () {
+        var text = emptyText(page);
+        var said = "\u201cMaplebrook\u201d looks like a name: no picture's words, places, " +
+            "folders or file names mention it, and it is not in this app's list of English " +
+            "words";
+        assert.ok(text.indexOf(said) >= 0, text);
+        assert.ok(!/Nothing is close enough in meaning/.test(text), text);
+        assert.ok(!/Search by words/.test(text), text);
+        assert.ok(/Search by words/.test(emptyText(words)), emptyText(words));
+        assert.ok(!/like a name/.test(emptyText(words)), emptyText(words));
+    });
+});
+
+test("words of the language that find nothing: check the spelling, as before", function () {
+    // (Not names: what to check is the spelling, or other words.)
+    var page = exportPage({wordList: true, far: true});
+    return loaded(page).then(function () {
+        search(page, "kids playing outside today");
+        return waitFor(function () {
+            return !byId(page, "empty").hidden &&
+                /close enough in meaning/.test(byId(page, "empty").textContent);
+        });
+    }).then(function () {
+        var text = byId(page, "empty").textContent;
+        assert.ok(/Check the spelling, or describe it another way\./.test(text), text);
+        assert.ok(!/like a name/.test(text), text);
     });
 });
 

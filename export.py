@@ -9,7 +9,8 @@ disk by double-clicking index.html.
 
     index.html  detail.html  [map.html]
     assets/     style.css shell.js site.js search-core.js english-words.js
-                streets.js routes.js viewer.js app.js detail.js [map.js]
+                english-words-more.js (loaded when first needed) streets.js
+                routes.js viewer.js app.js detail.js [map.js]
                 [embed-engine.js embed-kernel.js]
     data/       manifest.js  window.SEARCH_DATA_MANIFEST = {...}
                 index-NNN.js  SEARCH_DATA.push([records])
@@ -294,8 +295,11 @@ PLACES_CREDIT = ('Place names: <a href="%s">GeoNames</a> (<a href="%s" rel="lice
                                      html.escape(places.LICENSE_URL)))
 MAX_ID_LIST = 100000
 # Scripts and the style sheet every export carries (map.js only with the map).
-ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "english-words.js", "streets.js",
-          "routes.js", "viewer.js", "app.js", "detail.js")
+# (english-words-more.js: the rest of the word list, which the search page
+# loads when it first needs it; the first part names it with its version.)
+ASSETS = ("style.css", "site.js", "shell.js", "search-core.js", "english-words.js",
+          "english-words-more.js", "streets.js", "routes.js", "viewer.js", "app.js",
+          "detail.js")
 MAP_ASSETS = ("map.js",)
 # (file in the export, template)
 PAGES = (("index.html", "page.html"), ("detail.html", "detail.html"))

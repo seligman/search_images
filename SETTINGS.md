@@ -1232,8 +1232,9 @@ changes them).
   threshold for "the same person" is about 0.36.
 - `group_quality` - the faces of at least this quality (0 to 1, default
   0.25) are grouped; the others (small, blurred, turned away) only join a
-  person afterwards. The viewer's suggestions of who a face is measure it
-  against these faces of each named person, whoever put them there (all
+  person afterwards. The viewer's suggestions of who a face is (and the
+  People page's **Who's this?**) measure it against these faces of each
+  named person, whoever put them there (all
   of its faces while it has fewer than five such; it is then never
   marked) (README, "Naming a face in the viewer").
 - `min_faces` - a group of at least this many faces (1 to 100, default 3)

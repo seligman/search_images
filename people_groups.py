@@ -1104,6 +1104,13 @@ CANNOT_UNDO = ("The people changed since then (another change, a grouping, or th
                "was deleted): it cannot be undone here. Put it right on the People page.")
 
 
+def restorable(store, snap):
+    """True while nothing changed the people since the change snap was taken for
+    (undoable, settle_snapshot): restore would undo it now."""
+    return (_meta_value(store, "epoch") == snap.get("epoch")
+            and people_version(store) == snap.get("after"))
+
+
 def restore(store, snap):
     """Undo the change snap was taken for (undoable, settle_snapshot): its faces are in
     the people they were in again (the owner's or not, as before), with the "not this
@@ -1111,19 +1118,22 @@ def restore(store, snap):
     covers and times again (one it deleted comes back with its id; one it made goes);
     and when the faces wait for a grouping only because of it, they do no more. Refused
     (GroupError, 409) when anything changed the people since the change: that is read
-    inside the undo's own write (BEGIN IMMEDIATE), so nothing comes in between."""
+    inside the undo's own write (BEGIN IMMEDIATE), so nothing comes in between. Returns
+    {"faces", "people" (how many were put back), "version": the people version the undo
+    left (read in its write: the "after" of a change made right before this one, which
+    can be undone next)}."""
     store.execute("BEGIN IMMEDIATE")
     try:
-        if (_meta_value(store, "epoch") != snap.get("epoch")
-                or people_version(store) != snap.get("after")):
+        if not restorable(store, snap):
             raise GroupError(CANNOT_UNDO, status=409)
         present = _put_back(store, snap)
         _changed(store)
+        version = people_version(store)
         store.commit()
     except BaseException:
         store.rollback()
         raise
-    return {"faces": len(present), "people": len(snap["people"])}
+    return {"faces": len(present), "people": len(snap["people"]), "version": version}
 
 
 def _put_back(store, snap):
@@ -1373,6 +1383,38 @@ def face_person(store, face_id):
     row = store.execute("SELECT person_id FROM face_people WHERE face_id = ?",
                         (face_id,)).fetchone()
     return row[0] if row is not None else None
+
+
+def faces_in(store, face_ids, person_id):
+    """True when each of face_ids (a list of face ids) that is still there is in person
+    person_id now -- None: a face of nobody (in no person, and not marked "not a
+    face")."""
+    face_ids = _face_ids(list(face_ids))
+    for start in range(0, len(face_ids), ID_CHUNK):
+        part = face_ids[start:start + ID_CHUNK]
+        for _face_id, holder, marked in store.execute(
+                "SELECT f.id, fp.person_id, (SELECT 1 FROM face_marks m WHERE m.face_id = "
+                "f.id AND m.not_face) FROM faces f LEFT JOIN face_people fp ON fp.face_id = "
+                "f.id WHERE f.id IN (%s)" % ",".join("?" * len(part)), part):
+            if holder != person_id or (person_id is None and marked):
+                return False
+    return True
+
+
+def in_one_write(store, change):
+    """change() -- a change of the people that commits, with what it checks first -- in
+    one write (BEGIN IMMEDIATE): no change of another connection comes in between.
+    Returns its answer."""
+    store.execute("BEGIN IMMEDIATE")
+    try:
+        answer = change()
+        if store.in_transaction:
+            store.commit()
+    except BaseException:
+        if store.in_transaction:
+            store.rollback()
+        raise
+    return answer
 
 
 def person_view(store, conn, config, person_id, library_ids):

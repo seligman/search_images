@@ -376,3 +376,292 @@
         flex-basis: 72px;
     }
 }
+
+/* "Who's this?": one face or unnamed person at a time (people.js, ?view=queue) */
+
+.queue-entry {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px 16px;
+    margin: 0 0 16px;
+}
+
+.queue-entry h2 {
+    margin: 0 0 4px;
+    font-size: 18px;
+}
+
+.queue-entry p {
+    margin: 0;
+}
+
+.queue-entry .person-actions {
+    margin-top: 0;
+}
+
+.queue-progress {
+    margin: 0 0 8px;
+    color: var(--text-muted);
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+}
+
+.queue-card {
+    max-width: 920px;
+}
+
+.queue-question {
+    margin: 0 0 4px;
+    font-size: 22px;
+    overflow-wrap: anywhere;
+}
+
+/* (Focused by the page, so a screen reader reads it and Enter answers it.) */
+.queue-question:focus {
+    outline: none;
+}
+
+.queue-words,
+.queue-tally {
+    margin: 0 0 14px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
+.queue-sides {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 20px;
+}
+
+.queue-side h3 {
+    margin: 0 0 8px;
+    font-size: 15px;
+    overflow-wrap: anywhere;
+}
+
+.queue-face {
+    width: 100%;
+    max-width: 280px;
+    aspect-ratio: 1;
+    overflow: hidden;
+    border-radius: 10px;
+    background: var(--image-bg);
+}
+
+.queue-face img,
+.queue-strip img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.queue-picture,
+.queue-more {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    font-size: 14px;
+}
+
+.queue-picture img {
+    width: 80px;
+    height: 60px;
+    object-fit: cover;
+    border-radius: 6px;
+    background: var(--image-bg);
+}
+
+.queue-strip {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    max-width: 360px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.queue-strip li {
+    aspect-ratio: 1;
+    overflow: hidden;
+    border-radius: 6px;
+    background: var(--image-bg);
+}
+
+.queue-keys {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 18px;
+}
+
+.queue-keys .button {
+    min-width: 0;
+}
+
+.queue-keys .button > span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* (A person's place of "Not a face": kept empty where the answers stay in
+   one place, see below.) */
+.queue-slot {
+    display: none;
+}
+
+/* (A key's name on its button, where there is a keyboard.) */
+.queue-key {
+    display: none;
+    padding: 0 5px;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    font: inherit;
+    font-size: 12px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .queue-key {
+        display: inline-block;
+    }
+}
+
+/* (A short screen, a laptop's: the face smaller, so the answers fit below it.) */
+@media (max-height: 700px) and (min-width: 601px) {
+    .queue-face {
+        max-width: 200px;
+    }
+
+    .queue-strip {
+        max-width: 300px;
+    }
+}
+
+@media (max-width: 600px) {
+    /* (On a phone the face, the faces to compare with and the answers all fit
+       on the screen: the lead is left out, the two sides stay side by side.) */
+    .people-queue-view #people-lead {
+        display: none;
+    }
+
+    .queue-card {
+        padding: 14px 12px;
+    }
+
+    .queue-question {
+        font-size: 19px;
+    }
+
+    .queue-words {
+        margin-bottom: 10px;
+    }
+
+    .queue-sides {
+        gap: 10px;
+    }
+
+    .queue-side h3 {
+        font-size: 14px;
+    }
+
+    .queue-face {
+        max-width: none;
+    }
+
+    .queue-picture {
+        gap: 6px;
+        font-size: 13px;
+    }
+
+    .queue-picture img {
+        width: 56px;
+        height: 42px;
+    }
+
+    /* (Two faces a row, four of them: about as tall as the face asked about.) */
+    .queue-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 4px;
+    }
+
+    .queue-strip li:nth-child(n+5) {
+        display: none;
+    }
+
+    /* (The end's longer buttons: two a row.) */
+    .queue-end .queue-keys .button {
+        flex: 1 1 45%;
+        min-height: 44px;
+        padding: 6px 8px;
+        white-space: normal;
+    }
+}
+
+@media (max-width: 600px), (max-height: 520px) {
+    /* (On a phone, and on a short screen: the answers in a bar at the foot of the
+       screen, each in the same place for every item -- three a row, each the same
+       size, a long name cut short to two lines, a person's "Not a face" place kept
+       empty -- so a second tap lands on the same answer, never on another.) */
+    .queue-card:not(.queue-end) .queue-keys {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 5;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-auto-rows: 48px;
+        gap: 6px;
+        margin: 0;
+        padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
+        border-top: 1px solid var(--border);
+        background: var(--surface);
+    }
+
+    .queue-card:not(.queue-end) .queue-keys .button {
+        height: 100%;
+        padding: 4px 6px;
+        white-space: normal;
+        overflow: hidden;
+    }
+
+    .queue-card:not(.queue-end) .queue-keys .button > span {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+    }
+
+    .queue-slot {
+        display: block;
+    }
+
+    /* (Room for the bar below the item; messages above it.) */
+    .people-queue-view .queue-card:not(.queue-end) {
+        margin-bottom: calc(124px + env(safe-area-inset-bottom, 0px));
+    }
+
+    .people-queue-view #shell-toasts {
+        bottom: calc(132px + env(safe-area-inset-bottom, 0px));
+    }
+}
+
+@media (max-height: 520px) and (min-width: 601px) {
+    /* (A wide, short screen -- a phone on its side: the six in one row.) */
+    .queue-card:not(.queue-end) .queue-keys {
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+    }
+
+    .people-queue-view .queue-card:not(.queue-end) {
+        margin-bottom: calc(70px + env(safe-area-inset-bottom, 0px));
+    }
+
+    .people-queue-view #shell-toasts {
+        bottom: calc(78px + env(safe-area-inset-bottom, 0px));
+    }
+}

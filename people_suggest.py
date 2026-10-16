@@ -268,7 +268,7 @@ def suggest(store, face_id, config, limit=SHOWN, use_numpy=None):
     picture last (0: every named person, closest first, to measure them) --,
     "preselect": the id Enter takes, or None}. basis: "face" (a face in no person),
     "person" (a face of an unnamed person: what that person most likely is, as
-    suggest_person, with "person": {"id", "label", "faces"}; preselected only when
+    suggest_person, with "person": {"id", "label", "faces", "hidden"}; preselected only when
     this face is like that named person too), "named" (a face of a named person),
     "not_face" or "missing": nothing. config: config.json (people's settings)."""
     answer = {"face": face_id, "basis": "missing", "people": [], "preselect": None}
@@ -320,7 +320,7 @@ def _shown(items, limit):
 
 def suggest_person(store, person_id, config, limit=SHOWN, use_numpy=None):
     """The named people an unnamed person most likely is ("Name Person 12 as X?"):
-    {"basis": "person", "person": {"id", "label", "faces"}, "people": [...] as
+    {"basis": "person", "person": {"id", "label", "faces", "hidden"}, "people": [...] as
     suggest()'s ("in_picture": that person is in PERSON_SHARED or more of its
     pictures, "shared": in how many), "preselect"}; basis "named" (nothing) for a
     named person, "missing" for none. Never a named person a face of this one was
@@ -345,7 +345,8 @@ def _person(store, index, person_id):
 
 def _person_answer(store, index, person_id):
     answer = {"basis": "missing", "people": [], "preselect": None}
-    row = store.execute("SELECT name FROM people WHERE id = ?", (person_id,)).fetchone()
+    row = store.execute("SELECT name, hidden FROM people WHERE id = ?",
+                        (person_id,)).fetchone()
     if row is None:
         return answer, frozenset()
     if row[0]:
@@ -356,8 +357,9 @@ def _person_answer(store, index, person_id):
         "fp.person_id = ? AND f.id NOT IN (SELECT face_id FROM face_marks WHERE not_face) "
         "ORDER BY f.quality DESC, f.id", (person_id,))]
     answer["basis"] = "person"
+    # (hidden: Who's this? does not ask about a stranger the owner hid.)
     answer["person"] = {"id": person_id, "label": people_groups.label(person_id, ""),
-                        "faces": len(faces)}
+                        "faces": len(faces), "hidden": bool(row[1])}
     if not faces:
         return answer, frozenset()
     refused = {item[0] for item in store.execute(

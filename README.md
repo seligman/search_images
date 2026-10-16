@@ -911,9 +911,11 @@ the page header or the filters.
   keys `1` to `5`) rate it, `0` clears the rating, and **Add to album...**
   (or `A`) puts it in an album; see [Favorites, ratings and
   albums](#favorites-ratings-and-albums).
-- The **Map** shows the located pictures of the current search as pins; a
-  pin with a number holds pictures taken close together, which come apart
-  as you zoom in. Click a pin for a list of its pictures: click one to view
+- The **Map** shows the located pictures of the current search as pins
+  (those it finds by their words: it does not search by meaning, so the
+  search page's link to it counts only those); a pin with a number holds
+  pictures taken close together, which come apart as you zoom in. Click a
+  pin for a list of its pictures: click one to view
   it, or **Show these in the grid** for a search page with just those
   pictures, from where **Back to the map** returns to the same place. Drag
   or use the arrow keys to move the map; the wheel, `+` and `-` or a double
@@ -938,11 +940,21 @@ the page header or the filters.
 - When nothing matches, the page says what left the pictures out (a filter,
   "Hide sensitive pictures", the library) with a button to change it, or
   suggests a spelling. A word that is itself a word of the language
-  ("cold") is taken as you typed it, never "corrected" to another one the
-  pictures have ("old"); nor is the first letter of a short word (four
-  letters or fewer), or of any word two letters off, changed (other than
-  swapped with the second): when the closest spelling would change it,
-  none is suggested.
+  ("cold", or a rarer one such as "cutlery" or "waterfowl") is taken as
+  you typed it, never "corrected" to another one the pictures have ("old",
+  "waterfall"); nor is the first letter of a short word (four letters or
+  fewer), or of any word two letters off, changed (other than swapped with
+  the second): when the closest spelling would change it, none is
+  suggested. Nor is a well-known name of a place or a person ("rome" is
+  not "rose", "greece" not "green"). The page knows about 65,000 English
+  words, their plurals and other forms included, and about 7,600 such
+  names (see [Credits](#credits)): the everyday words come with the page;
+  the others and the names (about 125 KB, 77 KB where the web host
+  compresses it) load the first time a search has a word that no picture
+  has and that is not an everyday one -- from the server, a published
+  site, or a copy of one opened from disk -- and until they are in, such
+  a word gets no suggestion (a moment, usually while you are still
+  typing).
 
 ### Search syntax
 
@@ -1234,6 +1246,32 @@ three). **Meaning** shows these too (and the closest few of all pictures
 when none stands out), so it never shows fewer pictures by meaning than
 the default, apart from the rare one the default reaches because it
 left out closer ones that lack a word.
+A word that no picture has and that the app's list of English words
+lacks is taken for a name (a made-up `Maplebrook`, a town abroad, a
+well-known place such as `Rome` too): the pictures closest to it are
+mostly unrelated ones, so in a small set it gets none of the closest
+few, and a search of such names alone gets nothing from **Meaning**'s
+wider net either, only the pictures that stand out as the default shows
+them (so **Meaning** still never shows fewer). When the default or
+**Meaning** then finds nothing for a search of such names alone, the
+page says so: no picture's words, places, folders or file names mention
+them (on a published site, only what it publishes), the app's list of
+English words lacks them, and if they are not names, to check the
+spelling or try another word (a misspelling of a word no picture has, or
+a real word the list lacks, is taken for a name too). A word of the
+language that descriptions seldom use (`cutlery`, `waterfowl`) keeps the
+closest few, and so does a misspelling that "did you mean" corrects
+(`elephnt`: the model often finds what it means anyway). The price, in a
+small set: a name next to a thing (`Maplebrook boats`) loses the boats
+the closest few would have shown; a well-known place none of the
+pictures names (`Rome`, `Norway`) loses what the model would have found
+close to it there (a replica, a dish, a museum piece); and a real word
+the list lacks (mostly recent words, dishes and drinks: `kombucha`,
+`boba`, `chai`) is taken for a name and loses the pictures only
+the closest few find (measured on five such words, a quarter to a third
+of their right pictures in sets of 30 to 63 pictures, nearly all in a
+set of 19). A large library, where the closest few are gone, is searched
+as before.
 - **Words**: the words alone, as without an embedding model. The page
   remembers this choice; the other two last until you leave the page.
 
@@ -2840,14 +2878,15 @@ Each change shows a message with **Undo** (or press Ctrl+Z while it
 shows; in the viewer, Tab reaches its Undo too): everything is as it was
 before, also a person that went with its last face, or one that went
 into another with **Name Person 12 as Ann** (unless the two have more
-than 5000 faces together). Only the last change can be undone, and
-only while nothing else changed the people since
-(another change, here or on the People page, a grouping, or Delete face
-data) and the server has not been started again since (it keeps the
-change in memory only); then put it right on the People page. **Name
-Person 12** is refused when a grouping has moved that face to another
-person meanwhile (so is **Name Person 12 as Ann**): look at it again.
-The names in the pane and on the boxes change at once; the People page
+than 5000 faces together). Only the last change can be undone (in
+[Who's this?](#whos-this-confirming-faces-one-at-a-time) the ones before
+it too, one after another), and only while nothing else changed the
+people since (another change, here or on the People page, a grouping, or
+Delete face data) and the server has not been started again since (it
+keeps the changes in memory only); then put it right on the People
+page. **Name Person 12** is refused when a grouping has moved that face
+to another person meanwhile (so is **Name Person 12 as Ann**): look at
+it again. The names in the pane and on the boxes change at once; the People page
 and `person:` searches see the new names the next time they look (the
 search page's next search). Esc (or a click elsewhere) closes the box
 and gives the keyboard back to the face. For a video or a 360-degree
@@ -2856,6 +2895,96 @@ video to the moment it was seen at, and a face of a 360-degree photo
 turns the view to it. This is the admin's
 only, on this computer: never visitors (even with `"visitors": true`),
 never a published site.
+
+### Who's this? Confirming faces one at a time
+
+When the app is sure who some faces of nobody or unnamed people are (the
+suggestions the viewer marks, see [Naming a face in the
+viewer](#naming-a-face-in-the-viewer)), the People page says so at the
+top: **Who's this? 12 to confirm**. **Start** asks about them one at a
+time (`/people?view=queue`), with how far you are ("3 of 12"):
+
+- a face of nobody: "Is this Ann?", the face, the picture it is in (a
+  click opens it in a new tab; a video at the moment the face was seen),
+  Ann's clearest faces to compare with (one of each moment first), and
+  how close it is, in words and as the closeness itself;
+- an unnamed person: "Is Person 12 Ann?", Person 12's clearest faces
+  beside Ann's, how many faces it has, and a link to all of them (an
+  unnamed person you hid is not asked about).
+
+Answer with a key or with the buttons (each shows its key where there is
+a keyboard; on a phone, or a short screen, they stay in a bar at the foot
+of the screen, each in the same place for every item, so a second tap
+never lands on another answer):
+
+- **Enter** - yes: the face goes to Ann (as **Move to...**), or Person 12
+  goes into Ann with all of its faces (as **Merge into...**);
+- **N** - **Not Ann**: never offered again (as **Not <name>**; for an
+  unnamed person, each of its faces);
+- **S** or the right arrow - **Skip** for now: this browser remembers it,
+  and it is neither counted nor asked about again until **Show the
+  skipped ones again** (on the People page, or at the end);
+- **X** - **Not a face** (a face only);
+- **U** or **Ctrl+Z** - **Undo** the last answer, then the one before
+  it, and so on (up to 20, while nothing else changed the people: see
+  [Naming a face in the viewer](#naming-a-face-in-the-viewer); answers
+  given meanwhile in another tab's **Who's this?** are undone there first,
+  and a change made meanwhile in the viewer can be undone there only
+  while its message shows: after that the answers before it can no
+  longer be undone, so put them right on the People page); that face or
+  person is asked about again, and the line above it says what was
+  undone ("3 of 12 - undone: Not Ann"). This goes on after you leave and
+  come back, or load the page again: the browser tab keeps the answers
+  that can still be undone (not the skips: **Show the skipped ones
+  again** brings those back), and the People page's **Who's this?**
+  offers **Undo last answer** while there is one. A grouping ends it, as
+  it does in the viewer;
+- **Esc** - **Leave**: back to the list.
+
+Nothing is decided without a key or a click, and a press in the first
+moment after an item shows (a second press meant for the one before), or
+a key held down, decides nothing, nor leaves. Each item is asked about
+again right before it shows: one the app is no longer sure about (an
+earlier answer, a grouping or another tab changed it), or an unnamed
+person that was hidden or has other faces now, is passed over, and the
+line above the next one says how many were. An answer about a face or an
+unnamed person that changed after it was shown (a grouping moved the
+face, gave the person other faces; another tab named or hid it) is
+refused, so it never says more than you saw: that item is passed over
+with a note. At the end you see what you decided ("Named 12 faces, named
+3 people (25 faces), 1 skipped.") and **Group faces again to look for
+more**: your answers give the named people more faces, so a grouping
+(the job **Group faces again** queues, its command line in the log)
+often makes the app sure about more; they show here when it has
+finished. Back on the list, the people and the count are as your
+answers left them.
+
+The faces of nobody come first, grouped by the person suggested (so the
+faces to compare with stay the same), the surest first; then the
+unnamed people, most faces first. Measured on a library's faces judged by
+eye: asking about the unnamed people first lost right answers before they
+were asked -- a merge gives a person many faces at once, which made a
+face asked about after it look less sure, and an unnamed person seen in
+pictures with two others named so just before was no longer offered (a
+named person already in two of its pictures is taken for someone else;
+the frames of one video count as one picture) -- so unnamed people seen
+in the same pictures now come one after another, the one in pictures
+with the most of the others first. On that library every answer of the
+first round was the person suggested (but for one face the judges did
+not agree on), and each grouping after a round found a few more, until
+there were none.
+
+The list is worked out on this computer when the People page asks for it
+and kept until the people change: in a large library a fraction of a
+second with numpy, several seconds without it (the page says it is
+looking meanwhile; without numpy the work pauses a moment
+after each few faces, so the rest of the server keeps answering). While
+faces are being found the face data changes every few seconds: the list
+is then the one worked out after you asked (each item is asked about
+again anyway). It is the admin's only, on this computer: never visitors,
+never a published site; nothing about it is saved, but the skips (in
+this browser, for this face data) and, until the tab is closed, the
+answers to undo.
 
 ### Deleting all face data
 
@@ -3570,15 +3699,19 @@ tiles that are whole and writes the missing or damaged ones.
   tested, with their hashes); `people_groups.py` groups the faces into people
   and keeps what you say about them, and answers the server's
   `/api/people`, `/face/<id>` and the People page; `people_suggest.py`
-  suggests who a face is (the viewer's naming box)
+  suggests who a face is (the viewer's naming box), and `people_queue.py`
+  lists the faces and unnamed people it is sure about (the People page's
+  **Who's this?**)
 - `export.py` - publish one library as a static website
 - `trip_export.py` - publish one trip as a static website (`export.py
   --trip`), home kept out
 - `compare_models.py` - compare how endpoints describe the same images
 - `progress.py`, `world_map.py`, `make_tiles.py`, `make_places.py` - see
   [Other tools](#other-tools)
-- `english_words.py` - makes `static/english-words.js`, the words of the
-  language that "did you mean" leaves alone (see [Credits](#credits))
+- `english_words.py` - makes `static/english-words.js` and
+  `english-words-more.js`, the words of the language (and the well-known
+  names) that "did you mean" leaves alone and that tell a word from a name
+  (see [Credits](#credits))
 - `videos.py` - videos: what ffprobe says, posters, contact sheets,
   copies without metadata and playable copies (ffmpeg); 360-degree videos
   (their LRV, stitched frames, the lens geometry the viewer uses)
@@ -3637,8 +3770,12 @@ tiles that are whole and writes the missing or damaged ones.
   by every page; `site.js` is where the pages get their data, from the
   server or from a static export; `search-core.js` is the search engine and
   `viewer.js` the picture viewer, both shared with a static export;
-  `english-words.js` holds the words of the language that "did you mean"
-  leaves alone (made by `english_words.py`, see [Credits](#credits));
+  `english-words.js` holds the everyday words of the language that "did
+  you mean" leaves alone and that tell a word from a name, and
+  `english-words-more.js` the others and the well-known names, which the
+  search page (and the Albums page, for its smart albums) loads when it
+  first needs them (both made by
+  `english_words.py`, see [Credits](#credits));
   `routes.js` draws drive routes, for the map and the viewer;
   `streets.js` draws the maps' ground, the world image and the street
   maps;
@@ -3824,6 +3961,14 @@ Other changes to be aware of:
 - Street maps are optional and downloaded only when you ask (see [Street
   maps](#street-maps)); they are kept in `data/maps/`. Without them the
   maps are as before.
+- The words of the language that "did you mean" leaves alone are a fuller
+  list now, in two files (see [Credits](#credits)): `english-words.js`,
+  which every search page (and the Albums page) loads, and
+  `english-words-more.js` (with the well-known names it leaves alone
+  too), which it loads when a search first needs it. A word that no picture has and that is none of them is
+  taken for a name (see [Search by meaning](#search-by-meaning)). A
+  published site gets the new list when you publish it again; until then
+  it keeps the one it was published with.
 - `config.json` is now written with non-ASCII characters escaped (`\u00fc`),
   and read as UTF-8. A file saved in the system's encoding still loads, with a
   warning.
@@ -3864,7 +4009,11 @@ otherwise. The browser's embedding engine is tested on tiny made-up
 models (`tests/fake_gguf.py`) against what llama.cpp makes of them,
 kept in `tests/fixtures/fake_bert_llamacpp.json`; after a change to the
 made-up models, `SEARCH_IMAGES_LLAMA_SERVER=/path/to/llama-server python
-tests/make_embed_fixture.py` makes that file again.
+tests/make_embed_fixture.py` makes that file again. With
+`ENGLISH_WORDS_LISTS` set to the folder 12dicts is unpacked in (see
+[Credits](#credits)), `tests/test_english_words.py` also runs the command
+that makes the word list files and checks that it makes them as shipped;
+it is skipped otherwise.
 
 `tests/test_repo_hygiene.py` checks every file git would commit for
 personal details (absolute paths, host names, model files). To add your own
@@ -3913,19 +4062,33 @@ names](#place-names)) are from GeoNames, https://www.geonames.org/, under
 the Creative Commons Attribution 4.0 licence
 (https://creativecommons.org/licenses/by/4.0/).
 
-The words of the language that "did you mean" leaves alone
-(`static/english-words.js`, a Bloom filter that `english_words.py` makes;
-it holds no word as text) are the whole words of the vocabulary of the
-mdbr-leaf-ir model (MongoDB, Apache License 2.0,
-https://www.apache.org/licenses/LICENSE-2.0), which is the uncased
-WordPiece vocabulary of BERT (Google, https://github.com/google-research/bert,
-Apache License 2.0). `python english_words.py --model MODEL.gguf` makes the
-file again from a model of your own (or `--list WORDS.txt` from a list).
-With the mdbr-leaf-ir model, this makes the file as shipped, these credits
-in its notes included (and so does `--list vocab.txt` in place of
-`--model`, with the model's WordPiece vocabulary as text, one piece a
-line):
+The words of the language that "did you mean" leaves alone and that tell
+a word from a name, and the well-known names it leaves alone too
+(`static/english-words.js` and `static/english-words-more.js`, Bloom
+filters that `english_words.py` makes; they hold no word as text) are
+from three lists of 12dicts 6.0.2 by Alan Beale,
+http://wordlist.aspell.net/12dicts/, which he released to the public
+domain, asking only to be credited: 3of6game (English as six learner's
+dictionaries have it, with the words' inflected forms), 3esl (everyday
+words, the capitalized ones included) and, for the names, the capitalized
+words of 5d+2a (places, people). To make the files again, download
+`12dicts-6.0.2.zip` from that page (SourceForge project "wordlist", folder
+12Dicts/6.0; SHA-256
+64ac1d35acb66b550c7ebc56e080b62e0bad8f5984d72059dc2e05ac48780e52), unpack
+it into a folder `12dicts` in the program folder (git leaves that folder
+alone; or anywhere else, with the paths below changed to match), and run
+this in the program folder (it writes both files, these credits in their
+notes; the words of `3esl.txt` go to `english-words.js`, the others and
+the names to `english-words-more.js`):
 
 ```
-python english_words.py --model MODEL.gguf --source "the whole words of the WordPiece vocabulary of the mdbr-leaf-ir model (MongoDB), which is the uncased vocabulary of BERT (Google); both under the Apache License 2.0"
+python english_words.py --list 12dicts/International/3of6game.txt --list 12dicts/American/3esl.txt --first 12dicts/American/3esl.txt --names 12dicts/International/5d+2a.txt --source "the 3of6game, 3esl and 5d+2a lists of 12dicts 6.0.2 by Alan Beale (public domain)"
 ```
+
+`python english_words.py --check WORD ...` says whether the files take a
+word for one of the language, or for a well-known name; `--model
+MODEL.gguf` adds the whole words of an embedding model's vocabulary (the
+list before this one was the mdbr-leaf-ir model's: it has many names of
+places and people, which a search must not take for words). With
+`ENGLISH_WORDS_LISTS` set to the folder the zip is unpacked in, the tests
+run that command too and check that it makes the files as shipped.

@@ -42,7 +42,7 @@ MAP_TESTS = os.path.join(support.REPO, "tests", "js", "map_test.js")
 NODE = shutil.which("node")
 SCRIPTS = ("site.js", "viewer.js", "app.js", "detail.js", "map.js", "duplicates.js",
            "embed-engine.js", "embed-kernel.js", "albums.js", "streets.js", "street-maps.js",
-           "english-words.js")
+           "english-words.js", "english-words-more.js")
 
 
 def read(*parts):
@@ -232,6 +232,22 @@ class PageScriptSourceTest(unittest.TestCase):
                        for value in re.findall(r"min-height:\s*(\d+)px", declarations)]
             self.assertTrue(heights and max(heights) >= 40, selector)
 
+    def test_a_map_credit_wraps_inside_the_map(self):
+        # The credits in the map's corner (the world image's and street maps', an
+        # export's GeoNames one) sit 8 px from the right; on a phone 320 px wide
+        # the first takes two lines, and keeps as far from the left edge.
+        css = re.sub(r"/\*.*?\*/", "", read(STATIC, "style.css"), flags=re.S)
+        for query, body in media_blocks(css):
+            css = css.replace(body, "")
+        found = [declarations for selectors, declarations
+                 in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+                 if ".map-credit" in [selector.strip() for selector in selectors.split(",")]]
+        self.assertEqual(len(found), 1)
+        right = re.search(r"(?:^|;)\s*right:\s*(\d+)px", found[0])
+        self.assertIsNotNone(right)
+        self.assertRegex(found[0], r"max-width:\s*calc\(100%% - %dpx\)"
+                         % (2 * int(right.group(1))))
+
     def test_a_small_pane_is_the_same_for_the_viewer_and_its_style(self):
         # The viewer puts a drive's route map under the title in a small pane
         # (COMPACT_QUERY), and style.css makes that map lower there.
@@ -385,6 +401,18 @@ class SearchPagesRenderTest(support.TempBaseMixin, unittest.TestCase):
         # The search box is labelled, and the address never reaches the HTML.
         self.assertIn('aria-label="Search pictures"', html)
         self.assertNotIn("beach", html)
+        # The rest of the word list, which the page adds when a search first
+        # needs it (next to site.js, with the version the first part names).
+        response = self.client.get("/static/english-words.js")
+        first = response.get_data(as_text=True)
+        response.close()
+        more = re.search(r'more: \{file: "(english-words-more\.js)", v: "([0-9a-f]+)"', first)
+        self.assertIsNotNone(more)
+        response = self.client.get("/static/%s?v=%s" % more.groups())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("javascript", response.headers["Content-Type"])
+        self.assertIn(b"var ENGLISH_WORDS_MORE = {", response.get_data())
+        response.close()
 
     def test_detail_page_uses_the_viewer(self):
         html = self.page("/detail?id=12&q=dog")

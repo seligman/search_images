@@ -59,6 +59,7 @@ import not_duplicates
 import opening_views
 import people
 import people_groups
+import people_queue
 import people_suggest
 import place_estimates
 import prompts
@@ -92,6 +93,11 @@ HIDE_LIMIT = 10000          # pictures one hide/unhide (or paths, or tags) reque
 DESCRIBE_IDS_LIMIT = 1000   # pictures one describe job may name
 ID_CHUNK = 500              # ids per SQL statement (older SQLite allows 999 parameters)
 IMAGE_ID_MAX = 2 ** 63 - 1  # SQLite integers are 64-bit
+UNDO_STEPS = 20             # changes of the people Undo can take back, the last one first
+UNDO_VIEWER_SECONDS = 15    # the viewer offers Undo 12 s (viewer.js UNDO_SECONDS), and a margin
+# (A Who's this? answer about a person that changed since it was shown: "seen".)
+PERSON_CHANGED = ("That person changed since it was shown (a grouping gave it other faces, "
+                  "or another change named or hid it): look at it again.")
 # Parameters each kind of job accepts (all optional).
 JOB_PARAMS = {
     "scan": ("allow_mass_removal",),
@@ -1690,6 +1696,7 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         if kind == "delete_faces":
             forget_undo()       # (the names an undo kept go with the face data)
             people_suggest.forget()     # (and those the suggestions keep)
+            people_queue.forget()       # (and the "Who's this?" queue's)
         answer.update(job=job, added=added, jobs=snapshot(config))
         return jsonify(answer), 202
 
@@ -1759,6 +1766,15 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                              {name: "A person's id."})
         return value
 
+    def seen_of(data):
+        """A change's "seen" (Who's this?: people_queue.person_seen() of the person
+        asked about, as it was shown), or None."""
+        seen = data.get("seen")
+        if seen is not None and (not isinstance(seen, str) or not 0 < len(seen) <= 64):
+            raise AdminError(400, "seen is what a Who's this? item said of its person.",
+                             {"seen": "The item's seen."})
+        return seen
+
     @bp.route("/people", methods=["GET"])
     def people_state():
         """People's state for the People page: people.status() (finding faces), "groups":
@@ -1779,30 +1795,45 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         return jsonify(with_people(lambda store: people_groups.person_view(
             store, get_conn(), config, person_id, people_libraries(config)), write=True))
 
-    # The last change made with "undo": true (the viewer's, when a face is named there):
-    # {"token", "snap"} (people_groups.snapshot), until it is undone, another replaces it,
-    # an undo of it is refused, or the face data is deleted. Kept in memory only: a
-    # server started again has none.
+    # The last changes made with "undo": true (the viewer's, when a face is named there,
+    # and the People page's "Who's this?"), the last one last: [{"token", "snap", "held",
+    # "until"}] (people_groups.snapshot; held: a Who's this? answer, whose tab keeps the
+    # token; until: when the viewer's message with Undo has gone), at most UNDO_STEPS.
+    # Only the last one can be undone (POST /people/undo); once it is, the one before it
+    # is the last -- as long as each was made right after the one before it: a change in
+    # between (a grouping, a change made without "undo", another server's) takes them all
+    # away (when the next change is made with undo, or an undo is asked for), and so do
+    # an undo refused, a later change only the viewer could undo once its message has
+    # gone, and Delete face data. Kept in memory only: a server started again has none.
     undo_lock = threading.Lock()
-    last_undo = {}
+    undo_stack = []
 
-    def undo_token(store, snap, made=()):
+    def undo_token(store, snap, made=(), held=False):
         """The token that undoes the change snap was taken before (POST /people/undo), or
-        None when it cannot be undone (another change came in between, too many faces)."""
+        None when it cannot be undone (another change came in between, too many faces).
+        held: Who's this? asked (its tab keeps the token until it is used); else the
+        viewer did, which offers its Undo for a moment only."""
         if not people_groups.settle_snapshot(store, snap, made):
+            forget_undo()       # (nor can those before it: this change came after them)
             return None
         token = os.urandom(12).hex()
         with undo_lock:
-            last_undo.clear()
-            last_undo.update({"token": token, "snap": snap})
+            if undo_stack and undo_stack[-1]["snap"].get("after") != snap["before"]:
+                del undo_stack[:]       # (the people changed in between)
+            undo_stack.append({"token": token, "snap": snap, "held": bool(held),
+                               "until": time.monotonic() + UNDO_VIEWER_SECONDS})
+            del undo_stack[:-UNDO_STEPS]
         return token
 
-    def forget_undo(token=None):
-        """No undo any more (of token's change only, when given): its snapshot -- names
-        among it -- is let go."""
+    def forget_undo(top=None):
+        """No undo any more: the snapshots -- names among them -- are let go. With top
+        (an entry): only while that is still the last change (one made or undone since
+        keeps them); True when they were let go."""
         with undo_lock:
-            if token is None or last_undo.get("token") == token:
-                last_undo.clear()
+            if top is not None and not (undo_stack and undo_stack[-1] is top):
+                return False
+            del undo_stack[:]
+            return True
 
     @bp.route("/people/<int:person_id>", methods=["POST"])
     def person_change(person_id):
@@ -1836,9 +1867,11 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
 
     @bp.route("/people/<int:person_id>/merge", methods=["POST"])
     def person_merge(person_id):
-        """{into: person id, face?, undo?}: every face of this person goes to the other
-        one. face (the viewer's "Name Person 12 as X", asked about one of its faces):
-        refused (409) when that face is not in this person (any more). With "undo": true
+        """{into: person id, face?, seen?, undo?}: every face of this person goes to the
+        other one. face (the viewer's "Name Person 12 as X", asked about one of its
+        faces): refused (409) when that face is not in this person (any more). seen (Who's
+        this?: people_queue.person_seen() of this person when it was shown): refused
+        (409) when it changed since -- other faces, a name, hidden. With "undo": true
         the answer's "undo" is a token that undoes it (POST /people/undo; null when it
         cannot be: the two hold more than people_groups.UNDO_MERGE_FACES faces)."""
         data = body()
@@ -1847,10 +1880,13 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         if face is not None and (isinstance(face, bool) or not isinstance(face, int)
                                  or not 0 < face <= IMAGE_ID_MAX):
             raise AdminError(400, "face is a face's id (a number).", {"face": "A face's id."})
+        seen = seen_of(data)
         quality = people.settings(state.config())["group_quality"]
 
         def work(store):
             def change():
+                if seen is not None and people_queue.person_seen(store, person_id) != seen:
+                    raise AdminError(409, PERSON_CHANGED)
                 if face is not None and people_groups.face_person(store, face) != person_id:
                     raise AdminError(409, "That face is not in this person any more (a "
                                           "grouping or another change moved it): look at it "
@@ -1858,13 +1894,17 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                 return {"person": people_groups.merge(store, person_id, target,
                                                       group_quality=quality)}
             if data.get("undo") is not True:
+                if face is not None or seen is not None:
+                    # (What it checks and the merge in one write.)
+                    return people_groups.in_one_write(store, change)
                 return change()
             # (Every face of both: a merge makes the clear ones the owner's.)
             reply, snap = people_groups.undoable(
                 store, lambda: (people_groups.person_faces(store, person_id) +
                                 people_groups.person_faces(store, target)),
                 [person_id, target], change, limit=people_groups.UNDO_MERGE_FACES)
-            reply["undo"] = undo_token(store, snap) if snap is not None else None
+            reply["undo"] = (undo_token(store, snap, held=seen is not None)
+                             if snap is not None else None)
             return reply
         return jsonify(with_people(work, write=True))
 
@@ -1900,14 +1940,59 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         g.by_etag = True
         return response
 
+    @bp.route("/people/queue", methods=["GET"])
+    def people_queue_route():
+        """The People page's "Who's this?" (people_queue.get): every face in no person
+        and every unnamed person whose suggestion is marked, in the order they are asked
+        about, with the faces to compare. The browser keeps it and asks again by its
+        ETag (the face data's state, the settings, the pictures shown): 304 while
+        nothing changed. 202 {"building": true, "build": n} (Retry-After) while it is
+        being worked out: ask again in a moment with ?build=n (then the answer is that
+        build's, or a later one's, even when the faces changed again meanwhile)."""
+        after = request.args.get("build")
+        if after is not None:
+            if not (after.isascii() and after.isdigit() and len(after) <= 18):
+                raise AdminError(400, "build is the number a 202 answer gave.",
+                                 {"build": "A number."})
+            after = int(after)
+        config = state.config()
+
+        def work(store):
+            if store is None:
+                people_queue.forget()       # (no face data: nothing kept either)
+                return people_queue.empty(), None, None
+            return people_queue.get(store, get_conn(), config, people_libraries(config),
+                                    after=after)
+        answer, tag, build = with_people(work)
+        if answer is None:
+            response = jsonify({"building": True, "build": build, "items": []})
+            response.status_code = 202
+            response.headers["Retry-After"] = "1"
+            return response
+        if tag is not None and request.if_none_match.contains(tag):
+            response = Response(status=304)
+        else:
+            response = jsonify(answer)
+        if tag is not None:
+            response.set_etag(tag)
+            response.headers["Cache-Control"] = "private, no-cache"
+            g.by_etag = True
+        return response
+
     @bp.route("/people/faces", methods=["POST"])
     def people_faces():
-        """{action, faces (face ids, or "all" with person), person?, to?, name?, undo?}:
-        "move" the faces to person "to" (null: a new person called name), "reject" them
-        from person ("not this person"), "not_face" ("not a face") or "is_face" (a face
-        after all). With person, the answer's "source" is that person now (null when it
-        went: its last faces left). With "undo": true (the viewer's) the answer's "undo"
-        is a token that undoes it (POST /people/undo; null when it cannot be)."""
+        """{action, faces (face ids, or "all" with person), person?, to?, name?, from?,
+        seen?, undo?}: "move" the faces to person "to" (null: a new person called name),
+        "reject" them from person ("not this person"), "not_face" ("not a face") or
+        "is_face" (a face after all). With person, the answer's "source" is that person
+        now (null when it went: its last faces left). from (Who's this?: where the faces
+        were when they were shown): the person they must be in (null: faces of nobody --
+        in no person, not marked "not a face"), else 409 (a grouping or another change
+        moved them); "all" faces are then that person's, and seen
+        (people_queue.person_seen() of it when it was shown) is refused (409) when that
+        person changed since -- other faces, a name, hidden. With "undo": true (the
+        viewer's, Who's this?) the answer's "undo" is a token that undoes it (POST
+        /people/undo; null when it cannot be)."""
         data = body()
         action = data.get("action")
         if action not in ("move", "reject", "not_face", "is_face"):
@@ -1916,14 +2001,24 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
         person = data.get("person")
         if person is not None:
             person = person_id_of(person)
+        guard = "from" in data
+        source = data.get("from")
+        if source is not None:
+            source = person_id_of(source, "from")
+        seen = seen_of(data)
+        if seen is not None and source is None:
+            raise AdminError(400, "seen goes with from (the person it was said of).",
+                             {"from": "Needed."})
 
         def work(store):
             faces = data.get("faces")
-            if faces == "all":
-                if person is None:
+            every = faces == "all"
+            if every:
+                whose = source if source is not None else person
+                if whose is None:
                     raise AdminError(400, "\"all\" faces needs the person.",
                                      {"person": "Needed."})
-                faces = people_groups.person_faces(store, person)
+                faces = people_groups.person_faces(store, whose)
                 if not faces:
                     raise AdminError(404, "That person has no faces (any more).")
             to = data.get("to") if action == "move" else None
@@ -1934,6 +2029,15 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                  {"person": "Needed."})
 
             def change():
+                if seen is not None and people_queue.person_seen(store, source) != seen:
+                    raise AdminError(409, PERSON_CHANGED)
+                if guard and not people_groups.faces_in(store, faces, source):
+                    raise AdminError(409, "That face is not where it was any more (a "
+                                          "grouping or another change moved it): look at "
+                                          "it again.")
+                if guard and every and people_groups.person_faces(store, source) != faces:
+                    raise AdminError(409, "That person's faces changed meanwhile (a grouping "
+                                          "or another change): look at it again.")
                 if action == "move":
                     return {"person": people_groups.move_faces(store, faces, to,
                                                                data.get("name") or "")}
@@ -1943,12 +2047,20 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
                                                                action == "not_face")}
 
             if data.get("undo") is True:
-                # (The snapshot and the change in one write: see people_groups.undoable.)
+                # (The snapshot and the change in one write: see people_groups.undoable.
+                # "Not Ann" for a whole unnamed person -- its faces stay where they are,
+                # each "not Ann" -- is undone by Ann's "not this person" alone, however
+                # many faces it has.)
+                whole = (action == "reject" and every and source is not None
+                         and source != person)
                 reply, snap = people_groups.undoable(
-                    store, faces if isinstance(faces, list) else (),
+                    store, faces if isinstance(faces, list) and not whole else (),
                     [value for value in (person, to) if value is not None], change)
                 made = [reply["person"]["id"]] if action == "move" and to is None else []
-                reply["undo"] = undo_token(store, snap, made) if snap is not None else None
+                reply["undo"] = (undo_token(store, snap, made, held=guard)
+                                 if snap is not None else None)
+            elif guard:
+                reply = people_groups.in_one_write(store, change)
             else:
                 reply = change()
             if person is not None:
@@ -1963,25 +2075,64 @@ def init_app(app, state, manager, allowed_hosts, enabled=True, model_servers=Non
     @bp.route("/people/undo", methods=["POST"])
     def people_undo():
         """{undo: the token of the last change made with "undo": true}: the people as
-        they were before it (people_groups.restore). Only that change, once, only while
-        nothing else changed the people since, and not after the server was started
-        again (it keeps the change in memory): 409 else."""
+        they were before it (people_groups.restore). Only the last such change, once,
+        only while nothing else changed the people since, and not after the server was
+        started again (it keeps the changes in memory): 409 else -- with "kept": true
+        when later changes made with undo are to be undone first and each still can be
+        (another tab's Who's this? keeps its answers; the viewer offers its Undo while
+        its message shows): this one is kept until then. When one of them no longer can
+        be (it is gone from the viewer, or the people changed since), none of them can.
+        Once it is undone, the change made right before it is the last (of UNDO_STEPS)."""
         token = body().get("undo")
         with undo_lock:
-            entry = dict(last_undo)
-        if not isinstance(token, str) or not entry or token != entry["token"]:
+            entry = below = None
+            later = []
+            if isinstance(token, str) and undo_stack and undo_stack[-1]["token"] == token:
+                entry = undo_stack.pop()
+                below = undo_stack[-1]["token"] if undo_stack else None
+            elif isinstance(token, str):
+                for at, item in enumerate(undo_stack):
+                    if item["token"] == token:
+                        later = undo_stack[at + 1:]
+
+        def refuse(store):
+            top = later[-1]
+            if ((store is None or not people_groups.restorable(store, top["snap"]))
+                    and forget_undo(top)):
+                raise AdminError(409, people_groups.CANNOT_UNDO)
+            if (not all(item["held"] or time.monotonic() < item["until"] for item in later)
+                    and forget_undo(top)):
+                raise AdminError(409, "A change made in the viewer after it can no longer be "
+                                      "undone there, so this one cannot be either: put it "
+                                      "right on the People page.")
+            # (Kept: it can be undone once the later ones are -- or the last change was
+            # undone, or another made, while this was asked: then ask again.)
+            raise AdminError(409, "A later change (in the viewer or another tab) has to be "
+                                  "undone first.", kept=True)
+        if later:
+            with_people(refuse)
+        if entry is None:
             raise AdminError(409, "That change cannot be undone here any more (only the last "
-                                  "change made in the viewer can be, once, and not after the "
-                                  "server was started again). Put it right on the People "
-                                  "page.")
+                                  "changes made in the viewer or in Who's this? can be, the "
+                                  "last one first, each once, and not after the server was "
+                                  "started again). Put it right on the People page.")
 
         def work(store):
             try:
-                people_groups.restore(store, entry["snap"])
+                done = people_groups.restore(store, entry["snap"])
             except people_groups.GroupError:
-                forget_undo(token)      # (refused once, it is refused for good)
+                forget_undo()       # (refused once: it and those before it, for good)
                 raise
-            forget_undo(token)
+            except Exception:
+                with undo_lock:     # (not undone: it can be tried again)
+                    if (undo_stack[-1]["token"] if undo_stack else None) == below:
+                        undo_stack.append(entry)
+                raise
+            with undo_lock:
+                if undo_stack and undo_stack[-1]["token"] == below:
+                    # (The change before it can be undone next: the people are as it left
+                    # them, but for the version the undo raised.)
+                    undo_stack[-1]["snap"]["after"] = done["version"]
             return {"undone": True}
         return jsonify(with_people(work, write=True))
 

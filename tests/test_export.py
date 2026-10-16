@@ -571,6 +571,14 @@ class ExportTest(ExportFixture):
             rel, version = source.split("?v=")
             with open(os.path.join(out, rel), "rb") as handle:
                 self.assertEqual(version, hashlib.sha1(handle.read()).hexdigest()[:10], rel)
+        # The rest of the word list, which the page loads when a search first
+        # needs it: next to the first part, which names it with its version.
+        with open(os.path.join(out, "assets", "english-words.js"), encoding="ascii") as handle:
+            more = re.search(r'more: \{file: "([a-z-]+\.js)", v: "([0-9a-f]+)"',
+                             handle.read())
+        self.assertEqual(more.group(1), "english-words-more.js")
+        with open(os.path.join(out, "assets", more.group(1)), "rb") as handle:
+            self.assertEqual(more.group(2), hashlib.sha1(handle.read()).hexdigest()[:10])
 
         # Dates only from the camera or a file name, never a file's time.
         rows = {row["id"]: row for row in self.conn.execute(

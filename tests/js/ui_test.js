@@ -751,6 +751,123 @@ test("the meaning of a query: ready, starting, too many, not set up", function (
     });
 });
 
+/* ---------- The rest of the word list (SITE.loadWords) ----------------------- */
+
+/* A search page whose added scripts run a moment later (delay ms; or fail to
+   load, with fail); src: where its site.js came from (none: an export's
+   assets/). */
+function wordsPage(src, fail, delay) {
+    var log = {scripts: [], async: []};
+    var win = {location: {search: "", protocol: src ? "http:" : "file:"},
+               APP_CONFIG: src ? {mode: "server", api: "/api", page: "search"}
+                   : {mode: "static", data: "data/", page: "search"}};
+    var doc = {
+        currentScript: src ? {getAttribute: function () {
+            return src;
+        }} : null,
+        getElementById: function () {
+            return null;
+        },
+        createElement: function () {
+            return {};
+        },
+        head: {appendChild: function (script) {
+            log.scripts.push(script.src);
+            log.async.push(script.async);
+            setTimeout(function () {
+                if (fail) {
+                    script.onerror();
+                } else {
+                    win.ENGLISH_WORDS_MORE = {format: 1, count: 1, size: 5, hashes: 1,
+                                              data: "1"};
+                    script.onload();
+                }
+            }, delay || 0);
+        }}
+    };
+    var file = require.resolve(path.join(STATIC, "site.js"));
+    delete require.cache[file];
+    global.window = win;
+    global.document = doc;
+    var site;
+    try {
+        site = require(file);
+    } finally {
+        delete global.window;
+        delete global.document;
+    }
+    return {
+        site: site,
+        log: log,
+        load: function (more, late, wait) {
+            global.document = doc;
+            // (wait: how long the page waits for it, for SITE's WORDS_WAIT.)
+            var timer = global.setTimeout;
+            if (wait) {
+                global.setTimeout = function (callback, ms) {
+                    return timer(callback, ms >= 20000 ? wait : ms);
+                };
+            }
+            try {
+                return site.loadWords(more, late);
+            } finally {
+                global.setTimeout = timer;
+                delete global.document;
+            }
+        }
+    };
+}
+
+test("the rest of the word list: one script next to site.js, with its version", function () {
+    var more = {file: "english-words-more.js", v: "0123456789", count: 1};
+    var exported = wordsPage(null);
+    var served = wordsPage("/static/site.js");
+    var first = exported.load(more);
+    // (Asked again, the same answer: loaded once.)
+    assert.strictEqual(exported.load(more), first);
+    return Promise.all([first, served.load(more)]).then(function (found) {
+        assert.deepStrictEqual(exported.log.scripts, ["assets/english-words-more.js?v=0123456789"]);
+        assert.deepStrictEqual(served.log.scripts,
+                               ["/static/english-words-more.js?v=0123456789"]);
+        // (Out of the order the meaning engine's scripts keep: it holds none back.)
+        assert.deepStrictEqual(exported.log.async, [true]);
+        assert.strictEqual(found[0].count, 1);
+        assert.strictEqual(found[1].size, 5);
+        // A script that does not load, or a name that is no script of the page's
+        // own: none (the page then searches as with the first part alone).
+        return Promise.all([wordsPage(null, true).load(more),
+                            wordsPage(null).load({file: "../other.js", v: "1"}),
+                            wordsPage(null).load({file: "https://example.com/x.js"}),
+                            wordsPage(null).load(null)]);
+    }).then(function (found) {
+        assert.deepStrictEqual(found, [null, null, null, null]);
+    });
+});
+
+test("the rest of the word list after the page stopped waiting: handed over still", function () {
+    // (The page searches as with the first part alone once SITE stops waiting;
+    // a list that comes in later still is taken for the next searches.)
+    var more = {file: "english-words-more.js", v: "0123456789", count: 1};
+    var page = wordsPage(null, false, 60);
+    var late = [];
+    var first = page.load(more, function (words) {
+        late.push(words);
+    }, 10);
+    return first.then(function (found) {
+        assert.strictEqual(found, null);
+        assert.deepStrictEqual(late, []);
+        return new Promise(function (resolve) {
+            setTimeout(resolve, 120);
+        });
+    }).then(function () {
+        assert.strictEqual(late.length, 1);
+        assert.strictEqual(late[0].size, 5);
+        // (Loaded once: asked again, the same answer.)
+        assert.strictEqual(page.load(more), first);
+        assert.strictEqual(page.log.scripts.length, 1);
+    });
+});
+
 /* ---------- Search by meaning in an export (a stub engine) ------------------- */
 
 var MEANING = {id: "m-0123456789ab", dims: 4, model: "meaning/model.js",

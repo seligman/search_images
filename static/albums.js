@@ -17,10 +17,13 @@
    covers from SearchCore (a smart album's search runs here, by meaning
    too when the server can embed it, and with the people of
    SITE.peopleForSearch when it names a person, and with where the
-   pictures were taken, SITE.loadPlaces, when it has an area of the map),
-   so they agree with the search page. A smart album that names a person
-   cannot be copied until the people have come (nor where there are none to
-   have), nor one with an area until the places have.
+   pictures were taken, SITE.loadPlaces, when it has an area of the map,
+   and with the page's list of English words, so that a word no picture
+   has and the list lacks is taken for a name as there), so they agree
+   with the search page. A smart album that names a person cannot be
+   copied until the people have come (nor where there are none to have),
+   nor one with an area until the places have, nor while a search waits
+   for the rest of the word list.
 
    Pages are built with DOM calls and textContent only (never innerHTML).
 */
@@ -190,8 +193,13 @@
     }
 
     /* Why a smart album's pictures cannot be copied now ('' when they can):
-       it names a person and the people have not come (or there are none). */
+       a search waits for the rest of the word list, or it has an area and
+       the places have not come, or it names a person and the people have
+       not (or there are none). */
     function notCopyable(album) {
+        if (SearchCore.wordsHeld()) {
+            return "Wait a moment: the rest of the list of words is on its way.";
+        }
         if (hasArea(album) && !places) {
             return "Wait a moment: where the pictures were taken is on its way.";
         }
@@ -978,6 +986,17 @@
         setupDragging();
         window.addEventListener("popstate", function () {
             go(wanted(), false);
+        });
+        // The rest of the word list, when a smart album's search first needs
+        // it (as on the search page: whether a word no picture has is a
+        // name); the list is drawn again once it is in, when one waited.
+        SearchCore.wantWords(function (more) {
+            function take(words) {
+                if (SearchCore.addWords(words) && data) {
+                    render();
+                }
+            }
+            SITE.loadWords(more, take).then(take);
         });
         SITE.loadIndex(function (loaded) {
             if (!loaded) {

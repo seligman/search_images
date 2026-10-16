@@ -335,7 +335,7 @@ class PersonTest(SuggestMixin, unittest.TestCase):
         answer = people_suggest.suggest_person(self.store, person, CONFIG)
         self.assertEqual(answer["basis"], "person")
         self.assertEqual(answer["person"], {"id": person, "label": "Person %d" % person,
-                                            "faces": 4})
+                                            "faces": 4, "hidden": False})
         self.assertEqual(self.labels(answer), ["Ann"])
         self.assertEqual(self.labels(people_suggest.suggest_person(
             self.store, person, CONFIG, limit=0)), ["Ann", "Bob"])
